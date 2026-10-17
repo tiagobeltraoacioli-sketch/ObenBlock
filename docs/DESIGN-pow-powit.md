@@ -260,7 +260,12 @@ A partitioned side may keep producing blocks (LOG_avail), but at most one
 side can finalize. After the heal every node that holds both sides learns
 that side's finalization from its blocks (it advances the finality both
 sides share), pins the same checkpoint and converges on the same chain,
-whatever the arrival order. Before this (finding 2) the pin came from the
+whatever the arrival order. To hold them, a node of the heavier side admits
+the finalized side's blocks below its anti-DoS work window when they claim
+a newer finality (attestations linking from a checkpoint justified beyond
+its pin), within per-peer and per-node budgets (docs/CONSENSUS.md, "Anti-DoS
+work rule", item 4; review HIGH 2: the work rule alone split any partition
+longer than 360 blocks of work for good). Before this (finding 2) the pin came from the
 node's own applied chain only, so the lighter-but-finalized side and the
 heavier side split for good.
 

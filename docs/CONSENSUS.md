@@ -1121,7 +1121,35 @@ bound of B's blue work:
    admitted, and only admissions more than 1,000 blocks deep were rationed.
    From the activation no orphan vouches: B's own chain cannot come within
    the 360-block window, so B is below the merge-depth root of every block
-   that builds on the tip and merging it is a `MergeDepthViolation`.
+   that builds on the tip and merging it is a `MergeDepthViolation`; or
+4. B is FINALITY-BACKED (review of the PoWit finality pin, HIGH 2): a
+   lighter chain wins fork choice when it carries a finality newer than the
+   node's ("Selected parent and fork choice"), and the node learns that
+   finality only from blocks it stores, so the rule above split a healed
+   partition for good once the side without new finality was more than 360
+   blocks of work ahead. A block whose PoWit section claims a newer finality
+   — an attestation whose source checkpoint lies more than one checkpoint
+   interval above the node's pin (its slot; with no pin, the PoWit
+   activation): consensus requires the source to be the including chain's
+   justified checkpoint, so a chain that finalized `F` beyond the pin links
+   from `F` + one interval or later, and the node's own chain links from at
+   most its pin + one interval — marks itself, when buffered as an orphan,
+   and the missing parents the node then requests; each marked block it
+   requested in turn marks its own. A marked block (the claiming orphan, or
+   an ancestor of it the node requested) is admitted below `T`, after
+   every cheap check and its proof of work, and charged, once, to the peer
+   that delivered it (at most 1,440 admissions, refilled at one a minute)
+   and to the node (at most 2,880, refilled at one per 30 s; about two
+   mainnet epochs, more than an honest side needs to reach the block whose
+   state carries its newer finality, and a side that finalized only through
+   inactivity decay is fetched at the refill rate); a spent budget drops the
+   block without penalty (it is requested again). At most 8,192 blocks are
+   marked at once. A claim is only a reason to fetch: the claimed finality
+   counts once the blocks are stored and their PoWit states computed, like
+   any other; a false one costs its senders their budgets and leaves stored
+   fork-loser blocks, pruned like any other. Once the node pins the claimed
+   finality, its selected tip is on that chain and the rest of it is within
+   the window (`node/tests/fix_powit_finality_heal_ingress.rs`).
 
 Otherwise B is ignored without penalty (a refused block is not re-evaluated
 until the orphan pool, the DAG or the selected tip changes). A chain that

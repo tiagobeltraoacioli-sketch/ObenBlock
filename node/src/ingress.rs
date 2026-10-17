@@ -27,7 +27,9 @@
 //!   if the proof-of-work-verified orphans announced on top of it (summed,
 //!   each once, buffered or evicted) bring it there (see [`work_admission`]).
 //!   A chain that carries the work is accepted, so the final outcome for
-//!   honest data is unchanged;
+//!   honest data is unchanged; so is a lighter chain that claims a finality
+//!   newer than the node's, within budgets ([`FinalityPulls`], review of the
+//!   PoWit finality pin, HIGH 2: such a chain can win fork choice);
 //! * a copy of a block already in the DAG is processed only if a body of it
 //!   is wanted (`accept::awaits_body`: its body was rejected for a
 //!   witness-dependent reason, or a connect — or an operator override —
@@ -1681,6 +1683,13 @@ pub enum WorkAdmission {
     /// parent (it merges a lower-work block); deep ones consume the
     /// [`DeepBackfillBudget`].
     MergeBacked,
+    /// Review HIGH 2: below the threshold, but a requested ancestor of an
+    /// orphan whose chain claims a finality newer than this node's
+    /// ([`FinalityPulls`]): a lighter chain that finalized can win fork
+    /// choice (`consensus::finality`), so the node must hold its blocks to
+    /// compute their PoWit states. Charged to the delivering peer's and the
+    /// node's finality-pull budgets.
+    FinalityBacked,
     /// Nothing backs it: its chain cannot come within the window of our tip.
     /// Not stored, not processed, not penalized; if a heavier chain ever
     /// builds on it, that chain's orphans make it `ChainBacked` /
@@ -1701,6 +1710,168 @@ pub fn work_admission(lb: u128, threshold: u128, chain_above: u128, merge_lb: u1
         WorkAdmission::MergeBacked
     } else {
         WorkAdmission::LowWork
+    }
+}
+
+// ── Review HIGH 2: finality-backed pulls ─────────────────────────────────────
+//
+// A lighter chain can win fork choice when it carries a newer finality
+// (`consensus::finality`: a finalized checkpoint learned from any stored
+// block advances the node's own). The POW-3 work rule dropped every block of
+// a chain more than `ANTI_DOS_WINDOW_BLOCKS` of work below the tip, so after
+// a partition longer than that window the heavier side without new finality
+// never stored the other side's blocks, never computed their PoWit states,
+// never learned their finality, and the network stayed split.
+//
+// The fix (the review's option (a), the simplest that is DoS-bounded): a
+// block whose PoWit section claims that its chain justified a checkpoint
+// beyond this node's finality is a FINALITY CLAIM, and the ancestors the node
+// pulls for it (directed: the missing parents of buffered orphans it backs)
+// are admitted below the work threshold, within budgets. The claim is the
+// block itself, no new wire message: an attestation's source is its chain's
+// justified checkpoint (consensus rejects any other), so a block of a chain
+// that finalized `F` beyond this node's pin carries sources at least one
+// checkpoint interval above `F`. A claim is only a reason to fetch: the
+// claimed chain's finality counts once its blocks are stored and their PoWit
+// states computed, like any other (`powit::refresh_finality_pin`); a false
+// claim costs the claimer its budget and leaves stored fork-loser blocks,
+// pruned like any other.
+//
+// Bounds (`FinalityPulls`): each admission stores one block that passed every
+// check a block passes, proof of work included, and that the node requested
+// (a missing parent of a buffered orphan the claim backs; the claiming
+// orphan itself met the orphan floor, `ORPHAN_WORK_FLOOR_SHIFT`, and its
+// proof). At most `FINALITY_PULL_PEER_BURST` admissions per delivering peer
+// (the connection that answered the pull or relayed the orphan, refilled at
+// `FINALITY_PULL_PEER_REFILL`) and `FINALITY_PULL_BURST` for the node (refilled
+// at one block interval's rate): two mainnet epochs, more than an honest side
+// needs to show a newer finality (a checkpoint every 60 blocks, finalized
+// one interval later); a side that finalized only through inactivity decay
+// is fetched at the refill rate after the burst. At most `FINALITY_MARKS_MAX`
+// blocks are marked as backed at once (oldest forgotten first).
+
+/// Admissions below the work threshold per delivering peer (burst).
+pub const FINALITY_PULL_PEER_BURST: u32 = 1_440;
+/// Per delivering peer, tokens per second (one per minute).
+pub const FINALITY_PULL_PEER_REFILL: f64 = 1.0 / 60.0;
+/// Admissions below the work threshold for the whole node (burst).
+pub const FINALITY_PULL_BURST: u32 = 2_880;
+/// Node-wide, tokens per second (one per 30 s block interval).
+pub const FINALITY_PULL_REFILL: f64 = 1.0 / 30.0;
+/// Blocks marked as finality-backed at once.
+pub const FINALITY_MARKS_MAX: usize = 8_192;
+/// Delivering peers tracked by the per-peer budget.
+const FINALITY_PULL_PEERS_TRACKED: usize = 1_024;
+
+/// Whether `block` claims a finality newer than this node's: one of its
+/// attestations links from a checkpoint above `floor` ([`finality_claim_floor`]),
+/// i.e. its chain justified a checkpoint more than one interval beyond the
+/// node's finalized one. Cheap (no signature is checked: a claim is only a
+/// reason to fetch, see the section comment).
+pub fn claims_finality(block: &core::Block, floor: u64) -> bool {
+    block.powit.attestations.iter().any(|a| a.source.height > floor)
+}
+
+/// The source height above which an attestation claims a finality newer than
+/// `dag`'s pin: the pin's checkpoint slot (else its DAG height + 1; with no
+/// pin, the PoWit activation) plus one checkpoint interval (the justified
+/// checkpoint of a chain that finalized `F` and nothing newer is `F` + one
+/// interval).
+pub fn finality_claim_floor(dag: &GhostDAG) -> u64 {
+    let base = match dag.finalized() {
+        Some((h, height)) => dag.finality_outcome().counted.iter()
+            .find(|c| c.0 == h).map(|c| c.2).unwrap_or(height.saturating_add(1)),
+        None => core::powit_height(),
+    };
+    base.saturating_add(core::powit::params().checkpoint_interval)
+}
+
+/// Review HIGH 2: the blocks a finality claim backs, and the budgets of
+/// their admission below the work threshold (section comment above).
+pub struct FinalityPulls {
+    marks:    HashSet<[u8; 32]>,
+    order:    VecDeque<[u8; 32]>,
+    per_peer: crate::network::ratelimit::TokenBuckets<Option<PeerId>>,
+    global:   crate::network::ratelimit::TokenBuckets<()>,
+}
+
+impl Default for FinalityPulls {
+    fn default() -> Self {
+        Self::new(FINALITY_PULL_PEER_BURST, FINALITY_PULL_BURST)
+    }
+}
+
+impl FinalityPulls {
+    /// Budgets of `per_peer` and `global` admissions (bursts; the refill
+    /// rates are the constants').
+    pub fn new(per_peer: u32, global: u32) -> Self {
+        Self {
+            marks: HashSet::new(),
+            order: VecDeque::new(),
+            per_peer: crate::network::ratelimit::TokenBuckets::new(per_peer, FINALITY_PULL_PEER_REFILL,
+                FINALITY_PULL_PEERS_TRACKED),
+            global: crate::network::ratelimit::TokenBuckets::new(global, FINALITY_PULL_REFILL, 1),
+        }
+    }
+
+    /// Whether a finality claim backs `hash`.
+    pub fn backs(&self, hash: &[u8; 32]) -> bool {
+        self.marks.contains(hash)
+    }
+
+    /// Number of blocks marked as backed.
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
+    pub fn len(&self) -> usize {
+        self.marks.len()
+    }
+
+    fn mark(&mut self, hash: [u8; 32]) {
+        if !self.marks.insert(hash) {
+            return;
+        }
+        self.order.push_back(hash);
+        while self.marks.len() > FINALITY_MARKS_MAX {
+            match self.order.pop_front() {
+                Some(old) => { self.marks.remove(&old); }
+                None => break,
+            }
+        }
+        // Entries `forget` left behind: keep the queue within twice the bound.
+        if self.order.len() > 2 * FINALITY_MARKS_MAX {
+            let marks = &self.marks;
+            self.order.retain(|h| marks.contains(h));
+        }
+    }
+
+    /// A buffered orphan `hash` with these missing parents: if it claims a
+    /// finality newer than the node's, or a claim already backs it, mark it
+    /// and its missing parents (the ancestors the node requests next).
+    pub fn note_orphan(&mut self, hash: [u8; 32], claims: bool, missing: &[[u8; 32]]) {
+        if !claims && !self.backs(&hash) {
+            return;
+        }
+        self.mark(hash);
+        for p in missing {
+            self.mark(*p);
+        }
+    }
+
+    /// Spend one admission delivered by `peer`: its budget and the node's.
+    /// `false` (nothing spent) when either is exhausted.
+    pub fn charge(&mut self, peer: Option<PeerId>, now: Instant) -> bool {
+        if !self.per_peer.allow_at(peer, now) {
+            return false;
+        }
+        if !self.global.allow_at((), now) {
+            self.per_peer.refund_n(peer, 1);
+            return false;
+        }
+        true
+    }
+
+    /// `hash` was stored: its mark is no longer needed.
+    pub fn forget(&mut self, hash: &[u8; 32]) {
+        self.marks.remove(hash);
     }
 }
 
@@ -1886,6 +2057,10 @@ pub enum DropReason {
     /// refused proof-of-work job directly.
     #[allow(dead_code)] // tests only; the node binary compiles this module too
     PowBusy,
+    /// Review HIGH 2: a finality-backed block while the delivering peer's or
+    /// the node's finality-pull budget is spent ([`FinalityPulls`]); the
+    /// orphans above it keep waiting and it is requested again.
+    FinalityBudgetExhausted,
 }
 
 /// At most this many pruned bodies are named by an operator override that
@@ -2147,6 +2322,9 @@ pub struct BlockIngress {
     /// What happened to drained orphans since the last
     /// [`BlockIngress::take_orphan_events`] (their withheld gossip verdicts).
     orphan_events:    OrphanBlockEvents,
+    /// Review HIGH 2: blocks a finality claim backs, and the budgets of
+    /// their admission below the work threshold.
+    pub finality:     FinalityPulls,
 }
 
 type LowWorkState = (u64, usize, Option<BlockHash>);
@@ -2162,16 +2340,19 @@ impl Default for BlockIngress {
 
 /// The POW-3 work rule (see [`BlockIngress::work_check`]) on the core's
 /// parts, so the orphan drain can apply it while it holds the pool. With
-/// `budget` `None` a merge-backed admission is classified but not charged:
-/// the caller charges it once the block's proof is known valid.
+/// `budget` `None` a merge-backed or finality-backed admission is classified
+/// but not charged: the caller charges it once the block's proof is known
+/// valid.
 #[allow(clippy::too_many_arguments)]
 fn work_rule(
     orphans:         &OrphanPool,
     budget:          Option<&mut DeepBackfillBudget>,
+    finality:        &mut FinalityPulls,
     threshold_cache: &mut Option<(BlockHash, u128)>,
     low_work:        &mut LowWorkCache,
     block:           &core::Block,
     hash:            &[u8; 32],
+    peer:            Option<PeerId>,
     now:             Instant,
     now_unix:        u64,
     dag:             &GhostDAG,
@@ -2189,12 +2370,19 @@ fn work_rule(
         }
     };
     let lb = block_work_lower_bound(dag, &block.header.parents, block.header.bits, block.height).unwrap_or(0);
+    let charge = budget.is_some();
     let (chain_above, merge_lb) = if lb >= threshold {
         (0, 0)
     } else {
         let chain_above = orphans.announced_work_capped(hash, threshold - lb);
         if lb.saturating_add(chain_above) >= threshold {
             (chain_above, 0) // ChainBacked: the merge bound is not needed
+        } else if finality.backs(hash) {
+            // Review HIGH 2: a requested ancestor of a finality claim.
+            if charge && !finality.charge(peer, now) {
+                return Err(DropReason::FinalityBudgetExhausted);
+            }
+            return Ok(WorkAdmission::FinalityBacked);
         } else {
             let act = core::activation::hardening_activation_height();
             (chain_above, orphans.best_voucher_lb(hash, block, lb, dag, now_unix, act))
@@ -2229,7 +2417,16 @@ impl BlockIngress {
             reference_override: None,
             chain: crate::accept::ChainMove::default(),
             orphan_events: OrphanBlockEvents::default(),
+            finality: FinalityPulls::default(),
         }
+    }
+
+    /// Use these finality-pull budgets (bursts per delivering peer and for
+    /// the node) instead of the defaults.
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
+    pub fn with_finality_pull_budgets(mut self, per_peer: u32, global: u32) -> Self {
+        self.finality = FinalityPulls::new(per_peer, global);
+        self
     }
 
     /// Use `w` as the minimum chain work (default: the process-wide
@@ -2321,8 +2518,8 @@ impl BlockIngress {
         now_unix: u64,
         dag: &GhostDAG,
     ) -> Result<WorkAdmission, DropReason> {
-        work_rule(&self.orphans, Some(&mut self.deep_budget), &mut self.threshold_cache, &mut self.low_work,
-            block, hash, now, now_unix, dag)
+        work_rule(&self.orphans, Some(&mut self.deep_budget), &mut self.finality, &mut self.threshold_cache,
+            &mut self.low_work, block, hash, None, now, now_unix, dag)
     }
 
     /// The reference target of the orphan floor and the IBD evidence.
@@ -2442,6 +2639,10 @@ impl BlockIngress {
                 PowCheck::Deferred => return Gated::PowPending(Box::new(block)),
             }
             let evidence = orphan_is_sync_evidence_from(block.header.bits, block.height, tip_h, &reference);
+            // Review HIGH 2: a claim of a newer finality (or an ancestor of
+            // one) backs the parents the node requests for it.
+            let claims = claims_finality(&block, finality_claim_floor(&ctx.dag.read()));
+            self.finality.note_orphan(hash, claims, &missing);
             // Request each missing parent that nobody is waiting for and that
             // is not itself buffered (a deep gap fans out one level at a time).
             let fresh: Vec<[u8; 32]> = missing.iter()
@@ -2467,8 +2668,8 @@ impl BlockIngress {
                 let d = ctx.dag.read();
                 // The work rule on the read guard's DAG; a merge-backed
                 // admission is charged below, once its proof is known valid.
-                let a = match work_rule(&self.orphans, None, &mut self.threshold_cache, &mut self.low_work,
-                    &block, &hash, now, now_unix, &d)
+                let a = match work_rule(&self.orphans, None, &mut self.finality, &mut self.threshold_cache,
+                    &mut self.low_work, &block, &hash, peer, now, now_unix, &d)
                 {
                     Ok(a) => a,
                     Err(r) => return Gated::Done(BlockOutcome::Dropped(r)),
@@ -2500,6 +2701,10 @@ impl BlockIngress {
                 if admission == WorkAdmission::MergeBacked && !self.deep_budget.allow_at(now) {
                     return Gated::Done(BlockOutcome::Dropped(DropReason::DeepBudgetExhausted));
                 }
+                // Review HIGH 2: likewise the finality-pull budgets.
+                if admission == WorkAdmission::FinalityBacked && !self.finality.charge(peer, now) {
+                    return Gated::Done(BlockOutcome::Dropped(DropReason::FinalityBudgetExhausted));
+                }
             }
             normalize_wire_metadata(&mut block, ctx.dag);
             let height = block.height;
@@ -2510,6 +2715,7 @@ impl BlockIngress {
             let drained = match &result {
                 Ok(h) => {
                     self.orphans.forget(h);
+                    self.finality.forget(h);
                     self.drain_orphans_at(*h, now, now_unix, ctx)
                 }
                 Err(_) => Vec::new(),
@@ -2596,12 +2802,17 @@ impl BlockIngress {
     }
 
     fn drain_orphans_at(&mut self, accepted: [u8; 32], now: Instant, now_unix: u64, ctx: &AcceptCtx) -> Vec<[u8; 32]> {
-        let Self { orphans, deep_budget, threshold_cache, low_work, chain, .. } = self;
+        let Self { orphans, deep_budget, finality, threshold_cache, low_work, chain, .. } = self;
         let mut gate = |pool: &OrphanPool, block: &core::Block, hash: &[u8; 32], d: &GhostDAG| {
-            work_rule(pool, Some(&mut *deep_budget), threshold_cache, low_work, block, hash, now, now_unix, d)
+            let peer = pool.get(hash).and_then(|e| e.peer);
+            work_rule(pool, Some(&mut *deep_budget), &mut *finality, threshold_cache, low_work, block, hash, peer,
+                now, now_unix, d)
         };
         let mut events = OrphanBlockEvents::default();
         process_orphans_gated(accepted, orphans, ctx, chain, &mut gate, &mut events);
+        for h in &events.accepted {
+            self.finality.forget(h);
+        }
         let out = events.accepted.clone();
         self.orphan_events.accepted.extend(events.accepted);
         self.orphan_events.rejected.extend(events.rejected);
