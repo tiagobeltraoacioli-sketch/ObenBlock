@@ -454,6 +454,31 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn tmp_cost_probe() {
+        let none = HashSet::new();
+        let mut d = GhostDAG::with_default_k();
+        d.add_genesis(h(0, 0), 0);
+        let mut p = h(0, 0);
+        let n = 20_000u64;
+        for i in 1..=n {
+            d.add_block(h(1, i), vec![p], i, 10).unwrap();
+            p = h(1, i);
+        }
+        for i in (2..=n).step_by(2) {
+            d.note_finality_source(h(1, i), h(1, i - 1), i);
+            d.note_finality_source(h(1, i - 1), h(1, i.saturating_sub(3).max(1)), i);
+        }
+        let t = std::time::Instant::now();
+        let mut o = PinOutcome::default();
+        for _ in 0..10 {
+            o = d.compute_finality_pin(&policy(&none));
+        }
+        eprintln!("candidates {} -> {:?} per compute; pin {:?}", d.finality_index().candidates(),
+            t.elapsed() / 10, o.pin.map(|x| x.1));
+    }
+
+    #[test]
     fn a_source_below_the_minimum_chain_work_does_not_count() {
         let none = HashSet::new();
         let mut d = dag();

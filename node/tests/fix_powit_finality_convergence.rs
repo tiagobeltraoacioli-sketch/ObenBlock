@@ -28,6 +28,7 @@ use fix_common::*;
 use gnb::consensus::{BlockHash, GhostDAG};
 use gnb::core::{self, Block, BlockHeader, MerkleRoot, Transaction};
 use gnb::pow;
+use gnb::powit::FinalityOp;
 
 fn setup() {
     let _ = gnb::ingress::set_minimum_chain_work(0);
@@ -342,4 +343,116 @@ fn invalidating_the_pinned_checkpoint_moves_the_node_to_the_best_remaining_chain
     assert_eq!(pin_of(&n), None, "the finality its disqualified blocks carried is gone");
     assert_eq!(applied_tip(&n), Some(tip(&z)), "the best remaining chain");
     assert_eq!(sel_tip(&n), Some(tip(&z)));
+}
+
+fn finality_op(n: &Node, op: FinalityOp) -> gnb::accept::ChainOverride {
+    gnb::accept::override_finality(op, &n.dag, &n.store, &n.mempool, &n.node_state, Some(&n.tip_tx), &n.shielded)
+        .unwrap_or_else(|e| panic!("{op:?}: {e}"))
+}
+
+/// The operator escape hatch (RPC `ignorefinalized` / `reconsiderfinalized`,
+/// the finality analogue of Bitcoin Core's `invalidateblock` /
+/// `reconsiderblock`): setting the pinned checkpoint aside leaves the blocks
+/// valid and lets the most work decide (here a heavier chain that forks
+/// below it); taking it back pins it again and returns to its chain. The
+/// setting is persisted: a restart keeps it.
+#[test]
+fn the_operator_can_set_the_pin_aside_and_take_it_back() {
+    setup();
+    let genesis = mk_genesis(unix_now() - 100_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let x = b.chain(gh, 20, "x");
+    let z = b.chain(gh, 30, "z");
+    let mut n = node_with(&genesis, &[]);
+    finalize(&n, &b, &x, 3, 10);
+    deliver(&n, &x);
+    deliver(&n, &z);
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(x[3].block_hash()), Some(tip(&x))));
+
+    let r = finality_op(&n, FinalityOp::Ignore(x[3].block_hash()));
+    assert_eq!(r.affected, 1, "the pin moved");
+    assert_eq!(pin_of(&n), None);
+    assert_eq!(applied_tip(&n), Some(tip(&z)), "the most work decides");
+    assert!(n.store.invalid_block_reason(&x[3].block_hash()).unwrap().is_none(), "no block was marked");
+    restart(&mut n);
+    assert_eq!((pin_of(&n), applied_tip(&n)), (None, Some(tip(&z))), "the setting survives a restart");
+    let info = gnb::powit::finality_info_json(&n.dag.read(), 8);
+    assert_eq!(info["ignored"], serde_json::json!([hex::encode(x[3].block_hash())]), "{info}");
+    assert_eq!(info["ignored_finalized"], serde_json::json!(1));
+
+    finality_op(&n, FinalityOp::Reconsider(x[3].block_hash()));
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(x[3].block_hash()), Some(tip(&x))));
+    restart(&mut n);
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(x[3].block_hash()), Some(tip(&x))));
+}
+
+/// An operator weak-subjectivity checkpoint (`setfinalitycheckpoint`): the
+/// node trusts that block as final, so a chain through it wins whatever its
+/// work, and no finalized checkpoint that conflicts with it counts; `none`
+/// removes every anchor, `default` returns to the release checkpoint (none
+/// on this network). Persisted across restarts.
+#[test]
+fn an_operator_checkpoint_anchors_the_pin() {
+    setup();
+    let genesis = mk_genesis(unix_now() - 100_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let x = b.chain(gh, 20, "x");
+    let y = b.chain(gh, 12, "y");
+    let mut n = node_with(&genesis, &[]);
+    finalize(&n, &b, &x, 3, 10);
+    deliver(&n, &x);
+    deliver(&n, &y);
+    assert_eq!(pin_of(&n), Some(x[3].block_hash()));
+
+    finality_op(&n, FinalityOp::SetAnchor(y[5].block_hash()));
+    assert_eq!(pin_of(&n), Some(y[5].block_hash()), "the anchor; X's finality conflicts with it");
+    assert_eq!(applied_tip(&n), Some(tip(&y)), "the lighter chain through the anchor");
+    let info = gnb::powit::finality_info_json(&n.dag.read(), 8);
+    assert_eq!((info["origin"].as_str(), info["anchor_source"].as_str(), info["against_anchor"].as_u64()),
+        (Some("anchor"), Some("operator"), Some(1)), "{info}");
+    restart(&mut n);
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(y[5].block_hash()), Some(tip(&y))));
+
+    finality_op(&n, FinalityOp::DisableAnchor);
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(x[3].block_hash()), Some(tip(&x))));
+    finality_op(&n, FinalityOp::SetAnchor(y[5].block_hash()));
+    finality_op(&n, FinalityOp::DefaultAnchor);
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(x[3].block_hash()), Some(tip(&x))));
+    restart(&mut n);
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(x[3].block_hash()), Some(tip(&x))));
+}
+
+/// Conflicting finalized checkpoints are reported (`getfinalityinfo`
+/// `conflict`, `getpowitinfo` `finality_conflict`) and the pin is their
+/// latest common block; an operator then picks a side with
+/// `setfinalitycheckpoint`.
+#[test]
+fn a_finality_conflict_is_reported_and_the_operator_can_resolve_it() {
+    setup();
+    let genesis = mk_genesis(unix_now() - 100_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let common = b.chain(gh, 4, "c");
+    let x = b.chain(tip(&common), 20, "x");
+    let y = b.chain(tip(&common), 25, "y");
+    let n = node_with(&genesis, &[]);
+    finalize(&n, &b, &x, 3, 10);
+    finalize(&n, &b, &y, 6, 12);
+    deliver(&n, &common);
+    deliver(&n, &x);
+    deliver(&n, &y);
+    assert_eq!(pin_of(&n), Some(tip(&common)), "their latest common block");
+    assert_eq!(applied_tip(&n), Some(tip(&y)), "the most work above it");
+    let info = gnb::powit::finality_info_json(&n.dag.read(), 8);
+    assert_eq!(info["origin"], serde_json::json!("conflict"), "{info}");
+    let pair: Vec<String> = info["conflict"].as_array().unwrap().iter()
+        .map(|c| c["hash"].as_str().unwrap().to_string()).collect();
+    assert_eq!(pair, vec![hex::encode(y[6].block_hash()), hex::encode(x[3].block_hash())]);
+    assert_eq!(gnb::powit::info_json(&n.dag.read(), &n.store)["finality_conflict"], serde_json::json!(true));
+
+    finality_op(&n, FinalityOp::SetAnchor(x[3].block_hash()));
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(x[3].block_hash()), Some(tip(&x))));
+    assert!(gnb::powit::finality_info_json(&n.dag.read(), 8)["conflict"].is_null());
 }
