@@ -15,9 +15,12 @@
 //!   its own checkpoints; an eclipsed syncing node never pins them below the
 //!   release finality checkpoint, and follows the honest chain once it sees
 //!   it, even when the fork carries more work. Without an anchor (operator
-//!   `setfinalitycheckpoint none`) the two finalities conflict and the most
-//!   work decides: the honest chain when it is heavier, the fork otherwise
+//!   `setfinalitycheckpoint none`) the node keeps the fork's finality it
+//!   reached, raises the conflict, and only an operator checkpoint moves it
 //!   (why the release checkpoint matters).
+//! - Review HIGH 1: a synced node keeps its finality when a heavier fork
+//!   that finalized its own (a majority of the hashrate, first rule) is
+//!   published, and raises the conflict.
 //! - Producers at the activation boundary: the pool and the witness duty
 //!   judge membership by the rule of the next block's height (H-1 / H).
 //!
@@ -298,11 +301,15 @@ fn an_eclipsed_node_never_pins_a_fork_below_the_release_checkpoint() {
     deliver(&v2, &honest.blocks[2..]);
     assert_eq!(applied_tip(&v2), Some(honest.tip()), "the release checkpoint outweighs the fork's work");
 
-    // V3 / V4: no anchor at all (`setfinalitycheckpoint none`): the two
-    // finalities conflict, the pin falls back to their latest common block,
-    // and the most work decides: the honest chain if heavier, the fork if
-    // it carries more work (what the release checkpoint prevents).
-    for (fork, honest_wins) in [(&fork, true), (&heavier_fork, false)] {
+    // V3 / V4: no anchor at all (`setfinalitycheckpoint none`). The fork's
+    // finality is all the eclipsed node knows: it reaches it on its applied
+    // chain, and keeps it when the honest chain arrives with its own, whether
+    // the honest chain is heavier (V3) or not (V4), raising the conflict:
+    // a node cannot tell an eclipse from a majority-hashrate attack on its
+    // finality (review HIGH 1, the test below), which is why the release
+    // checkpoint (V1, V2) and the minimum chain work exist. The operator's
+    // weak-subjectivity checkpoint then moves it to the honest chain.
+    for fork in [&fork, &heavier_fork] {
         let v = node_with(&genesis, &[]);
         deliver(&v, &honest.blocks[..2]);
         gnb::accept::override_finality(FinalityOp::DisableAnchor, &v.dag, &v.store, &v.mempool, &v.node_state,
@@ -310,11 +317,59 @@ fn an_eclipsed_node_never_pins_a_fork_below_the_release_checkpoint() {
         deliver(&v, fork);
         assert_eq!(pin_of(&v), Some(fin_of(fork)), "no anchor: the fork's finality pins the eclipsed node");
         deliver(&v, &honest.blocks[2..]);
-        assert_eq!(pin_of(&v), Some(honest.blocks[1].block_hash()), "the conflict falls back to the fork point");
-        let want = if honest_wins { honest.tip() } else { fork.last().unwrap().block_hash() };
-        assert_eq!(applied_tip(&v), Some(want), "the most work above it");
+        assert_eq!(pin_of(&v), Some(fin_of(fork)), "it keeps the finality it reached");
+        assert_eq!(applied_tip(&v), Some(fork.last().unwrap().block_hash()), "whatever the honest chain's work");
         assert!(powit::info_json(&v.dag.read(), &v.store)["finality_conflict"].as_bool().unwrap());
+        gnb::accept::override_finality(FinalityOp::SetAnchor(x.block_hash()), &v.dag, &v.store, &v.mempool,
+            &v.node_state, Some(&v.tip_tx), &v.shielded).unwrap();
+        assert_eq!((pin_of(&v), applied_tip(&v)), (Some(honest_fin.hash), Some(honest.tip())),
+            "the operator's checkpoint moves it");
     }
+}
+
+/// Review HIGH 1 (regression against main), end to end under the first
+/// witness-set rule: a majority-hashrate attacker forks the honest chain
+/// privately right after its finalized checkpoint, mines four shares per
+/// block for its own key Z, finalizes its own checkpoint, and publishes the
+/// heavier fork once the honest chain has finalized above the fork point. A
+/// synced node used to pin the latest common block of the two finalities and
+/// follow the most work, rolling its finalized history back. It now keeps the
+/// finality it reached, stays on the honest chain and raises the conflict.
+#[test]
+fn a_synced_node_keeps_its_finality_when_a_heavier_fork_finalizes_its_own() {
+    setup();
+    let _g = activation::scoped_override_v2(activation::NEVER);
+    let genesis = mk_genesis(unix_now() - 100_000);
+    let (k1, k2, z) = (Key::new(41), Key::new(42), Key::new(49));
+    let mut honest = Producer::new(&genesis);
+    honest.extend(60, "h", &[(&k1, 1), (&k2, 1)], &[&k1, &k2]);
+    let mut attacker = Producer::new(&genesis);
+    attacker.adopt(&honest.blocks);
+    let fork = attacker.extend(80, "z", &[(&z, 4)], &[&z]);
+    let fork_fin = attacker.tip_state().finalized;
+    assert!(fork.iter().any(|b| b.block_hash() == fork_fin.hash), "the fork finalized its own: {fork_fin:?}");
+    let more = honest.extend(40, "i", &[(&k1, 1), (&k2, 1)], &[&k1, &k2]);
+    let honest_fin = honest.tip_state().finalized;
+    assert!(more.iter().any(|b| b.block_hash() == honest_fin.hash), "honest finality above the fork point");
+    assert!(fork.len() > more.len(), "the attacker's fork carries more work");
+
+    let mut v = node_with(&genesis, &[]);
+    // No anchor: the release checkpoint of this binary belongs to another
+    // chain (`an_eclipsed_node_never_pins_a_fork_below_the_release_checkpoint`).
+    gnb::accept::override_finality(FinalityOp::DisableAnchor, &v.dag, &v.store, &v.mempool, &v.node_state,
+        Some(&v.tip_tx), &v.shielded).unwrap();
+    deliver(&v, &honest.blocks);
+    assert_eq!((pin_of(&v), applied_tip(&v)), (Some(honest_fin.hash), Some(honest.tip())));
+    deliver(&v, &fork);
+    assert_eq!(pin_of(&v), Some(honest_fin.hash), "the node keeps the finality it reached");
+    assert_eq!(applied_tip(&v), Some(honest.tip()), "and never rolls it back for more work");
+    let info = powit::finality_info_json(&v.dag.read(), 8);
+    let pair: Vec<String> = info["conflict"].as_array().expect("the conflict is reported").iter()
+        .map(|c| c["hash"].as_str().unwrap().to_string()).collect();
+    assert_eq!(pair, vec![hex::encode(honest_fin.hash), hex::encode(fork_fin.hash)], "{info}");
+    restart(&mut v);
+    assert_eq!((pin_of(&v), applied_tip(&v)), (Some(honest_fin.hash), Some(honest.tip())));
+    assert!(powit::info_json(&v.dag.read(), &v.store)["finality_conflict"].as_bool().unwrap());
 }
 
 // ── Producers at the second hardening boundary ───────────────────────────────

@@ -4,47 +4,62 @@
 //!
 //! The pin ([`GhostDAG::finalized`]) restricts which blocks are selectable:
 //! a block whose selected-parent chain misses it is never selected nor
-//! offered as a template parent. It used to come from the PoWit state of the
-//! node's own applied tip only, so a node that never applied the blocks
-//! carrying a finalization never learned it (a healed partition split
-//! forever), and a restart restored it from the applied tip only (it could
-//! drop). As in Gasper, whose fork choice starts from the highest justified
-//! checkpoint learned from ANY block, the pin is now a pure function of the
-//! blocks the node holds:
+//! offered as a template parent. As in Gasper, whose fork choice starts from
+//! the highest checkpoint learned from ANY block, the node learns finality
+//! from every block it stores, applied or not (finding 2: a healed partition
+//! used to stay split), and, as every Ethereum client does, finality the node
+//! has reached is never given up because a conflicting finality appeared:
 //!
 //! * a **candidate** is a finalized checkpoint (beyond the activation one)
 //!   carried by the PoWit state of a stored block, its **source**;
 //!   [`FinalityIndex`] records every (source, checkpoint) pair;
-//! * it **counts** when some source is not disqualified
-//!   ([`GhostDAG::is_invalid`]) and has at least the node's minimum chain
-//!   work (a cheap chain pulled during initial sync proves nothing,
+//! * it **counts** when some source is not disqualified for a reason its id
+//!   commits to ([`GhostDAG::is_invalid_persistently`]: a block waiting for
+//!   a body or a verdict still counts) and has at least the node's minimum
+//!   chain work (a cheap chain pulled during initial sync proves nothing,
 //!   `ingress::minimum_chain_work`), the operator did not set it aside, and
 //!   it agrees with the weak-subjectivity **anchor** (the release finality
 //!   checkpoint, or the operator's): a candidate at or below the anchor's
 //!   height never counts (the anchor dominates it), one above it counts only
 //!   if the anchor is on its selected chain;
-//! * the **pin** is the highest counted candidate when all of them lie on
-//!   one selected chain; when two conflict (neither is on the other's
-//!   selected chain: accountable safety says at least a third of the
-//!   witness weight signed both, or the two chains derived different
-//!   witness sets, e.g. a fork that branched before any common finality, or
-//!   inactivity decay through a long partition) it is their latest common
-//!   block, so the most work decides above it and the node reports the
-//!   conflict; and never below the anchor, once the anchor block is known.
+//! * the node's **own finality** is the highest counted candidate on its
+//!   applied chain, or the counted candidate it pinned last (persisted,
+//!   `powit::FINALITY_PIN_META`) when that one descends from it: a learned
+//!   finality the node pinned before its chain move to it was done (a move
+//!   stopped between chunks, a rebuild that restarts from genesis);
+//! * a candidate that descends from the own finality **advances** it. The
+//!   pin is the highest advancing candidate when they all lie on one chain
+//!   (the healed partition: a node with no finality of its own, or an older
+//!   one on the same chain, learns a newer one from a stored fork-loser).
+//!   Two advancing candidates that conflict (neither on the other's selected
+//!   chain) were only learned from chains the node has not applied: the
+//!   node takes the one whose best source carries the most blue work (then
+//!   the higher, then the larger hash), never their latest common block;
+//! * a candidate that **conflicts** with the pin (it is neither on the pin's
+//!   selected chain nor descends from it) never moves it: at least a third
+//!   of the witness weight signed both, or the two chains derived different
+//!   witness sets (a fork that branched before any common finality, a long
+//!   partition finalized through inactivity decay, or a majority-hashrate
+//!   fork building its own witness set under the first rule). The node keeps
+//!   its finality and raises a persistent conflict alert (`getfinalityinfo`
+//!   `conflict`, the log, the `gnb_finality_conflicts` metric) for as long as
+//!   the conflicting candidate counts; only the operator moves it
+//!   (`ignorefinalized`, `setfinalitycheckpoint`), as Ethereum clients
+//!   require a manual intervention to leave a finalized checkpoint.
 //!
-//! Two nodes holding the same blocks (and the same disqualifications,
-//! minimum chain work, anchor and operator settings) therefore compute the
-//! same pin whatever the arrival order, and a restart rebuilds it from the
-//! persisted (source, checkpoint) rows (`powit::load_finality_index`).
+//! Without a conflict, two nodes holding the same blocks (and the same
+//! disqualifications, minimum chain work, anchor and operator settings)
+//! compute the same pin whatever the arrival order. With one, a node keeps
+//! whichever finality it reached first: the weak-subjectivity assumption of
+//! every finality protocol, which the release anchor and the minimum chain
+//! work make hold for a node that syncs while eclipsed.
 //!
 //! Cost: one computation is linear in the recorded candidates and their
-//! sources (`tests::measure_pin_computation_cost`: about 26 ms for 10,000
-//! candidates in a debug build). A candidate is one finalized checkpoint,
-//! at most one per checkpoint interval of a chain (60 blocks on mainnet,
-//! about 17,500 a year), and candidates at or below the anchor never count:
-//! each release that moves the release finality checkpoint up retires the
-//! history below it from the pin's decision. Skipping them in the scan is
-//! the follow-up if the cost ever matters.
+//! sources, with O(1) reachability queries (no selected-chain walk);
+//! `tests::measure_pin_computation_cost` measures it, with and without a
+//! conflict. A candidate is one finalized checkpoint, at most one per
+//! checkpoint interval of a chain (60 blocks on mainnet, about 17,500 a
+//! year), and candidates at or below the anchor never count.
 
 use std::collections::{HashMap, HashSet};
 
@@ -88,6 +103,12 @@ pub struct PinPolicy<'a> {
     /// Blocks the operator set aside (`ignorefinalized`): no candidate at or
     /// above one of them on its selected chain counts.
     pub ignored: &'a HashSet<BlockHash>,
+    /// The node's applied tip (the block its UTXO set sits on): the counted
+    /// candidates on its selected chain are the node's own finality.
+    pub applied: Option<BlockHash>,
+    /// The finalized checkpoint the node pinned last ([`FinalityIndex`],
+    /// persisted by the node): its own finality while it still counts.
+    pub sticky: Option<BlockHash>,
 }
 
 /// Where the pin comes from.
@@ -97,10 +118,9 @@ pub enum PinOrigin {
     None,
     /// The anchor (no counted candidate above it).
     Anchor,
-    /// The highest counted finalized checkpoint.
+    /// A counted finalized checkpoint: the node's own finality, or one that
+    /// advances it.
     Finalized,
-    /// The latest common block of conflicting finalized checkpoints.
-    Conflict,
 }
 
 impl PinOrigin {
@@ -109,7 +129,31 @@ impl PinOrigin {
             PinOrigin::None => "none",
             PinOrigin::Anchor => "anchor",
             PinOrigin::Finalized => "finalized",
-            PinOrigin::Conflict => "conflict",
+        }
+    }
+}
+
+/// How a conflict between counted finalized checkpoints was handled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConflictResolution {
+    /// No conflict.
+    #[default]
+    None,
+    /// The node kept the finality it had reached: the conflicting
+    /// checkpoints are reported, the operator decides.
+    OwnFinality,
+    /// The node had no finality of its own above them: of the conflicting
+    /// checkpoints it learned from chains it has not applied, it took the one
+    /// whose best source carries the most blue work.
+    MostWork,
+}
+
+impl ConflictResolution {
+    pub fn as_str(&self) -> Option<&'static str> {
+        match self {
+            ConflictResolution::None => None,
+            ConflictResolution::OwnFinality => Some("own_finality"),
+            ConflictResolution::MostWork => Some("most_work"),
         }
     }
 }
@@ -140,9 +184,14 @@ pub struct PinOutcome {
     pub anchor: AnchorStatus,
     /// Counted candidates: (checkpoint, DAG height, slot), highest first.
     pub counted: Vec<(BlockHash, u64, u64)>,
-    /// The two highest conflicting counted checkpoints (block, DAG height),
-    /// when any two conflict.
+    /// The node's own finality (module docs), if any counted candidate is.
+    pub own: Option<(BlockHash, u64)>,
+    /// (the pinned checkpoint, the highest counted checkpoint that conflicts
+    /// with it), when any does: the persistent conflict alert.
     pub conflict: Option<((BlockHash, u64), (BlockHash, u64))>,
+    /// Counted checkpoints that conflict with the pin.
+    pub conflicting: usize,
+    pub resolution: ConflictResolution,
     /// Supported candidates refused because they conflict with the anchor.
     pub against_anchor: usize,
     /// Supported candidates the operator set aside.
@@ -158,6 +207,9 @@ pub struct FinalityIndex {
     /// Operator settings (loaded from storage at start-up, changed by RPC).
     pub(crate) anchor_setting: AnchorSetting,
     pub(crate) ignored: HashSet<BlockHash>,
+    /// The finalized checkpoint pinned last ([`PinPolicy::sticky`]): set by
+    /// [`GhostDAG::set_finality_pin`], persisted and reloaded by the node.
+    pub(crate) sticky: Option<BlockHash>,
     /// The last outcome applied ([`GhostDAG::set_finality_pin`]), for RPC and
     /// for logging changes once.
     pub(crate) last: PinOutcome,
@@ -170,6 +222,16 @@ impl FinalityIndex {
 
     pub fn sources(&self) -> usize {
         self.by_source.len()
+    }
+
+    /// The finalized checkpoint pinned last (see [`PinPolicy::sticky`]).
+    pub fn sticky(&self) -> Option<BlockHash> {
+        self.sticky
+    }
+
+    /// Restore the finalized checkpoint pinned last (start-up reload).
+    pub fn set_sticky(&mut self, h: Option<BlockHash>) {
+        self.sticky = h;
     }
 
     /// The checkpoint `source`'s state finalized, if recorded.
@@ -232,22 +294,20 @@ impl GhostDAG {
         self.is_on_selected_chain_of(a, b)
     }
 
-    /// The latest block on both `a`'s and `b`'s selected chains.
-    pub fn selected_chain_meet(&self, a: &BlockHash, b: &BlockHash) -> Option<BlockHash> {
-        let (ha, hb) = (self.store.get(a)?.height, self.store.get(b)?.height);
-        let (mut x, other) = if ha >= hb { (*a, *b) } else { (*b, *a) };
-        loop {
-            if self.is_chain_ancestor_or_self(&x, &other) {
-                return Some(x);
-            }
-            x = self.store.get(&x)?.selected_parent?;
-        }
-    }
-
     /// The pin these blocks and `policy` give (see the module docs). Pure:
     /// it reads the DAG, the disqualified set and the index, and changes
-    /// nothing.
+    /// nothing. O(candidates + sources), every chain relation an O(1)
+    /// reachability query (no selected-chain walk, review MEDIUM 4).
     pub fn compute_finality_pin(&self, policy: &PinPolicy<'_>) -> PinOutcome {
+        /// A counted candidate: checkpoint, DAG height, slot, blue work of
+        /// its heaviest counted source.
+        #[derive(Clone, Copy)]
+        struct Counted {
+            hash: BlockHash,
+            height: u64,
+            slot: u64,
+            work: u128,
+        }
         let mut out = PinOutcome::default();
         // The anchor: the block if known and valid, and the height that
         // separates what it dominates from what must descend from it.
@@ -259,7 +319,7 @@ impl GhostDAG {
                     (None, Some(a.height))
                 }
                 Some(d) => {
-                    out.anchor = if self.invalid.contains(&a.hash) {
+                    out.anchor = if self.is_invalid_persistently(&a.hash) {
                         AnchorStatus::Invalid
                     } else if d.height != a.height {
                         AnchorStatus::HeightMismatch
@@ -271,89 +331,131 @@ impl GhostDAG {
                 }
             },
         };
+        let anc = |a: &BlockHash, b: &BlockHash| self.is_chain_ancestor_or_self(a, b);
 
-        let mut counted: Vec<(BlockHash, u64, u64)> = Vec::new();
+        let mut counted: Vec<Counted> = Vec::new();
         for (cp, cand) in &self.finality.by_checkpoint {
             let Some(d) = self.store.get(cp) else { continue };
-            let supported = cand.sources.iter().any(|s| {
-                !self.invalid.contains(s)
-                    && self.store.get(s).is_some_and(|sd| sd.blue_work >= policy.min_chain_work)
-            });
-            if !supported {
-                continue;
-            }
-            if policy.ignored.iter().any(|i| self.is_chain_ancestor_or_self(i, cp)) {
+            // Review LOW 7: a source counts unless it is disqualified for a
+            // reason its id commits to; one waiting for a body or a verdict
+            // (in-memory marks) keeps its finality.
+            let work = cand.sources.iter()
+                .filter(|s| !self.is_invalid_persistently(s))
+                .filter_map(|s| self.store.get(s).map(|sd| sd.blue_work))
+                .filter(|w| *w >= policy.min_chain_work)
+                .max();
+            let Some(work) = work else { continue };
+            if policy.ignored.iter().any(|i| anc(i, cp)) {
                 out.ignored += 1;
                 continue;
             }
             if let Some(ah) = anchor_height {
-                let descends = anchor_block.is_some_and(|a| d.height > ah && self.is_chain_ancestor_or_self(&a.hash, cp));
+                let descends = anchor_block.is_some_and(|a| d.height > ah && anc(&a.hash, cp));
                 if !descends {
                     // Above the anchor's height without it on its chain:
                     // against it (were the anchor on that chain, it would be
                     // in the DAG). At or below: dominated if it is on the
                     // anchor's chain, against it if not, undecided while
                     // the anchor is unknown.
-                    let against = d.height > ah
-                        || anchor_block.is_some_and(|a| !self.is_chain_ancestor_or_self(cp, &a.hash));
+                    let against = d.height > ah || anchor_block.is_some_and(|a| !anc(cp, &a.hash));
                     if against {
                         out.against_anchor += 1;
                     }
                     continue;
                 }
             }
-            counted.push((*cp, d.height, cand.slot));
+            counted.push(Counted { hash: *cp, height: d.height, slot: cand.slot, work });
         }
         // Highest first; ties (two blocks at one DAG height) by hash, so the
         // order, and every choice below, is independent of insertion order.
-        counted.sort_by(|a, b| b.1.cmp(&a.1).then(b.0.cmp(&a.0)));
-        // The maximal candidates: none on the selected chain of another.
-        // Selected-chain heights strictly increase, so a candidate can only
-        // be an ancestor of one already taken.
-        let mut maximal: Vec<(BlockHash, u64)> = Vec::new();
-        for (h, ht, _) in &counted {
-            if !maximal.iter().any(|(m, _)| self.is_chain_ancestor_or_self(h, m)) {
-                maximal.push((*h, *ht));
+        counted.sort_by(|a, b| b.height.cmp(&a.height).then(b.hash.cmp(&a.hash)));
+
+        // The node's own finality: the highest counted checkpoint on its
+        // applied chain, or the one it pinned last (still counted) when that
+        // one descends from it (learned and pinned, the chain move to it not
+        // done yet: a move stopped between chunks, a rebuild from genesis).
+        let on_applied = policy.applied.and_then(|t| counted.iter().find(|c| anc(&c.hash, &t)).copied());
+        let sticky = policy.sticky.and_then(|s| counted.iter().find(|c| c.hash == s).copied());
+        let own = match (on_applied, sticky) {
+            (Some(a), Some(s)) if anc(&a.hash, &s.hash) => Some(s),
+            (Some(a), _) => Some(a),
+            (None, s) => s,
+        };
+        // What advances it: counted checkpoints strictly above it on its
+        // chain (all of them when it has none). The maximal ones (none on
+        // the selected chain of another; heights strictly increase along a
+        // selected chain, so a candidate can only be an ancestor of one
+        // already taken).
+        let mut maximal: Vec<Counted> = Vec::new();
+        for c in &counted {
+            // Only a higher block can descend from `own` (and `counted` is
+            // highest first, so the rest is not advancing either).
+            if own.is_some_and(|o| c.height <= o.height) {
+                break;
+            }
+            let advances = own.is_none_or(|o| anc(&o.hash, &c.hash));
+            if advances && !maximal.iter().any(|m| anc(&c.hash, &m.hash)) {
+                maximal.push(*c);
             }
         }
-        let finalized_pin = match maximal.as_slice() {
-            [] => None,
-            [only] => {
-                out.origin = PinOrigin::Finalized;
-                Some(*only)
-            }
-            [first, second, rest @ ..] => {
-                out.origin = PinOrigin::Conflict;
-                out.conflict = Some((*first, *second));
-                let mut meet = Some(first.0);
-                for (m, _) in std::iter::once(second).chain(rest) {
-                    meet = meet.and_then(|x| self.selected_chain_meet(&x, m));
-                }
-                meet.and_then(|m| self.store.get(&m).map(|d| (m, d.height)))
+        let chosen = match maximal.as_slice() {
+            [] => own,
+            [only] => Some(*only),
+            // Learned only from chains the node has not applied (an applied
+            // one would be its own finality): the most work, deterministic.
+            several => {
+                out.resolution = ConflictResolution::MostWork;
+                several.iter().copied()
+                    .max_by(|a, b| a.work.cmp(&b.work).then(a.height.cmp(&b.height)).then(a.hash.cmp(&b.hash)))
             }
         };
-        out.counted = counted;
-        out.pin = match (anchor_block, finalized_pin) {
+        if let Some(p) = chosen {
+            out.origin = PinOrigin::Finalized;
+            // Every counted checkpoint off the pin's chain conflicts with it
+            // (one reachability query each: only a lower block can be on the
+            // pin's selected chain, only a higher one can descend from it).
+            let mut conflicting = counted.iter().filter(|c| match c.height.cmp(&p.height) {
+                std::cmp::Ordering::Greater => !anc(&p.hash, &c.hash),
+                _ => !anc(&c.hash, &p.hash),
+            });
+            if let Some(first) = conflicting.next() {
+                out.conflict = Some(((p.hash, p.height), (first.hash, first.height)));
+                out.conflicting = 1 + conflicting.count();
+                if out.resolution == ConflictResolution::None {
+                    out.resolution = ConflictResolution::OwnFinality;
+                }
+            } else {
+                out.resolution = ConflictResolution::None;
+            }
+        }
+        out.own = own.map(|o| (o.hash, o.height));
+        out.counted = counted.iter().map(|c| (c.hash, c.height, c.slot)).collect();
+        out.pin = match (anchor_block, chosen) {
             (Some(a), None) => {
                 out.origin = PinOrigin::Anchor;
                 Some((a.hash, a.height))
             }
-            // Every counted candidate descends from the anchor, so does
-            // their latest common block: the higher of the two is the pin.
-            (Some(a), Some(p)) if p.1 < a.height => {
+            // Every counted candidate descends from the anchor: the higher
+            // of the two is the pin.
+            (Some(a), Some(p)) if p.height < a.height => {
                 out.origin = PinOrigin::Anchor;
                 Some((a.hash, a.height))
             }
-            (_, p) => p,
+            (_, p) => p.map(|p| (p.hash, p.height)),
         };
         out
     }
 
-    /// Replace the pin (it may move back: a conflict, a disqualification or
-    /// an operator setting changes what counts). [`GhostDAG::set_finalized`]
-    /// only ever advances it.
+    /// Replace the pin (it may move back: a disqualification or an operator
+    /// setting changes what counts; a conflicting finalized checkpoint never
+    /// does). [`GhostDAG::set_finalized`] only ever advances it. The pinned
+    /// finalized checkpoint becomes the sticky one ([`PinPolicy::sticky`]).
     pub fn set_finality_pin(&mut self, outcome: PinOutcome) {
         self.finalized = outcome.pin;
+        self.finality.sticky = match outcome.origin {
+            PinOrigin::Finalized => outcome.pin.map(|(h, _)| h),
+            PinOrigin::Anchor | PinOrigin::None => None,
+        };
         self.finality.last = outcome;
     }
 
@@ -402,37 +504,102 @@ mod tests {
     }
 
     fn policy(ignored: &HashSet<BlockHash>) -> PinPolicy<'_> {
-        PinPolicy { min_chain_work: 0, anchor: None, ignored }
+        PinPolicy { min_chain_work: 0, anchor: None, ignored, applied: None, sticky: None }
     }
 
+    /// A node whose applied tip is `applied` and which pinned `sticky` last.
+    fn on(applied: BlockHash, sticky: Option<BlockHash>, ignored: &HashSet<BlockHash>) -> PinPolicy<'_> {
+        PinPolicy { applied: Some(applied), sticky, ..policy(ignored) }
+    }
+
+    /// The pin is the highest candidate of one chain; a finality learned from
+    /// a chain the node has not applied advances it when it descends from it
+    /// (finding 2, the healed partition).
     #[test]
-    fn the_pin_is_the_highest_candidate_of_one_chain_and_the_meet_of_conflicting_ones() {
+    fn the_pin_is_the_highest_candidate_and_a_learned_one_advances_it() {
         let none = HashSet::new();
         let mut d = dag();
-        assert_eq!(d.compute_finality_pin(&policy(&none)).pin, None);
+        assert_eq!(d.compute_finality_pin(&on(h(1, 10), None, &none)).pin, None);
+        d.note_finality_source(h(1, 8), h(1, 2), 3);
+        let o = d.compute_finality_pin(&on(h(1, 10), None, &none));
+        assert_eq!((o.pin, o.own, o.origin, o.conflict), (Some((h(1, 2), 2)), Some((h(1, 2), 2)),
+            PinOrigin::Finalized, None));
+        // b finalizes b6, which descends from a2: the node on a learns it.
+        d.note_finality_source(h(2, 11), h(2, 6), 7);
+        let o = d.compute_finality_pin(&on(h(1, 10), Some(h(1, 2)), &none));
+        assert_eq!((o.pin, o.own, o.conflict, o.resolution), (Some((h(2, 6), 6)), Some((h(1, 2), 2)), None,
+            ConflictResolution::None));
+    }
+
+    /// Review HIGH 1: finality the node reached on its own chain is sticky.
+    /// a finalizes a5, b (heavier) finalizes b6: they conflict. The node on
+    /// a keeps a5 and the node on b keeps b6, each reporting the other; a
+    /// node with no finality of its own takes the one whose best source has
+    /// the most work (review MEDIUM 3), never their latest common block a3.
+    #[test]
+    fn own_finality_is_kept_against_a_conflict_and_learned_conflicts_go_to_the_most_work() {
+        let none = HashSet::new();
+        let mut d = dag();
         d.note_finality_source(h(1, 8), h(1, 2), 3);
         d.note_finality_source(h(1, 9), h(1, 5), 6);
-        let o = d.compute_finality_pin(&policy(&none));
-        assert_eq!((o.pin, o.origin, o.conflict), (Some((h(1, 5), 5)), PinOrigin::Finalized, None));
-        // b finalizes b6: conflicts with a5 (a3 is their latest common block).
         d.note_finality_source(h(2, 11), h(2, 6), 7);
+        let o = d.compute_finality_pin(&on(h(1, 10), Some(h(1, 5)), &none));
+        assert_eq!((o.pin, o.own, o.origin), (Some((h(1, 5), 5)), Some((h(1, 5), 5)), PinOrigin::Finalized));
+        assert_eq!((o.conflict, o.conflicting, o.resolution),
+            (Some(((h(1, 5), 5), (h(2, 6), 6))), 1, ConflictResolution::OwnFinality));
+        // The same without the sticky pin (a restart before it was persisted):
+        // the applied chain's finality is the node's own.
+        assert_eq!(d.compute_finality_pin(&on(h(1, 10), None, &none)), o);
+        let o = d.compute_finality_pin(&on(h(2, 12), None, &none));
+        assert_eq!((o.pin, o.conflict), (Some((h(2, 6), 6)), Some(((h(2, 6), 6), (h(1, 5), 5)))));
+        // The applied chain wins over a sticky pin that conflicts with it.
+        assert_eq!(d.compute_finality_pin(&on(h(1, 10), Some(h(2, 6)), &none)).pin, Some((h(1, 5), 5)));
+        // A sticky pin above the applied chain's finality stays (a move
+        // stopped below it, a rebuild that restarts from the fork point).
+        assert_eq!(d.compute_finality_pin(&on(h(1, 3), Some(h(1, 5)), &none)).pin, Some((h(1, 5), 5)));
+        assert_eq!(d.compute_finality_pin(&on(h(1, 3), Some(h(2, 6)), &none)).pin, Some((h(2, 6), 6)));
+        // No finality of its own: b6's source (11 blocks of work) beats a5's (9).
         let o = d.compute_finality_pin(&policy(&none));
-        assert_eq!(o.pin, Some((h(1, 3), 3)));
-        assert_eq!(o.origin, PinOrigin::Conflict);
+        assert_eq!((o.pin, o.own, o.resolution), (Some((h(2, 6), 6)), None, ConflictResolution::MostWork));
         assert_eq!(o.conflict, Some(((h(2, 6), 6), (h(1, 5), 5))));
+        let o2 = d.compute_finality_pin(&on(h(1, 3), None, &none));
+        assert_eq!((o2.pin, o2.own, o2.resolution), (Some((h(2, 6), 6)), Some((h(1, 2), 2)),
+            ConflictResolution::MostWork), "both advance a2: still the most work");
         // The same set in another insertion order gives the same outcome.
         let mut e = dag();
         e.note_finality_source(h(2, 11), h(2, 6), 7);
         e.note_finality_source(h(1, 9), h(1, 5), 6);
         e.note_finality_source(h(1, 8), h(1, 2), 3);
         assert_eq!(e.compute_finality_pin(&policy(&none)), o);
-        // Disqualifying b's source drops b6: back to a5.
-        d.mark_invalid(h(2, 10));
+        // A later, heavier source of a5 turns the choice.
+        d.add_block(h(1, 11), vec![h(1, 10)], 11, 10).unwrap();
+        d.add_block(h(1, 12), vec![h(1, 11)], 12, 10).unwrap();
+        d.note_finality_source(h(1, 12), h(1, 5), 6);
         assert_eq!(d.compute_finality_pin(&policy(&none)).pin, Some((h(1, 5), 5)));
+        // Disqualifying b's source drops b6: no conflict any more.
+        d.mark_invalid(h(2, 10));
+        let o = d.compute_finality_pin(&on(h(1, 10), None, &none));
+        assert_eq!((o.pin, o.conflict, o.resolution), (Some((h(1, 5), 5)), None, ConflictResolution::None));
         // The operator sets a5 aside: a2 remains.
         let ignored: HashSet<BlockHash> = [h(1, 4)].into_iter().collect();
-        let o = d.compute_finality_pin(&policy(&ignored));
+        let o = d.compute_finality_pin(&on(h(1, 10), Some(h(1, 5)), &ignored));
         assert_eq!((o.pin, o.ignored), (Some((h(1, 2), 2)), 1));
+    }
+
+    /// Review LOW 7: a source counts unless it is disqualified for a reason
+    /// its id commits to; a block waiting for a body or a verdict keeps it.
+    #[test]
+    fn only_a_persistent_disqualification_drops_a_source() {
+        let none = HashSet::new();
+        let mut d = dag();
+        d.note_finality_source(h(1, 9), h(1, 5), 6);
+        d.mark_body_pending(h(1, 8), None);
+        assert!(d.is_invalid(&h(1, 9)));
+        assert_eq!(d.compute_finality_pin(&policy(&none)).pin, Some((h(1, 5), 5)));
+        d.park_no_verdict(h(1, 7));
+        assert_eq!(d.compute_finality_pin(&policy(&none)).pin, Some((h(1, 5), 5)));
+        d.mark_invalid(h(1, 9));
+        assert_eq!(d.compute_finality_pin(&policy(&none)).pin, None);
     }
 
     #[test]
@@ -443,29 +610,31 @@ mod tests {
         d.note_finality_source(h(2, 11), h(2, 6), 7);
         // Anchor b4: a5 conflicts with it, b6 descends from it.
         let anchor = Some(Anchor { hash: h(2, 4), height: 4 });
-        let o = d.compute_finality_pin(&PinPolicy { min_chain_work: 0, anchor, ignored: &none });
+        let o = d.compute_finality_pin(&PinPolicy { anchor, ..policy(&none) });
         assert_eq!((o.pin, o.origin, o.against_anchor, o.anchor), (Some((h(2, 6), 6)), PinOrigin::Finalized, 1,
             AnchorStatus::Known));
         // Anchor b8, above b6: b6 is below it (dominated), a5 conflicts.
         let anchor = Some(Anchor { hash: h(2, 8), height: 8 });
-        let o = d.compute_finality_pin(&PinPolicy { min_chain_work: 0, anchor, ignored: &none });
+        let o = d.compute_finality_pin(&PinPolicy { anchor, ..policy(&none) });
         assert_eq!((o.pin, o.origin, o.against_anchor), (Some((h(2, 8), 8)), PinOrigin::Anchor, 1));
         // An anchor not in the DAG yet: nothing above its height counts, and
         // nothing pins (a fork the node is eclipsed on cannot pin it).
         let anchor = Some(Anchor { hash: h(9, 4), height: 4 });
-        let o = d.compute_finality_pin(&PinPolicy { min_chain_work: 0, anchor, ignored: &none });
+        let o = d.compute_finality_pin(&PinPolicy { anchor, ..policy(&none) });
         assert_eq!((o.pin, o.anchor, o.counted.len()), (None, AnchorStatus::Unknown, 0));
         // A disqualified anchor pins nothing (and nothing through it counts).
         d.mark_invalid(h(2, 4));
         let anchor = Some(Anchor { hash: h(2, 4), height: 4 });
-        let o = d.compute_finality_pin(&PinPolicy { min_chain_work: 0, anchor, ignored: &none });
+        let o = d.compute_finality_pin(&PinPolicy { anchor, ..policy(&none) });
         assert_eq!((o.pin, o.anchor), (None, AnchorStatus::Invalid));
     }
 
     /// Cost probe for the pin computation (run with `--ignored
     /// --nocapture`): 10,000 finalized checkpoints on one chain, each with
-    /// two sources. About 26 ms per computation in a debug build on the
-    /// reference machine (module docs, "Cost").
+    /// two sources, then the same with a conflicting chain of 2,000 more
+    /// (review MEDIUM 4: the former latest-common-block walk made a
+    /// conflict cost a selected-chain walk per maximal candidate, at least
+    /// three times per accepted block).
     #[test]
     #[ignore = "timing probe: prints the cost of one pin computation"]
     fn measure_pin_computation_cost() {
@@ -482,13 +651,25 @@ mod tests {
             d.note_finality_source(h(1, i), h(1, i - 1), i);
             d.note_finality_source(h(1, i - 1), h(1, i.saturating_sub(3).max(1)), i);
         }
-        let t = std::time::Instant::now();
-        let mut o = PinOutcome::default();
-        for _ in 0..10 {
-            o = d.compute_finality_pin(&policy(&none));
+        let measure = |d: &GhostDAG, what: &str| {
+            let t = std::time::Instant::now();
+            let mut o = PinOutcome::default();
+            for _ in 0..10 {
+                o = d.compute_finality_pin(&on(h(1, n), Some(h(1, n - 1)), &none));
+            }
+            eprintln!("{what}: candidates {} -> {:?} per compute; pin {:?}, conflicting {}",
+                d.finality_index().candidates(), t.elapsed() / 10, o.pin.map(|x| x.1), o.conflicting);
+        };
+        measure(&d, "one chain");
+        let mut p = h(1, 10);
+        for i in 11..=4_010u64 {
+            d.add_block(h(2, i), vec![p], i, 10).unwrap();
+            p = h(2, i);
         }
-        eprintln!("candidates {} -> {:?} per compute; pin {:?}", d.finality_index().candidates(),
-            t.elapsed() / 10, o.pin.map(|x| x.1));
+        for i in (12..=4_010u64).step_by(2) {
+            d.note_finality_source(h(2, i), h(2, i - 1), i);
+        }
+        measure(&d, "with a conflicting chain");
     }
 
     #[test]
@@ -497,7 +678,7 @@ mod tests {
         let mut d = dag();
         d.note_finality_source(h(1, 6), h(1, 2), 3);
         let w6 = d.get_block_data(&h(1, 6)).unwrap().blue_work;
-        let p = |min| PinPolicy { min_chain_work: min, anchor: None, ignored: &none };
+        let p = |min| PinPolicy { min_chain_work: min, ..policy(&none) };
         assert_eq!(d.compute_finality_pin(&p(w6)).pin, Some((h(1, 2), 2)));
         assert_eq!(d.compute_finality_pin(&p(w6 + 1)).pin, None);
         // A later source of the same checkpoint reaching the minimum counts.

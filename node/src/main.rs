@@ -1078,8 +1078,10 @@ async fn main() {
             }
         }
     }
-    // PoWit finality: pin fork choice to the checkpoint the applied chain's
-    // witness set has finalized (kept current by accept_block from here on).
+    // PoWit finality: pin fork choice to the node's own finalized checkpoint
+    // (the one it pinned last, the applied chain's), advanced by those it
+    // learns from any stored block (kept current by accept_block from here
+    // on; `consensus::finality`).
     powit::update_finalized(&dag, &store);
     if let Some((h, height)) = dag.read().finalized() {
         info!("PoWit finalized checkpoint: {} (DAG height {})", hex::encode(&h[..8]), height);

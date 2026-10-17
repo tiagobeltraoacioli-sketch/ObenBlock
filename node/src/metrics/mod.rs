@@ -83,6 +83,9 @@ pub struct MetricsState {
     /// `reorg::DEEP_REORG_ALERT_DEPTH`. Alert series only: there is no
     /// reorg-depth limit, so every such reorg was followed.
     pub deep_reorgs_total:               IntCounter,
+    /// PoWit finality conflict alert (review HIGH 1): counted finalized
+    /// checkpoints that conflict with the node's pin; 0 when none.
+    pub finality_conflicts:              IntGauge,
 
     // ── Histograms (Phase 2) ────────────────────────────────────
     pub block_validation_seconds:        Histogram,
@@ -222,6 +225,13 @@ impl MetricsState {
             registry
         ).expect("register deep_reorgs_total");
 
+        let finality_conflicts = register_int_gauge_with_registry!(
+            opts!("gnb_finality_conflicts",
+                  "Finalized PoWit checkpoints that conflict with this node's finality pin (alert while > 0; \
+                   the node keeps its finality, an operator decides: getfinalityinfo)"),
+            registry
+        ).expect("register finality_conflicts");
+
         // ── Histograms ───────────────────────────────────────────
         // Block validation buckets tuned for expected range: 1ms..10s
         let block_validation_seconds = register_histogram_with_registry!(
@@ -265,6 +275,7 @@ impl MetricsState {
             reorg_success_total,
             reorg_depth,
             deep_reorgs_total,
+            finality_conflicts,
             block_validation_seconds,
             rpc_latency_seconds,
         }
@@ -402,6 +413,13 @@ pub fn observe_reorg_depth(depth: f64) {
 #[inline]
 pub fn inc_deep_reorg() {
     if let Some(m) = METRICS.get() { m.deep_reorgs_total.inc(); }
+}
+
+/// Review HIGH 1: the number of counted finalized checkpoints that conflict
+/// with the finality pin (`powit::refresh_finality_pin`).
+#[inline]
+pub fn set_finality_conflicts(n: i64) {
+    if let Some(m) = METRICS.get() { m.finality_conflicts.set(n); }
 }
 
 #[inline]

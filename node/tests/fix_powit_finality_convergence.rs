@@ -9,13 +9,18 @@
 //! pin from the applied tip only, so it could drop. Now (Gasper's fork
 //! choice starts from the highest justified checkpoint learned from ANY
 //! block) the pin is the highest finalized checkpoint carried by the PoWit
-//! state of any stored block that is not disqualified; conflicting
-//! finalized checkpoints are handled deterministically (the pin falls back
-//! to their latest common block and the most work decides above it, with an
-//! alert); restart rebuilds the same pin from storage.
+//! state of any stored block that is not disqualified; restart rebuilds the
+//! same pin from storage.
 //!
-//! Finding 3 (node side): an eclipsed node pinned a cheap fork's checkpoint
-//! and then ignored the heavier honest chain forever.
+//! Review of that fix, HIGH 1 and MEDIUM 3: conflicting finalized
+//! checkpoints used to make the pin fall back to their latest common block,
+//! so the most work decided above it: a majority-hashrate fork that
+//! finalized its own rolled every synced node's finalized history back, and
+//! a cheap fork froze a syncing node's pin at the fork point. Finality the
+//! node reached on its own chain is now sticky (a conflicting one raises a
+//! persistent alert, the operator decides), a finality learned from another
+//! chain only advances it, and a node with no finality of its own resolves
+//! conflicting learned ones by the work of their best sources.
 //!
 //! Every block goes through the REAL acceptance pipeline; PoWit states are
 //! synthetic (below the PoWit activation acceptance computes none), as in
@@ -292,15 +297,19 @@ fn a_restart_restores_exactly_the_pin_it_had() {
     assert_eq!(applied_tip(&n), Some(tip(&y)), "a heavier chain forking below the pin never wins");
 }
 
-/// Finding 3, the eclipse: a node syncing while eclipsed sees only a fork F
-/// whose own witness set finalized F[3], and pins it. When the honest chain
-/// H arrives it carries its own finalized checkpoint H[5]: the two conflict
-/// (finality cannot be trusted any more: at least a third of the witness
-/// weight signed both, or the witness sets differ), so the pin falls back to
-/// their latest common block (genesis here) and the most work decides: H.
-/// The node used to stay on F forever.
+/// Finding 3, the eclipse, without an anchor: a node syncing while eclipsed
+/// sees only a fork F whose own witness set finalized F[3], and pins it: that
+/// is finality reached on its own applied chain. When the honest chain H
+/// arrives with its own finalized checkpoint H[5], the two conflict, and the
+/// node cannot tell an eclipse from a majority-hashrate attack on finality
+/// (review HIGH 1, `a_synced_node_keeps_its_finality_against_a_heavier_
+/// conflicting_fork`): it keeps F[3] and raises the conflict alert, as every
+/// Ethereum client keeps its finalized checkpoint. The defences against the
+/// eclipse come first (the release finality checkpoint, the minimum chain
+/// work, `fix_powit_finality_e2e.rs`); the remedy is the operator's: a
+/// weak-subjectivity checkpoint on H moves the node, for good.
 #[test]
-fn an_eclipsed_node_pinned_to_a_fork_follows_the_honest_chain_once_it_sees_it() {
+fn an_eclipsed_node_keeps_the_forks_finality_and_alerts_until_the_operator_moves_it() {
     setup();
     let genesis = mk_genesis(unix_now() - 100_000);
     let gh = genesis.block_hash();
@@ -313,10 +322,18 @@ fn an_eclipsed_node_pinned_to_a_fork_follows_the_honest_chain_once_it_sees_it() 
     deliver(&n, &fork);
     assert_eq!(pin_of(&n), Some(fork[3].block_hash()), "eclipsed: the fork's finality is all it knows");
     deliver(&n, &honest);
-    assert_eq!(applied_tip(&n), Some(tip(&honest)), "the honest chain, the most work");
-    assert_ne!(pin_of(&n), Some(fork[3].block_hash()));
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(fork[3].block_hash()), Some(tip(&fork))),
+        "it keeps the finality it reached, whatever the work of the other chain");
+    let info = gnb::powit::finality_info_json(&n.dag.read(), 8);
+    assert_eq!((info["conflict_resolution"].as_str(), info["conflicting_finalized"].as_u64()),
+        (Some("own_finality"), Some(1)), "{info}");
+    assert_eq!(info["own_finality"]["hash"], serde_json::json!(hex::encode(fork[3].block_hash())));
+
+    finality_op(&n, FinalityOp::SetAnchor(honest[2].block_hash()));
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(honest[5].block_hash()), Some(tip(&honest))));
+    assert!(gnb::powit::finality_info_json(&n.dag.read(), 8)["conflict"].is_null(), "F[3] is against the anchor");
     restart(&mut n);
-    assert_eq!(applied_tip(&n), Some(tip(&honest)));
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(honest[5].block_hash()), Some(tip(&honest))));
 }
 
 /// An operator `invalidateblock` of the pinned checkpoint: the block and
@@ -425,9 +442,9 @@ fn an_operator_checkpoint_anchors_the_pin() {
 }
 
 /// Conflicting finalized checkpoints are reported (`getfinalityinfo`
-/// `conflict`, `getpowitinfo` `finality_conflict`) and the pin is their
-/// latest common block; an operator then picks a side with
-/// `setfinalitycheckpoint`.
+/// `conflict`, `getpowitinfo` `finality_conflict`, persistently): the node
+/// keeps the finality it reached (X[3]), never the heavier chain Y that
+/// finalized Y[6]; an operator then picks a side with `setfinalitycheckpoint`.
 #[test]
 fn a_finality_conflict_is_reported_and_the_operator_can_resolve_it() {
     setup();
@@ -437,22 +454,154 @@ fn a_finality_conflict_is_reported_and_the_operator_can_resolve_it() {
     let common = b.chain(gh, 4, "c");
     let x = b.chain(tip(&common), 20, "x");
     let y = b.chain(tip(&common), 25, "y");
-    let n = node_with(&genesis, &[]);
+    let mut n = node_with(&genesis, &[]);
     finalize(&n, &b, &x, 3, 10);
     finalize(&n, &b, &y, 6, 12);
     deliver(&n, &common);
     deliver(&n, &x);
     deliver(&n, &y);
-    assert_eq!(pin_of(&n), Some(tip(&common)), "their latest common block");
-    assert_eq!(applied_tip(&n), Some(tip(&y)), "the most work above it");
+    assert_eq!(pin_of(&n), Some(x[3].block_hash()), "its own finality");
+    assert_eq!(applied_tip(&n), Some(tip(&x)), "not the most work");
     let info = gnb::powit::finality_info_json(&n.dag.read(), 8);
-    assert_eq!(info["origin"], serde_json::json!("conflict"), "{info}");
+    assert_eq!(info["origin"], serde_json::json!("finalized"), "{info}");
     let pair: Vec<String> = info["conflict"].as_array().unwrap().iter()
         .map(|c| c["hash"].as_str().unwrap().to_string()).collect();
-    assert_eq!(pair, vec![hex::encode(y[6].block_hash()), hex::encode(x[3].block_hash())]);
+    assert_eq!(pair, vec![hex::encode(x[3].block_hash()), hex::encode(y[6].block_hash())]);
+    assert_eq!(gnb::powit::info_json(&n.dag.read(), &n.store)["finality_conflict"], serde_json::json!(true));
+    restart(&mut n);
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(x[3].block_hash()), Some(tip(&x))));
+    assert!(!gnb::powit::finality_info_json(&n.dag.read(), 8)["conflict"].is_null(), "the alert persists");
+
+    finality_op(&n, FinalityOp::SetAnchor(y[6].block_hash()));
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(y[6].block_hash()), Some(tip(&y))));
+    assert!(gnb::powit::finality_info_json(&n.dag.read(), 8)["conflict"].is_null());
+}
+
+// ── Review of the PoWit finality pin: findings HIGH 1 and MEDIUM 3 ──────────
+
+/// Review HIGH 1 (regression against main): a majority-hashrate attacker
+/// forks right after the honest finalized checkpoint H[3], finalizes its own
+/// checkpoint A[5] (under the first witness-set rule its own shares become
+/// its witness set) and publishes the heavier fork once the honest chain has
+/// finalized H[12] above the fork point. The pin used to fall back to the
+/// latest common block of the two finalities, so the most work decided above
+/// it and every synced node rolled finalized history back. Finality the
+/// node reached on its own chain is now sticky: it keeps H[12], stays on H,
+/// raises a persistent conflict alert, and only the operator moves it.
+#[test]
+fn a_synced_node_keeps_its_finality_against_a_heavier_conflicting_fork() {
+    setup();
+    let genesis = mk_genesis(unix_now() - 100_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let h = b.chain(gh, 20, "h");
+    let a = b.chain(h[4].block_hash(), 30, "a");
+    assert!(b.work(&tip(&a)) > b.work(&tip(&h)), "the attacker's fork carries more work");
+    let mut n = node_with(&genesis, &[]);
+    finalize(&n, &b, &h, 3, 8);
+    finalize(&n, &b, &h, 12, 18);
+    finalize(&n, &b, &a, 5, 20);
+    deliver(&n, &h);
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(h[12].block_hash()), Some(tip(&h))));
+
+    deliver(&n, &a);
+    assert_eq!(pin_of(&n), Some(h[12].block_hash()), "the node keeps the finality it reached");
+    assert_eq!(applied_tip(&n), Some(tip(&h)), "finalized history is never rolled back by work");
+    let info = gnb::powit::finality_info_json(&n.dag.read(), 8);
+    let pair: Vec<String> = info["conflict"].as_array().expect("a conflict is reported").iter()
+        .map(|c| c["hash"].as_str().unwrap().to_string()).collect();
+    assert_eq!(pair, vec![hex::encode(h[12].block_hash()), hex::encode(a[5].block_hash())], "{info}");
     assert_eq!(gnb::powit::info_json(&n.dag.read(), &n.store)["finality_conflict"], serde_json::json!(true));
 
-    finality_op(&n, FinalityOp::SetAnchor(x[3].block_hash()));
-    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(x[3].block_hash()), Some(tip(&x))));
-    assert!(gnb::powit::finality_info_json(&n.dag.read(), 8)["conflict"].is_null());
+    // Persistent: a restart, and more attacker blocks, change nothing.
+    restart(&mut n);
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(h[12].block_hash()), Some(tip(&h))));
+    assert!(!gnb::powit::finality_info_json(&n.dag.read(), 8)["conflict"].is_null(), "still alerting");
+    let more = b.chain(tip(&a), 5, "m");
+    for blk in &more {
+        gnb::powit::save_state(&n.store, &blk.block_hash(), &state_finalizing(a[5].block_hash(),
+            b.height(&a[5].block_hash()) + 1)).unwrap();
+    }
+    deliver(&n, &more);
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(h[12].block_hash()), Some(tip(&h))));
+
+    // The operator's escape hatch: set the node's own checkpoint aside and
+    // the other finality, which descends from H[3], advances the pin.
+    finality_op(&n, FinalityOp::Ignore(h[12].block_hash()));
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(a[5].block_hash()), Some(tip(&more))));
+}
+
+/// Review MEDIUM 3: a cheap fork X with its own finalization, sent to a
+/// node syncing the honest chain H, used to pin the node at the fork point
+/// forever: X's checkpoint stayed counted, so the latest common block of the
+/// two (genesis here) stayed the pin however far H's own finality went, and
+/// the node followed X while X was heavier. The node now keeps the finality
+/// it reached on H, reports X, and its pin keeps advancing on H.
+#[test]
+fn a_cheap_conflicting_fork_never_freezes_the_pin_of_a_syncing_node() {
+    setup();
+    let genesis = mk_genesis(unix_now() - 100_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let h = b.chain(gh, 40, "h");
+    let x = b.chain(gh, 12, "x");
+    let n = node_with(&genesis, &[]);
+    for (cp, from) in [(3, 8), (13, 18), (23, 28), (33, 38)] {
+        let till = if from + 10 < h.len() { from + 10 } else { h.len() };
+        let cph = h[cp].block_hash();
+        for blk in &h[from..till] {
+            gnb::powit::save_state(&n.store, &blk.block_hash(), &state_finalizing(cph, b.height(&cph) + 1)).unwrap();
+        }
+    }
+    finalize(&n, &b, &x, 3, 6);
+    deliver(&n, &h[..10]);
+    assert_eq!(pin_of(&n), Some(h[3].block_hash()));
+    deliver(&n, &x);
+    assert_eq!(pin_of(&n), Some(h[3].block_hash()), "the cheap fork does not move the pin back");
+    assert_eq!(applied_tip(&n), Some(h[9].block_hash()), "nor capture the node, although it is heavier");
+    assert!(!gnb::powit::finality_info_json(&n.dag.read(), 8)["conflict"].is_null());
+    for (upto, cp) in [(20, 13), (30, 23), (40, 33)] {
+        deliver(&n, &h[upto - 10..upto]);
+        assert_eq!(pin_of(&n), Some(h[cp].block_hash()), "the pin keeps advancing on H");
+    }
+    assert_eq!(applied_tip(&n), Some(tip(&h)));
+}
+
+/// Review MEDIUM 3, a node with no finality of its own: conflicting
+/// finalized checkpoints it only learned from chains it has not applied
+/// resolve deterministically, to the one whose best source carries the most
+/// work, never to their latest common block forever. Here the operator set
+/// the node's own checkpoint X[3] aside (`ignorefinalized`), leaving H[5]
+/// and Y[4], which conflict: H's sources are heavier, so the node pins H[5],
+/// moves to H, and its pin then advances with H's next finalization.
+#[test]
+fn with_no_finality_of_its_own_conflicting_checkpoints_resolve_by_work() {
+    setup();
+    let genesis = mk_genesis(unix_now() - 100_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let x = b.chain(gh, 12, "x");
+    let y = b.chain(gh, 14, "y");
+    let h = b.chain(gh, 30, "h");
+    let n = node_with(&genesis, &[]);
+    finalize(&n, &b, &x, 3, 6);
+    finalize(&n, &b, &y, 4, 8);
+    let cph = h[5].block_hash();
+    for blk in &h[10..20] {
+        gnb::powit::save_state(&n.store, &blk.block_hash(), &state_finalizing(cph, b.height(&cph) + 1)).unwrap();
+    }
+    deliver(&n, &x);
+    deliver(&n, &y);
+    deliver(&n, &h[..20]);
+    assert_eq!(pin_of(&n), Some(x[3].block_hash()), "the finality the node reached first");
+    finality_op(&n, FinalityOp::Ignore(x[3].block_hash()));
+    assert_eq!(pin_of(&n), Some(h[5].block_hash()), "H's checkpoint: its best source carries the most work");
+    assert_eq!(applied_tip(&n), Some(h[19].block_hash()));
+    let cph = h[15].block_hash();
+    for blk in &h[20..] {
+        gnb::powit::save_state(&n.store, &blk.block_hash(), &state_finalizing(cph, b.height(&cph) + 1)).unwrap();
+    }
+    deliver(&n, &h[20..]);
+    assert_eq!(pin_of(&n), Some(h[15].block_hash()), "and the pin advances with H, not stuck at genesis");
+    assert_eq!(applied_tip(&n), Some(tip(&h)));
 }

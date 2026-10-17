@@ -1628,10 +1628,14 @@ fn commit_chunk(
 /// PoWit finality (`consensus::finality`): the candidate is always the best
 /// block whose selected chain passes through the pin, and the pin is
 /// recomputed (`powit::refresh_finality_pin`) before each resolution step.
-/// It depends on every stored block's PoWit state, not on the applied chain
-/// (PoWit audit finding 2), so a chunk committing or failing changes it only
-/// through what the step disqualified: a disqualified block's finalization
-/// stops counting, and the move goes to the best chain under what remains.
+/// It depends on every stored block's PoWit state (PoWit audit finding 2)
+/// and on the node's own finality: the checkpoint it pinned last (sticky,
+/// persisted), which the applied chain only raises. A chunk moving toward
+/// the pin never lowers it (the applied chain stays at or above the fork
+/// point, which is at or above the pin's chain below the pin), so a chunk
+/// committing or failing changes the pin only through what the step
+/// disqualified: a disqualified block's finalization stops counting, and the
+/// move goes to the best chain under what remains.
 #[allow(clippy::too_many_arguments)]
 fn resolve_best_chain(
     dag: &Arc<RwLock<consensus::GhostDAG>>,
@@ -2354,7 +2358,9 @@ pub fn accept_block_tracking(
         // (Gasper's fork choice starts from the highest justified
         // checkpoint learned from ANY block), so the pin is refreshed before
         // the chain move: a node that learns a finalization from a lighter
-        // branch moves to that branch.
+        // branch moves to that branch when it advances the node's own
+        // finality; one that conflicts with it only raises the conflict
+        // alert (review HIGH 1, `consensus::finality`).
         crate::powit::note_block_finality(dag, store, &block_hash, powit_state.as_ref());
         crate::powit::refresh_finality_pin(dag, store);
     }
@@ -4057,8 +4063,11 @@ pub fn reconsider_block(
 /// for the finality pin. Persist the setting (`powit::apply_finality_op`),
 /// recompute the pin, and move the applied chain to the best valid block
 /// under it, committed in chunks like [`invalidate_block`]. No block is
-/// marked: setting a finalized checkpoint aside leaves its blocks valid, the
-/// most work decides above the remaining pin. The setting stands even when
+/// marked: setting a finalized checkpoint aside leaves its blocks valid; the
+/// pin falls back to the node's remaining own finality, which a finalized
+/// checkpoint that conflicted with the one set aside may now advance, and
+/// the most work decides above it. This is how an operator moves a node off
+/// a finality it keeps against a conflict (review HIGH 1). The setting stands even when
 /// the move first needs pruned bodies ([`OverrideError::MissingBodies`]: they
 /// are requested, retry) or stops on a storage failure (the next acceptance
 /// or start resumes it). `affected` in the result is 1 when the pin moved.

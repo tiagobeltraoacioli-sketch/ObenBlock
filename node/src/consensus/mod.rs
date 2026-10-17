@@ -975,7 +975,8 @@ pub struct GhostDAG {
     /// passes through. A block whose selected-parent chain does not pass
     /// through it is never selected or offered as a template parent:
     /// finalized history is never rolled back. Computed from every stored
-    /// block's PoWit state ([`GhostDAG::compute_finality_pin`]).
+    /// block's PoWit state and the node's own finality
+    /// ([`GhostDAG::compute_finality_pin`]).
     finalized: Option<(BlockHash, u64)>,
     /// Every finalized checkpoint the PoWit states of stored blocks carry,
     /// and the operator's finality settings (`finality`).

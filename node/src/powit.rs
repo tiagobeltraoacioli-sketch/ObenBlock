@@ -1205,14 +1205,17 @@ pub fn evidence_item(e: &Equivocation) -> (Hash, u8, Vec<u8>) {
 
 // ── Finality pin (node-local fork choice) ────────────────────────────────────
 //
-// PoWit audit findings 2 and 3. The pin (`GhostDAG::finalized`) is a pure
-// function of the blocks the node holds (`consensus::finality`): the highest
-// finalized checkpoint the PoWit state of any stored, not disqualified block
-// carries, among those whose source reaches the minimum chain work and which
-// agree with the weak-subjectivity anchor (the release finality checkpoint
-// below, or the operator's); conflicting finalized checkpoints fall back to
-// their latest common block. The (block, checkpoint) pairs are persisted with
-// each block's state (`finality_row`), so a restart rebuilds the same pin.
+// PoWit audit findings 2 and 3, and the review of their fix (HIGH 1, MEDIUM
+// 3). The pin (`GhostDAG::finalized`) is computed from the PoWit state of any
+// stored, not disqualified block (`consensus::finality`): finalized
+// checkpoints whose sources reach the minimum chain work and which agree
+// with the weak-subjectivity anchor (the release finality checkpoint below,
+// or the operator's). The finality the node has reached on its own chain is
+// sticky: a finalized checkpoint learned from another chain only advances it,
+// one that conflicts with it raises an alert and never moves it. The
+// (block, checkpoint) pairs are persisted with each block's state
+// (`finality_row`), and the pinned checkpoint itself (`FINALITY_PIN_META`),
+// so a restart rebuilds the same pin.
 
 /// A release finality checkpoint (weak subjectivity, as Bitcoin Core's
 /// release checkpoints and `-assumevalid`, and the weak-subjectivity
@@ -1284,6 +1287,10 @@ const FIN_INDEX_READY: &str = "powit/fin_index_v1";
 pub const FINALITY_ANCHOR_META: &str = "powit/finality/anchor";
 /// Blocks the operator set aside (`ignorefinalized`): `powit/finality/ignored/<hex>`.
 const FINALITY_IGNORED_PREFIX: &str = "powit/finality/ignored/";
+/// The finalized checkpoint the node pinned last (its own finality, sticky:
+/// `consensus::finality::PinPolicy::sticky`): block hash (32); absent when
+/// the pin is the anchor or nothing.
+pub const FINALITY_PIN_META: &str = "powit/finality/pin";
 
 /// The finality row of `hash` with PoWit state `state`, if that state
 /// finalized a checkpoint beyond the activation one.
@@ -1356,6 +1363,11 @@ pub fn load_finality_index(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage)
             .ok_or("finality index: malformed ignored-checkpoint key")?;
         ignored.insert(h);
     }
+    let sticky = match store.get_meta(FINALITY_PIN_META).map_err(io)? {
+        None => None,
+        Some(v) => Some(<Hash>::try_from(v.as_slice())
+            .map_err(|_| format!("finality index: {FINALITY_PIN_META} holds {} bytes", v.len()))?),
+    };
     let rows = store.scan_meta_prefix(FIN_ROW_PREFIX).map_err(io)?;
     let mut d = dag.write();
     d.clear_finality_sources();
@@ -1363,6 +1375,7 @@ pub fn load_finality_index(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage)
         let idx = d.finality_index_mut();
         idx.anchor_setting = anchor;
         idx.ignored = ignored;
+        idx.set_sticky(sticky);
     }
     let mut loaded = 0usize;
     for (k, v) in rows {
@@ -1390,24 +1403,39 @@ fn anchor_in_force(setting: AnchorSetting) -> Option<Anchor> {
     }
 }
 
+/// The applied tip: the block the UTXO set sits on (the persisted tip
+/// pointer), else, for a store without one the DAG knows (fixtures), the
+/// selected tip.
+fn applied_tip(dag: &GhostDAG, store: &Storage) -> Option<Hash> {
+    store.get_meta("tip_hash").ok().flatten()
+        .and_then(|v| <Hash>::try_from(v.as_slice()).ok())
+        .filter(|t| dag.has_block(t))
+        .or_else(|| dag.selected_tip())
+}
+
 /// Recompute the pin from every recorded finalized checkpoint
 /// (`GhostDAG::compute_finality_pin`) and apply it: after every acceptance
 /// (before the chain move, so the move goes to the best chain under the new
 /// pin), at each step of a chain move (a disqualified block's finality stops
-/// counting), at start-up, and after an operator setting. Logs a change of
-/// pin, and a conflict once. Returns the outcome.
+/// counting), at start-up, and after an operator setting. The node's own
+/// finality comes from its applied tip and the checkpoint it pinned last,
+/// which is persisted here when it changes. Logs a change of pin, and the
+/// conflict alert whenever the set of conflicting checkpoints changes (and
+/// at start-up), and keeps the `gnb_finality_conflicts` metric at the number
+/// of counted checkpoints that conflict with the pin. Returns the outcome.
 pub fn refresh_finality_pin(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage) -> PinOutcome {
-    let _ = store;
     let min_chain_work = crate::ingress::minimum_chain_work();
-    let (outcome, previous) = {
+    let (outcome, previous, sticky) = {
         let d = dag.read();
         let idx = d.finality_index();
         let policy = PinPolicy {
             min_chain_work,
             anchor: anchor_in_force(idx.anchor_setting),
             ignored: &idx.ignored,
+            applied: applied_tip(&d, store),
+            sticky: idx.sticky(),
         };
-        (d.compute_finality_pin(&policy), d.finality_outcome().clone())
+        (d.compute_finality_pin(&policy), d.finality_outcome().clone(), idx.sticky())
     };
     if outcome.pin != previous.pin {
         match outcome.pin {
@@ -1416,15 +1444,28 @@ pub fn refresh_finality_pin(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage
             None => log::warn!("PoWit finality pin cleared (was {:?})", previous.pin.map(|(h, x)| (hex::encode(&h[..8]), x))),
         }
     }
-    if outcome.conflict.is_some() && outcome.conflict != previous.conflict {
+    crate::metrics::set_finality_conflicts(outcome.conflicting as i64);
+    if outcome.conflict.is_some() && (outcome.conflict, outcome.conflicting) != (previous.conflict, previous.conflicting) {
         let ((a, ah), (b, bh)) = outcome.conflict.expect("checked");
-        log::error!("PoWit FINALITY CONFLICT: checkpoints {} (DAG height {ah}) and {} (DAG height {bh}) are both \
-            finalized and neither is on the other's chain. At least a third of the witness weight signed both \
-            (the equivocation is provable on chain), or the chains derived different witness sets (a fork from \
-            before any common finality, or a long partition finalized through inactivity decay). This node no \
-            longer trusts either: it pins their latest common block and follows the most work above it. An \
-            operator can choose with `setfinalitycheckpoint <hash>` (docs/RUNNING.md)",
-            hex::encode(&a[..8]), hex::encode(&b[..8]));
+        match outcome.resolution {
+            crate::consensus::finality::ConflictResolution::MostWork => log::error!(
+                "PoWit FINALITY CONFLICT: {} finalized checkpoint(s) conflict with {} (DAG height {ah}), the highest \
+                 {} (DAG height {bh}); this node had no finality of its own above them and pinned the one whose \
+                 chain carries the most work. At least a third of the witness weight signed both, or the chains \
+                 derived different witness sets. An operator can choose with `setfinalitycheckpoint <hash>` \
+                 (docs/RUNNING.md)",
+                outcome.conflicting, hex::encode(&a[..8]), hex::encode(&b[..8])),
+            _ => log::error!(
+                "PoWit FINALITY CONFLICT: {} finalized checkpoint(s) conflict with this node's finality {} (DAG \
+                 height {ah}), the highest {} (DAG height {bh}). At least a third of the witness weight signed \
+                 both (the equivocation is provable on chain), or the chains derived different witness sets (a \
+                 fork from before any common finality, a long partition finalized through inactivity decay, or a \
+                 majority of the hashrate building its own witness set). This node keeps the finality it reached \
+                 and never follows the other chain on its own, whatever its work; if this node is the one on the \
+                 wrong side, an operator moves it with `setfinalitycheckpoint <hash>` or `ignorefinalized <hash>` \
+                 (docs/RUNNING.md)",
+                outcome.conflicting, hex::encode(&a[..8]), hex::encode(&b[..8])),
+        }
     }
     if outcome.anchor != previous.anchor && matches!(outcome.anchor,
         crate::consensus::finality::AnchorStatus::Invalid | crate::consensus::finality::AnchorStatus::HeightMismatch)
@@ -1434,6 +1475,18 @@ pub fn refresh_finality_pin(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage
             anchor_in_force(dag.read().finality_index().anchor_setting).map(|a| hex::encode(a.hash)), outcome.anchor);
     }
     dag.write().set_finality_pin(outcome.clone());
+    // The pinned checkpoint is the node's own finality from now on: persist
+    // it (a lost write falls back to the applied chain's finality).
+    let pinned = dag.read().finality_index().sticky();
+    if pinned != sticky {
+        let r = match pinned {
+            Some(h) => store.put_meta(FINALITY_PIN_META, &h),
+            None => store.delete_meta(FINALITY_PIN_META),
+        };
+        if let Err(e) = r {
+            log::warn!("PoWit finality pin: not persisted ({e})");
+        }
+    }
     outcome
 }
 
@@ -1449,7 +1502,9 @@ pub fn update_finalized(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FinalityOp {
     /// Never pin a finalized checkpoint at or above this block on its chain
-    /// (the blocks stay valid; the most work decides above the next pin).
+    /// (the blocks stay valid; the pin falls back to the node's remaining own
+    /// finality, which a checkpoint that conflicted with the one set aside
+    /// may now advance; the most work decides above it).
     Ignore(Hash),
     /// Undo [`FinalityOp::Ignore`] for this block.
     Reconsider(Hash),
@@ -1517,6 +1572,7 @@ pub fn finality_info_json(dag: &GhostDAG, max: usize) -> serde_json::Value {
     serde_json::json!({
         "pin": dag.finalized().map(|(h, height)| block(&h, height)),
         "origin": o.origin.as_str(),
+        "own_finality": o.own.map(|(h, height)| block(&h, height)),
         "anchor": anchor.map(|a| block(&a.hash, a.height)),
         "anchor_source": match idx.anchor_setting {
             AnchorSetting::Release => if anchor.is_some() { "release" } else { "none" },
@@ -1527,7 +1583,12 @@ pub fn finality_info_json(dag: &GhostDAG, max: usize) -> serde_json::Value {
         "finalized": o.counted.iter().take(max).map(|(h, height, slot)| serde_json::json!({
             "hash": hex::encode(h), "block_height": height, "slot": slot })).collect::<Vec<_>>(),
         "finalized_count": o.counted.len(),
+        // The persistent conflict alert: [the pinned checkpoint, the highest
+        // counted checkpoint that conflicts with it], how many conflict, and
+        // whether the node kept its own finality or chose by work.
         "conflict": o.conflict.map(|(a, b)| serde_json::json!([block(&a.0, a.1), block(&b.0, b.1)])),
+        "conflicting_finalized": o.conflicting,
+        "conflict_resolution": o.resolution.as_str(),
         "against_anchor": o.against_anchor,
         "ignored": idx.ignored.iter().map(hex::encode).collect::<Vec<_>>(),
         "ignored_finalized": o.ignored,

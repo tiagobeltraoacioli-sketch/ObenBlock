@@ -715,36 +715,64 @@ choice: a block whose selected-parent chain does not pass through the pin is
 never selected, nor offered as a template parent (`GhostDAG::finalized`;
 docs/DESIGN-pow-powit.md §7.6). It restricts which blocks are selectable,
 never a block's GhostDAG data (selected parent, coloring, blue work). The
-pin is node-local and a pure function of the blocks the node holds
-(`consensus::finality`, PoWit audit findings 2 and 3), as Gasper's fork
-choice starts from the highest checkpoint learned from any block:
+pin is node-local (`consensus::finality`, PoWit audit findings 2 and 3 and
+the review of their fix). As Gasper's fork choice starts from the highest
+checkpoint learned from any block, the node learns finality from every
+block it stores; as every Ethereum client does, it never gives up finality
+it has reached because a conflicting finality appeared:
 
 - a candidate is a finalized checkpoint carried by the PoWit state of any
   stored block (its source), on the applied chain or not;
-- it counts when some source is not disqualified and has at least the
-  node's minimum chain work ("Minimum chain work and unrequested blocks"
-  below: a cheap chain pulled during initial sync proves nothing), the
-  operator has not set it aside (`ignorefinalized`), and it agrees with the
-  weak-subjectivity anchor: the release finality checkpoint
+- it counts when some source is not disqualified for a reason its id
+  commits to (a block waiting for a body or a verdict still counts) and has
+  at least the node's minimum chain work ("Minimum chain work and
+  unrequested blocks" below: a cheap chain pulled during initial sync proves
+  nothing), the operator has not set it aside (`ignorefinalized`), and it
+  agrees with the weak-subjectivity anchor: the release finality checkpoint
   (`powit::MAINNET_FINALITY_CHECKPOINT`, printed by
   `tools/release/min_chain_work.py` with the minimum chain work; none yet on
   mainnet) or the operator's (`setfinalitycheckpoint`). A candidate at or
   below the anchor never counts, one above it only if the anchor is on its
   selected chain, and once the node holds the anchor block no chain that
   forks below it is selectable;
-- the pin is the highest counted candidate when all of them lie on one
-  selected chain. Two conflicting finalized checkpoints (neither on the
-  other's selected chain) mean that a third of the witness weight signed
-  both, or that the two chains derived different witness sets; the pin is
-  then their latest common block, so the most work decides above it, and the
-  node reports the conflict (`getfinalityinfo`).
+- the node's own finality is the highest counted candidate on its applied
+  chain, or the counted candidate it pinned last (persisted) when that one
+  descends from it (pinned before the chain move to it was done: a move
+  stopped between chunks, a chain-state rebuild);
+- a candidate that descends from the own finality advances it: the pin is
+  the highest such candidate. A node with no finality of its own, or an
+  older one on the same chain, thus learns a newer one from a stored
+  fork-loser. When advancing candidates conflict with each other (neither on
+  the other's selected chain), all were learned from chains the node has not
+  applied, and the node takes the one whose best source carries the most
+  blue work (then the higher, then the larger hash), never their latest
+  common block;
+- a counted candidate that conflicts with the pin means that a third of the
+  witness weight signed both, or that the two chains derived different
+  witness sets (a fork from before any common finality, a long partition
+  finalized through inactivity decay, or, below the second hardening
+  activation, a majority of the hashrate mining its own witness set on a
+  private fork). It never moves the pin, whatever its chain's work: the node
+  keeps its finality and raises a persistent conflict alert for as long as
+  the candidate counts (`getfinalityinfo` `conflict`, `conflicting_finalized`
+  and `conflict_resolution`; `getpowitinfo` `finality_conflict`; an error
+  log line; the `gnb_finality_conflicts` metric). Only the operator moves it
+  (`setfinalitycheckpoint`, `ignorefinalized`, below).
 
-Two nodes holding the same blocks (and the same disqualifications, minimum
-chain work, anchor and operator settings) therefore compute the same pin
-whatever the arrival order, and a node that never applied the blocks
-carrying a finalization still learns it: after a partition heals, every node
-holding both sides pins the same checkpoint and converges on one chain. The
-(source, checkpoint) pairs are persisted with each block's PoWit state, so a
+Without a conflict, two nodes holding the same blocks (and the same
+disqualifications, minimum chain work, anchor and operator settings)
+compute the same pin whatever the arrival order, and a node that never
+applied the blocks carrying a finalization still learns it: after a
+partition heals, every node holding both sides pins the same checkpoint and
+converges on one chain. With a conflict, each node keeps the finality it
+reached first: the weak-subjectivity assumption of every finality protocol,
+which the release anchor and the minimum chain work make hold for a node
+that syncs while eclipsed. (The first fix of finding 2 pinned the latest
+common block of conflicting finalities instead, so the most work decided
+above it: a heavier fork that finalized its own rolled every synced node's
+finalized history back, and a cheap one froze a syncing node's pin at the
+fork point for good.) The (source, checkpoint) pairs are persisted with each
+block's PoWit state and the pinned checkpoint on its own, so a
 restart rebuilds the same pin. The
 former 1,000-block `MAX_REORG_DEPTH` and the `finalized_height` gate compared
 a fork with the node's own history, so nodes that received the same blocks in
@@ -764,11 +792,11 @@ an interrupted move. When a block of a later chunk turns out invalid the best
 valid chain is resolved again from where the applied chain stands, which can
 move back to the old branch; the end state is the same as with one batch.
 The PoWit finality pin above is recomputed before each resolution step
-(`powit::refresh_finality_pin`) from the stored blocks, not from the applied
-chain, so a chunk committing or failing changes it only through what the
-step disqualified (a disqualified block's finalization stops counting), and
-start-up rebuilds it from the persisted finality rows before it resumes a
-move: neither a block of a later chunk that turns out invalid nor a crash
+(`powit::refresh_finality_pin`) from the stored blocks and the node's own
+finality, which a move toward the pin never lowers, so a chunk committing or
+failing changes it only through what the step disqualified (a disqualified
+block's finalization stops counting), and start-up rebuilds it from the
+persisted finality rows and pinned checkpoint before it resumes a move: neither a block of a later chunk that turns out invalid nor a crash
 between chunks changes where the move ends. A block's PoWit state and the
 reachability records its insertion changed are committed in the same batch
 as its DAG record (the in-memory copy of those records is marked written
@@ -818,14 +846,18 @@ pruned node, an override whose new chain needs pruned bodies changes nothing,
 requests the next (at most 4,096) of those bodies and asks to be retried.
 
 The finality pin has the same kind of escape hatch, also node-local and
-persistent: `ignorefinalized [hash]` sets aside the pinned checkpoint (or
-the given block): no finalized checkpoint at or above it on its selected
-chain counts any more, so the pin falls back to the highest remaining
-candidate, if any, and the most work decides above it; `reconsiderfinalized
+persistent, and it is the only way off a finality the node keeps against a
+conflict: `ignorefinalized [hash]` sets aside the pinned checkpoint (or the
+given block): no finalized checkpoint at or above it on its selected chain
+counts any more, so the node's own finality falls back to the highest
+remaining one, which a checkpoint that conflicted with the one set aside may
+now advance, and the most work decides above the pin; `reconsiderfinalized
 <hash>` takes such a setting back; `setfinalitycheckpoint <hash>|none|default`
-sets the operator's weak-subjectivity anchor, removes every anchor, or goes
-back to the release one. `getfinalityinfo` reports the pin, its origin
-(`anchor`, `finalized` or `conflict`), the anchor and the candidates.
+sets the operator's weak-subjectivity anchor (every candidate that conflicts
+with it stops counting, the node's own finality included), removes every
+anchor, or goes back to the release one. `getfinalityinfo` reports the pin,
+its origin (`anchor` or `finalized`), the node's own finality, the anchor,
+the candidates and the conflict alert.
 
 ### Blue work
 

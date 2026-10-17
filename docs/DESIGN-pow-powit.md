@@ -227,37 +227,61 @@ resumes, so > 1/3 offline or withholding can only delay finality, not stop it.
 ### 7.6 Fork choice
 
 Heaviest blue-work DAG **among the branches that contain the pinned
-checkpoint**. The pin is node-local and a pure function of the blocks the
-node holds (PoWit audit findings 2 and 3; docs/CONSENSUS.md, "Selected
-parent and fork choice"):
+checkpoint**. The pin is node-local (PoWit audit findings 2 and 3, and the
+review of their fix; docs/CONSENSUS.md, "Selected parent and fork choice"):
 
-- the highest finalized checkpoint carried by the PoWit state of ANY stored,
-  not disqualified block (as Gasper's fork choice starts from the highest
-  checkpoint learned from any branch), not only the node's applied chain;
-- only from sources with at least the minimum chain work, and never one
-  that conflicts with the weak-subjectivity anchor (the release finality
+- candidates are the finalized checkpoints carried by the PoWit state of ANY
+  stored block (as Gasper's fork choice starts from the highest checkpoint
+  learned from any branch), not only the node's applied chain. One counts
+  when a source is not disqualified for a reason its id commits to and has
+  at least the minimum chain work, the operator has not set it aside, and it
+  does not conflict with the weak-subjectivity anchor (the release finality
   checkpoint, or the operator's);
-- two conflicting finalized checkpoints (accountable-safety evidence, or two
-  chains with different witness sets) pin their latest common block, so the
-  most work decides above it, and the node reports the conflict;
+- finality the node has reached is sticky, as in every Ethereum client: the
+  node's own finality is the highest finalized checkpoint of its applied
+  chain, or the checkpoint it pinned last (persisted) when that one
+  descends from it. A checkpoint learned
+  from a chain the node has not applied only ADVANCES it: the pin is the
+  highest counted checkpoint that descends from the node's own finality. A
+  node with no finality of its own above them resolves conflicting learned
+  checkpoints to the one whose best source carries the most work, never to
+  their latest common block;
+- a counted checkpoint that conflicts with the pin (accountable-safety
+  evidence, or two chains with different witness sets) never moves it,
+  whatever its chain's work: the node keeps its finality, raises a
+  persistent alert (`getfinalityinfo` `conflict`, the log,
+  `gnb_finality_conflicts`), and only the operator moves it
+  (`setfinalitycheckpoint`, `ignorefinalized`);
 - rebuilt from persisted rows on restart; the operator can set a pin aside
   or change the anchor (`ignorefinalized`, `reconsiderfinalized`,
   `setfinalitycheckpoint`).
 
 A partitioned side may keep producing blocks (LOG_avail), but at most one
 side can finalize. After the heal every node that holds both sides learns
-that side's finalization from its blocks, pins the same checkpoint and
-converges on the same chain, whatever the arrival order. Before this
-(finding 2) the pin came from the node's own applied chain only, so the
-lighter-but-finalized side and the heavier side split for good.
+that side's finalization from its blocks (it advances the finality both
+sides share), pins the same checkpoint and converges on the same chain,
+whatever the arrival order. Before this (finding 2) the pin came from the
+node's own applied chain only, so the lighter-but-finalized side and the
+heavier side split for good.
 
 Guarantees and limits: the pin never reverts LOG_fin while less than a third
-of the witness weight is Byzantine and the node holds the finalizing blocks.
-A node that syncs only an attacker's chain while eclipsed can be held on it
-until it sees the honest chain. The minimum chain work and the release
-checkpoint bound that (as `nMinimumChainWork` and `-assumevalid` do for
-Bitcoin Core). Both are unset on mainnet until a release reads them from
-independent nodes.
+of the witness weight is Byzantine and the node holds the finalizing blocks,
+and it never reverts the node's own finality on a conflict. The fix of
+finding 2 first made two conflicting finalities pin their latest common
+block, so the most work decided above it: under the first witness-set rule
+a majority of the hashrate that forked privately after the last common
+finality, finalized its own checkpoint with its own shares and published a
+heavier fork rolled the finalized history of every synced node back (review
+HIGH 1). A node now keeps its finality; one that had not finalized beyond
+the fork point still follows such a fork (it advances its finality), which
+from the second hardening activation cannot finalize (§7.4). A node that
+syncs only an attacker's chain while eclipsed reaches the attacker's
+finality and keeps it, alerting, once it sees the honest chain: it cannot
+tell an eclipse from an attack on its own finality. The minimum chain work
+and the release checkpoint prevent that eclipse (as `nMinimumChainWork` and
+`-assumevalid` do for Bitcoin Core, and the weak-subjectivity checkpoint for
+Ethereum), and an operator checkpoint undoes it. Both are unset on mainnet
+until a release reads them from independent nodes.
 
 ### 7.7 Other attacks
 
