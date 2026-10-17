@@ -1,11 +1,12 @@
 # Each tick anchors only when Bloch finality advanced BLOCH_ANCHOR_EVERY_EPOCHS
 # epochs past the last anchor (one Bloch epoch is ~16 min).
+# A wall-clock schedule: OnBootSec/OnUnitInactiveSec left nothing scheduled
+# when the timer was enabled long after boot (NEXT "-", no runs).
 [Unit]
 Description=Anchor the Bloch finalized checkpoint in GnB-SMH (periodic)
 
 [Timer]
-OnBootSec=5min
-OnUnitInactiveSec=10min
+OnCalendar=*:0/10
 RandomizedDelaySec=60
 Persistent=true
 
