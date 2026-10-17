@@ -131,6 +131,16 @@ impl PqPsbt {
             return Err("PQ-PSBT input/output limit".into());
         }
         self.spend.check_signing_shape()?;
+        // P5-S: PQ-PSBT version 1 carries hybrid keys only (docs/PQ-PSBT.md;
+        // its independent reference pins the key shapes). A policy that
+        // lists a conservative suite-0x0003 key is spent with the spend-file
+        // flow (`policyspend` / `policysign`).
+        let conservative = self.spend.policy.has_conservative_key()
+            || self.spend.tree.as_ref().is_some_and(|(t, _)| t.branches.iter().any(|b| b.has_conservative_key()));
+        if conservative {
+            return Err("PQ-PSBT version 1 carries hybrid keys only: spend a policy with a conservative \
+                        suite-0x0003 key with policyspend / policysign".into());
+        }
         if self.inputs.len() != self.spend.tx.inputs.len() {
             return Err("PQ-PSBT input count mismatch".into());
         }
@@ -1154,6 +1164,21 @@ mod tests {
     /// Where hardening 2 holds from genesis (testnet, regtest) such a spend
     /// is refused before any role runs. Before the fix every role accepted
     /// it at every height.
+    /// P5-S: PQ-PSBT version 1 carries hybrid keys only; a spend of a
+    /// policy (or tree) listing a conservative suite-0x0003 key is refused
+    /// at creation, not written as a document other implementations reject.
+    #[test]
+    fn conservative_key_policies_are_refused_by_pqpsbt_v1() {
+        let _act2 = crate::core::activation::scoped_override_v2(0);
+        let (hpk, _) = crate::crypto::generate_keypair();
+        let (cpk, _) = crate::crypto::generate_conservative_keypair_from_seed_secret(&[0x42; 32]).unwrap();
+        let policy = SpendPolicy::new_under(1, vec![hpk, cpk], 0, 0, crate::crypto::SuiteRules::HARDENING2).unwrap();
+        let spend = PolicySpend::new(Network::Testnet, policy, &[([1u8; 32], 0, 5_000_000)],
+                                     vec![9u8; 20], 1_000_000, 0, 0).unwrap();
+        let err = PqPsbt::from_policy_spend(spend).unwrap_err();
+        assert!(err.contains("hybrid keys only"), "{err}");
+    }
+
     #[test]
     fn twin_key_policy_spends_are_refused_from_hardening2() {
         use crate::core::activation;

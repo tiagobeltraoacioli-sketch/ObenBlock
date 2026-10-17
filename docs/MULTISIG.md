@@ -16,7 +16,13 @@ Any other output script is invalid (it used to be an unspendable burn).
 A policy is:
 
 - **m-of-n multisig**: 1 ≤ m ≤ n ≤ 7 distinct hybrid keys (each 3,749 bytes
-  enveloped, or 3,745 bytes raw for a genesis carry-over key). Distinct means
+  enveloped, or 3,745 bytes raw for a genesis carry-over key). From the
+  second hardening height a key may also be a conservative suite-0x0003 key
+  (SLH-DSA-SHAKE-128s AND Falcon-1024, 1,829 bytes, signatures up to 9,322
+  bytes), mixed freely with hybrid keys; below it a policy listing one is
+  invalid (`docs/CONSENSUS.md`, "Conservative suite 0x0003"). `policyaddress`,
+  `policyspend` and `policysign` carry such keys; the PQ-PSBT format and the
+  vault commands do not yet. Distinct means
   distinct keys, not distinct byte strings: the raw and the enveloped
   encoding of one key are the same signer (`core::policy::key_identity`,
   PF-4). `gnb-cli policyaddress`, `vaultcreate` and every other tool

@@ -53,6 +53,70 @@ const SUITE_MAGIC: [u8; 2] = [0xB1, 0x0C];
 pub const SUITE_MLDSA65_FALCON1024: u16 = 0x0001;
 /// ML-DSA-65 only — the "Falcon removed" suite (proof that Falcon is removable).
 pub const SUITE_MLDSA65_ONLY: u16 = 0x0002;
+/// The conservative suite (P5-S): SLH-DSA-SHAKE-128s (FIPS 205, hash-based)
+/// AND Falcon-1024 (lattice), so a forgery needs a break of both a hash
+/// function and a lattice problem. Opt-in, for vaults, treasury, vesting,
+/// the bridge and cold storage; valid only in sighash-v3 transaction
+/// signatures from the second hardening height ([`SuiteRules`],
+/// `docs/CONSENSUS.md`, "Conservative suite 0x0003").
+///
+/// Layout (fixed-length component first, like suite 0x0001):
+/// `pk = B1 0C 03 00 ‖ slh_pk (32) ‖ falcon_pk (1,793)`,
+/// `sk = B1 0C 03 00 ‖ slh_sk (64) ‖ falcon_sk (2,305)`,
+/// `sig = B1 0C 03 00 ‖ slh_sig (7,856) ‖ falcon_sig (compact)`.
+pub const SUITE_SLHDSA128S_FALCON1024: u16 = 0x0003;
+/// [`SUITE_SLHDSA128S_FALCON1024`] by its role.
+pub const SUITE_CONSERVATIVE: u16 = SUITE_SLHDSA128S_FALCON1024;
+/// Enveloped conservative public key: 4 + 32 + 1,793 = 1,829 bytes.
+pub const CONSERVATIVE_PUBLIC_KEY_LEN: usize = SUITE_HEADER_LEN + slhdsa::PUBLIC_KEY_LEN + FALCON_PUBKEY_LEN;
+/// Enveloped conservative secret key: 4 + 64 + 2,305 = 2,373 bytes.
+pub const CONSERVATIVE_SECRET_KEY_LEN: usize = SUITE_HEADER_LEN + slhdsa::SECRET_KEY_LEN + FALCON_SECRET_LEN;
+/// Longest canonical conservative signature: 4 + 7,856 + 1,462 = 9,322 bytes.
+pub const CONSERVATIVE_MAX_SIGNATURE_LEN: usize =
+    SUITE_HEADER_LEN + slhdsa::SIGNATURE_LEN + gnb_secret::pq::FALCON1024_SIGNATURE_BYTES;
+
+/// Which signature suites a TRANSACTION signature may use: the consensus rule
+/// of the block it is in (mempool and producers: the next block).
+///
+/// | | suites 0x0001, 0x0002 | suite 0x0003 (conservative) |
+/// | --- | --- | --- |
+/// | below the second hardening height | as before | invalid (an unknown suite, exactly the old verdict) |
+/// | from it | as before | valid under sighash v3 |
+///
+/// Suite 0x0003 exists only in sighash-v3 transaction signatures
+/// ([`verify_bound_under`]): every other verifier ([`verify`] and the
+/// sighash-v2 path, signed messages, disclosures, KES, PoWit shares, the P2P
+/// identity) keeps refusing it. The second hardening height is at or above
+/// the first on every network (`core::activation`), so the conservative suite
+/// never meets sighash v2.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SuiteRules {
+    conservative: bool,
+}
+
+impl SuiteRules {
+    /// The rules before the second hardening height: suites 0x0001 and
+    /// 0x0002, exactly the historical verdicts.
+    pub const LEGACY: SuiteRules = SuiteRules { conservative: false };
+    /// The rules from the second hardening height: the conservative suite
+    /// 0x0003 too.
+    pub const HARDENING2: SuiteRules = SuiteRules { conservative: true };
+
+    /// The rules for a block at header height `height` under the second
+    /// hardening activation height `hardening2_activation_height`.
+    pub const fn at(height: u64, hardening2_activation_height: u64) -> SuiteRules {
+        if crate::core::activation::is_active_at(height, hardening2_activation_height) {
+            SuiteRules::HARDENING2
+        } else {
+            SuiteRules::LEGACY
+        }
+    }
+
+    /// Whether suite 0x0003 is valid.
+    pub const fn conservative_suite(self) -> bool {
+        self.conservative
+    }
+}
 
 /// Maximum encoded signature length emitted by the currently supported signers.
 /// Producers may reserve this before signing; this does not change wire rules.
@@ -60,6 +124,36 @@ pub fn max_signature_len() -> usize {
     SUITE_HEADER_LEN.saturating_add(MLDSA_SIG_LEN)
         .saturating_add(pqcrypto_falcon::falcon1024::signature_bytes())
 }
+
+/// Maximum encoded signature length of a key whose encoding is
+/// `public_key_len` bytes long: [`CONSERVATIVE_MAX_SIGNATURE_LEN`] for the
+/// conservative key length, otherwise the hybrid maximum
+/// ([`max_signature_len`], at least the maximum of every other suite).
+/// Exact length decides, as for [`public_key_suite`]. Producers size fees
+/// with it before signing.
+pub fn max_signature_len_for_public_key_len(public_key_len: usize) -> usize {
+    if public_key_len == CONSERVATIVE_PUBLIC_KEY_LEN {
+        CONSERVATIVE_MAX_SIGNATURE_LEN
+    } else {
+        max_signature_len()
+    }
+}
+
+/// Maximum encoded signature length of a key of `suite` (`None` for an
+/// unknown suite): the hybrid maximum ([`max_signature_len`]), 3,313 for
+/// suite 0x0002, [`CONSERVATIVE_MAX_SIGNATURE_LEN`] for suite 0x0003.
+/// Producers size fees and budgets with it.
+pub fn max_signature_len_for_suite(suite: u16) -> Option<usize> {
+    match suite {
+        SUITE_MLDSA65_FALCON1024 => Some(max_signature_len()),
+        SUITE_MLDSA65_ONLY => Some(SUITE_HEADER_LEN + MLDSA_SIG_LEN),
+        SUITE_SLHDSA128S_FALCON1024 => Some(CONSERVATIVE_MAX_SIGNATURE_LEN),
+        _ => None,
+    }
+}
+
+/// SLH-DSA-SHAKE-128s, the hash-based component of the conservative suite.
+pub mod slhdsa;
 
 // 0x0000 and 0xFFFF are reserved and never valid ⇒ verify returns false.
 
@@ -223,6 +317,177 @@ pub fn generate_keypair_from_seed_secret(seed: &[u8]) -> Result<(Vec<u8>, Secret
     Ok((pk, sk))
 }
 
+// ── Conservative suite 0x0003 key generation (P5-S) ─────────────────────────
+
+/// The signature suite of a key a wallet generates: the everyday hybrid suite
+/// 0x0001 (ML-DSA-65 AND Falcon-1024, compact) or the opt-in conservative
+/// suite 0x0003 (SLH-DSA-SHAKE-128s AND Falcon-1024: family diversity, about
+/// 9.3 kB per signature, slow signing; valid from the second hardening
+/// height, [`SuiteRules`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub enum KeySuite {
+    /// Suite 0x0001.
+    #[default]
+    Hybrid,
+    /// Suite 0x0003.
+    Conservative,
+}
+
+impl KeySuite {
+    /// The suite id in the key's envelope.
+    pub const fn id(self) -> u16 {
+        match self {
+            KeySuite::Hybrid => SUITE_MLDSA65_FALCON1024,
+            KeySuite::Conservative => SUITE_SLHDSA128S_FALCON1024,
+        }
+    }
+
+    /// The suite of a public key a wallet can sign with, by its exact
+    /// encoding: [`is_hybrid_public_key`] (enveloped or raw carry-over) or
+    /// [`is_conservative_public_key`]. `None` for suite 0x0002, a key of
+    /// another length and unknown encodings.
+    pub fn of_public_key(public_key_bytes: &[u8]) -> Option<KeySuite> {
+        if is_hybrid_public_key(public_key_bytes) {
+            Some(KeySuite::Hybrid)
+        } else if is_conservative_public_key(public_key_bytes) {
+            Some(KeySuite::Conservative)
+        } else {
+            None
+        }
+    }
+
+    /// The name used by the CLIs (`--suite hybrid|conservative`), the
+    /// descriptors and the RPC.
+    pub const fn name(self) -> &'static str {
+        match self {
+            KeySuite::Hybrid => "hybrid",
+            KeySuite::Conservative => "conservative",
+        }
+    }
+
+    /// Parse [`KeySuite::name`] (also accepts the hex suite ids `0x0001` and
+    /// `0x0003`).
+    pub fn parse(s: &str) -> Result<KeySuite, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "hybrid" | "0x0001" | "1" => Ok(KeySuite::Hybrid),
+            "conservative" | "0x0003" | "3" => Ok(KeySuite::Conservative),
+            other => Err(format!("unknown signature suite `{other}` (expected hybrid or conservative)")),
+        }
+    }
+
+    /// Whether a producer may emit a key or signature of this suite for a
+    /// block at `height` under the second hardening activation height `h2`
+    /// (the conservative suite only at/after it). Error text for the CLIs.
+    pub fn check_allowed_at(self, height: u64, h2: u64) -> Result<(), String> {
+        if self == KeySuite::Conservative && !SuiteRules::at(height, h2).conservative_suite() {
+            let when = if h2 == crate::core::activation::NEVER {
+                "the second hardening upgrade is not scheduled on this chain".to_string()
+            } else {
+                format!("it activates at height {h2}")
+            };
+            return Err(format!(
+                "the conservative signature suite (0x0003, SLH-DSA + Falcon-1024) is not valid for a \
+                 block at height {height}: {when}; funds locked to such a key could not be spent before it"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Domain-separated seed of a conservative key derived from a wallet seed:
+/// `SHA3-256("GNB-SUITE-0003/keygen-v1" ‖ seed[..32])`. A mnemonic used for
+/// both suites therefore yields two independent Falcon-1024 keys (the hybrid
+/// derivation feeds `seed[..32]` itself to the seeded RNG).
+fn conservative_seed(seed32: &[u8; 32]) -> zeroize::Zeroizing<[u8; 32]> {
+    let mut h = Sha3_256::new();
+    h.update(b"GNB-SUITE-0003/keygen-v1");
+    h.update(seed32);
+    zeroize::Zeroizing::new(h.finalize().into())
+}
+
+/// Generate the enveloped conservative key pair in place (CRY-4: SLH-DSA's
+/// seeds are drawn into secret memory, Falcon's key straight into `sk`).
+/// SLH-DSA first (48 bytes of `randombytes`), then Falcon-1024.
+fn conservative_keypair_into(pk: &mut [u8], sk: &mut [u8]) -> Result<(), CryptoError> {
+    let mut header = [0u8; SUITE_HEADER_LEN];
+    header[..2].copy_from_slice(&SUITE_MAGIC);
+    header[2..].copy_from_slice(&SUITE_SLHDSA128S_FALCON1024.to_le_bytes());
+    pk[..SUITE_HEADER_LEN].copy_from_slice(&header);
+    sk[..SUITE_HEADER_LEN].copy_from_slice(&header);
+    let (spk, fpk) = pk[SUITE_HEADER_LEN..].split_at_mut(slhdsa::PUBLIC_KEY_LEN);
+    let (ssk, fsk) = sk[SUITE_HEADER_LEN..].split_at_mut(slhdsa::SECRET_KEY_LEN);
+    slhdsa::keypair_into(spk, ssk)?;
+    gnb_secret::pq::falcon1024_keypair(fpk, fsk)
+        .map_err(|e| CryptoError::InvalidKey(format!("Falcon-1024 key generation: {e}")))?;
+    Ok(())
+}
+
+/// A fresh conservative (suite 0x0003) key pair, OS randomness, the secret
+/// key only in a [`SecretBytes`] (CRY-4).
+pub fn generate_conservative_keypair_secret() -> Result<(Vec<u8>, SecretBytes), CryptoError> {
+    let mut pk = vec![0u8; CONSERVATIVE_PUBLIC_KEY_LEN];
+    let mut sk = SecretBytes::zeroed(CONSERVATIVE_SECRET_KEY_LEN);
+    let r = conservative_keypair_into(&mut pk, &mut sk);
+    gnb_secret::scrub_stack();
+    r.map(|()| (pk, sk))
+}
+
+/// Deterministic conservative key pair from a seed of at least 32 bytes
+/// (wallet recovery): [`conservative_seed`] of `seed[..32]` drives the same
+/// seeded RNG as [`generate_keypair_from_seed_secret`]. Same seed, same key,
+/// on every platform (SLH-DSA is integer hashing, Falcon the `clean`
+/// variant).
+pub fn generate_conservative_keypair_from_seed_secret(seed: &[u8]) -> Result<(Vec<u8>, SecretBytes), CryptoError> {
+    if seed.len() < 32 {
+        return Err(CryptoError::InvalidKey(format!("seed too short: {} bytes (need 32+)", seed.len())));
+    }
+    let mut seed32 = zeroize::Zeroizing::new([0u8; 32]);
+    seed32.copy_from_slice(&seed[..32]);
+    let derived = conservative_seed(&seed32);
+    let mut pk = vec![0u8; CONSERVATIVE_PUBLIC_KEY_LEN];
+    let mut sk = SecretBytes::zeroed(CONSERVATIVE_SECRET_KEY_LEN);
+    let r = pqcrypto_internals::with_seeded_rng_scope(&derived, || conservative_keypair_into(&mut pk, &mut sk));
+    gnb_secret::scrub_stack();
+    r.map(|()| (pk, sk))
+}
+
+/// A fresh key pair of `suite` (secret in a [`SecretBytes`]).
+pub fn generate_keypair_for_suite_secret(suite: KeySuite) -> Result<(Vec<u8>, SecretBytes), CryptoError> {
+    match suite {
+        KeySuite::Hybrid => Ok(generate_keypair_secret()),
+        KeySuite::Conservative => generate_conservative_keypair_secret(),
+    }
+}
+
+/// The deterministic key pair of `suite` from a wallet seed (at least 32
+/// bytes): [`generate_keypair_from_seed_secret`] or
+/// [`generate_conservative_keypair_from_seed_secret`].
+pub fn generate_keypair_from_seed_for_suite_secret(suite: KeySuite, seed: &[u8])
+    -> Result<(Vec<u8>, SecretBytes), CryptoError>
+{
+    match suite {
+        KeySuite::Hybrid => generate_keypair_from_seed_secret(seed),
+        KeySuite::Conservative => generate_conservative_keypair_from_seed_secret(seed),
+    }
+}
+
+/// Whether `public_key_bytes` is exactly an enveloped conservative key
+/// (`B1 0C 03 00 ‖ 32 ‖ 1,793` bytes). A format predicate; it does not check
+/// the key material. There is no raw (unenveloped) form of this suite.
+pub fn is_conservative_public_key(public_key_bytes: &[u8]) -> bool {
+    public_key_bytes.len() == CONSERVATIVE_PUBLIC_KEY_LEN
+        && matches!(parse_envelope(public_key_bytes), Some((SUITE_SLHDSA128S_FALCON1024, _)))
+}
+
+/// Whether a key may be a spend-policy key (`core::policy`) under `rules`:
+/// a hybrid key ([`is_hybrid_public_key`]: enveloped suite 0x0001 or the
+/// raw carry-over encoding) at every height, and from the second hardening
+/// height also a conservative key ([`is_conservative_public_key`]).
+pub fn is_policy_key_under(public_key_bytes: &[u8], rules: SuiteRules) -> bool {
+    is_hybrid_public_key(public_key_bytes)
+        || (rules.conservative_suite() && is_conservative_public_key(public_key_bytes))
+}
+
 // ── Signed-message domain (A4-M-4) ──────────────────────────────────────────
 //
 // `crypto::sign` signs its `message` argument verbatim. Every OTHER caller in
@@ -322,6 +587,12 @@ pub fn sign(secret_key_bytes: &[u8], message: &[u8]) -> Result<Vec<u8>, CryptoEr
             gnb_secret::scrub_stack();
             Ok(wrap_envelope(suite, &out?))
         }
+        // P5-S: the conservative suite exists only as a component-bound
+        // sighash-v3 transaction signature (`sign_bound`); no verifier of
+        // unbound messages accepts it.
+        SUITE_SLHDSA128S_FALCON1024 => Err(CryptoError::InvalidKey(
+            "the conservative suite 0x0003 signs only sighash-v3 transaction digests (crypto::sign_bound)".into(),
+        )),
         _ => Err(CryptoError::InvalidKey(format!("unknown/reserved suite {:#06x}", suite))),
     }
 }
@@ -743,11 +1014,24 @@ pub fn split_envelope(bytes: &[u8]) -> Option<(u16, &[u8])> {
 /// envelope's suite. `None` for anything else (no envelope, unknown or
 /// reserved suite). A format predicate; it does not check the key material.
 pub fn public_key_suite(public_key_bytes: &[u8]) -> Option<u16> {
+    public_key_suite_under(public_key_bytes, SuiteRules::LEGACY)
+}
+
+/// [`public_key_suite`] under `rules`: from the second hardening height also
+/// suite 0x0003, for a key of exactly [`CONSERVATIVE_PUBLIC_KEY_LEN`] bytes
+/// (no raw form, no other length). Under [`SuiteRules::LEGACY`] exactly
+/// [`public_key_suite`].
+pub fn public_key_suite_under(public_key_bytes: &[u8], rules: SuiteRules) -> Option<u16> {
     if public_key_bytes.len() == legacy_hybrid_pubkey_len() {
         return Some(SUITE_MLDSA65_FALCON1024);
     }
     match parse_envelope(public_key_bytes) {
         Some((suite @ (SUITE_MLDSA65_FALCON1024 | SUITE_MLDSA65_ONLY), _)) => Some(suite),
+        Some((SUITE_SLHDSA128S_FALCON1024, _))
+            if rules.conservative_suite() && public_key_bytes.len() == CONSERVATIVE_PUBLIC_KEY_LEN =>
+        {
+            Some(SUITE_SLHDSA128S_FALCON1024)
+        }
         _ => None,
     }
 }
@@ -767,11 +1051,25 @@ pub fn public_key_suite(public_key_bytes: &[u8]) -> Option<u16> {
 /// with a successful [`verify`] it is equivalent to
 /// [`verify_enveloped_canonical`] / [`verify_legacy_hybrid_raw_canonical`].
 pub fn is_canonical_signature_encoding(signature_bytes: &[u8]) -> bool {
+    is_canonical_signature_encoding_under(signature_bytes, SuiteRules::LEGACY)
+}
+
+/// [`is_canonical_signature_encoding`] under `rules`. From the second
+/// hardening height also suite 0x0003: `slh_sig (exactly 7,856 bytes) ‖
+/// falcon_sig` with the Falcon half in its COMPACT encoding (as for suite
+/// 0x0001: header 0x3A, 40-byte nonce, exactly framed coefficients, zero
+/// padding bits, nothing after it, at most 1,462 bytes), so the whole body is
+/// 7,898..=9,318 bytes. Under [`SuiteRules::LEGACY`] exactly
+/// [`is_canonical_signature_encoding`].
+pub fn is_canonical_signature_encoding_under(signature_bytes: &[u8], rules: SuiteRules) -> bool {
     match parse_envelope(signature_bytes) {
         Some((SUITE_MLDSA65_FALCON1024, body)) => {
             body.len() > MLDSA_SIG_LEN && falcon::is_canonical_encoding(&body[MLDSA_SIG_LEN..])
         }
         Some((SUITE_MLDSA65_ONLY, body)) => body.len() == MLDSA_SIG_LEN,
+        Some((SUITE_SLHDSA128S_FALCON1024, body)) if rules.conservative_suite() => {
+            body.len() > slhdsa::SIGNATURE_LEN && falcon::is_canonical_encoding(&body[slhdsa::SIGNATURE_LEN..])
+        }
         _ => false,
     }
 }
@@ -803,6 +1101,9 @@ pub const TX_SIG_COMPONENT_DOMAIN: [u8; 12] = *b"GNB-TXSIG-v3";
 pub const COMPONENT_MLDSA65: u8 = 0x01;
 /// Component id of the Falcon-1024 signature in a v3 component message.
 pub const COMPONENT_FALCON1024: u8 = 0x02;
+/// Component id of the SLH-DSA-SHAKE-128s signature in a v3 component
+/// message (suite 0x0003 only).
+pub const COMPONENT_SLHDSA_SHAKE128S: u8 = 0x03;
 /// Length of a v3 component message: 12 + 2 + 1 + 32.
 pub const BOUND_COMPONENT_MESSAGE_LEN: usize = 47;
 
@@ -844,12 +1145,31 @@ pub fn sign_bound(secret_key_bytes: &[u8], digest: &[u8; 32]) -> Result<Vec<u8>,
             gnb_secret::scrub_stack();
             Ok(wrap_envelope(suite, &out?))
         }
+        SUITE_SLHDSA128S_FALCON1024 => {
+            // Conservative body: slh_sk (64) ‖ falcon_sk (2,305). Produce
+            // slh_sig (7,856) ‖ falcon_sig (compact), each component over its
+            // own bound message. SLH-DSA signing takes about 2 s.
+            if sk_body.len() != slhdsa::SECRET_KEY_LEN + FALCON_SECRET_LEN {
+                return Err(CryptoError::InvalidKey("conservative secret key wrong length".into()));
+            }
+            let (ssk, fsk) = sk_body.split_at(slhdsa::SECRET_KEY_LEN);
+            let signed = slhdsa::sign(ssk, &bound_component_message(suite, COMPONENT_SLHDSA_SHAKE128S, digest))
+                .and_then(|mut out| {
+                    out.extend_from_slice(&falcon::sign(fsk, &bound_component_message(suite, COMPONENT_FALCON1024, digest))?);
+                    Ok(out)
+                });
+            gnb_secret::scrub_stack();
+            Ok(wrap_envelope(suite, &signed?))
+        }
         _ => Err(CryptoError::InvalidKey(format!("unknown/reserved suite {:#06x}", suite))),
     }
 }
 
-/// [`sign_bound`] followed by [`verify_bound`] under `public_key_bytes`
-/// (enveloped, or the exact raw legacy hybrid key of a carry-over wallet).
+/// [`sign_bound`] followed by verification under `public_key_bytes`
+/// (enveloped, or the exact raw legacy hybrid key of a carry-over wallet)
+/// with every suite allowed ([`verify_bound_under`] with
+/// [`SuiteRules::HARDENING2`]: whether the conservative suite may be used at
+/// the target height is the producer's check, [`KeySuite::check_allowed_at`]).
 /// The wallet entry point for version-3 transactions.
 pub fn sign_bound_checked(
     secret_key_bytes: &[u8],
@@ -857,7 +1177,7 @@ pub fn sign_bound_checked(
     digest: &[u8; 32],
 ) -> Result<Vec<u8>, CryptoError> {
     let sig = sign_bound(secret_key_bytes, digest)?;
-    if !verify_bound(public_key_bytes, digest, &sig) {
+    if !verify_bound_under(public_key_bytes, digest, &sig, SuiteRules::HARDENING2) {
         return Err(CryptoError::SignFailed(
             "produced signature does not verify under the wallet public key \
              (corrupted or mismatched secret key)".into(),
@@ -873,15 +1193,39 @@ pub fn sign_bound_checked(
 /// key's suite must equal the signature's, and every component must verify
 /// over its [`bound_component_message`]. Never panics.
 pub fn verify_bound(public_key_bytes: &[u8], digest: &[u8; 32], signature_bytes: &[u8]) -> bool {
+    verify_bound_under(public_key_bytes, digest, signature_bytes, SuiteRules::LEGACY)
+}
+
+/// [`verify_bound`] under `rules`: the consensus verifier of a sighash-v3
+/// transaction signature in a block whose height gives `rules`
+/// ([`SuiteRules::at`]). Under [`SuiteRules::LEGACY`] exactly
+/// [`verify_bound`]. From the second hardening height also suite 0x0003: the
+/// key is exactly `B1 0C 03 00 ‖ slh_pk (32) ‖ falcon_pk (1,793)`, the
+/// signature canonical ([`is_canonical_signature_encoding_under`]), and BOTH
+/// components verify, each over its own [`bound_component_message`]: Falcon
+/// (component 0x02) first, the cheaper check, then SLH-DSA-SHAKE-128s
+/// (component 0x03, FIPS 205 pure verification, empty context). Never panics.
+pub fn verify_bound_under(public_key_bytes: &[u8], digest: &[u8; 32], signature_bytes: &[u8], rules: SuiteRules) -> bool {
     #[cfg(test)]
     POLICY_VERIFICATION_CALLS.with(|n| n.set(n.get() + 1));
-    if !is_canonical_signature_encoding(signature_bytes) {
+    if !is_canonical_signature_encoding_under(signature_bytes, rules) {
         return false;
     }
     let Some((sig_suite, sig_body)) = parse_envelope(signature_bytes) else { return false };
-    let Some(pk_suite) = public_key_suite(public_key_bytes) else { return false };
+    let Some(pk_suite) = public_key_suite_under(public_key_bytes, rules) else { return false };
     if pk_suite != sig_suite {
         return false;
+    }
+    if sig_suite == SUITE_SLHDSA128S_FALCON1024 {
+        // `public_key_suite_under` admitted exactly the enveloped length and
+        // `is_canonical_signature_encoding_under` the 7,856-byte split.
+        let pk_body = &public_key_bytes[SUITE_HEADER_LEN..];
+        let (spk, fpk) = pk_body.split_at(slhdsa::PUBLIC_KEY_LEN);
+        let (ssig, fsig) = sig_body.split_at(slhdsa::SIGNATURE_LEN);
+        #[cfg(test)]
+        SLHDSA_VERIFICATION_CALLS.with(|n| n.set(n.get() + 1));
+        return falcon::verify_canonical(fpk, &bound_component_message(sig_suite, COMPONENT_FALCON1024, digest), fsig)
+            && slhdsa::verify(spk, &bound_component_message(sig_suite, COMPONENT_SLHDSA_SHAKE128S, digest), ssig);
     }
     let pk_body = if public_key_bytes.len() == legacy_hybrid_pubkey_len() {
         public_key_bytes
@@ -2607,4 +2951,285 @@ thread_local! {
     /// Actual strict policy verifier calls, including the consensus witness
     /// check. Thread-local so parallel tests cannot contaminate cost evidence.
     pub(crate) static POLICY_VERIFICATION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Suite-0x0003 verifications that reached the component checks (P5-S
+    /// cost evidence: a malformed or out-of-regime witness must not get here).
+    pub(crate) static SLHDSA_VERIFICATION_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+// ── Conservative suite 0x0003 (P5-S) ─────────────────────────────────────────
+#[cfg(test)]
+mod conservative_suite_tests {
+    use super::*;
+    use crate::core::activation::NEVER;
+
+    const H: SuiteRules = SuiteRules::HARDENING2;
+    const L: SuiteRules = SuiteRules::LEGACY;
+
+    /// One seeded conservative key pair and one seeded bound signature over
+    /// `digest` (deterministic: the SLH-DSA `opt_rand` and the Falcon nonce
+    /// come from the seeded scope).
+    fn fixture(digest: &[u8; 32]) -> (Vec<u8>, SecretBytes, Vec<u8>) {
+        let (pk, sk) = generate_conservative_keypair_from_seed_secret(&[0x42; 32]).unwrap();
+        let sig = pqcrypto_internals::with_seeded_rng_scope(&[0x43; 32], || sign_bound(&sk, digest)).unwrap();
+        (pk, sk, sig)
+    }
+
+    #[test]
+    fn layout_lengths_and_suite_rules() {
+        assert_eq!(SUITE_SLHDSA128S_FALCON1024, 3);
+        assert_eq!(CONSERVATIVE_PUBLIC_KEY_LEN, 1_829);
+        assert_eq!(CONSERVATIVE_SECRET_KEY_LEN, 2_373);
+        assert_eq!(CONSERVATIVE_MAX_SIGNATURE_LEN, 9_322);
+        assert_eq!(max_signature_len_for_suite(3), Some(9_322));
+        assert_eq!(max_signature_len_for_suite(1), Some(max_signature_len()));
+        assert_eq!(max_signature_len_for_suite(2), Some(3_313));
+        assert_eq!(max_signature_len_for_suite(4), None);
+        // The rule boundary is the second hardening height, inclusive.
+        assert_eq!(SuiteRules::at(99, 100), L);
+        assert_eq!(SuiteRules::at(100, 100), H);
+        assert_eq!(SuiteRules::at(0, 0), H);
+        assert_eq!(SuiteRules::at(u64::MAX - 1, NEVER), L);
+        assert!(H.conservative_suite() && !L.conservative_suite());
+        // Producers: refuse below, allow at/after.
+        assert!(KeySuite::Conservative.check_allowed_at(99, 100).unwrap_err().contains("height 100"));
+        assert!(KeySuite::Conservative.check_allowed_at(100, 100).is_ok());
+        assert!(KeySuite::Conservative.check_allowed_at(5, NEVER).unwrap_err().contains("not scheduled"));
+        assert!(KeySuite::Hybrid.check_allowed_at(0, NEVER).is_ok());
+        assert_eq!(KeySuite::parse("conservative"), Ok(KeySuite::Conservative));
+        assert_eq!(KeySuite::parse("0x0003"), Ok(KeySuite::Conservative));
+        assert_eq!(KeySuite::parse("Hybrid"), Ok(KeySuite::Hybrid));
+        assert!(KeySuite::parse("mldsa").is_err());
+        assert_eq!(KeySuite::Conservative.id(), 3);
+        // Producers size fees by the key's exact length.
+        assert_eq!(max_signature_len_for_public_key_len(CONSERVATIVE_PUBLIC_KEY_LEN), 9_322);
+        assert_eq!(max_signature_len_for_public_key_len(HYBRID_PUBLIC_KEY_LEN), max_signature_len());
+        assert_eq!(max_signature_len_for_public_key_len(legacy_hybrid_pubkey_len()), max_signature_len());
+        assert_eq!(max_signature_len_for_public_key_len(CONSERVATIVE_PUBLIC_KEY_LEN + 1), max_signature_len());
+    }
+
+    /// A wallet signs only with a key of an exact hybrid or conservative
+    /// encoding: an envelope naming a suite with a body of another length is
+    /// neither.
+    #[test]
+    fn key_suite_of_public_key_requires_the_exact_encoding() {
+        let (hpk, _) = generate_keypair();
+        assert_eq!(KeySuite::of_public_key(&hpk), Some(KeySuite::Hybrid));
+        assert_eq!(KeySuite::of_public_key(&hpk[SUITE_HEADER_LEN..]), Some(KeySuite::Hybrid), "raw carry-over key");
+        assert_eq!(KeySuite::of_public_key(&hpk[..hpk.len() - 1]), None);
+        let mut long = hpk.clone();
+        long.push(0);
+        assert_eq!(KeySuite::of_public_key(&long), None);
+        let short_conservative = wrap_envelope(SUITE_CONSERVATIVE, &[7u8; 100]);
+        assert_eq!(KeySuite::of_public_key(&short_conservative), None);
+        let mldsa_only = wrap_envelope(SUITE_MLDSA65_ONLY, &[7u8; MLDSA_PUBKEY_LEN]);
+        assert_eq!(KeySuite::of_public_key(&mldsa_only), None);
+    }
+
+    /// Golden vectors (docs/CONSENSUS.md, "Conservative suite 0x0003"): the
+    /// key from seed `0x42 × 32` and its seeded bound signature are
+    /// byte-stable (SLH-DSA is integer hashing, Falcon the `clean` variant).
+    #[test]
+    fn golden_seeded_key_and_bound_signature_are_byte_stable() {
+        let digest = [0x5Au8; 32];
+        let (pk, sk, sig) = fixture(&digest);
+        assert_eq!(pk[..4], [0xB1, 0x0C, 0x03, 0x00]);
+        assert_eq!(sk[..4], [0xB1, 0x0C, 0x03, 0x00]);
+        assert_eq!((pk.len(), sk.len()), (CONSERVATIVE_PUBLIC_KEY_LEN, CONSERVATIVE_SECRET_KEY_LEN));
+        // The SLH-DSA secret key ends with the SLH-DSA public key.
+        assert_eq!(&sk[4 + 32..4 + 64], &pk[4..4 + 32]);
+        let h = |b: &[u8]| hex::encode(Sha3_256::digest(b));
+        assert_eq!(h(&pk), GOLDEN_CONSERVATIVE_PK_SHA3, "seeded conservative public key moved");
+        assert_eq!(h(&sig), GOLDEN_CONSERVATIVE_SIG_SHA3, "seeded conservative bound signature moved");
+        assert_eq!(hex::encode(&pk[4..36]), GOLDEN_CONSERVATIVE_SLH_PK);
+        assert!(verify_bound_under(&pk, &digest, &sig, H));
+        // The same seed through the hybrid derivation is a different key with
+        // a different Falcon half (domain separation of the two suites).
+        let (hpk, _) = generate_keypair_from_seed_secret(&[0x42; 32]).unwrap();
+        assert_ne!(&hpk[4 + MLDSA_PUBKEY_LEN..], &pk[4 + 32..], "the suites derive independent Falcon keys");
+    }
+
+    pub(super) const GOLDEN_CONSERVATIVE_PK_SHA3: &str = "2cd5860017d9d444dd033d14244c7cba99c760a42920e3ead14643d3ea535d67";
+    pub(super) const GOLDEN_CONSERVATIVE_SIG_SHA3: &str = "27d37c8c554c05651f745cf31d3f3376e7a37cd641a77eeb1cc8e974f8c71b5f";
+    pub(super) const GOLDEN_CONSERVATIVE_SLH_PK: &str = "6d715a7553b8c9ba54697aef96e6d1cd3c086b2b26557623a613850c6fe339bb";
+
+    #[test]
+    fn valid_from_hardening2_only_and_never_through_the_unbound_verifiers() {
+        let digest = [0x21u8; 32];
+        let (pk, sk, sig) = fixture(&digest);
+        assert!(verify_bound_under(&pk, &digest, &sig, H));
+        // Below the second hardening height: exactly today's verdict (an
+        // unknown suite).
+        assert!(!verify_bound_under(&pk, &digest, &sig, L));
+        assert!(!verify_bound(&pk, &digest, &sig));
+        assert!(!is_canonical_signature_encoding(&sig));
+        assert!(is_canonical_signature_encoding_under(&sig, H));
+        assert_eq!(public_key_suite(&pk), None);
+        assert_eq!(public_key_suite_under(&pk, L), None);
+        assert_eq!(public_key_suite_under(&pk, H), Some(SUITE_CONSERVATIVE));
+        assert_eq!(KeySuite::of_public_key(&pk), Some(KeySuite::Conservative));
+        // No unbound verifier knows the suite (sighash v2, messages, KES, ...).
+        assert!(!verify(&pk, &digest, &sig));
+        assert!(!verify_canonical(&pk, &digest, &sig));
+        assert!(!verify_enveloped(&pk, &digest, &sig));
+        assert!(!verify_enveloped_canonical(&pk, &digest, &sig));
+        assert!(!is_hybrid_public_key(&pk));
+        // The unbound signer refuses the suite; the checked bound signer works.
+        assert!(matches!(sign(&sk, b"message"), Err(CryptoError::InvalidKey(_))));
+        let checked = sign_bound_checked(&sk, &pk, &digest).unwrap();
+        assert!(verify_bound_under(&pk, &digest, &checked, H));
+        // Another digest, another key.
+        assert!(!verify_bound_under(&pk, &[0x22; 32], &sig, H));
+        let (other, other_sk) = generate_conservative_keypair_from_seed_secret(&[0x44; 32]).unwrap();
+        assert!(!verify_bound_under(&other, &digest, &sig, H));
+        assert!(matches!(sign_bound_checked(&other_sk, &pk, &digest), Err(CryptoError::SignFailed(_))));
+        // Policy keys: hybrid at every height, conservative from hardening 2.
+        assert!(!is_policy_key_under(&pk, L) && is_policy_key_under(&pk, H));
+        let (hpk, _) = generate_keypair_from_seed_secret(&[0x45; 32]).unwrap();
+        assert!(is_policy_key_under(&hpk, L) && is_policy_key_under(&hpk, H));
+        assert!(is_policy_key_under(&hpk[4..], L), "raw carry-over key");
+    }
+
+    #[test]
+    fn both_components_must_verify_each_over_its_own_message() {
+        let digest = [0x31u8; 32];
+        let (pk, sk, sig) = fixture(&digest);
+        let split = SUITE_HEADER_LEN + slhdsa::SIGNATURE_LEN;
+        // Tampering either component fails.
+        let mut s = sig.clone();
+        s[SUITE_HEADER_LEN + 100] ^= 1;
+        assert!(is_canonical_signature_encoding_under(&s, H));
+        assert!(!verify_bound_under(&pk, &digest, &s, H), "SLH-DSA half tampered");
+        let mut s = sig.clone();
+        s[split + 1] ^= 1; // the Falcon nonce
+        assert!(!verify_bound_under(&pk, &digest, &s, H), "Falcon half tampered");
+        // A signature whose components signed the digest verbatim (the
+        // unbound binding) does not verify.
+        let ssk = &sk[SUITE_HEADER_LEN..SUITE_HEADER_LEN + slhdsa::SECRET_KEY_LEN];
+        let fsk = &sk[SUITE_HEADER_LEN + slhdsa::SECRET_KEY_LEN..];
+        let mut unbound = slhdsa::sign(ssk, &digest).unwrap();
+        unbound.extend_from_slice(&falcon::sign(fsk, &digest).unwrap());
+        let unbound = wrap_envelope(SUITE_CONSERVATIVE, &unbound);
+        assert!(is_canonical_signature_encoding_under(&unbound, H));
+        assert!(!verify_bound_under(&pk, &digest, &unbound, H));
+        // Swapped component messages (SLH-DSA over the Falcon message) fail.
+        let mut swapped = slhdsa::sign(ssk, &bound_component_message(3, COMPONENT_FALCON1024, &digest)).unwrap();
+        swapped.extend_from_slice(&falcon::sign(fsk, &bound_component_message(3, COMPONENT_SLHDSA_SHAKE128S, &digest)).unwrap());
+        assert!(!verify_bound_under(&pk, &digest, &wrap_envelope(3, &swapped), H));
+        // The component messages are distinct per suite and component.
+        let msgs = [
+            bound_component_message(1, COMPONENT_MLDSA65, &digest),
+            bound_component_message(1, COMPONENT_FALCON1024, &digest),
+            bound_component_message(2, COMPONENT_MLDSA65, &digest),
+            bound_component_message(3, COMPONENT_FALCON1024, &digest),
+            bound_component_message(3, COMPONENT_SLHDSA_SHAKE128S, &digest),
+        ];
+        for i in 0..msgs.len() {
+            for j in i + 1..msgs.len() {
+                assert_ne!(msgs[i], msgs[j]);
+            }
+        }
+    }
+
+    /// A Falcon-1024 key used in BOTH a hybrid key and a conservative key
+    /// (a coordinator who copies a participant's Falcon key into a key of
+    /// the other suite): a hybrid signature's Falcon half never fills the
+    /// conservative slot, because each component message names its suite.
+    #[test]
+    fn a_shared_falcon_key_signature_does_not_cross_suites() {
+        let digest = [0x41u8; 32];
+        let (hpk, hsk) = generate_keypair_from_seed_secret(&[0x46; 32]).unwrap();
+        let falcon_pk = &hpk[SUITE_HEADER_LEN + MLDSA_PUBKEY_LEN..];
+        let falcon_sk = &hsk[SUITE_HEADER_LEN + MLDSA_SECRET_LEN..];
+        // A conservative key made of a fresh SLH-DSA key and the hybrid
+        // key's Falcon key.
+        let (slh_pk, slh_sk) = slhdsa::keypair_secret().unwrap();
+        let mut body = slh_pk.clone();
+        body.extend_from_slice(falcon_pk);
+        let cpk = wrap_envelope(SUITE_CONSERVATIVE, &body);
+        assert!(is_conservative_public_key(&cpk));
+        // The hybrid key's Falcon signature over the SUITE-1 component
+        // message, next to a valid SLH-DSA half for the suite-3 message.
+        let hybrid_sig = sign_bound(&hsk, &digest).unwrap();
+        let hybrid_falcon = &hybrid_sig[SUITE_HEADER_LEN + MLDSA_SIG_LEN..];
+        let mut forged = slhdsa::sign(&slh_sk, &bound_component_message(3, COMPONENT_SLHDSA_SHAKE128S, &digest)).unwrap();
+        forged.extend_from_slice(hybrid_falcon);
+        let forged = wrap_envelope(SUITE_CONSERVATIVE, &forged);
+        assert!(is_canonical_signature_encoding_under(&forged, H));
+        assert!(!verify_bound_under(&cpk, &digest, &forged, H), "a suite-1 Falcon component replayed into suite 3");
+        // With the suite-3 Falcon message it verifies (control).
+        let mut honest = slhdsa::sign(&slh_sk, &bound_component_message(3, COMPONENT_SLHDSA_SHAKE128S, &digest)).unwrap();
+        honest.extend_from_slice(&falcon::sign(falcon_sk, &bound_component_message(3, COMPONENT_FALCON1024, &digest)).unwrap());
+        assert!(verify_bound_under(&cpk, &digest, &wrap_envelope(SUITE_CONSERVATIVE, &honest), H));
+        // And a conservative signature never verifies under the hybrid key.
+        assert!(!verify_bound_under(&hpk, &digest, &wrap_envelope(SUITE_CONSERVATIVE, &honest), H));
+    }
+
+    /// Canonical encodings: exact lengths, compact Falcon, nothing after it.
+    #[test]
+    fn malformed_oversized_and_trailing_byte_encodings_are_refused() {
+        let digest = [0x51u8; 32];
+        let (pk, _sk, sig) = fixture(&digest);
+        let split = SUITE_HEADER_LEN + slhdsa::SIGNATURE_LEN;
+        let bad_sigs: Vec<(&str, Vec<u8>)> = vec![
+            ("trailing byte", { let mut s = sig.clone(); s.push(0); s }),
+            ("one byte short", sig[..sig.len() - 1].to_vec()),
+            ("SLH-DSA half one byte short", { let mut s = sig[..split - 1].to_vec(); s.extend_from_slice(&sig[split..]); s }),
+            ("no Falcon half", sig[..split].to_vec()),
+            ("header only", sig[..SUITE_HEADER_LEN].to_vec()),
+            ("Falcon half zero-padded to 1,280", { let mut s = sig.clone(); s.resize(split + falcon::padded_signature_len(), 0); s }),
+            ("oversized", { let mut s = sig.clone(); s.resize(CONSERVATIVE_MAX_SIGNATURE_LEN + 1, 0); s }),
+            ("relabelled 0x0001", { let mut s = sig.clone(); s[2] = 1; s }),
+            ("no envelope", sig[SUITE_HEADER_LEN..].to_vec()),
+        ];
+        for (what, s) in &bad_sigs {
+            if s == &sig {
+                continue; // a compact half of exactly 1,280 bytes cannot be padded
+            }
+            assert!(!is_canonical_signature_encoding_under(s, H), "{what}");
+            assert!(!verify_bound_under(&pk, &digest, s, H), "{what}");
+        }
+        let bad_keys: Vec<(&str, Vec<u8>)> = vec![
+            ("trailing byte", { let mut k = pk.clone(); k.push(0); k }),
+            ("one byte short", pk[..pk.len() - 1].to_vec()),
+            ("no envelope (raw body)", pk[SUITE_HEADER_LEN..].to_vec()),
+            ("relabelled 0x0001", { let mut k = pk.clone(); k[2] = 1; k }),
+        ];
+        for (what, k) in &bad_keys {
+            assert!(!is_conservative_public_key(k), "{what}");
+            assert_ne!(public_key_suite_under(k, H), Some(SUITE_CONSERVATIVE), "{what}");
+            assert!(!verify_bound_under(k, &digest, &sig, H), "{what}");
+            assert!(!is_policy_key_under(k, H), "{what}");
+        }
+        assert!(verify_bound_under(&pk, &digest, &sig, H), "control");
+    }
+
+    #[test]
+    fn fuzz_conservative_verification_never_panics() {
+        let digest = [0x61u8; 32];
+        let (pk, _sk, sig) = fixture(&digest);
+        let mut x = 0x5EED_0003_u64;
+        let mut next = || { x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); (x >> 33) as usize };
+        for _ in 0..300 {
+            let mut s = sig.clone();
+            let mut k = pk.clone();
+            match next() % 4 {
+                0 => { let i = next() % s.len(); s[i] ^= (next() % 255 + 1) as u8; }
+                1 => s.truncate(next() % (s.len() + 1)),
+                2 => { let i = next() % k.len(); k[i] ^= (next() % 255 + 1) as u8; }
+                _ => s.extend((0..next() % 64).map(|i| i as u8)),
+            }
+            let r = std::panic::catch_unwind(|| verify_bound_under(&k, &digest, &s, H));
+            assert!(r.is_ok(), "verify_bound_under panicked");
+        }
+    }
+
+    /// CRY-4: the conservative secret key is secret memory and wiped on drop.
+    #[test]
+    fn conservative_secret_key_is_wiped_on_drop() {
+        let q = gnb_secret::test_support::Quarantine::start();
+        let (pk, sk) = generate_conservative_keypair_secret().unwrap();
+        assert!(is_conservative_public_key(&pk));
+        drop(sk);
+        assert!(q.all_released_zeroed(), "a dropped conservative secret key left bytes behind");
+    }
 }

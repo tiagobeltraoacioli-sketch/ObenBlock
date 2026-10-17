@@ -429,3 +429,77 @@ fn kes_signing_and_evolution_leave_no_seed_in_dead_stack() {
     // Forward security: the erased seed is nowhere, nor is the new one.
     assert_no_residue(&stack, "KesSigner::evolve_to", &[&seed0, &seed1]);
 }
+
+// ── Conservative suite 0x0003 (P5-S): SLH-DSA secrets ───────────────────────
+//
+// `fips205`'s secret-key value (`PrivateKey`) is not `Copy` and is zeroized on
+// drop, but every way of building one (`PrivateKey::try_from_bytes`,
+// `KG::keygen_with_seeds`, `try_keygen*`) and of extracting its bytes by value
+// (`into_bytes`) copies the secret around; it is confined to the one wrapper
+// module that scrubs the stack after it, `crypto/slhdsa.rs`.
+
+/// `fips205` entry points that create or expose a secret-key value.
+const SLHDSA_SECRET_APIS: &[&str] = &[
+    "PrivateKey::try_from_bytes",
+    "keygen_with_seeds",
+    "try_keygen",
+    "_test_only_raw_sign",
+    "slh_dsa_shake_128s::KG",
+];
+
+#[test]
+fn fips205_secret_keys_are_built_only_by_the_slhdsa_wrapper() {
+    let sources = production_sources();
+    let mut wrapper_uses = 0;
+    let mut hits = Vec::new();
+    for (path, code) in &sources {
+        let in_wrapper = path.ends_with("crates/gnb-crypto/src/crypto/slhdsa.rs");
+        for pattern in SLHDSA_SECRET_APIS {
+            if code.contains(pattern) {
+                if in_wrapper {
+                    wrapper_uses += 1;
+                } else {
+                    hits.push(format!("{}: {}", path.display(), pattern));
+                }
+            }
+        }
+        if !in_wrapper && code.contains("fips205") {
+            hits.push(format!("{}: names the fips205 crate (only crypto/slhdsa.rs may)", path.display()));
+        }
+    }
+    assert!(wrapper_uses >= 2, "control: the wrapper's own uses were not found ({wrapper_uses})");
+    assert!(hits.is_empty(), "CRY-4: SLH-DSA secret keys handled outside crypto/slhdsa.rs:\n{}", hits.join("\n"));
+}
+
+/// The secret parts of an enveloped conservative secret key: SLH-DSA's
+/// `SK.seed ‖ SK.prf` and Falcon-1024's `f ‖ g ‖ F` (`PK.seed`, `PK.root`
+/// and the headers are public).
+fn conservative_secret_parts(sk: &[u8]) -> Vec<&[u8]> {
+    assert_eq!(sk.len(), crypto::CONSERVATIVE_SECRET_KEY_LEN);
+    let h = crypto::SUITE_HEADER_LEN;
+    let f = h + crypto::slhdsa::SECRET_KEY_LEN;
+    vec![&sk[h..h + 2 * crypto::slhdsa::N], &sk[f + 1..]]
+}
+
+#[test]
+fn conservative_signing_and_key_generation_leave_no_secret_in_dead_stack() {
+    gnb_secret::scrub_stack();
+    let (pk, sk) = crypto::generate_conservative_keypair_secret().unwrap();
+    let stack = dead_stack_below_caller();
+    assert_no_residue(&stack, "crypto::generate_conservative_keypair_secret", &conservative_secret_parts(&sk));
+
+    let seed: Vec<u8> = (0..32u8).map(|i| i.wrapping_mul(53).wrapping_add(7)).collect();
+    gnb_secret::scrub_stack();
+    let (spk, ssk) = crypto::generate_conservative_keypair_from_seed_secret(&seed).unwrap();
+    let stack = dead_stack_below_caller();
+    let mut parts = conservative_secret_parts(&ssk);
+    parts.push(&seed);
+    assert_no_residue(&stack, "crypto::generate_conservative_keypair_from_seed_secret", &parts);
+
+    gnb_secret::scrub_stack();
+    let sig = crypto::sign_bound(&sk, &[0x3C; 32]).unwrap();
+    let stack = dead_stack_below_caller();
+    assert!(crypto::verify_bound_under(&pk, &[0x3C; 32], &sig, crypto::SuiteRules::HARDENING2));
+    assert_no_residue(&stack, "crypto::sign_bound (conservative)", &conservative_secret_parts(&sk));
+    let _ = spk;
+}

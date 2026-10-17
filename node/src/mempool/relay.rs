@@ -97,6 +97,19 @@ pub const SIG_BUDGET_BYTES_PER_TOKEN: usize = 64 * 1024;
 /// spend 50 bursts at once): burst and sustained rate.
 pub const NODE_SIG_BUDGET_BURST: u32 = 4_000;
 pub const NODE_SIG_BUDGET_REFILL_PER_SEC: f64 = 400.0;
+/// P5-S: tokens one conservative suite-0x0003 signature check costs
+/// (SLH-DSA-SHAKE-128s AND Falcon-1024), against one token for a hybrid
+/// ML-DSA-65 + Falcon-1024 check. Measured on the reference machine in a
+/// release build (`crates/gnb-crypto/tests/conservative_suite_cost.rs`,
+/// docs/CONSENSUS.md "Conservative suite 0x0003"): about 1.8 to 2.0 ms
+/// against about 0.25 ms, a ratio of 6.6 to 7.5, rounded up. Without it a
+/// peer could make the node verify conservative signatures at one hybrid
+/// token each, about seven times
+/// the verification time the budget allows (Bitcoin Core prices by
+/// verification cost the same way: BIP342's validation weight charges each
+/// signature check against the witness bytes, and sigops cost weights a
+/// legacy CHECKSIG four times a witness one).
+pub const CONSERVATIVE_VERIFY_TOKENS: usize = 8;
 /// Bytes hashed per input by the sighash v3 digest besides the shared
 /// precomputed midstates (outpoint, amount and script commitments, index,
 /// suite: a fixed-size preimage), rounded up.
@@ -128,11 +141,12 @@ pub fn frame_cost(frame_len: usize) -> usize {
 /// Audit F5: an input spending a policy output carries up to
 /// `core::policy::MAX_POLICY_KEYS` (7) hybrid signatures, each verified
 /// (`core::sighash::verify_input_signatures`), so the signature part counts
-/// signatures, not inputs ([`input_signature_count`]).
+/// signatures, not inputs; P5-S: each priced by its suite's verification
+/// cost ([`input_verification_tokens`]).
 pub fn signature_gate_cost(tx: &Transaction, wire_len: usize, next_block_height: u64, act: u64) -> usize {
     let inputs = tx.inputs.len().max(1);
     let signatures = tx.inputs.iter()
-        .map(|i| input_signature_count(&i.script_sig))
+        .map(|i| input_verification_tokens(&i.script_sig))
         .fold(0usize, usize::saturating_add)
         .max(1);
     let hashed = if crate::core::activation::is_active_at(next_block_height, act) {
@@ -155,6 +169,24 @@ pub fn input_signature_count(script_sig: &[u8]) -> usize {
         Err(_) => 1,
     }
 }
+/// P5-S: the verification tokens the signatures of an input with
+/// `script_sig` can cost: one per signature ([`input_signature_count`]),
+/// [`CONSERVATIVE_VERIFY_TOKENS`] for each conservative suite-0x0003
+/// signature (told by its envelope; decoded, not verified, like
+/// [`input_signature_count`]: the input pays for at most what it could
+/// cost). A policy witness is read in its widest form (every suite), a
+/// key-hash witness by its exact framing.
+pub fn input_verification_tokens(script_sig: &[u8]) -> usize {
+    let tokens = |sig: &[u8]| match crate::crypto::split_envelope(sig) {
+        Some((crate::crypto::SUITE_CONSERVATIVE, _)) => CONSERVATIVE_VERIFY_TOKENS,
+        _ => 1,
+    };
+    match crate::core::policy::AnyPolicyWitness::decode_under(script_sig, crate::crypto::SuiteRules::HARDENING2) {
+        Ok(w) => w.signatures().iter().map(|(_, s)| tokens(s)).fold(0usize, usize::saturating_add).max(1),
+        Err(_) => Transaction::parse_script_sig_exact(script_sig).map_or(1, |(sig, _)| tokens(sig)),
+    }
+}
+
 /// Bound on the number of connections whose budget is tracked (far above
 /// the connection limit: a live connection is never evicted).
 pub const SIG_BUDGET_TRACK_CAP: usize = 4096;

@@ -45,8 +45,10 @@
 //!   verifying signer ([`crate::crypto::sign_checked`] for sighash v2,
 //!   [`crate::crypto::sign_bound_checked`] for v3), so the witness is
 //!   canonical: enveloped signature, compact Falcon encoding, exact-length
-//!   `script_sig`. Wallets sign only with the hybrid suite 0x0001
-//!   ([`crate::crypto::is_hybrid_public_key`]); they never produce 0x0002.
+//!   `script_sig`. Wallets sign with the hybrid suite 0x0001
+//!   ([`crate::crypto::is_hybrid_public_key`]) and never produce 0x0002;
+//!   P5-S: a conservative suite-0x0003 key signs only for a block at/after
+//!   the second hardening height of its chain ([`check_signing_suite`]).
 
 use super::Utxo;
 use crate::core::sighash::{self, SighashV3Precomputed, SighashVersion};
@@ -333,9 +335,10 @@ fn varint_len(n: usize) -> usize {
 }
 
 /// Upper bound on the signed wire size: every signature at its maximum
-/// encoded length.
+/// encoded length for the key's suite (P5-S: 9,322 bytes for a conservative
+/// suite-0x0003 key, `crypto::max_signature_len_for_public_key_len`).
 pub fn signed_size_upper_bound(n_inputs: usize, output_spk_lens: &[usize], public_key_len: usize) -> usize {
-    let script_sig = 8 + crate::crypto::max_signature_len() + public_key_len;
+    let script_sig = 8 + crate::crypto::max_signature_len_for_public_key_len(public_key_len) + public_key_len;
     let per_input = 32 + 4 + varint_len(script_sig) + script_sig + 4;
     let outputs: usize = output_spk_lens.iter().map(|l| 8 + varint_len(*l) + l).sum();
     4 + varint_len(n_inputs) + n_inputs.saturating_mul(per_input)
@@ -470,6 +473,28 @@ pub fn plan_payment_inputs(
     Ok(plan.inputs.iter().map(|&i| (utxos[i].txid, utxos[i].index)).collect())
 }
 
+/// Whether a wallet may sign a payment with `public_key` for the block at
+/// [`PaymentOptions::next_block_height`] of `chain_id`: a hybrid key
+/// always (CRY-2: never the single-algorithm suite 0x0002); P5-S: a
+/// conservative suite-0x0003 key only at/after the chain's second hardening
+/// height (`crypto::KeySuite::check_allowed_at`), where consensus accepts its
+/// signature.
+pub fn check_signing_suite(public_key: &[u8], chain_id: ChainId, opts: &PaymentOptions<'_>) -> Result<(), String> {
+    use crate::crypto::KeySuite;
+    match KeySuite::of_public_key(public_key) {
+        Some(KeySuite::Hybrid) => Ok(()),
+        Some(KeySuite::Conservative) => {
+            let next = opts.next_block_height.ok_or_else(|| {
+                "the height of the next block is unknown; ask the node (getdaginfo: next_block_height) \
+                 before signing".to_string()
+            })?;
+            KeySuite::Conservative.check_allowed_at(next, activation::hardening2_activation_height_for_signer(chain_id))
+        }
+        None => Err("wallets sign only with the hybrid ML-DSA-65 + Falcon-1024 suite (0x0001) or, from the \
+                     second hardening height, the conservative suite (0x0003); this key is neither".into()),
+    }
+}
+
 fn insufficient(have: u64, amount: u64) -> String {
     format!("insufficient funds: have {have} sats, need {amount} sats plus the fee")
 }
@@ -502,11 +527,7 @@ pub fn build_payment(
     if utxos.is_empty() {
         return Err(insufficient(0, amount));
     }
-    // CRY-2: wallets never produce the single-algorithm suite.
-    if !crate::crypto::is_hybrid_public_key(public_key) {
-        return Err("wallets sign only with the hybrid ML-DSA-65 + Falcon-1024 suite (0x0001); \
-                    this key is not a hybrid key".into());
-    }
+    check_signing_suite(public_key, chain_id, opts)?;
     let version = opts.tx_version(chain_id)?;
     let amounts_committed = SighashVersion::for_tx_version(version) == SighashVersion::V3;
     let (verified, total) = prepare(utxos, own_spk, opts.prev_txs)?;
@@ -607,7 +628,9 @@ pub fn sign_inputs(
             .map(|i| sign(&tx.sighash(i, chain_id), version))
             .collect::<Result<_, _>>()?,
         SighashVersion::V3 => {
-            let suite = crate::crypto::public_key_suite(public_key)
+            // P5-S: every suite a wallet signs with (the callers decided the
+            // key's suite is valid at the target height: `check_signing_suite`).
+            let suite = crate::crypto::public_key_suite_under(public_key, crate::crypto::SuiteRules::HARDENING2)
                 .ok_or("public key has no recognised signature suite")?;
             let pre = SighashV3Precomputed::new(tx, spent).map_err(|e| e.to_string())?;
             (0..tx.inputs.len())
@@ -619,7 +642,7 @@ pub fn sign_inputs(
         input.script_sig = Transaction::build_script_sig(&sig, public_key);
         if version == SighashVersion::V3 {
             // The consensus witness rule of version 3 (format only).
-            sighash::canonical_witness(&input.script_sig)?;
+            sighash::canonical_witness_under(&input.script_sig, crate::crypto::SuiteRules::HARDENING2)?;
         }
     }
     Ok(())
@@ -896,6 +919,47 @@ mod tests {
             &PaymentOptions { next_block_height: Some(1), ..Default::default() },
             &|_, _| Err("must not be asked to sign".into())).unwrap_err();
         assert!(err.contains("hybrid"), "{err}");
+    }
+
+    /// P5-S: a conservative suite-0x0003 key pays from the second hardening
+    /// height of its chain: the payment passes the consensus verifier there
+    /// and fails one block below. Below the height the wallet refuses before
+    /// signing, and the fee is sized for the 9,322-byte signature.
+    #[test]
+    fn conservative_keys_pay_from_the_second_hardening_height() {
+        use crate::crypto::KeySuite;
+        let _act = activation::scoped_override(0);
+        let _act2 = activation::scoped_override_v2(10);
+        let kp = crate::wallet::generate_keypair_for_suite(true, KeySuite::Conservative).unwrap();
+        let utxos = [utxo(&kp, 1, 2 * SAT)];
+        let pay = |next: u64| build_payment(&utxos, &[5u8; 20], SAT, &kp.address_bytes(), &kp.public_key,
+            ChainId::Testnet, &PaymentOptions { next_block_height: Some(next), ..Default::default() },
+            &|h, v| kp.sign_tx_digest(h, v));
+        let err = pay(9).unwrap_err();
+        assert!(err.contains("block at height 9") && err.contains("height 10"), "{err}");
+        let paid = pay(10).unwrap();
+        assert_eq!(paid.tx.version, 3);
+        let spent = [utxos[0].output.clone()];
+        assert_eq!(sighash::verify_tx_scripts_at(&paid.tx, &spent, ChainId::Testnet, 10, 0, 10), Ok(SighashVersion::V3));
+        assert!(sighash::verify_tx_scripts_at(&paid.tx, &spent, ChainId::Testnet, 9, 0, 10).is_err(),
+            "one block below the second hardening height the same transaction is invalid");
+        let spks: Vec<usize> = paid.tx.outputs.iter().map(|o| o.script_pubkey.len()).collect();
+        let bound = signed_size_upper_bound(1, &spks, kp.public_key.len());
+        assert!(bound >= crate::crypto::CONSERVATIVE_MAX_SIGNATURE_LEN + kp.public_key.len());
+        assert!(paid.size <= bound);
+        assert!(paid.fee >= tokenomics::min_tx_fee_sat(paid.size));
+    }
+
+    /// P5-S: where the second hardening is not scheduled (mainnet today) a
+    /// conservative key never signs.
+    #[test]
+    fn conservative_keys_never_pay_where_hardening2_is_not_scheduled() {
+        let kp = crate::wallet::generate_keypair_for_suite(false, crate::crypto::KeySuite::Conservative).unwrap();
+        let utxos = [utxo(&kp, 1, 2 * SAT)];
+        let err = build_payment(&utxos, &[5u8; 20], SAT, &kp.address_bytes(), &kp.public_key, ChainId::Mainnet,
+            &PaymentOptions { next_block_height: Some(10_000_000), ..Default::default() },
+            &|_, _| Err("must not be asked to sign".into())).unwrap_err();
+        assert!(err.contains("not scheduled"), "{err}");
     }
 
     #[test]

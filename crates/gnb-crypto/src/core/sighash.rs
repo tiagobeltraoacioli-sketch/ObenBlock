@@ -133,6 +133,29 @@ pub fn check_tx_version(version: u32, height: u64, activation_height: u64) -> Re
     }
 }
 
+/// P5-S: the signature suites a transaction input may use in a block at
+/// header height `height` (`crypto::SuiteRules`): the conservative suite
+/// 0x0003 from the second hardening height `hardening2_activation_height`,
+/// and only under sighash v3 (at/after the first activation
+/// `activation_height`; on every network the second height is at or above the
+/// first, so this is just the second height there). Below either height the
+/// historical rules ([`crypto::SuiteRules::LEGACY`]) apply exactly. The ONE
+/// mapping from heights to suite rules: the witness rule, the signature rule
+/// and the policy-spend rules (`node::blockval`) all derive the rules here.
+pub fn suite_rules_at(height: u64, activation_height: u64, hardening2_activation_height: u64) -> crypto::SuiteRules {
+    if activation::is_active_at(height, activation_height) {
+        crypto::SuiteRules::at(height, hardening2_activation_height)
+    } else {
+        crypto::SuiteRules::LEGACY
+    }
+}
+
+/// [`suite_rules_at`] under the process-wide activation heights (the node's
+/// chain; a test's `scoped_override` / `scoped_override_v2`).
+pub fn suite_rules_for_height(height: u64) -> crypto::SuiteRules {
+    suite_rules_at(height, activation::hardening_activation_height(), activation::hardening2_activation_height())
+}
+
 /// Relay policy (standardness) for the version of a non-coinbase transaction
 /// targeting a block at `height`: the consensus rule ([`check_tx_version`])
 /// plus, below the activation, version ≥ 3 is NON-STANDARD. Such a
@@ -359,10 +382,17 @@ impl Transaction {
 /// Consensus for every non-coinbase transaction at/after the activation
 /// (sighash v3); relay policy at every height.
 pub fn canonical_witness(script_sig: &[u8]) -> Result<Witness<'_>, String> {
+    canonical_witness_under(script_sig, crypto::SuiteRules::LEGACY)
+}
+
+/// [`canonical_witness`] under `rules`: from the second hardening height a
+/// canonical conservative suite-0x0003 signature is canonical too
+/// (`crypto::is_canonical_signature_encoding_under`). Same error strings.
+pub fn canonical_witness_under(script_sig: &[u8], rules: crypto::SuiteRules) -> Result<Witness<'_>, String> {
     let (sig, pk) = Transaction::parse_script_sig_exact(script_sig)
         .ok_or_else(|| "non-canonical script_sig framing (expected exactly \
                          [u32 sig_len][sig][u32 pk_len][pk])".to_string())?;
-    if !crypto::is_canonical_signature_encoding(sig) {
+    if !crypto::is_canonical_signature_encoding_under(sig, rules) {
         return Err("non-canonical signature encoding (envelope missing, unknown suite, \
                     padded or malformed Falcon half, or wrong ML-DSA length)".into());
     }
@@ -389,6 +419,31 @@ pub fn check_input_witnesses<'a>(
     prevouts: &[TxOutput],
     version: SighashVersion,
 ) -> Result<Vec<Witness<'a>>, String> {
+    check_input_witnesses_under(tx, prevouts, version, crypto::SuiteRules::LEGACY)
+}
+
+/// The suite rules that apply under `version`: the conservative suite
+/// exists only under sighash v3, so v2 always has the historical rules
+/// (unchanged at every height).
+fn effective_rules(version: SighashVersion, rules: crypto::SuiteRules) -> crypto::SuiteRules {
+    match version {
+        SighashVersion::V2 => crypto::SuiteRules::LEGACY,
+        SighashVersion::V3 => rules,
+    }
+}
+
+/// [`check_input_witnesses`] under `rules` ([`suite_rules_at`] of the
+/// block's height): from the second hardening height a version-3 key-hash
+/// witness may carry a canonical conservative signature and a policy witness
+/// may list conservative keys. Under [`crypto::SuiteRules::LEGACY`] exactly
+/// [`check_input_witnesses`].
+pub fn check_input_witnesses_under<'a>(
+    tx: &'a Transaction,
+    prevouts: &[TxOutput],
+    version: SighashVersion,
+    rules: crypto::SuiteRules,
+) -> Result<Vec<Witness<'a>>, String> {
+    let rules = effective_rules(version, rules);
     if prevouts.len() != tx.inputs.len() {
         return Err(format!("{} prevouts for {} inputs", prevouts.len(), tx.inputs.len()));
     }
@@ -399,7 +454,7 @@ pub fn check_input_witnesses<'a>(
         // checked by `verify_input_signatures`; the witness slot carries the
         // whole `script_sig` and an empty key.
         if policy::output_kind(&prev.script_pubkey) == Some(policy::OutputKind::Policy) {
-            let w = policy::AnyPolicyWitness::decode(&inp.script_sig)
+            let w = policy::AnyPolicyWitness::decode_under(&inp.script_sig, rules)
                 .map_err(|e| format!("malformed policy witness at input {}: {}", i, e))?;
             if w.script_pubkey() != prev.script_pubkey {
                 return Err(format!("policy does not match the output at input {}", i));
@@ -410,7 +465,7 @@ pub fn check_input_witnesses<'a>(
         let (sig, pk) = match version {
             SighashVersion::V2 => Transaction::parse_script_sig_borrowed(&inp.script_sig)
                 .ok_or_else(|| format!("malformed script_sig at input {}", i))?,
-            SighashVersion::V3 => canonical_witness(&inp.script_sig)
+            SighashVersion::V3 => canonical_witness_under(&inp.script_sig, rules)
                 .map_err(|e| format!("input {i}: {e}"))?,
         };
         if !pubkey_hash_matches(pk, &prev.script_pubkey) {
@@ -434,6 +489,26 @@ pub fn verify_input_signatures(
     version: SighashVersion,
     chain_id: ChainId,
 ) -> Result<(), String> {
+    verify_input_signatures_under(tx, prevouts, witnesses, version, chain_id, crypto::SuiteRules::LEGACY)
+}
+
+/// [`verify_input_signatures`] under `rules` ([`suite_rules_at`] of the
+/// block's height; `witnesses` from [`check_input_witnesses_under`] with the
+/// same rules). Under sighash v3 every signature is
+/// `crypto::verify_bound_under(pk, d_i, sig, rules)` with `d_i` committing to
+/// the signature's suite; from the second hardening height that admits the
+/// conservative suite 0x0003 (both its SLH-DSA and its Falcon component must
+/// verify, each over its bound message). Under [`crypto::SuiteRules::LEGACY`]
+/// exactly [`verify_input_signatures`].
+pub fn verify_input_signatures_under(
+    tx: &Transaction,
+    prevouts: &[TxOutput],
+    witnesses: &[Witness<'_>],
+    version: SighashVersion,
+    chain_id: ChainId,
+    rules: crypto::SuiteRules,
+) -> Result<(), String> {
+    let rules = effective_rules(version, rules);
     if witnesses.len() != tx.inputs.len() {
         return Err(format!("{} witnesses for {} inputs", witnesses.len(), tx.inputs.len()));
     }
@@ -469,20 +544,20 @@ pub fn verify_input_signatures(
             let pre = SighashV3Precomputed::new(tx, prevouts).map_err(|e| e.to_string())?;
             for (i, (sig, pk)) in witnesses.iter().enumerate() {
                 if is_policy(i) {
-                    let w = policy::AnyPolicyWitness::decode(sig)
+                    let w = policy::AnyPolicyWitness::decode_under(sig, rules)
                         .map_err(|e| format!("malformed policy witness at input {}: {}", i, e))?;
                     let pol = w.policy();
                     for (idx, psig) in w.signatures() {
                         let key = pol.pubkeys.get(*idx as usize)
                             .ok_or_else(|| format!("policy key {} out of range at input {}", idx, i))?;
-                        if !crypto::is_canonical_signature_encoding(psig) {
+                        if !crypto::is_canonical_signature_encoding_under(psig, rules) {
                             return Err(format!("non-canonical signature by policy key {} at input {}", idx, i));
                         }
                         let suite = crypto::split_envelope(psig)
                             .map(|(s, _)| s)
                             .ok_or_else(|| format!("input {i}: policy signature has no suite envelope"))?;
                         let digest = pre.digest(i, suite, chain_id).map_err(|e| e.to_string())?;
-                        if !crypto::verify_bound(key, &digest, psig) {
+                        if !crypto::verify_bound_under(key, &digest, psig, rules) {
                             return Err(format!("invalid signature by policy key {} at input {}", idx, i));
                         }
                     }
@@ -492,7 +567,7 @@ pub fn verify_input_signatures(
                     .map(|(s, _)| s)
                     .ok_or_else(|| format!("input {i}: signature has no suite envelope"))?;
                 let digest = pre.digest(i, suite, chain_id).map_err(|e| e.to_string())?;
-                if !crypto::verify_bound(pk, &digest, sig) {
+                if !crypto::verify_bound_under(pk, &digest, sig, rules) {
                     return Err(format!("invalid signature at input {}", i));
                 }
             }
@@ -512,9 +587,24 @@ pub fn verify_tx_scripts(
     height: u64,
     activation_height: u64,
 ) -> Result<SighashVersion, String> {
+    verify_tx_scripts_at(tx, prevouts, chain_id, height, activation_height, activation::NEVER)
+}
+
+/// [`verify_tx_scripts`] with the second hardening height
+/// `hardening2_activation_height` too (the conservative suite 0x0003 from it,
+/// [`suite_rules_at`]). `NEVER` gives exactly [`verify_tx_scripts`].
+pub fn verify_tx_scripts_at(
+    tx: &Transaction,
+    prevouts: &[TxOutput],
+    chain_id: ChainId,
+    height: u64,
+    activation_height: u64,
+    hardening2_activation_height: u64,
+) -> Result<SighashVersion, String> {
     let version = check_tx_version(tx.version, height, activation_height)?;
-    let witnesses = check_input_witnesses(tx, prevouts, version)?;
-    verify_input_signatures(tx, prevouts, &witnesses, version, chain_id)?;
+    let rules = suite_rules_at(height, activation_height, hardening2_activation_height);
+    let witnesses = check_input_witnesses_under(tx, prevouts, version, rules)?;
+    verify_input_signatures_under(tx, prevouts, &witnesses, version, chain_id, rules)?;
     Ok(version)
 }
 

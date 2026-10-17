@@ -551,6 +551,47 @@ mod tests {
         assert!(q.all_released_zeroed(), "a dropped wallet or keypair left secret bytes behind");
     }
 
+    /// P5-S: one seed phrase derives one key per suite. The hybrid key is
+    /// exactly the one every earlier release derived; the conservative key
+    /// is deterministic, independent of it, survives the keystore, signs
+    /// under sighash v3 only, and its secret must be the enveloped form.
+    #[test]
+    fn seed_phrase_derives_one_key_per_suite() {
+        use crate::crypto::{KeySuite, SuiteRules};
+        let (wallet, phrase) = Wallet::generate(Network::Testnet).unwrap();
+        let hybrid = keypair_from_seed_phrase_for_suite(&phrase, Network::Testnet, KeySuite::Hybrid).unwrap();
+        let legacy = wallet.into_keypair();
+        assert_eq!((&hybrid.public_key, &hybrid.address), (&legacy.public_key, &legacy.address));
+        let words = phrase.words().join(" ");
+        let c1 = keypair_from_mnemonic_for_suite(&words, Network::Testnet, KeySuite::Conservative).unwrap();
+        let c2 = keypair_from_seed_phrase_for_suite(&phrase, Network::Testnet, KeySuite::Conservative).unwrap();
+        assert_eq!((&c1.public_key, &c1.address), (&c2.public_key, &c2.address));
+        assert_eq!(c1.private_key, c2.private_key);
+        assert!(crypto::is_conservative_public_key(&c1.public_key));
+        assert_ne!(c1.address, hybrid.address);
+        assert_ne!(&c1.public_key[crypto::SUITE_HEADER_LEN + 32..],
+                   &hybrid.public_key[crypto::SUITE_HEADER_LEN + crypto::MLDSA_PUBKEY_LEN..],
+                   "independent Falcon keys");
+
+        let password = "synthetic-conservative-password-23!";
+        let json = c1.to_encrypted_json(password).unwrap();
+        let back = Keypair::from_encrypted_bytes(json.as_bytes(), password).unwrap();
+        assert_eq!((&back.public_key, &back.address), (&c1.public_key, &c1.address));
+        let digest = [0x33u8; 32];
+        let sig = back.sign_tx_digest(&digest, crate::core::sighash::SighashVersion::V3).unwrap();
+        assert!(crypto::verify_bound_under(&back.public_key, &digest, &sig, SuiteRules::HARDENING2));
+        assert!(!crypto::verify_bound(&back.public_key, &digest, &sig), "invalid under the earlier rules");
+        assert!(back.sign_tx_digest(&digest, crate::core::sighash::SighashVersion::V2).is_err());
+        assert!(back.sign_message(b"hello").is_err(), "messages are never signed with this suite");
+        // The secret must be the whole enveloped conservative key.
+        let truncated = Keypair {
+            private_key: back.private_key[..back.private_key.len() - 1].to_vec().into(),
+            public_key: back.public_key.clone(),
+            address: back.address.clone(),
+        };
+        assert!(truncated.sign_bound(&digest).unwrap_err().contains("conservative"));
+    }
+
     #[test]
     fn current_wallet_custom_file_budget_preserves_authenticated_roundtrip() {
         let (wallet, _) = Wallet::generate(Network::Testnet).unwrap();
@@ -955,10 +996,26 @@ impl Keypair {
     /// the uniformly random `rho`) as enveloped under a bogus suite, and such
     /// a wallet could never sign. Bitcoin Core takes a key's type from its
     /// size and metadata in the same way, never from its first bytes.
+    ///
+    /// P5-S: a conservative suite-0x0003 key has no raw form; its secret must
+    /// be exactly the enveloped [`crypto::CONSERVATIVE_SECRET_KEY_LEN`] bytes
+    /// naming that suite. (Only sighash-v3 signing accepts such a key:
+    /// [`Self::sign`] refuses it inside `crypto::sign`.)
     fn with_enveloped_secret(
         &self,
         f: impl FnOnce(&[u8]) -> Result<Vec<u8>, crypto::CryptoError>,
     ) -> Result<Vec<u8>, String> {
+        if crypto::is_conservative_public_key(&self.public_key) {
+            let sk: &[u8] = &self.private_key;
+            return match crypto::split_envelope(sk) {
+                Some((crypto::SUITE_CONSERVATIVE, _)) if sk.len() == crypto::CONSERVATIVE_SECRET_KEY_LEN => {
+                    f(sk).map_err(|e| e.to_string())
+                }
+                _ => Err(format!(
+                    "secret key ({} bytes) is not the enveloped conservative suite-0x0003 secret key \
+                     ({} bytes) of the public key", sk.len(), crypto::CONSERVATIVE_SECRET_KEY_LEN)),
+            };
+        }
         let suite = crypto::public_key_suite(&self.public_key).ok_or_else(|| {
             "public key is neither the raw hybrid encoding nor a supported suite envelope".to_string()
         })?;
@@ -1738,6 +1795,9 @@ impl TxBuilder {
 
         let chain_id = crate::core::ChainId::for_network(keypair.network()?);
         let opts = PaymentOptions { next_block_height: Some(next_block_height), ..PaymentOptions::default() };
+        // CRY-2 / P5-S: the key's suite must be one a wallet signs with for
+        // this block (`payment::check_signing_suite`).
+        payment::check_signing_suite(&keypair.public_key, chain_id, &opts)?;
         let version = opts.tx_version(chain_id)?;
         let mut tx = Transaction { version, inputs, outputs, locktime: 0 };
         let spent: Vec<TxOutput> = selected.iter().map(|(_, _, o)| o.clone()).collect();
@@ -1829,6 +1889,48 @@ pub fn generate_mnemonic_keypair(network: Network) -> Result<(Keypair, SeedPhras
 pub fn keypair_from_mnemonic(phrase: &str, network: Network) -> Result<Keypair, WalletError> {
     let phrase = SeedPhrase::parse(phrase)?;
     Ok(Wallet::from_seed(&phrase, network)?.into_keypair())
+}
+
+/// P5-S: a fresh keypair of `suite` (OS randomness). [`generate_keypair`]
+/// for [`crypto::KeySuite::Hybrid`].
+pub fn generate_keypair_for_suite(testnet: bool, suite: crypto::KeySuite) -> Result<Keypair, WalletError> {
+    let (public_key, private_key) = crypto::generate_keypair_for_suite_secret(suite)
+        .map_err(|e| WalletError::Crypto(e.to_string()))?;
+    let address = crypto::address_from_pubkey(&public_key, testnet);
+    Ok(Keypair { private_key, public_key, address })
+}
+
+/// P5-S: the keypair of `suite` a seed phrase derives (seed version V2, no
+/// passphrase, like [`Wallet::from_seed`]): for the hybrid suite exactly
+/// [`keypair_from_mnemonic`]; for the conservative suite the key of
+/// `crypto::generate_conservative_keypair_from_seed_secret`, an independent
+/// key (its own domain-separated seed) of the same phrase.
+pub fn keypair_from_seed_phrase_for_suite(
+    phrase: &SeedPhrase,
+    network: Network,
+    suite: crypto::KeySuite,
+) -> Result<Keypair, WalletError> {
+    let seed_bytes = phrase.to_seed_bytes_versioned(SeedVersion::V2Bip39Sha512, "")?;
+    let (public_key, private_key) = crypto::generate_keypair_from_seed_for_suite_secret(suite, &seed_bytes[..32])
+        .map_err(|e| WalletError::Crypto(e.to_string()))?;
+    let address = crypto::address_from_pubkey(&public_key, network == Network::Testnet);
+    Ok(Keypair { private_key, public_key, address })
+}
+
+/// P5-S: [`generate_mnemonic_keypair`] for a key of `suite`.
+pub fn generate_mnemonic_keypair_for_suite(network: Network, suite: crypto::KeySuite)
+    -> Result<(Keypair, SeedPhrase), WalletError>
+{
+    let phrase = SeedPhrase::generate()?;
+    let keypair = keypair_from_seed_phrase_for_suite(&phrase, network, suite)?;
+    Ok((keypair, phrase))
+}
+
+/// P5-S: [`keypair_from_mnemonic`] for a key of `suite`.
+pub fn keypair_from_mnemonic_for_suite(phrase: &str, network: Network, suite: crypto::KeySuite)
+    -> Result<Keypair, WalletError>
+{
+    keypair_from_seed_phrase_for_suite(&SeedPhrase::parse(phrase)?, network, suite)
 }
 
 pub fn validate_password(pw: &str) -> Result<(), String> {

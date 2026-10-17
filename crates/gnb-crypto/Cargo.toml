@@ -87,6 +87,23 @@ pqcrypto-mldsa     = { version = "=0.1.2", default-features = false, features = 
 pqcrypto-falcon    = { version = "=0.4.1", default-features = false, features = ["std"] }
 pqcrypto-traits    = "0.3"
 pqcrypto-internals = "0.2"
+# P5-S: SLH-DSA-SHAKE-128s (FIPS 205, stateless hash-based), the second
+# component of the opt-in conservative suite 0x0003 (Falcon-1024 AND
+# SLH-DSA; docs/CONSENSUS.md, "Conservative suite 0x0003"). `fips205` is a
+# pure-Rust FIPS 205 (final, August 2024) implementation with no `unsafe`
+# code whose only dependencies (sha3 0.10, sha2 0.10, rand_core 0.6,
+# zeroize) are already in this crate's graph; its tests carry the NIST ACVP
+# vectors. Pinned EXACT like the PQClean wrappers (I-4): signature
+# verification is consensus and keygen from seeds must stay byte-stable, so a
+# bump is a reviewed action (re-run tests/acvp_slhdsa.rs and the differential
+# test against the RustCrypto `slh-dsa` crate). Only the SHAKE-128s
+# parameter set is compiled; `default-rng` is off (randomness comes from
+# `pqcrypto_internals::randombytes_fill`, the source Falcon uses, so seeded
+# scopes cover SLH-DSA too).
+fips205 = { version = "=0.4.1", default-features = false, features = ["slh_dsa_shake_128s"] }
+# The RNG trait `fips205` signs with (its `try_sign_with_rng` takes a
+# rand_core 0.6 `CryptoRngCore`); traits only, no OS RNG.
+rand_core_06 = { package = "rand_core", version = "0.6.4", default-features = false }
 
 # Hashing / KDF / AEAD.
 sha2   = "0.10"
@@ -150,3 +167,7 @@ proptest = "1"
 # snapshot test (core::carryover::tests::shipped_snapshot_verifies). Pure-Rust
 # miniz_oxide backend; test-only, never linked into a build artifact.
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# P5-S: the second, independent SLH-DSA implementation for the differential
+# test of the conservative suite (tests/slhdsa_differential.rs): RustCrypto's
+# `slh-dsa`, test-only, never linked into a build artifact. Pinned exact.
+slh-dsa = { version = "=0.2.0-rc.5", default-features = false }

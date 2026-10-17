@@ -609,6 +609,7 @@ rule is the one that produced the existing chain, bit for bit. The rules:
 | `W(e)` = every unbarred share key with weight (no 64-key cap); justification = two thirds of the total window weight; decay entries go with their key's share work | PoWit audit 4 | `B.height` | "PoWit", "Witness set and justification" |
 | Every `W(e)` a block reads comes from finalized history: the share window of `h2_window_epoch(e)` (frozen at the last epoch entirely below the finalized checkpoint while finality lags), whose epochs the state keeps | PoWit audit 3 | `B.height` | "PoWit", "Witness set from finalized history" |
 | A revealed spend policy (or policy-tree branch) may not name one key twice in its raw and enveloped encodings | PF-4 | `B.height` of the containing block (mempool and templates: the next block's height) | "Spend-policy key identity (PF-4)" |
+| The conservative signature suite 0x0003 (SLH-DSA-SHAKE-128s AND Falcon-1024) is valid in sighash-v3 key-hash witnesses and spend-policy keys; policy signatures may be up to 10 KiB | P5-S (opt-in conservative suite) | `B.height` of the containing block (mempool and templates: the next block's height) | "Conservative suite 0x0003" |
 
 The PoWit rules are evaluated by one function for every path that judges a
 block or an item for a block: `PowitState::apply_at` (block acceptance,
@@ -1761,7 +1762,8 @@ Sighash v3 signatures (bound): component `c` of a suite-`s` signature signs
 
 ```text
 "GNB-TXSIG-v3" (12) ‖ s u16 LE ‖ c (1) ‖ sighash_v3 (32)          (47 bytes)
-c = 0x01 for ML-DSA-65, 0x02 for Falcon-1024
+c = 0x01 for ML-DSA-65, 0x02 for Falcon-1024,
+    0x03 for SLH-DSA-SHAKE-128s (suite 0x0003 only, "Conservative suite 0x0003")
 ```
 
 Suite 0x0001 (hybrid) signature body: `mldsa_sig (3,309) ‖ falcon_sig`; both
@@ -1798,7 +1800,8 @@ must hash to the spent output: `SHA3-256(pk)[0..20] == script_pubkey`.
   required. `script_sig` is exactly the framing above with no trailing bytes,
   and `sig` has its single canonical encoding
   (`crypto::is_canonical_signature_encoding`): the 4-byte envelope
-  `B1 0C ‖ suite u16 LE` is present and names suite 0x0001 or 0x0002; for
+  `B1 0C ‖ suite u16 LE` is present and names suite 0x0001 or 0x0002 (from
+  the second hardening height also 0x0003, "Conservative suite 0x0003"); for
   0x0001 the Falcon half is the COMPACT encoding (header byte 0x3A, 40-byte
   nonce, exactly framed coefficients, zero padding bits, nothing after it, at
   most 1,462 bytes); for 0x0002 the body is exactly 3,309 bytes.
@@ -1817,11 +1820,141 @@ every input whose key is not hybrid (`crypto::is_hybrid_public_key`), and
 wallets never sign with such a key. A holder of a 0x0002 output needs a miner
 to include the spend directly.
 
+### Conservative suite 0x0003
+
+Suite 0x0003 is SLH-DSA-SHAKE-128s AND Falcon-1024, an opt-in suite for
+holders who want the two halves of a signature to rest on different
+families of assumptions. SLH-DSA (NIST FIPS 205) is stateless and
+hash-based: its security rests on SHAKE256 alone. Falcon-1024 rests on NTRU
+lattices. A forgery therefore needs a break of a hash function AND of a
+lattice problem. The everyday suite 0x0001 pairs two lattice schemes
+(Module-LWE and NTRU). The suite is part of the second hardening
+("Second hardening activation (hardening 2)"): mainnet not scheduled,
+testnet and regtest from genesis.
+
+Encodings, with the fixed-length component first like suite 0x0001 and no
+raw (unenveloped) form (`crypto::SUITE_SLHDSA128S_FALCON1024`):
+
+```text
+pk  = B1 0C 03 00 ‖ slh_pk (32) ‖ falcon_pk (1,793)                    exactly 1,829 bytes
+sig = B1 0C 03 00 ‖ slh_sig (7,856) ‖ falcon_sig (compact, ≤ 1,462)   at most 9,322 bytes
+sk  = B1 0C 03 00 ‖ slh_sk (64) ‖ falcon_sk (2,305)                    2,373 bytes (wallet only)
+```
+
+`slh_pk` is `PK.seed ‖ PK.root` and `slh_sk` is `SK.seed ‖ SK.prf ‖ PK.seed ‖
+PK.root` (FIPS 205, parameter set SLH-DSA-SHAKE-128s: n = 16, h = 63,
+d = 7, h' = 9, a = 12, k = 14, lg w = 4, m = 30; category 1).
+
+Which rule applies is decided by the header height `h` of the block that
+contains the transaction (mempool and producers: the next block's height,
+"Which height"), through ONE function, `core::sighash::suite_rules_at`
+(`crypto::SuiteRules`), which the witness rule, the signature rule, the
+policy-spend rule (`node::blockval`) and the assumed-valid path all call:
+
+| Height | Suite 0x0003 |
+| --- | --- |
+| below the second hardening height | invalid everywhere, exactly the historical verdict: an unknown suite in a key-hash witness, and a policy listing such a key does not decode (`NotHybridKey`) |
+| from it | valid in sighash-v3 transaction signatures: key-hash witnesses and spend-policy keys (up to 7 per policy, mixed freely with hybrid keys) |
+
+At every height suite 0x0003 is refused by every other verifier: sighash v2
+(which keeps the historical rules at every height; the second hardening
+height is never below the first, so the suite never meets sighash v2),
+`crypto::verify`, signed messages, disclosures, KES keys, PoWit shares and
+attestations, and the P2P identity.
+
+From the second hardening height a suite-0x0003 signature verifies under a
+key (`crypto::verify_bound_under` with `SuiteRules::HARDENING2`) iff:
+
+1. the key is exactly 1,829 bytes with the envelope `B1 0C 03 00`
+   (`crypto::public_key_suite_under`), and the signature's envelope names
+   the same suite;
+2. the signature is canonical (`crypto::is_canonical_signature_encoding_under`):
+   its body is longer than 7,856 bytes and the bytes after the first 7,856
+   are a canonical COMPACT Falcon-1024 signature, the same rule as the Falcon
+   half of suite 0x0001 ("Witnesses");
+3. both components verify, each over its own bound message ("Signature
+   binding") with `s` = 0x0003: the first 7,856 bytes by FIPS 205
+   `slh_verify` (Algorithm 24, pure, with the EMPTY context, so the signed
+   string is `M' = 00 ‖ 00 ‖ message`) under `slh_pk` with `c` = 0x03, and
+   the rest by the canonical Falcon-1024 verification of suite 0x0001 under
+   `falcon_pk` with `c` = 0x02.
+
+The digest is sighash v3, which commits the suite id like for every suite.
+A policy signature may be up to 10 KiB from the second hardening height
+(8 KiB below it). The policy-witness wire cap (`MAX_POLICY_WITNESS_LEN`,
+114,834 bytes) does not move: the largest valid witness, a 7-of-7 branch
+witness with conservative keys, is about 78 kB. A suite-0x0003 key has one
+encoding, so its PF-4 identity is the key itself and never equals the
+identity of a hybrid key ("Spend-policy key identity (PF-4)").
+
+SLH-DSA is implemented by the `fips205` crate (pure Rust, FIPS 205 final,
+pinned exactly). It is validated against the NIST ACVP keyGen, sigGen and
+sigVer vectors of the parameter set
+(`crates/gnb-crypto/tests/acvp_slhdsa.rs`) and differentially against the
+independent RustCrypto `slh-dsa` crate
+(`crates/gnb-crypto/tests/slhdsa_differential.rs`). It is integer-only code, so
+every platform gives the same verdict. Signing is hedged (16 fresh bytes of
+`opt_rand`); the verdict does not depend on them.
+
+Cost, measured in a release build on the reference machine
+(`cargo test --release -p gnb-crypto --test conservative_suite_cost --
+--ignored --nocapture`):
+
+| | suite 0x0001 | suite 0x0003 |
+| --- | --- | --- |
+| public key | 3,749 bytes | 1,829 bytes |
+| signature | at most 4,775 bytes | at most 9,322 bytes (about 9,130 typical) |
+| verification | about 0.25 ms | about 1.8 to 2.0 ms (about 7×) |
+| signing | about 9 ms | about 2 s |
+
+Every suite-0x0003 signature carries at least 7,860 bytes, so a 1,000,000-byte
+block holds at most 127 of them: about 0.25 s of signature verification in
+the worst case. Every hybrid signature carries at least 3,313 bytes, so the
+hybrid worst case is 301 signatures, about 0.08 s.
+
+Relay policy: from the next block's second hardening height a suite-0x0003
+key-hash witness (canonical signature, key of exactly that suite) and a
+policy listing such keys are standard. Below it they are non-standard
+(`WitnessRefusal::SuiteNotYetActive`, and for a policy the admission split
+of `blockval::check_tx_chain_rules_with_conservative_suite`). The relay
+answers `Ignore` without a penalty, since a peer one block ahead across the
+height relays them honestly. The signature budget charges
+`CONSERVATIVE_VERIFY_TOKENS` = 8 tokens for each suite-0x0003 signature
+against 1 for any other (`mempool::relay::input_verification_tokens`), so a
+peer cannot make the node verify conservative signatures at the hybrid
+price (Bitcoin Core prices verification the same way: BIP342's validation
+weight and the sigops cost).
+
+Producers (`crypto::KeySuite`). Wallets and `gnb-cli` generate hybrid keys
+by default, and conservative keys only on request (`gnb-cli newwallet` /
+`restorewallet --suite conservative`, `wallet::generate_keypair_for_suite`).
+A conservative key is the seed-phrase key derived from
+`SHA3-256("GNB-SUITE-0003/keygen-v1" ‖ seed[..32])`, so one mnemonic gives
+independent keys for the two suites. The hybrid key of a phrase is unchanged.
+
+- Creating a conservative key, or a policy address listing one
+  (`policyaddress`), is refused on a chain where the second hardening is not
+  scheduled (mainnet today), since coins locked to it could never move.
+  Where the height is scheduled, these offline commands print it.
+- The paths that know the next block's height refuse to sign below it
+  (`KeySuite::check_allowed_at`): a payment
+  (`wallet::payment::check_signing_suite`: `send`, `WalletClient`) and a
+  policy spend (`PolicySpend::target_height` /
+  `check_suites_for_height`). A conservative key never signs a
+  version-1 (sighash v2) spend.
+- Fees are sized for the 9,322-byte signature
+  (`crypto::max_signature_len_for_public_key_len`). The policy-spend files
+  carry signatures of up to 10 KiB.
+- The PQ-PSBT format (`docs/PQ-PSBT.md`), descriptors, the bridge vault and
+  the browser wallet still carry hybrid keys only. Their independent
+  references pin that, and extending them is a separate change.
+
 ### Relay policy (all heights)
 
 Mempool admission (gossip, RPC; not reorg re-injection of already-mined
 transactions) additionally requires, at every height, the canonical witness of
-every input and a hybrid public key. Transactions are admitted only if valid
+every input and a hybrid public key (from the next block's second hardening
+height also a conservative suite-0x0003 key, "Conservative suite 0x0003"). Transactions are admitted only if valid
 and standard for the next block's height (see "Which height"): below the
 activation version ≥ 3 is non-standard, at/after it only version 3 is valid.
 Whenever the next height moves (after every connect, and after a DAG change

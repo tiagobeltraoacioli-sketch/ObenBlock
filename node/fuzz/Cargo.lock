@@ -1154,6 +1154,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
 
 [[package]]
+name = "fips205"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f5626bf5534df4ebdbd2536465d7eaa8a9dc2cdeb7e036e0ecf291dcc80ffb6"
+dependencies = [
+ "rand_core 0.6.4",
+ "sha2 0.10.9",
+ "sha3",
+ "zeroize",
+]
+
+[[package]]
 name = "fixed-hash"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1483,6 +1495,7 @@ dependencies = [
  "bip39",
  "chrono",
  "coherence-core",
+ "fips205",
  "gnb-secret",
  "gnb-smh",
  "hex",
@@ -1495,6 +1508,7 @@ dependencies = [
  "pqcrypto-traits",
  "primitive-types",
  "rand 0.9.4",
+ "rand_core 0.6.4",
  "reqwest",
  "rustls",
  "serde",

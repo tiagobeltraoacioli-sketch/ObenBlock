@@ -23,7 +23,10 @@
 //!   `core::powit_height()`. From the second hardening height
 //!   (`activation::hardening2_*`, PF-4) the revealed policy or branch must
 //!   not name one key twice in its raw and enveloped encodings
-//!   (`policy::SpendPolicy::check_key_identities`). The policy's keys and
+//!   (`policy::SpendPolicy::check_key_identities`), and its keys may also be
+//!   conservative suite-0x0003 keys (P5-S: SLH-DSA-SHAKE-128s AND Falcon-1024;
+//!   below that height such a policy does not decode, exactly as before,
+//!   `core::sighash::suite_rules_for_height`). The policy's keys and
 //!   signatures are checked with every other input script
 //!   (`core::sighash::verify_input_signatures`, which checks the same hash
 //!   again);
@@ -103,24 +106,30 @@ pub fn check_policy_spends_with_confirmations(
     height: u64,
     confirmations: &ConfirmationsLookup<'_>,
 ) -> Result<(), String> {
-    check_policy_spends_under(tx, prevouts, height, core::activation::hardening2_active_at(height), confirmations)
+    check_policy_spends_under(tx, prevouts, height, core::activation::hardening2_active_at(height),
+        core::sighash::suite_rules_for_height(height), confirmations)
 }
 
 /// [`check_policy_spends_with_confirmations`] with the PF-4 key-identity
 /// rule of the second hardening upgrade on (`key_identity_rule`, the
-/// consensus value is `hardening2_active_at(height)`) or off.
+/// consensus value is `hardening2_active_at(height)`) or off, and the
+/// signature suites a policy key may use (`suites`, P5-S; the consensus
+/// value is `core::sighash::suite_rules_for_height(height)`: the
+/// conservative suite 0x0003 from the second hardening height, under
+/// sighash v3).
 fn check_policy_spends_under(
     tx: &Transaction,
     prevouts: &[TxOutput],
     height: u64,
     key_identity_rule: bool,
+    suites: crate::crypto::SuiteRules,
     confirmations: &ConfirmationsLookup<'_>,
 ) -> Result<(), String> {
     for (i, (inp, prev)) in tx.inputs.iter().zip(prevouts).enumerate() {
         if policy::output_kind(&prev.script_pubkey) != Some(policy::OutputKind::Policy) {
             continue;
         }
-        let w = policy::AnyPolicyWitness::decode(&inp.script_sig)
+        let w = policy::AnyPolicyWitness::decode_under(&inp.script_sig, suites)
             .map_err(|e| format!("malformed policy witness at input {}: {}", i, e))?;
         // Same check and message as `core::sighash::check_input_witnesses`.
         if w.script_pubkey() != prev.script_pubkey {
@@ -200,7 +209,27 @@ pub fn check_tx_chain_rules_without_key_identity_rule(
     confirmations: &ConfirmationsLookup<'_>,
 ) -> Result<(), String> {
     check_tx_context_free(tx, height)?;
-    check_policy_spends_under(tx, prevouts, height, false, confirmations)
+    check_policy_spends_under(tx, prevouts, height, false, core::sighash::suite_rules_for_height(height), confirmations)
+}
+
+/// [`check_tx_chain_rules_with_confirmations`] with the conservative
+/// suite 0x0003 allowed in policy keys whatever the height (P5-S), for
+/// mempool admission only: how to classify a transaction the full rules
+/// refuse. When the full rules fail but these pass, the only failure is that
+/// a revealed policy lists a conservative key before the second hardening
+/// height: the next block is below it, so a peer one block ahead across the
+/// height relays such a spend honestly, and admission answers it as a policy
+/// refusal (`AdmissionError::NonStandard`), never `Rejected` (the split of
+/// [`check_tx_chain_rules_without_key_identity_rule`]).
+pub fn check_tx_chain_rules_with_conservative_suite(
+    tx: &Transaction,
+    prevouts: &[TxOutput],
+    height: u64,
+    confirmations: &ConfirmationsLookup<'_>,
+) -> Result<(), String> {
+    check_tx_context_free(tx, height)?;
+    check_policy_spends_under(tx, prevouts, height, core::activation::hardening2_active_at(height),
+        crate::crypto::SuiteRules::HARDENING2, confirmations)
 }
 
 /// Where a transaction is being validated: the height of the block it is (or
@@ -240,8 +269,9 @@ pub fn validate_tx_inputs(
         prevouts.push(out);
     }
     check_tx_chain_rules(tx, &prevouts, ctx.height, ctx.confirm_height)?;
-    core::sighash::verify_tx_scripts(tx, &prevouts, core::node_chain_id(), ctx.height,
-                                     core::activation::hardening_activation_height())?;
+    core::sighash::verify_tx_scripts_at(tx, &prevouts, core::node_chain_id(), ctx.height,
+                                        core::activation::hardening_activation_height(),
+                                        core::activation::hardening2_activation_height())?;
     if let Some(s) = spent_set.as_mut() {
         s.extend(local);
     }

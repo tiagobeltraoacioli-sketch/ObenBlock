@@ -32,6 +32,13 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.gnb-smh]
 opt-level = 3
+# SLH-DSA-SHAKE-128s (conservative suite 0x0003, P5-S) hashes about 2^20
+# Keccak calls per signature; unoptimized a signature takes minutes. The
+# RustCrypto copy is the differential test's second implementation.
+[profile.dev.package.fips205]
+opt-level = 3
+[profile.dev.package.slh-dsa]
+opt-level = 3
 # Argon2id is memory-hard by design; unoptimized it makes keystore tests slow.
 [profile.dev.package.argon2]
 opt-level = 3

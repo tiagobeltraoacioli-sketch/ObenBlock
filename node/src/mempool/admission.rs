@@ -339,26 +339,48 @@ fn sig_cache() -> &'static parking_lot::Mutex<(HashSet<[u8; 32]>, std::collectio
 ///   activation is in force at the block height (the regime is a function of
 ///   both, so a version-3 transaction verified under v2 below the activation
 ///   never hits at/after it, and vice versa);
+/// * the signature suites valid at the block height (P5-S: the conservative
+///   suite 0x0003 from the second hardening height,
+///   `core::sighash::suite_rules_at`);
 /// * the wtxid (every input's outpoint, sequence, script_sig, every output,
 ///   version and locktime);
 /// * every spent output (value and `script_pubkey`, in input order): sighash
 ///   v3 commits to them, and the witness check hashes the public key against
 ///   the spent script. Included for v2 too, so the key never depends on the
 ///   regime-specific reasoning above.
-fn sig_cache_key(tx: &Transaction, version: SighashVersion, active: bool, prevouts: &[TxOutput]) -> [u8; 32] {
-    sig_cache_key_for(&wtxid(tx), version, active, prevouts)
+fn sig_cache_key(
+    tx: &Transaction,
+    version: SighashVersion,
+    active: bool,
+    suites: crate::crypto::SuiteRules,
+    prevouts: &[TxOutput],
+) -> [u8; 32] {
+    sig_cache_key_for(&wtxid(tx), version, active, suites, prevouts)
 }
 
 /// [`sig_cache_key`] from the transaction's wtxid (B1-T19: the gossip relay
 /// computes it once per frame, from the frame's canonical bytes).
-fn sig_cache_key_for(wtxid: &[u8; 32], version: SighashVersion, active: bool, prevouts: &[TxOutput]) -> [u8; 32] {
+fn sig_cache_key_for(
+    wtxid: &[u8; 32],
+    version: SighashVersion,
+    active: bool,
+    suites: crate::crypto::SuiteRules,
+    prevouts: &[TxOutput],
+) -> [u8; 32] {
     use sha3::{Digest, Sha3_256};
     #[cfg(test)]
     tests::SIG_KEYS_COMPUTED.with(|c| c.set(c.get() + 1));
     let mut h = Sha3_256::new();
-    h.update(b"gnb-sigcache-v4");
+    h.update(b"gnb-sigcache-v5");
     h.update(core::node_chain_id().to_le_bytes());
-    h.update([match version { SighashVersion::V2 => 2u8, SighashVersion::V3 => 3u8 }, u8::from(active)]);
+    // P5-S: whether the conservative suite 0x0003 is valid at the height
+    // (the second hardening height), so a conservative spend verified from
+    // that height never answers below it.
+    h.update([
+        match version { SighashVersion::V2 => 2u8, SighashVersion::V3 => 3u8 },
+        u8::from(active),
+        u8::from(suites.conservative_suite()),
+    ]);
     h.update(wtxid);
     h.update((prevouts.len() as u64).to_le_bytes());
     for p in prevouts {
@@ -373,6 +395,12 @@ fn sig_cache_key_for(wtxid: &[u8; 32], version: SighashVersion, active: bool, pr
 /// under (process-wide; a `scoped_override` on the calling thread in tests).
 fn activation_height() -> u64 {
     core::activation::hardening_activation_height()
+}
+
+/// The second hardening activation height (P5-S: the conservative suite;
+/// PF-4), process-wide like [`activation_height`].
+fn hardening2_activation_height() -> u64 {
+    core::activation::hardening2_activation_height()
 }
 
 /// True iff the signatures of `tx` spending `prevouts` in a block at header
@@ -390,7 +418,8 @@ pub fn signatures_cached(tx: &Transaction, prevouts: &[TxOutput], block_height: 
 pub fn signatures_cached_at(tx: &Transaction, prevouts: &[TxOutput], block_height: u64, act: u64) -> bool {
     match core::sighash::check_tx_version(tx.version, block_height, act) {
         Ok(version) => {
-            let key = sig_cache_key(tx, version, core::activation::is_active_at(block_height, act), prevouts);
+            let suites = core::sighash::suite_rules_at(block_height, act, hardening2_activation_height());
+            let key = sig_cache_key(tx, version, core::activation::is_active_at(block_height, act), suites, prevouts);
             sig_cache().lock().0.contains(&key)
         }
         Err(_) => false,
@@ -466,15 +495,19 @@ pub fn verify_input_scripts_gated_with_wtxid_at(
     gate: &mut SignatureGate<'_>,
 ) -> Result<(), AdmissionError> {
     let version = core::sighash::check_tx_version(tx.version, block_height, act).map_err(AdmissionError::Rejected)?;
-    let witnesses = core::sighash::check_input_witnesses(tx, prevouts, version).map_err(AdmissionError::Rejected)?;
-    let key = sig_cache_key_for(tx_wtxid, version, core::activation::is_active_at(block_height, act), prevouts);
+    // P5-S: the signature suites of the block's height (the conservative
+    // suite 0x0003 from the second hardening height, process-wide).
+    let suites = core::sighash::suite_rules_at(block_height, act, hardening2_activation_height());
+    let witnesses = core::sighash::check_input_witnesses_under(tx, prevouts, version, suites)
+        .map_err(AdmissionError::Rejected)?;
+    let key = sig_cache_key_for(tx_wtxid, version, core::activation::is_active_at(block_height, act), suites, prevouts);
     if sig_cache().lock().0.contains(&key) {
         count_signature_inputs(|c| c.cached += tx.inputs.len() as u64);
         return Ok(());
     }
     gate(tx)?;
     count_signature_inputs(|c| c.verified += tx.inputs.len() as u64);
-    core::sighash::verify_input_signatures(tx, prevouts, &witnesses, version, core::node_chain_id())
+    core::sighash::verify_input_signatures_under(tx, prevouts, &witnesses, version, core::node_chain_id(), suites)
         .map_err(AdmissionError::Rejected)?;
     let mut g = sig_cache().lock();
     let (set, order) = &mut *g;
@@ -506,7 +539,11 @@ pub fn check_input_scripts_without_signatures_at(
     act: u64,
 ) -> Result<(), String> {
     let version = core::sighash::check_tx_version(tx.version, block_height, act)?;
-    core::sighash::check_input_witnesses(tx, prevouts, version)?;
+    // P5-S: the witness rules of the block's height, as the full path
+    // ([`verify_input_scripts_at`]): a conservative suite-0x0003 witness is
+    // valid from the second hardening height on the assumed-valid path too.
+    let suites = core::sighash::suite_rules_at(block_height, act, hardening2_activation_height());
+    core::sighash::check_input_witnesses_under(tx, prevouts, version, suites)?;
     count_signature_inputs(|c| c.assumed += tx.inputs.len() as u64);
     Ok(())
 }
@@ -615,6 +652,10 @@ fn check_policy(tx: &Transaction) -> Result<(), AdmissionError> {
 ///   key of a carry-over address). Single-algorithm suite 0x0002 stays
 ///   consensus-valid (outputs that may already be locked to such keys are not
 ///   frozen) but is non-standard: no new 0x0002 spend enters the pool.
+/// * P5-S: from the second hardening height (`crypto::SuiteRules` of the
+///   next block, [`check_standard_witnesses_classified_under`]) a
+///   conservative suite-0x0003 key and canonical signature are standard too.
+///   This entry point has the rules below that height.
 pub fn check_standard_witnesses(tx: &Transaction) -> Result<(), String> {
     check_standard_witnesses_classified(tx).map_err(|(_, m)| m)
 }
@@ -630,6 +671,12 @@ pub enum WitnessRefusal {
     /// Every witness is canonical, but some public key is not hybrid (suite
     /// 0x0002 or an unknown key): policy at every height (CRY-2).
     Suite,
+    /// P5-S: a key-hash witness carries the conservative suite 0x0003 (a
+    /// canonical signature or a key of that suite) for a block below the
+    /// second hardening height. Consensus-invalid there (exactly the old
+    /// verdict), but valid one block later across the height, so a peer
+    /// ahead of this node relays it honestly: policy, never a penalty.
+    SuiteNotYetActive,
 }
 
 /// [`check_standard_witnesses`] with the kind of refusal. The framing of
@@ -637,23 +684,65 @@ pub enum WitnessRefusal {
 /// (on different inputs) is reported as [`WitnessRefusal::Framing`], the
 /// failure that can be a consensus rule.
 pub fn check_standard_witnesses_classified(tx: &Transaction) -> Result<(), (WitnessRefusal, String)> {
+    check_standard_witnesses_classified_under(tx, crate::crypto::SuiteRules::LEGACY)
+}
+
+/// [`check_standard_witnesses_classified`] under the signature suites of
+/// the next block (`core::sighash::suite_rules_at`): from the second
+/// hardening height a conservative suite-0x0003 key-hash witness (canonical
+/// signature, a key of exactly that suite) is standard. Below it such a
+/// witness is [`WitnessRefusal::SuiteNotYetActive`] (checked after the
+/// framing of every input, so a real framing failure elsewhere still
+/// classifies as [`WitnessRefusal::Framing`]).
+pub fn check_standard_witnesses_classified_under(
+    tx: &Transaction,
+    suites: crate::crypto::SuiteRules,
+) -> Result<(), (WitnessRefusal, String)> {
+    use crate::crypto::SuiteRules;
     let mut keys = Vec::with_capacity(tx.inputs.len());
+    let mut premature: Option<usize> = None;
     for (i, inp) in tx.inputs.iter().enumerate() {
         // A policy spend (multisig / timelocks) carries a strictly parsed
         // policy witness, not the single-key framing; whether it matches the
-        // spent output is consensus (`core::sighash::check_input_witnesses`).
-        if core::policy::AnyPolicyWitness::decode(&inp.script_sig).is_ok() {
+        // spent output, and whether its keys' suites are valid at the height,
+        // is consensus (`core::sighash::check_input_witnesses_under`,
+        // `blockval`). Recognised in its widest form (every suite).
+        if core::policy::AnyPolicyWitness::decode_under(&inp.script_sig, SuiteRules::HARDENING2).is_ok() {
             continue;
         }
-        let (_sig, pk) = core::sighash::canonical_witness(&inp.script_sig)
-            .map_err(|e| (WitnessRefusal::Framing, format!("input {i}: {e} (non-standard)")))?;
+        let (_sig, pk) = match core::sighash::canonical_witness_under(&inp.script_sig, suites) {
+            Ok(w) => w,
+            Err(e) => match core::sighash::canonical_witness_under(&inp.script_sig, SuiteRules::HARDENING2) {
+                // Canonical once the conservative suite is valid: only the
+                // suite is premature.
+                Ok(w) if !suites.conservative_suite() => {
+                    premature.get_or_insert(i);
+                    w
+                }
+                _ => return Err((WitnessRefusal::Framing, format!("input {i}: {e} (non-standard)"))),
+            },
+        };
         keys.push(pk);
     }
+    if let Some(i) = premature {
+        return Err((WitnessRefusal::SuiteNotYetActive, format!(
+            "input {i}: the conservative signature suite 0x0003 is not valid before the second \
+             hardening height (non-standard for this block)"
+        )));
+    }
     for (i, pk) in keys.into_iter().enumerate() {
-        if !crate::crypto::is_hybrid_public_key(pk) {
+        let conservative = crate::crypto::is_conservative_public_key(pk);
+        if conservative && !suites.conservative_suite() {
+            return Err((WitnessRefusal::SuiteNotYetActive, format!(
+                "input {i}: a conservative suite-0x0003 key is not valid before the second \
+                 hardening height (non-standard for this block)"
+            )));
+        }
+        if !crate::crypto::is_hybrid_public_key(pk) && !conservative {
             return Err((WitnessRefusal::Suite, format!(
                 "input {i}: single-algorithm signature suite (non-standard; only the hybrid \
-                 ML-DSA-65 + Falcon-1024 suite 0x0001 is relayed)"
+                 ML-DSA-65 + Falcon-1024 suite 0x0001 and, from the second hardening height, \
+                 the conservative suite 0x0003 are relayed)"
             )));
         }
     }
@@ -677,7 +766,8 @@ pub fn check_witnesses_for_next_block(tx: &Transaction, next_block_height: u64) 
 
 /// [`check_witnesses_for_next_block`] for an explicit activation height.
 pub fn check_witnesses_for_next_block_at(tx: &Transaction, next_block_height: u64, act: u64) -> Result<(), AdmissionError> {
-    match check_standard_witnesses_classified(tx) {
+    let suites = core::sighash::suite_rules_at(next_block_height, act, hardening2_activation_height());
+    match check_standard_witnesses_classified_under(tx, suites) {
         Ok(()) => Ok(()),
         Err((WitnessRefusal::Framing, m))
             if matches!(core::sighash::check_tx_version(tx.version, next_block_height, act), Ok(SighashVersion::V3)) =>
@@ -940,6 +1030,24 @@ fn classify_chain_rule_failure(
             tx, prevouts, next_block_height, confirmations)
         {
             Ok(()) => return AdmissionError::NonStandard(e),
+            Err(other) if other.starts_with(crate::blockval::STORAGE_ERR) => return AdmissionError::Pool(other),
+            Err(_) => {}
+        }
+    }
+    // P5-S: a revealed policy that lists a conservative suite-0x0003 key for
+    // a block below the second hardening height. Invalid there (exactly the
+    // old verdict), valid one block later: a policy refusal when it is the
+    // only failure (the conservative suite only loosens the rules from the
+    // height; same split as the PF-4 rule above).
+    let lists_conservative_key = tx.inputs.iter().any(|i| {
+        core::policy::AnyPolicyWitness::decode_under(&i.script_sig, crate::crypto::SuiteRules::HARDENING2)
+            .is_ok_and(|w| w.policy().has_conservative_key())
+    });
+    if lists_conservative_key && !core::sighash::suite_rules_for_height(next_block_height).conservative_suite() {
+        match crate::blockval::check_tx_chain_rules_with_conservative_suite(tx, prevouts, next_block_height, confirmations) {
+            Ok(()) => return AdmissionError::NonStandard(format!(
+                "{e} (a policy key of the conservative signature suite 0x0003 is not valid before the second \
+                 hardening height; non-standard for this block)")),
             Err(other) if other.starts_with(crate::blockval::STORAGE_ERR) => return AdmissionError::Pool(other),
             Err(_) => {}
         }

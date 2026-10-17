@@ -55,10 +55,29 @@ struct SpendFile {
     amounts: Vec<String>,
 }
 
-/// Upper bound on a policy witness (sets the fee before anyone signs).
+/// Upper bound on a policy witness (sets the fee before anyone signs): every
+/// one of the `threshold` signatures at the maximum length of the policy's
+/// widest key suite (P5-S: 9,322 bytes once a conservative suite-0x0003 key
+/// is listed, `crypto::max_signature_len_for_public_key_len`).
 pub fn max_witness_size(policy: &SpendPolicy) -> usize {
-    1 + 4 + policy.encode().len() + 1 + policy.threshold as usize * (1 + 4 + core::SIG_SIZE)
+    let max_sig = policy.pubkeys.iter()
+        .map(|k| crypto::max_signature_len_for_public_key_len(k.len()))
+        .max()
+        .unwrap_or(core::SIG_SIZE)
+        .max(core::SIG_SIZE);
+    1 + 4 + policy.encode().len() + 1 + policy.threshold as usize * (1 + 4 + max_sig)
 }
+
+/// Largest partial signature the spend tooling carries: a conservative
+/// suite-0x0003 signature (9,322 bytes) within the consensus policy
+/// signature bound of the second hardening height (10 KiB; 8 KiB below it).
+pub const MAX_PARTIAL_SIGNATURE_LEN: usize = 10 * 1024;
+
+/// The suite rules the spend tooling reads a policy under: the widest
+/// ([`crypto::SuiteRules::HARDENING2`], conservative keys included).
+/// Whether a policy with such keys can be spent at the target block's
+/// height is checked against that height ([`PolicySpend::check_suites_for_height`]).
+const TOOLING_RULES: crypto::SuiteRules = crypto::SuiteRules::HARDENING2;
 
 /// Upper bound on a branch witness of a policy tree.
 pub fn max_branch_witness_size(branch: &SpendPolicy) -> usize {
@@ -120,6 +139,8 @@ impl PolicySpend {
         let spend = Self { network, policy, tree: None, tx, signatures: vec![BTreeMap::new(); inputs.len()], amounts };
         // PF-4: never valid where hardening 2 holds from genesis.
         spend.check_key_identities_for_height(0)?;
+        // P5-S: never valid where hardening 2 is not scheduled.
+        spend.check_suites_scheduled()?;
         Ok(spend)
     }
 
@@ -175,6 +196,8 @@ impl PolicySpend {
         let spend = Self { network, policy, tree: Some((tree, branch)), tx, signatures: vec![BTreeMap::new(); inputs.len()], amounts };
         // PF-4: never valid where hardening 2 holds from genesis.
         spend.check_key_identities_for_height(0)?;
+        // P5-S: never valid where hardening 2 is not scheduled.
+        spend.check_suites_scheduled()?;
         Ok(spend)
     }
 
@@ -208,6 +231,7 @@ impl PolicySpend {
             return Err("the spend already carries signatures; its version is fixed".into());
         }
         self.check_key_identities_for_height(next_block_height)?;
+        self.check_suites_for_height(next_block_height)?;
         let act = core::activation::hardening_activation_height_for_signer(self.chain_id());
         self.tx.version = core::sighash::tx_version_for_height(next_block_height, act);
         Ok(())
@@ -232,6 +256,30 @@ impl PolicySpend {
         Ok(())
     }
 
+    /// P5-S for producers: a policy (or revealed branch) that lists a
+    /// conservative suite-0x0003 key decodes only from the second hardening
+    /// height (`core::sighash::suite_rules_at`), so no tool targets such a
+    /// spend at a block below it.
+    pub fn check_suites_for_height(&self, next_block_height: u64) -> Result<(), String> {
+        if !self.policy.has_conservative_key() {
+            return Ok(());
+        }
+        let h2 = core::activation::hardening2_activation_height_for_signer(self.chain_id());
+        crypto::KeySuite::Conservative.check_allowed_at(next_block_height, h2)
+            .map_err(|e| format!("the policy lists a conservative suite-0x0003 key: {e}"))
+    }
+
+    /// [`Self::check_suites_for_height`] for a spend not yet targeted at a
+    /// height: refused only where no height accepts it (the second
+    /// hardening is not scheduled on the spend's chain).
+    fn check_suites_scheduled(&self) -> Result<(), String> {
+        let h2 = core::activation::hardening2_activation_height_for_signer(self.chain_id());
+        if h2 == core::activation::NEVER {
+            return self.check_suites_for_height(0);
+        }
+        Ok(())
+    }
+
     /// The sighash version this spend's signatures use.
     pub fn sighash_version(&self) -> SighashVersion {
         SighashVersion::for_tx_version(self.tx.version)
@@ -250,7 +298,8 @@ impl PolicySpend {
                 let spent: Vec<TxOutput> = self.amounts.iter()
                     .map(|v| TxOutput { value: *v, script_pubkey: spk.clone() })
                     .collect();
-                let suite = crypto::public_key_suite(public_key).ok_or("unknown public key suite")?;
+                let suite = crypto::public_key_suite_under(public_key, TOOLING_RULES)
+                    .ok_or("unknown public key suite")?;
                 SighashV3Precomputed::new(&self.tx, &spent)
                     .and_then(|p| p.digest(i, suite, chain_id))
                     .map_err(|e| e.to_string())
@@ -261,7 +310,9 @@ impl PolicySpend {
     pub(super) fn verifies(&self, public_key: &[u8], digest: &[u8; 32], sig: &[u8]) -> bool {
         match self.sighash_version() {
             SighashVersion::V2 => crypto::verify_enveloped_canonical(public_key, digest, sig),
-            SighashVersion::V3 => crypto::verify_bound(public_key, digest, sig),
+            // P5-S: the widest rules; the target height was checked by
+            // `check_suites_for_height`.
+            SighashVersion::V3 => crypto::verify_bound_under(public_key, digest, sig, TOOLING_RULES),
         }
     }
 
@@ -292,6 +343,10 @@ impl PolicySpend {
         let idx = self.policy.pubkeys.iter().position(|k| k == public_key)
             .ok_or("this key is not part of the policy")? as u8;
         let version = self.sighash_version();
+        if version == SighashVersion::V2 && crypto::is_conservative_public_key(public_key) {
+            return Err("a conservative suite-0x0003 key signs only version-3 spends (sighash v3) for a block \
+                        at or above the second hardening height: target the spend at that height first".into());
+        }
         for i in 0..self.tx.inputs.len() {
             let digest = self.digest(i, public_key)?;
             let sig = sign(&digest, version)?;
@@ -359,7 +414,7 @@ impl PolicySpend {
             if p.pubkeys.len() > core::policy::MAX_POLICY_KEYS || p.pubkeys.iter().any(|k| k.len() > 8192) {
                 return Err("policy exceeds wallet limits".into());
             }
-            SpendPolicy::decode(&p.encode()).map_err(|e| format!("policy: {e}"))?;
+            SpendPolicy::decode_under(&p.encode(), TOOLING_RULES).map_err(|e| format!("policy: {e}"))?;
             Ok(())
         };
         check_policy(&self.policy)?;
@@ -392,7 +447,9 @@ impl PolicySpend {
             }
         }
         for signatures in &self.signatures {
-            if signatures.iter().any(|(i, s)| *i as usize >= self.policy.pubkeys.len() || s.is_empty() || s.len() > 8192) {
+            if signatures.iter().any(|(i, s)| *i as usize >= self.policy.pubkeys.len() || s.is_empty()
+                || s.len() > MAX_PARTIAL_SIGNATURE_LEN)
+            {
                 return Err("invalid partial signature index or size".into());
             }
         }
@@ -434,7 +491,7 @@ impl PolicySpend {
             "testnet" => Network::Testnet,
             other => return Err(format!("unknown network {}", other)),
         };
-        let policy = SpendPolicy::decode(&hex::decode(&f.policy).map_err(|_| "policy hex")?)
+        let policy = SpendPolicy::decode_under(&hex::decode(&f.policy).map_err(|_| "policy hex")?, TOOLING_RULES)
             .map_err(|e| format!("policy: {}", e))?;
         let tx = Transaction::from_wire_bytes(&hex::decode(&f.tx).map_err(|_| "tx hex")?)?;
         if f.signatures.len() != tx.inputs.len() {
@@ -454,7 +511,7 @@ impl PolicySpend {
         }
         let tree = match (f.tree, f.branch) {
             (Some(t), Some(b)) => {
-                let tree = PolicyTree::decode(&hex::decode(&t).map_err(|_| "tree hex")?)
+                let tree = PolicyTree::decode_under(&hex::decode(&t).map_err(|_| "tree hex")?, TOOLING_RULES)
                     .map_err(|e| format!("tree: {}", e))?;
                 if tree.branches.get(b as usize) != Some(&policy) {
                     return Err("policy is not the named branch of the tree".into());
@@ -516,6 +573,61 @@ mod tests {
         assert_eq!(tx.outputs[1].script_pubkey, policy.script_pubkey());
         let fee = 5_000_000 - tx.outputs.iter().map(|o| o.value).sum::<u64>();
         assert!(fee >= core::tokenomics::min_tx_fee_sat(tx.to_wire_bytes(true).len()));
+    }
+
+    fn signer(sk: &[u8]) -> impl Fn(&[u8; 32], SighashVersion) -> Result<Vec<u8>, String> + '_ {
+        move |d, v| match v {
+            SighashVersion::V2 => crypto::sign(sk, d),
+            SighashVersion::V3 => crypto::sign_bound(sk, d),
+        }.map_err(|e| format!("{e:?}"))
+    }
+
+    /// P5-S: a 2-of-2 of one hybrid and one conservative suite-0x0003 key.
+    /// The tooling carries it through spend files, refuses to target it
+    /// below the second hardening height or to sign it under sighash v2, and
+    /// from the height builds a spend the consensus rules accept there and
+    /// reject one block below.
+    #[test]
+    fn a_policy_with_a_conservative_key_spends_from_the_second_hardening_height() {
+        let _act = core::activation::scoped_override(0);
+        let _act2 = core::activation::scoped_override_v2(10);
+        let (hpk, hsk) = crypto::generate_keypair();
+        let (cpk, csk) = crypto::generate_conservative_keypair_from_seed_secret(&[0x42; 32]).unwrap();
+        let keys = vec![hpk.clone(), cpk.clone()];
+        assert!(SpendPolicy::new(2, keys.clone(), 0, 0).is_err(), "below the height such a policy is not valid");
+        let policy = SpendPolicy::new_under(2, keys, 0, 0, crypto::SuiteRules::HARDENING2).unwrap();
+        let spend = PolicySpend::new(Network::Testnet, policy.clone(), &[([1u8; 32], 0, 5_000_000)],
+                                     vec![9u8; 20], 1_000_000, 0, 0).unwrap();
+        let mut v1 = PolicySpend::from_json(&spend.to_json().unwrap()).unwrap();
+        assert!(v1.sign_digest(&cpk, signer(&csk)).unwrap_err().contains("version-3"));
+        let mut below = spend.clone();
+        assert!(below.target_height(9).unwrap_err().contains("conservative"));
+        let mut s = spend.clone();
+        s.target_height(10).unwrap();
+        assert_eq!(s.tx.version, 3);
+        let mut s = PolicySpend::from_json(&s.to_json().unwrap()).unwrap();
+        assert_eq!(s.sign_digest(&cpk, signer(&csk)).unwrap(), 1);
+        let mut s = PolicySpend::from_json(&s.to_json().unwrap()).unwrap();
+        assert_eq!(s.sign_digest(&hpk, signer(&hsk)).unwrap(), 0);
+        let tx = PolicySpend::from_json(&s.to_json().unwrap()).unwrap().finalize().unwrap();
+        let spent = [TxOutput { value: 5_000_000, script_pubkey: policy.script_pubkey() }];
+        assert_eq!(core::sighash::verify_tx_scripts_at(&tx, &spent, ChainId::Testnet, 10, 0, 10), Ok(SighashVersion::V3));
+        assert!(core::sighash::verify_tx_scripts_at(&tx, &spent, ChainId::Testnet, 9, 0, 10).is_err());
+        assert!(tx.inputs[0].script_sig.len() <= max_witness_size(&policy));
+        let fee = 5_000_000 - tx.outputs.iter().map(|o| o.value).sum::<u64>();
+        assert!(fee >= core::tokenomics::min_tx_fee_sat(tx.to_wire_bytes(true).len()));
+    }
+
+    /// P5-S: where the second hardening is not scheduled no spend of a
+    /// policy listing a conservative key is built.
+    #[test]
+    fn a_conservative_policy_is_refused_where_hardening2_is_not_scheduled() {
+        let _act2 = core::activation::scoped_override_v2(core::activation::NEVER);
+        let (cpk, _) = crypto::generate_conservative_keypair_from_seed_secret(&[0x42; 32]).unwrap();
+        let policy = SpendPolicy::new_under(1, vec![cpk], 0, 0, crypto::SuiteRules::HARDENING2).unwrap();
+        let err = PolicySpend::new(Network::Mainnet, policy, &[([1u8; 32], 0, 5_000_000)],
+                                   vec![9u8; 20], 1_000_000, 0, 0).unwrap_err();
+        assert!(err.contains("not scheduled"), "{err}");
     }
 
     #[test]

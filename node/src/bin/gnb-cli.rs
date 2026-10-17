@@ -345,9 +345,11 @@ fn main() {
                     let pk = &kp.public_key; let sk = &kp.private_key;
                     // B2-T2: encodings are told apart by exact length, never by
                     // the first bytes (a raw key starts with random bytes).
-                    let suite = gnb::crypto::public_key_suite(pk);
+                    // P5-S: every suite, the conservative 0x0003 included.
+                    let suite = gnb::crypto::public_key_suite_under(pk, gnb::crypto::SuiteRules::HARDENING2);
                     let pk_form = match suite {
                         Some(_) if pk.len() == 3_745 => "RAW hybrid (pre-envelope)".to_string(),
+                        Some(3) => "enveloped suite 0x0003 (conservative: SLH-DSA-SHAKE-128s + Falcon-1024)".to_string(),
                         Some(s) => format!("enveloped suite 0x{s:04x}"),
                         None => "UNKNOWN encoding".to_string(),
                     };
@@ -356,13 +358,14 @@ fn main() {
                         Some(1) if sk.len() == 6_341 => "enveloped suite 0x0001",
                         Some(2) if sk.len() == 4_032 => "RAW ML-DSA-65",
                         Some(2) if sk.len() == 4_036 => "enveloped suite 0x0002",
+                        Some(3) if sk.len() == gnb::crypto::CONSERVATIVE_SECRET_KEY_LEN => "enveloped suite 0x0003",
                         _ => "does not match the public key's suite",
                     };
                     println!("address:      {}", kp.address);
                     println!("pubkey  len:  {}  ({})", pk.len(), pk_form);
                     println!("privkey len:  {}  ({})", sk.len(), sk_form);
                     println!("expected: hybrid pk=3745 raw / 3749 enveloped, sk=6337 raw / 6341 enveloped; \
-                              mldsa-only pk=1956 sk=4036");
+                              mldsa-only pk=1956 sk=4036; conservative pk=1829 sk=2373");
                 }
                 Err(e) => { eprintln!("load failed: {}", e); process::exit(1); }
             }
@@ -371,15 +374,15 @@ fn main() {
 
         // ── Wallet: generate ───────────────────────────────────────
         "newwallet" | "createwallet" => {
-            require_params(params, 1, "newwallet <output_path.json> [--random-key] [--testnet]");
+            require_params(params, 1, "newwallet <output_path.json> [--random-key] [--suite hybrid|conservative] [--testnet]");
             let random_key = params[1..].contains(&"--random-key");
-            do_new_wallet(params[0], testnet, random_key);
+            do_new_wallet(params[0], testnet, random_key, suite_flag(params));
             return;
         }
 
         "restorewallet" => {
-            require_params(params, 1, "restorewallet <output_path.json> [--testnet]");
-            do_restore_wallet(params[0], testnet);
+            require_params(params, 1, "restorewallet <output_path.json> [--suite hybrid|conservative] [--testnet]");
+            do_restore_wallet(params[0], testnet, suite_flag(params));
             return;
         }
 
@@ -866,14 +869,20 @@ fn network_of(testnet: bool) -> gnb::address::Network {
 /// WAL-7: by default the key is derived from a new 24-word recovery phrase
 /// (shown once), so the encrypted file is not its only backup; the network
 /// is the explicit `--testnet` choice and keystore v3 authenticates it.
-fn do_new_wallet(output_path: &str, testnet: bool, random_key: bool) {
-    println!("Generating hybrid ML-DSA-65 + Falcon-1024 keypair...");
+///
+/// P5-S: `--suite conservative` makes a suite-0x0003 key (SLH-DSA-SHAKE-128s
+/// + Falcon-1024), refused where the second hardening is not scheduled
+/// ([`check_suite_for_new_key`]).
+fn do_new_wallet(output_path: &str, testnet: bool, random_key: bool, suite: gnb::crypto::KeySuite) {
+    check_suite_for_new_key(suite, network_of(testnet));
+    println!("Generating {} keypair...", suite_description(suite));
     warn_if_name_suggests_other_network(output_path, testnet);
 
     let keypair = if random_key {
-        gnb::wallet::generate_keypair(testnet)
+        gnb::wallet::generate_keypair_for_suite(testnet, suite)
+            .unwrap_or_else(|e| die(&format!("key generation failed: {e}")))
     } else {
-        let (keypair, phrase) = gnb::wallet::generate_mnemonic_keypair(network_of(testnet))
+        let (keypair, phrase) = gnb::wallet::generate_mnemonic_keypair_for_suite(network_of(testnet), suite)
             .unwrap_or_else(|e| die(&format!("key generation failed: {e}")));
         println!();
         println!("RECOVERY PHRASE (24 words). Write them down offline; anyone with them controls the funds:");
@@ -902,7 +911,8 @@ fn do_new_wallet(output_path: &str, testnet: bool, random_key: bool) {
             if random_key {
                 println!("BACKUP THIS FILE. If lost, your GNB is gone forever.");
             } else {
-                println!("The recovery phrase restores this key: gnb-cli restorewallet <path>.");
+                println!("The recovery phrase restores this key: gnb-cli restorewallet <path>{}.",
+                    if suite == gnb::crypto::KeySuite::Conservative { " --suite conservative" } else { "" });
             }
         }
         Err(e) => {
@@ -912,9 +922,10 @@ fn do_new_wallet(output_path: &str, testnet: bool, random_key: bool) {
     }
 }
 
-fn do_restore_wallet(output_path: &str, testnet: bool) {
+fn do_restore_wallet(output_path: &str, testnet: bool, suite: gnb::crypto::KeySuite) {
+    check_suite_for_new_key(suite, network_of(testnet));
     let phrase = read_password("Recovery phrase (24 words): ");
-    let keypair = gnb::wallet::keypair_from_mnemonic(&phrase, network_of(testnet))
+    let keypair = gnb::wallet::keypair_from_mnemonic_for_suite(&phrase, network_of(testnet), suite)
         .unwrap_or_else(|e| die(&format!("restore failed: {e}")));
     drop(phrase);
     println!("Address: {}", keypair.address);
@@ -1050,6 +1061,47 @@ fn flag_value<'a>(params: &[&'a str], flag: &str) -> Option<&'a str> {
     params.windows(2).find(|w| w[0] == flag).map(|w| w[1])
 }
 
+/// P5-S: the key suite of `--suite hybrid|conservative` (default hybrid).
+fn suite_flag(params: &[&str]) -> gnb::crypto::KeySuite {
+    match flag_value(params, "--suite") {
+        Some(v) => gnb::crypto::KeySuite::parse(v).unwrap_or_else(|e| die(&e)),
+        None if params.last() == Some(&"--suite") => die("--suite needs a value: hybrid or conservative"),
+        None => gnb::crypto::KeySuite::Hybrid,
+    }
+}
+
+fn suite_description(suite: gnb::crypto::KeySuite) -> &'static str {
+    match suite {
+        gnb::crypto::KeySuite::Hybrid => "hybrid ML-DSA-65 + Falcon-1024",
+        gnb::crypto::KeySuite::Conservative => "conservative SLH-DSA-SHAKE-128s + Falcon-1024 (suite 0x0003)",
+    }
+}
+
+/// P5-S: the second hardening height of `network`'s chain as a signer sees
+/// it (`activation::hardening2_activation_height_for_signer`).
+fn hardening2_height_of(network: gnb::address::Network) -> u64 {
+    gnb::core::activation::hardening2_activation_height_for_signer(gnb::core::ChainId::for_network(network))
+}
+
+/// P5-S: a conservative key is refused on a chain where the second hardening
+/// is not scheduled (no block could ever accept its signature, so coins sent
+/// to it would be frozen); where it is scheduled above genesis, the height it
+/// signs from is printed. Offline commands do not know the chain's height;
+/// `send` and `policyspend`, which do, refuse to sign below it.
+fn check_suite_for_new_key(suite: gnb::crypto::KeySuite, network: gnb::address::Network) {
+    if suite != gnb::crypto::KeySuite::Conservative {
+        return;
+    }
+    let h2 = hardening2_height_of(network);
+    if h2 == gnb::core::activation::NEVER {
+        die(&gnb::crypto::KeySuite::Conservative.check_allowed_at(0, h2).unwrap_err());
+    }
+    if h2 > 0 {
+        eprintln!("note: a conservative key signs only for blocks at or above height {h2} (the second \
+                   hardening); coins it receives earlier stay locked until then");
+    }
+}
+
 fn do_policy_address(params: &[&str], stated: Option<gnb::address::Network>) {
     let m: u8 = params[0].parse().unwrap_or_else(|_| die("m must be a number"));
     let mut keys = Vec::new();
@@ -1066,8 +1118,25 @@ fn do_policy_address(params: &[&str], stated: Option<gnb::address::Network>) {
     // CRY-7: `--testnet` reaches this function as `stated` (it was tested
     // in `params`, where it never is: a testnet policy got a mainnet address).
     let network = policy_network(stated);
-    let policy = gnb::core::policy::SpendPolicy::new(m, keys, after, older)
-        .unwrap_or_else(|e| die(&format!("invalid policy: {}", e)));
+    // P5-S: conservative suite-0x0003 keys only where the second hardening
+    // is scheduled (`check_suite_for_new_key`).
+    let h2 = hardening2_height_of(network);
+    let rules = if h2 == gnb::core::activation::NEVER {
+        gnb::crypto::SuiteRules::LEGACY
+    } else {
+        gnb::crypto::SuiteRules::HARDENING2
+    };
+    let policy = gnb::core::policy::SpendPolicy::new_under(m, keys.clone(), after, older, rules)
+        .unwrap_or_else(|e| {
+            let conservative = keys.iter().any(|k| gnb::crypto::is_conservative_public_key(k));
+            if conservative && rules == gnb::crypto::SuiteRules::LEGACY {
+                check_suite_for_new_key(gnb::crypto::KeySuite::Conservative, network);
+            }
+            die(&format!("invalid policy: {}", e))
+        });
+    if policy.has_conservative_key() {
+        check_suite_for_new_key(gnb::crypto::KeySuite::Conservative, network);
+    }
     println!("address: {}", gnb::address::PolicyAddress::from_policy(&policy, network));
     println!("policy:  {}", hex::encode(policy.encode()));
     println!("{}-of-{}{}{}", policy.threshold, policy.pubkeys.len(),
@@ -1077,7 +1146,9 @@ fn do_policy_address(params: &[&str], stated: Option<gnb::address::Network>) {
 }
 
 fn do_policy_spend(params: &[&str], stated: Option<gnb::address::Network>) {
-    let policy = gnb::core::policy::SpendPolicy::decode(&hex_arg(params[0]))
+    // P5-S: read in its widest form (conservative keys included);
+    // `PolicySpend` refuses it for a chain or height where it is not valid.
+    let policy = gnb::core::policy::SpendPolicy::decode_under(&hex_arg(params[0]), gnb::crypto::SuiteRules::HARDENING2)
         .unwrap_or_else(|e| die(&format!("invalid policy: {}", e)));
     // CRY-7: the spend's network is the one stated (mainnet by default), not
     // whatever the destination's prefix says; a destination of the other
@@ -1704,10 +1775,14 @@ fn print_usage() {
     gnb-cli utxos <address>               List unspent outputs
     gnb-cli txlist <address> [count]      Transaction history
     gnb-cli validate <address>            Validate address format
-    gnb-cli newwallet <path.json> [--random-key]
+    gnb-cli newwallet <path.json> [--random-key] [--suite hybrid|conservative]
                                           New 1-key wallet from a 24-word recovery
-                                          phrase (shown once); keystore v3
-    gnb-cli restorewallet <path.json>     Restore a 1-key wallet from its phrase
+                                          phrase (shown once); keystore v3.
+                                          --suite conservative: SLH-DSA-SHAKE-128s
+                                          + Falcon-1024 (suite 0x0003), valid from
+                                          the second hardening height
+    gnb-cli restorewallet <path.json> [--suite hybrid|conservative]
+                                          Restore a 1-key wallet from its phrase
     gnb-cli send <wallet.json> <to> <amount> [--fee auto|GNB] [--max-fee GNB]
                  [--yes] [--allow-unverified-inputs]
                                           Shows the actual fee and asks before

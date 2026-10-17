@@ -13,7 +13,9 @@
 //!
 //! - `threshold`-of-`pubkeys` hybrid ML-DSA-65 ‖ Falcon-1024 keys (1 ≤ m ≤ n ≤
 //!   [`MAX_POLICY_KEYS`], keys distinct, each a hybrid key; from the second
-//!   hardening upgrade distinct by [`key_identity`], not only by bytes);
+//!   hardening upgrade distinct by [`key_identity`], not only by bytes, and
+//!   each a hybrid key OR a conservative suite-0x0003 key, P5-S:
+//!   [`SpendPolicy::decode_under`] with `crypto::SuiteRules`);
 //! - `after`: absolute timelock — spendable only by a transaction whose
 //!   `locktime ≥ after`, and a transaction is only valid in a block at height
 //!   `≥ locktime`. `0` = none;
@@ -43,6 +45,12 @@ use std::borrow::Cow;
 /// ```
 ///
 /// (Any other length is not a policy key; it is returned unchanged.)
+///
+/// A conservative suite-0x0003 key (P5-S, from the second hardening height)
+/// has ONE encoding, the enveloped `B1 0C 03 00 ‖ slh_pk ‖ falcon_pk` (1,829
+/// bytes, `crypto::public_key_suite_under`: no raw form, no other length), so
+/// its identity is itself; it never equals the identity of a hybrid key
+/// (different length and suite header).
 pub fn key_identity(key: &[u8]) -> Cow<'_, [u8]> {
     if key.len() == crate::crypto::legacy_hybrid_pubkey_len() {
         Cow::Owned(crate::crypto::wrap_envelope(crate::crypto::SUITE_MLDSA65_FALCON1024, key))
@@ -69,20 +77,41 @@ const POLICY_DOMAIN: &[u8] = b"GNB-POLICY-v1";
 
 /// Upper bound on one encoded signature (hybrid ML-DSA-65 ‖ Falcon-1024,
 /// enveloped, with Falcon's variable length): generous, rejects absurd input.
+/// The bound of every height below the second hardening upgrade.
 const MAX_SIG_LEN: usize = 8 * 1024;
+/// P5-S: the per-signature bound from the second hardening height, where a
+/// policy signature may be a conservative suite-0x0003 signature (at most
+/// `crypto::CONSERVATIVE_MAX_SIGNATURE_LEN` = 9,322 bytes): generous like
+/// [`MAX_SIG_LEN`]. The witness as a whole stays within
+/// [`MAX_POLICY_WITNESS_LEN`], the wire parser's cap, which is unchanged.
+const MAX_SIG_LEN_HARDENING2: usize = 10 * 1024;
 /// Upper bound on one encoded public key.
 const MAX_PK_LEN: usize = 8 * 1024;
 
-/// Largest witness [`PolicyWitness::decode`] can accept: tag, policy length
-/// and the largest policy (`version ‖ m ‖ n`, `MAX_POLICY_KEYS` keys, `after`,
-/// `older`), signature count, then `MAX_POLICY_KEYS` × (index, length,
-/// signature). The transaction decoder must carry any `script_sig` up to this
-/// size, or valid policy spends (a 2-of-3 is about 20 KB) cannot be relayed.
+/// The per-signature bound of `rules` ([`MAX_SIG_LEN`] below the second
+/// hardening height, [`MAX_SIG_LEN_HARDENING2`] from it).
+const fn max_sig_len(rules: SuiteRules) -> usize {
+    if rules.conservative_suite() { MAX_SIG_LEN_HARDENING2 } else { MAX_SIG_LEN }
+}
+
+/// Largest policy witness the wire parser carries (`core::MAX_SCRIPT_SIG_LEN`):
+/// tag, policy length and the largest policy (`version ‖ m ‖ n`,
+/// `MAX_POLICY_KEYS` keys of [`MAX_PK_LEN`], `after`, `older`), signature
+/// count, then `MAX_POLICY_KEYS` × (index, length, [`MAX_SIG_LEN`]-byte
+/// signature), plus a branch witness's extra fields. The transaction decoder
+/// must carry any `script_sig` up to this size, or valid policy spends (a
+/// 2-of-3 is about 20 KB) cannot be relayed. The value (114,834 bytes) is
+/// part of the wire format and does not move with the hardening-2 signature
+/// bound: the largest VALID witness of any height, a 7-of-7 conservative
+/// branch witness (about 78 kB), fits well within it
+/// (`tests::every_valid_policy_witness_fits_the_wire_cap`).
 pub const MAX_POLICY_WITNESS_LEN: usize = 1 + 4
     + (3 + MAX_POLICY_KEYS * (4 + MAX_PK_LEN) + 8)
     + 1 + MAX_POLICY_KEYS * (1 + 4 + MAX_SIG_LEN)
     // a branch witness adds n_branches, index and a 2-level Merkle path
     + 2 + 2 * 32;
+
+use crate::crypto::SuiteRules;
 
 /// The two output types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,10 +171,30 @@ impl SpendPolicy {
     /// [`key_identity`] (PF-4): such a policy names one signer twice, and
     /// from the second hardening upgrade it can no longer be spent.
     pub fn new(threshold: u8, pubkeys: Vec<Vec<u8>>, after: u32, older: u32) -> Result<Self, PolicyError> {
+        Self::new_under(threshold, pubkeys, after, older, SuiteRules::LEGACY)
+    }
+
+    /// [`Self::new`] for a policy whose spends are valid under `rules` (P5-S:
+    /// with [`SuiteRules::HARDENING2`] the keys may also be conservative
+    /// suite-0x0003 keys). Tooling passes the rules of the height its
+    /// producer targets (`crypto::KeySuite::check_allowed_at`), so no tool
+    /// creates an output whose keys cannot sign yet.
+    pub fn new_under(
+        threshold: u8,
+        pubkeys: Vec<Vec<u8>>,
+        after: u32,
+        older: u32,
+        rules: SuiteRules,
+    ) -> Result<Self, PolicyError> {
         let p = Self { threshold, pubkeys, after, older };
-        p.check()?;
+        p.check_under(rules)?;
         p.check_key_identities()?;
         Ok(p)
+    }
+
+    /// Whether any key is a conservative suite-0x0003 key (P5-S).
+    pub fn has_conservative_key(&self) -> bool {
+        self.pubkeys.iter().any(|k| crate::crypto::is_conservative_public_key(k))
     }
 
     /// PF-4: [`PolicyError::DuplicateKey`] when two keys have the same
@@ -171,10 +220,13 @@ impl SpendPolicy {
         Ok(())
     }
 
-    /// The consensus checks of a policy at every height: threshold range,
-    /// key count, hybrid keys, byte-wise distinct keys. (The identity rule,
-    /// [`Self::check_key_identities`], is height-gated and not part of it.)
-    fn check(&self) -> Result<(), PolicyError> {
+    /// The consensus checks of a policy under `rules`: threshold range, key
+    /// count, policy keys (hybrid; from the second hardening height also
+    /// conservative, `crypto::is_policy_key_under`), byte-wise distinct keys.
+    /// (The identity rule, [`Self::check_key_identities`], is height-gated
+    /// and not part of it.) Under [`SuiteRules::LEGACY`] exactly the check of
+    /// every earlier release (a non-hybrid key is `NotHybridKey`).
+    fn check_under(&self, rules: SuiteRules) -> Result<(), PolicyError> {
         let n = self.pubkeys.len();
         if n > MAX_POLICY_KEYS {
             return Err(PolicyError::TooManyKeys);
@@ -183,7 +235,7 @@ impl SpendPolicy {
             return Err(PolicyError::BadThreshold);
         }
         for (i, k) in self.pubkeys.iter().enumerate() {
-            if !crate::crypto::is_hybrid_public_key(k) {
+            if !crate::crypto::is_policy_key_under(k, rules) {
                 return Err(PolicyError::NotHybridKey(i));
             }
             if self.pubkeys[..i].contains(k) {
@@ -205,8 +257,17 @@ impl SpendPolicy {
         out
     }
 
-    /// Strict decoding of [`encode`](Self::encode); validates the policy.
+    /// Strict decoding of [`encode`](Self::encode); validates the policy
+    /// under the rules below the second hardening height
+    /// ([`Self::decode_under`] with [`SuiteRules::LEGACY`]: hybrid keys only).
     pub fn decode(bytes: &[u8]) -> Result<Self, PolicyError> {
+        Self::decode_under(bytes, SuiteRules::LEGACY)
+    }
+
+    /// Strict decoding of [`encode`](Self::encode); validates the policy
+    /// under `rules` (the consensus rules of the spending block's height,
+    /// `core::sighash::suite_rules_at`).
+    pub fn decode_under(bytes: &[u8], rules: SuiteRules) -> Result<Self, PolicyError> {
         let mut r = Reader(bytes);
         if r.u8()? != POLICY_VERSION {
             return Err(PolicyError::BadVersion);
@@ -227,7 +288,7 @@ impl SpendPolicy {
         // identity rule is applied by the spend rule from its activation
         // height, so a revealed policy below it decodes exactly as before.
         let p = Self { threshold, pubkeys, after, older };
-        p.check()?;
+        p.check_under(rules)?;
         Ok(p)
     }
 
@@ -276,13 +337,23 @@ impl PolicyWitness {
     }
 
     /// Strict decoding: valid policy, exactly `threshold` signatures,
-    /// strictly increasing in-range key indices, no trailing bytes.
+    /// strictly increasing in-range key indices, no trailing bytes; under the
+    /// rules below the second hardening height ([`Self::decode_under`] with
+    /// [`SuiteRules::LEGACY`]).
     pub fn decode(bytes: &[u8]) -> Result<Self, PolicyError> {
+        Self::decode_under(bytes, SuiteRules::LEGACY)
+    }
+
+    /// [`Self::decode`] under `rules`: the policy's keys are checked with
+    /// [`SpendPolicy::decode_under`] and each signature may be up to the
+    /// rules' bound (8 KiB, from the second hardening height 10 KiB for the
+    /// conservative suite's 9,322-byte signatures).
+    pub fn decode_under(bytes: &[u8], rules: SuiteRules) -> Result<Self, PolicyError> {
         let mut r = Reader(bytes);
         if r.u8()? != POLICY_TAG {
             return Err(PolicyError::BadTag);
         }
-        let policy = SpendPolicy::decode(r.bytes(MAX_POLICY_KEYS * (MAX_PK_LEN + 4) + 16)?)?;
+        let policy = SpendPolicy::decode_under(r.bytes(MAX_POLICY_KEYS * (MAX_PK_LEN + 4) + 16)?, rules)?;
         let count = r.u8()? as usize;
         if count != policy.threshold as usize {
             return Err(PolicyError::WrongSignatureCount { got: count, want: policy.threshold as usize });
@@ -295,7 +366,7 @@ impl PolicyWitness {
                 return Err(PolicyError::KeyIndexOrder);
             }
             prev = Some(idx);
-            signatures.push((idx, r.bytes(MAX_SIG_LEN)?.to_vec()));
+            signatures.push((idx, r.bytes(max_sig_len(rules))?.to_vec()));
         }
         r.end()?;
         Ok(Self { policy, signatures })
@@ -428,6 +499,12 @@ impl PolicyTree {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, PolicyError> {
+        Self::decode_under(bytes, SuiteRules::LEGACY)
+    }
+
+    /// [`Self::decode`] with every branch decoded under `rules`
+    /// ([`SpendPolicy::decode_under`]).
+    pub fn decode_under(bytes: &[u8], rules: SuiteRules) -> Result<Self, PolicyError> {
         let mut r = Reader(bytes);
         if r.u8()? != TREE_VERSION {
             return Err(PolicyError::BadVersion);
@@ -438,7 +515,7 @@ impl PolicyTree {
         }
         let mut branches = Vec::with_capacity(n);
         for _ in 0..n {
-            branches.push(SpendPolicy::decode(r.bytes(MAX_POLICY_KEYS * (MAX_PK_LEN + 4) + 16)?)?);
+            branches.push(SpendPolicy::decode_under(r.bytes(MAX_POLICY_KEYS * (MAX_PK_LEN + 4) + 16)?, rules)?);
         }
         r.end()?;
         Self::new(branches)
@@ -483,6 +560,12 @@ impl BranchWitness {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, PolicyError> {
+        Self::decode_under(bytes, SuiteRules::LEGACY)
+    }
+
+    /// [`Self::decode`] under `rules` (the branch's keys, the signature
+    /// bound; see [`PolicyWitness::decode_under`]).
+    pub fn decode_under(bytes: &[u8], rules: SuiteRules) -> Result<Self, PolicyError> {
         let mut r = Reader(bytes);
         if r.u8()? != BRANCH_WITNESS_TAG {
             return Err(PolicyError::BadTag);
@@ -499,7 +582,7 @@ impl BranchWitness {
         for _ in 0..tree_depth(n_branches as usize) {
             path.push(r.take(32)?.try_into().expect("32 bytes"));
         }
-        let branch = SpendPolicy::decode(r.bytes(MAX_POLICY_KEYS * (MAX_PK_LEN + 4) + 16)?)?;
+        let branch = SpendPolicy::decode_under(r.bytes(MAX_POLICY_KEYS * (MAX_PK_LEN + 4) + 16)?, rules)?;
         let count = r.u8()? as usize;
         if count != branch.threshold as usize {
             return Err(PolicyError::WrongSignatureCount { got: count, want: branch.threshold as usize });
@@ -512,7 +595,7 @@ impl BranchWitness {
                 return Err(PolicyError::KeyIndexOrder);
             }
             prev = Some(idx);
-            signatures.push((idx, r.bytes(MAX_SIG_LEN)?.to_vec()));
+            signatures.push((idx, r.bytes(max_sig_len(rules))?.to_vec()));
         }
         r.end()?;
         Ok(Self { n_branches, index, path, branch, signatures })
@@ -527,10 +610,18 @@ pub enum AnyPolicyWitness {
 }
 
 impl AnyPolicyWitness {
+    /// Decode under the rules below the second hardening height
+    /// ([`Self::decode_under`] with [`SuiteRules::LEGACY`]).
     pub fn decode(bytes: &[u8]) -> Result<Self, PolicyError> {
+        Self::decode_under(bytes, SuiteRules::LEGACY)
+    }
+
+    /// Decode under `rules` (P5-S: the consensus callers pass the rules of
+    /// the spending block's height, `core::sighash::suite_rules_at`).
+    pub fn decode_under(bytes: &[u8], rules: SuiteRules) -> Result<Self, PolicyError> {
         match bytes.first() {
-            Some(&POLICY_TAG) => PolicyWitness::decode(bytes).map(AnyPolicyWitness::Single),
-            Some(&BRANCH_WITNESS_TAG) => BranchWitness::decode(bytes).map(AnyPolicyWitness::Branch),
+            Some(&POLICY_TAG) => PolicyWitness::decode_under(bytes, rules).map(AnyPolicyWitness::Single),
+            Some(&BRANCH_WITNESS_TAG) => BranchWitness::decode_under(bytes, rules).map(AnyPolicyWitness::Branch),
             _ => Err(PolicyError::BadTag),
         }
     }
@@ -747,5 +838,90 @@ mod tests {
         bad[1] = 9;
         assert_eq!(BranchWitness::decode(&bad), Err(PolicyError::BadBranchCount));
         assert_eq!(AnyPolicyWitness::decode(&[0x07]), Err(PolicyError::BadTag));
+    }
+
+    // ── P5-S: conservative suite-0x0003 keys ────────────────────────────────
+
+    fn conservative_key(seed: u8) -> Vec<u8> {
+        crate::crypto::generate_conservative_keypair_from_seed_secret(&[seed; 32]).unwrap().0
+    }
+
+    /// The wire parser's cap (`MAX_POLICY_WITNESS_LEN`, part of the wire
+    /// format) is unchanged by the hardening-2 signature bound, and the
+    /// largest VALID witness of any height fits in it: a 7-of-7 branch witness
+    /// over conservative keys with maximal (9,322-byte) signatures, and over
+    /// hybrid keys with maximal signatures.
+    #[test]
+    fn every_valid_policy_witness_fits_the_wire_cap() {
+        assert_eq!(MAX_POLICY_WITNESS_LEN, 114_834, "the wire cap is part of the wire format");
+        assert_eq!(crate::core::MAX_SCRIPT_SIG_LEN, MAX_POLICY_WITNESS_LEN);
+        let worst = |key_len: usize, sig_len: usize| {
+            let policy = 3 + MAX_POLICY_KEYS * (4 + key_len) + 8;
+            1 + 4 + policy + 1 + MAX_POLICY_KEYS * (1 + 4 + sig_len) + 2 + 2 * 32
+        };
+        let conservative = worst(crate::crypto::CONSERVATIVE_PUBLIC_KEY_LEN, crate::crypto::CONSERVATIVE_MAX_SIGNATURE_LEN);
+        let hybrid = worst(crate::crypto::HYBRID_PUBLIC_KEY_LEN, crate::crypto::max_signature_len());
+        assert!(conservative <= MAX_POLICY_WITNESS_LEN, "{conservative}");
+        assert!(hybrid <= MAX_POLICY_WITNESS_LEN, "{hybrid}");
+        assert!(crate::crypto::CONSERVATIVE_MAX_SIGNATURE_LEN <= MAX_SIG_LEN_HARDENING2);
+        assert!(crate::crypto::max_signature_len() <= MAX_SIG_LEN);
+    }
+
+    /// Below the second hardening height (`SuiteRules::LEGACY`, also
+    /// `decode`) a conservative key is not a policy key (`NotHybridKey`,
+    /// the old verdict) and a signature over 8 KiB is `TooLarge`; from it
+    /// both decode. Tooling (`new` / `new_under`) follows the same rules.
+    #[test]
+    fn conservative_keys_and_signatures_decode_from_hardening2_only() {
+        let (c, h) = (conservative_key(0x71), keys(1).remove(0));
+        let p = SpendPolicy { threshold: 1, pubkeys: vec![h.clone(), c.clone()], after: 0, older: 0 };
+        assert_eq!(SpendPolicy::decode(&p.encode()), Err(PolicyError::NotHybridKey(1)));
+        assert_eq!(SpendPolicy::decode_under(&p.encode(), SuiteRules::LEGACY), Err(PolicyError::NotHybridKey(1)));
+        assert_eq!(SpendPolicy::decode_under(&p.encode(), SuiteRules::HARDENING2), Ok(p.clone()));
+        assert_eq!(SpendPolicy::new(1, p.pubkeys.clone(), 0, 0), Err(PolicyError::NotHybridKey(1)));
+        assert_eq!(SpendPolicy::new_under(1, p.pubkeys.clone(), 0, 0, SuiteRules::HARDENING2), Ok(p.clone()));
+        assert!(p.has_conservative_key());
+        // A 9,322-byte signature: TooLarge below, decodes from hardening 2
+        // (whether it verifies is the signature rule's business).
+        let w = PolicyWitness { policy: p.clone(), signatures: vec![(1, vec![0x5A; 9_322])] }.encode();
+        assert_eq!(PolicyWitness::decode_under(&w, SuiteRules::LEGACY), Err(PolicyError::NotHybridKey(1)));
+        assert!(AnyPolicyWitness::decode_under(&w, SuiteRules::HARDENING2).is_ok());
+        let hp = SpendPolicy::new(1, vec![h.clone()], 0, 0).unwrap();
+        let big = PolicyWitness { policy: hp.clone(), signatures: vec![(0, vec![0x5A; 9_322])] }.encode();
+        assert_eq!(PolicyWitness::decode(&big), Err(PolicyError::TooLarge));
+        assert!(PolicyWitness::decode_under(&big, SuiteRules::HARDENING2).is_ok());
+        let huge = PolicyWitness { policy: hp, signatures: vec![(0, vec![0x5A; 10 * 1024 + 1])] }.encode();
+        assert_eq!(PolicyWitness::decode_under(&huge, SuiteRules::HARDENING2), Err(PolicyError::TooLarge));
+        // Trees: a branch with a conservative key decodes from hardening 2.
+        let t = PolicyTree::new(vec![p.clone(), SpendPolicy::new(1, vec![h.clone()], 0, 0).unwrap()]).unwrap();
+        assert_eq!(PolicyTree::decode(&t.encode()), Err(PolicyError::NotHybridKey(1)));
+        assert_eq!(PolicyTree::decode_under(&t.encode(), SuiteRules::HARDENING2), Ok(t.clone()));
+        let bw = BranchWitness { n_branches: 2, index: 0, path: t.path(0), branch: p, signatures: vec![(0, vec![1])] };
+        assert_eq!(BranchWitness::decode(&bw.encode()), Err(PolicyError::NotHybridKey(1)));
+        assert_eq!(BranchWitness::decode_under(&bw.encode(), SuiteRules::HARDENING2), Ok(bw.clone()));
+        assert_eq!(bw.script_pubkey(), t.script_pubkey());
+    }
+
+    /// PF-4 covers the new keys: a conservative key is its own identity (one
+    /// encoding), it is distinct from every hybrid identity, and listing it
+    /// twice is a duplicate (byte-wise already).
+    #[test]
+    fn key_identity_of_conservative_keys() {
+        let c = conservative_key(0x72);
+        assert_eq!(c.len(), crate::crypto::CONSERVATIVE_PUBLIC_KEY_LEN);
+        assert!(matches!(key_identity(&c), Cow::Borrowed(k) if k == c.as_slice()));
+        let h = keys(1).remove(0);
+        assert_ne!(key_identity(&c), key_identity(&h));
+        assert_ne!(key_identity(&c), key_identity(&h[4..]));
+        let twice = SpendPolicy { threshold: 1, pubkeys: vec![c.clone(), c.clone()], after: 0, older: 0 };
+        assert_eq!(SpendPolicy::decode_under(&twice.encode(), SuiteRules::HARDENING2), Err(PolicyError::DuplicateKey));
+        assert_eq!(SpendPolicy::new_under(1, twice.pubkeys.clone(), 0, 0, SuiteRules::HARDENING2), Err(PolicyError::DuplicateKey));
+        let pair = SpendPolicy::new_under(2, vec![c.clone(), conservative_key(0x73), h], 0, 0, SuiteRules::HARDENING2).unwrap();
+        assert_eq!(pair.check_key_identities(), Ok(()));
+        // The raw (unenveloped) body of a conservative key is no key at all.
+        assert_eq!(
+            SpendPolicy::new_under(1, vec![c[4..].to_vec()], 0, 0, SuiteRules::HARDENING2),
+            Err(PolicyError::NotHybridKey(0))
+        );
     }
 }
