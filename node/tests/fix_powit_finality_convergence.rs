@@ -605,3 +605,49 @@ fn with_no_finality_of_its_own_conflicting_checkpoints_resolve_by_work() {
     assert_eq!(pin_of(&n), Some(h[15].block_hash()), "and the pin advances with H, not stuck at genesis");
     assert_eq!(applied_tip(&n), Some(tip(&h)));
 }
+
+// ── Review MEDIUM 6: a weak-subjectivity checkpoint set before syncing ──────
+
+/// Review MEDIUM 6: `setfinalitycheckpoint` required the block to be stored
+/// (and there was no start-up option), so an operator could not set a
+/// weak-subjectivity checkpoint before syncing, which is when it protects:
+/// a node eclipsed on a fork F during sync reaches F's finality and keeps
+/// it (review HIGH 1). Set before sync, by hash and DAG height, the anchor
+/// is unknown until it arrives: nothing above its height counts, nothing at
+/// or below it is decided, so F's finality never pins the node, and the
+/// honest chain's finality through the anchor does once it arrives.
+#[test]
+fn an_operator_checkpoint_set_before_sync_keeps_an_eclipsed_node_off_the_fork() {
+    setup();
+    let genesis = mk_genesis(unix_now() - 100_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let fork = b.chain(gh, 12, "f");
+    let honest = b.chain(gh, 40, "h");
+    let mut n = node_with(&genesis, &[]);
+    finalize(&n, &b, &fork, 3, 6);
+    finalize(&n, &b, &honest, 15, 25);
+    let anchor = honest[9].block_hash();
+    let r = gnb::accept::override_finality(FinalityOp::SetAnchorAt(anchor, 10), &n.dag, &n.store, &n.mempool,
+        &n.node_state, Some(&n.tip_tx), &n.shielded);
+    assert!(r.is_ok(), "an unknown block is accepted with its height: {:?}", r.err());
+    let info = gnb::powit::finality_info_json(&n.dag.read(), 8);
+    assert_eq!((info["anchor_source"].as_str(), info["anchor_status"].as_str()), (Some("operator"), Some("unknown")));
+    restart(&mut n);
+    assert_eq!(gnb::powit::finality_info_json(&n.dag.read(), 8)["anchor_status"], serde_json::json!("unknown"));
+
+    deliver(&n, &fork);
+    assert_eq!(pin_of(&n), None, "F's finality is undecided while the anchor is unknown");
+    assert_eq!(applied_tip(&n), Some(tip(&fork)), "the only chain the eclipsed node knows");
+    deliver(&n, &honest);
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(honest[15].block_hash()), Some(tip(&honest))));
+    let info = gnb::powit::finality_info_json(&n.dag.read(), 8);
+    assert_eq!((info["anchor_status"].as_str(), info["against_anchor"].as_u64()), (Some("known"), Some(1)), "{info}");
+    assert!(info["conflict"].is_null(), "F's finality is against the anchor, not a conflict: {info}");
+
+    // A known block at another height is refused; an unknown one is not
+    // checked until it arrives (then `height_mismatch` is reported).
+    let e = gnb::accept::override_finality(FinalityOp::SetAnchorAt(anchor, 11), &n.dag, &n.store, &n.mempool,
+        &n.node_state, Some(&n.tip_tx), &n.shielded).expect_err("wrong height");
+    assert!(e.to_string().contains("DAG height 10"), "{e}");
+}

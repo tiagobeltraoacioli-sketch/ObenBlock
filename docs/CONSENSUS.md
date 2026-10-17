@@ -731,10 +731,13 @@ it has reached because a conflicting finality appeared:
   agrees with the weak-subjectivity anchor: the release finality checkpoint
   (`powit::MAINNET_FINALITY_CHECKPOINT`, printed by
   `tools/release/min_chain_work.py` with the minimum chain work; none yet on
-  mainnet) or the operator's (`setfinalitycheckpoint`). A candidate at or
-  below the anchor never counts, one above it only if the anchor is on its
-  selected chain, and once the node holds the anchor block no chain that
-  forks below it is selectable;
+  mainnet; `--finalitycheckpoint HASH:HEIGHT` replaces it for a run) or the
+  operator's (`setfinalitycheckpoint`). A candidate at or below the anchor
+  never counts, one above it only if the anchor is on its selected chain,
+  and once the node holds the anchor block no chain that forks below it is
+  selectable. An anchor given by hash and DAG height may be a block the node
+  does not hold yet (set before syncing): until it arrives no candidate
+  above its height counts and none at or below it is decided;
 - the node's own finality is the highest counted candidate on its applied
   chain, or the counted candidate it pinned last (persisted) when that one
   descends from it (pinned before the chain move to it was done: a move
@@ -852,10 +855,11 @@ given block): no finalized checkpoint at or above it on its selected chain
 counts any more, so the node's own finality falls back to the highest
 remaining one, which a checkpoint that conflicted with the one set aside may
 now advance, and the most work decides above the pin; `reconsiderfinalized
-<hash>` takes such a setting back; `setfinalitycheckpoint <hash>|none|default`
+<hash>` takes such a setting back; `setfinalitycheckpoint <hash> [height]|none|default`
 sets the operator's weak-subjectivity anchor (every candidate that conflicts
-with it stops counting, the node's own finality included), removes every
-anchor, or goes back to the release one. `getfinalityinfo` reports the pin,
+with it stops counting, the node's own finality included; with the block's
+DAG height, also for a block the node does not hold yet), removes every
+anchor, or goes back to the release one (or `--finalitycheckpoint`'s). `getfinalityinfo` reports the pin,
 its origin (`anchor` or `finalized`), the node's own finality, the anchor,
 the candidates and the conflict alert.
 

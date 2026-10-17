@@ -152,6 +152,9 @@ pub enum ChainAdminOp {
     ReconsiderFinalized,
     /// `setfinalitycheckpoint <hash>`: the operator's weak-subjectivity anchor.
     SetFinalityCheckpoint,
+    /// `setfinalitycheckpoint <hash> <height>`: the same by hash and DAG
+    /// height, for a block the node may not hold yet (review MEDIUM 6).
+    SetFinalityCheckpointAt(u64),
     /// `setfinalitycheckpoint none` (the hash is ignored).
     DisableFinalityCheckpoint,
     /// `setfinalitycheckpoint default`: back to the release checkpoint.
@@ -1258,9 +1261,20 @@ async fn handle_rpc(
 /// `invalidateblock` / `reconsiderblock` / `ignorefinalized` /
 /// `reconsiderfinalized` / `setfinalitycheckpoint`: params `[block_hash_hex]`
 /// (`ignorefinalized` without one: the current finality pin;
-/// `setfinalitycheckpoint` also takes `none` or `default`).
+/// `setfinalitycheckpoint` also takes `none` or `default`, or a second
+/// parameter, the block's DAG height, for a block the node may not hold
+/// yet: a weak-subjectivity checkpoint set before syncing).
 fn chain_admin_call(op: ChainAdminOp, params: Option<&Value>, state: &AppState) -> Value {
     let hex_str = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
+    let op = match (op, params.and_then(|p| p.get(1))) {
+        (ChainAdminOp::SetFinalityCheckpoint, Some(h)) => {
+            match h.as_u64().or_else(|| h.as_str().and_then(|s| s.trim().parse::<u64>().ok())) {
+                Some(height) => ChainAdminOp::SetFinalityCheckpointAt(height),
+                None => return json!({ "error": "the second parameter is the block's DAG height (a number)" }),
+            }
+        }
+        (op, _) => op,
+    };
     let (op, hex_str) = match (op, hex_str) {
         (ChainAdminOp::SetFinalityCheckpoint, "none") => (ChainAdminOp::DisableFinalityCheckpoint, None),
         (ChainAdminOp::SetFinalityCheckpoint, "default") => (ChainAdminOp::DefaultFinalityCheckpoint, None),
@@ -3592,7 +3606,9 @@ mod audit_2026_10_rpc_tests {
     /// PoWit audit findings 2 and 3: the finality settings reach the
     /// chain-admin hook with the right operation (`ignorefinalized` without a
     /// hash takes the current pin; `setfinalitycheckpoint` takes `none` and
-    /// `default`), are admin methods, and `getfinalityinfo` reports the pin.
+    /// `default`, and a DAG height for a block the node may not hold yet,
+    /// review MEDIUM 6), are admin methods, and `getfinalityinfo` reports the
+    /// pin.
     #[tokio::test]
     async fn finality_admin_methods_reach_the_hook() {
         let (_tmp, mut state) = state_with_chain(3);
@@ -3614,6 +3630,8 @@ mod audit_2026_10_rpc_tests {
             ("ignorefinalized", json!([hex::encode([5u8; 32])])),
             ("reconsiderfinalized", json!([hex::encode([5u8; 32])])),
             ("setfinalitycheckpoint", json!([hex::encode([6u8; 32])])),
+            ("setfinalitycheckpoint", json!([hex::encode([7u8; 32]), 20])),
+            ("setfinalitycheckpoint", json!([hex::encode([7u8; 32]), "21"])),
             ("setfinalitycheckpoint", json!(["none"])),
             ("setfinalitycheckpoint", json!(["default"])),
         ] {
@@ -3622,11 +3640,15 @@ mod audit_2026_10_rpc_tests {
         }
         let r = dispatch("setfinalitycheckpoint", Some(&json!(["zz"])), &state).await;
         assert!(r["error"].as_str().unwrap().contains("block hash"), "{r}");
+        let r = dispatch("setfinalitycheckpoint", Some(&json!([hex::encode([7u8; 32]), "x"])), &state).await;
+        assert!(r["error"].as_str().unwrap().contains("DAG height"), "{r}");
         assert_eq!(*calls.lock(), vec![
             (ChainAdminOp::IgnoreFinalized, pinned),
             (ChainAdminOp::IgnoreFinalized, [5u8; 32]),
             (ChainAdminOp::ReconsiderFinalized, [5u8; 32]),
             (ChainAdminOp::SetFinalityCheckpoint, [6u8; 32]),
+            (ChainAdminOp::SetFinalityCheckpointAt(20), [7u8; 32]),
+            (ChainAdminOp::SetFinalityCheckpointAt(21), [7u8; 32]),
             (ChainAdminOp::DisableFinalityCheckpoint, [0u8; 32]),
             (ChainAdminOp::DefaultFinalityCheckpoint, [0u8; 32]),
         ]);

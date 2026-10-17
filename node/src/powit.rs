@@ -1259,6 +1259,38 @@ pub const MAINNET_FINALITY_CHECKPOINT: Option<ReleaseCheckpoint> = None;
 pub const TESTNET_FINALITY_CHECKPOINT: Option<ReleaseCheckpoint> = None;
 
 static RELEASE_FINALITY_CHECKPOINT: std::sync::OnceLock<Option<ReleaseCheckpoint>> = std::sync::OnceLock::new();
+/// Whether the release finality checkpoint in force comes from
+/// `--finalitycheckpoint` ([`set_finality_checkpoint_flag`]).
+static FINALITY_CHECKPOINT_FROM_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Parse `--finalitycheckpoint` (review MEDIUM 6): `HASH:HEIGHT` (the block
+/// id in 64 hex digits, as the RPC prints it, and its DAG height), or `none`
+/// (no release checkpoint).
+pub fn parse_finality_checkpoint(s: &str) -> Result<Option<ReleaseCheckpoint>, String> {
+    let s = s.trim();
+    if s.eq_ignore_ascii_case("none") {
+        return Ok(None);
+    }
+    let (hash, height) = s.split_once(':')
+        .ok_or("expected HASH:HEIGHT (the block id in 64 hex digits and its DAG height) or none")?;
+    let hash = hex::decode(hash.trim_start_matches("0x")).ok()
+        .and_then(|b| <Hash>::try_from(b.as_slice()).ok())
+        .ok_or("the block id must be 64 hex digits")?;
+    let height = height.parse::<u64>().map_err(|_| "the DAG height must be a decimal number")?;
+    Ok(Some(ReleaseCheckpoint { height, hash }))
+}
+
+/// `--finalitycheckpoint`: replace the release finality checkpoint of the
+/// node's network for this process, before anything reads it (start-up).
+/// The block need not be held yet: that is the point of a weak-subjectivity
+/// checkpoint given before syncing. An operator setting persisted by
+/// `setfinalitycheckpoint` still takes precedence; `setfinalitycheckpoint
+/// default` returns to this one.
+pub fn set_finality_checkpoint_flag(cp: Option<ReleaseCheckpoint>) -> Result<(), String> {
+    set_release_finality_checkpoint(cp).map_err(|_| "the release finality checkpoint was already set".to_string())?;
+    FINALITY_CHECKPOINT_FROM_FLAG.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok(())
+}
 
 /// Set the process-wide release finality checkpoint once (tests, tools);
 /// later calls are refused. Nodes use the constant of their network.
@@ -1511,9 +1543,17 @@ pub enum FinalityOp {
     Ignore(Hash),
     /// Undo [`FinalityOp::Ignore`] for this block.
     Reconsider(Hash),
-    /// Trust this block as final (an operator weak-subjectivity checkpoint):
-    /// it replaces the release checkpoint as the anchor.
+    /// Trust this block, which the node holds, as final (an operator
+    /// weak-subjectivity checkpoint): it replaces the release checkpoint as
+    /// the anchor.
     SetAnchor(Hash),
+    /// [`FinalityOp::SetAnchor`] by hash and DAG height, whether or not the
+    /// node holds the block yet (review MEDIUM 6): a weak-subjectivity
+    /// checkpoint set before syncing, which is when it protects. Until the
+    /// block arrives nothing above its height counts and nothing at or below
+    /// it is decided (`AnchorStatus::Unknown`); a held block must be at that
+    /// height.
+    SetAnchorAt(Hash, u64),
     /// No anchor at all, not even the release checkpoint.
     DisableAnchor,
     /// Back to the release checkpoint.
@@ -1538,14 +1578,27 @@ pub fn apply_finality_op(op: FinalityOp, dag: &parking_lot::RwLock<GhostDAG>, st
                 dag.write().finality_index_mut().ignored.remove(&h);
             }
         }
-        FinalityOp::SetAnchor(h) => {
+        FinalityOp::SetAnchor(h) | FinalityOp::SetAnchorAt(h, _) => {
             let height = {
                 let d = dag.read();
-                let data = d.get_block_data(&h).ok_or_else(|| format!("block {} not found", hex::encode(h)))?;
-                if d.is_invalid(&h) {
-                    return Err(format!("block {} is disqualified on this node", hex::encode(h)));
+                match (d.get_block_data(&h), op) {
+                    (None, FinalityOp::SetAnchorAt(_, height)) => height,
+                    (None, _) => return Err(format!(
+                        "block {} not found; to set a checkpoint before the node holds it, give its DAG height \
+                         too (setfinalitycheckpoint <hash> <height>)", hex::encode(h))),
+                    (Some(data), op) => {
+                        if d.is_invalid_persistently(&h) {
+                            return Err(format!("block {} is disqualified on this node", hex::encode(h)));
+                        }
+                        if let FinalityOp::SetAnchorAt(_, height) = op {
+                            if height != data.height {
+                                return Err(format!("block {} is at DAG height {}, not {height}",
+                                    hex::encode(h), data.height));
+                            }
+                        }
+                        data.height
+                    }
                 }
-                data.height
             };
             let mut v = h.to_vec();
             v.extend_from_slice(&height.to_le_bytes());
@@ -1578,6 +1631,8 @@ pub fn finality_info_json(dag: &GhostDAG, max: usize) -> serde_json::Value {
         "own_finality": o.own.map(|(h, height)| block(&h, height)),
         "anchor": anchor.map(|a| block(&a.hash, a.height)),
         "anchor_source": match idx.anchor_setting {
+            AnchorSetting::Release if FINALITY_CHECKPOINT_FROM_FLAG.load(std::sync::atomic::Ordering::Relaxed) =>
+                if anchor.is_some() { "flag" } else { "none" },
             AnchorSetting::Release => if anchor.is_some() { "release" } else { "none" },
             AnchorSetting::Disabled => "disabled",
             AnchorSetting::Operator(_) => "operator",
@@ -1721,6 +1776,20 @@ mod tests {
         assert_eq!(s.of(&k1).count(), SEEN_LINKS_PER_KEY - 1, "the globally oldest link went");
         assert_eq!(s.of(&a.key_id()).count(), 1, "the newest is kept");
         assert_eq!(s.by_key.values().map(|v| v.len()).sum::<usize>(), SEEN_LINKS_CAP);
+    }
+
+    /// Review MEDIUM 6: `--finalitycheckpoint HASH:HEIGHT` (or `none`).
+    #[test]
+    fn the_finality_checkpoint_flag_parses_hash_and_height() {
+        let h = hex::encode([0xAB; 32]);
+        assert_eq!(parse_finality_checkpoint(&format!("{h}:20")),
+            Ok(Some(ReleaseCheckpoint { height: 20, hash: [0xAB; 32] })));
+        assert_eq!(parse_finality_checkpoint(&format!(" 0x{h}:7 ")),
+            Ok(Some(ReleaseCheckpoint { height: 7, hash: [0xAB; 32] })));
+        assert_eq!(parse_finality_checkpoint("NONE"), Ok(None));
+        for bad in [h.clone(), format!("{h}:"), format!("{h}:-1"), format!("{}:5", &h[..62]), "zz:5".into(), String::new()] {
+            assert!(parse_finality_checkpoint(&bad).is_err(), "{bad:?}");
+        }
     }
 
     /// The links that make an equivocation: a double vote or a surround vote

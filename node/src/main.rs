@@ -235,6 +235,17 @@ struct Cli {
     /// (`assumevalid::MAINNET_ASSUME_VALID`, none until a release sets it);
     /// `0` checks every signature. Non-consensus — node-local (docs/RUNNING.md).
     #[arg(long = "assumevalid")]                         assume_valid: Option<String>,
+    /// PoWit finality checkpoint (weak subjectivity, review MEDIUM 6):
+    /// `HASH:HEIGHT`, a block of the real chain (its id in 64 hex digits and
+    /// its DAG height, as `getblockdag` prints them, read from nodes you
+    /// trust) that this node treats as final from the start, before it holds
+    /// the block: a finalized checkpoint that conflicts with it never pins
+    /// fork choice, and once the block arrives no chain forking below it is
+    /// selectable. Replaces the release finality checkpoint for this run
+    /// (`powit::MAINNET_FINALITY_CHECKPOINT`); `none` removes it. An
+    /// operator setting made with `setfinalitycheckpoint` takes precedence.
+    /// Non-consensus, node-local (docs/RUNNING.md).
+    #[arg(long = "finalitycheckpoint")]                  finality_checkpoint: Option<String>,
 
 }
 
@@ -480,6 +491,26 @@ async fn main() {
         };
         let _ = assumevalid::set_assume_valid(av.block);
         info!("{}", av.describe());
+        // Review MEDIUM 6: the weak-subjectivity finality checkpoint, before
+        // the finality index is loaded (the block need not be held yet).
+        if let Some(arg) = cli.finality_checkpoint.as_deref() {
+            let cp = match powit::parse_finality_checkpoint(arg) {
+                Ok(cp) => cp,
+                Err(e) => {
+                    eprintln!("❌ --finalitycheckpoint: {e}");
+                    std::process::exit(2);
+                }
+            };
+            if let Err(e) = powit::set_finality_checkpoint_flag(cp) {
+                eprintln!("❌ --finalitycheckpoint: {e}");
+                std::process::exit(2);
+            }
+            match cp {
+                Some(c) => info!("PoWit finality checkpoint (--finalitycheckpoint): {} at DAG height {}",
+                    hex::encode(c.hash), c.height),
+                None => warn!("⚠ --finalitycheckpoint none: no release finality checkpoint"),
+            }
+        }
     }
 
     // FIX v0.5.1 BLK-3: apply --rpc-public escape hatch.
@@ -2834,6 +2865,7 @@ fn make_chain_admin_cb(
             rpc::ChainAdminOp::IgnoreFinalized => Some(powit::FinalityOp::Ignore(hash)),
             rpc::ChainAdminOp::ReconsiderFinalized => Some(powit::FinalityOp::Reconsider(hash)),
             rpc::ChainAdminOp::SetFinalityCheckpoint => Some(powit::FinalityOp::SetAnchor(hash)),
+            rpc::ChainAdminOp::SetFinalityCheckpointAt(height) => Some(powit::FinalityOp::SetAnchorAt(hash, height)),
             rpc::ChainAdminOp::DisableFinalityCheckpoint => Some(powit::FinalityOp::DisableAnchor),
             rpc::ChainAdminOp::DefaultFinalityCheckpoint => Some(powit::FinalityOp::DefaultAnchor),
         };
