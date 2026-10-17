@@ -537,6 +537,7 @@ dependencies = [
  "bip39",
  "chrono",
  "coherence-core",
+ "gnb-secret",
  "gnb-smh",
  "hex",
  "hmac",
@@ -553,6 +554,17 @@ dependencies = [
  "sha2",
  "sha3",
  "thiserror",
+ "zeroize",
+]
+
+[[package]]
+name = "gnb-secret"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+ "pqcrypto-falcon",
+ "pqcrypto-mldsa",
  "zeroize",
 ]
 

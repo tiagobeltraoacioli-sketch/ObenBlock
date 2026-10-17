@@ -1536,6 +1536,7 @@ dependencies = [
  "env_logger",
  "futures",
  "gnb-crypto",
+ "gnb-secret",
  "gnb-smh",
  "governor",
  "hex",
@@ -1594,6 +1595,7 @@ dependencies = [
  "clap",
  "coherence-core",
  "flate2",
+ "gnb-secret",
  "gnb-smh",
  "hex",
  "hmac 0.12.1",
@@ -1617,6 +1619,20 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "webpki-roots",
+ "zeroize",
+]
+
+[[package]]
+name = "gnb-secret"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+ "pqcrypto-falcon",
+ "pqcrypto-internals",
+ "pqcrypto-mldsa",
+ "pqcrypto-mlkem",
+ "pqcrypto-traits",
  "zeroize",
 ]
 

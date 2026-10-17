@@ -67,7 +67,9 @@
 //! witnesses below the activation or for a version other than 3, suite
 //! 0x0002, zero-value outputs, size) and every rule whose verdict depends on
 //! the next block's height (the version rule, the 64-byte rule, coinbase
-//! maturity) are policy refusals ([`AdmissionError::NonStandard`] /
+//! maturity, and the PF-4 key-identity rule of the second hardening upgrade
+//! when it is the only rule a transaction fails: `classify_chain_rule_failure`)
+//! are policy refusals ([`AdmissionError::NonStandard`] /
 //! [`AdmissionError::Immature`]): a peer one block behind across the
 //! activation relays such a transaction honestly. A non-canonical witness on
 //! a version-3 transaction for a block at/after the activation is
@@ -154,8 +156,9 @@ pub enum AdmissionError {
     /// outputs, a zero-value output, a non-canonical witness where it is not
     /// a consensus rule, a single-algorithm suite, the version policy) or by
     /// a rule whose verdict depends on this node's next block height (the
-    /// version rule, the 64-byte rule: [`check_tx_for_next_block`]). The
-    /// relay reports `Ignore`.
+    /// version rule, the 64-byte rule: [`check_tx_for_next_block`]; the
+    /// PF-4 key-identity rule of the second hardening upgrade when every
+    /// other chain rule passes). The relay reports `Ignore`.
     NonStandard(String),
     /// An input is neither in the UTXO set nor an output of a pooled
     /// transaction (unknown parent, or already spent by a confirmed
@@ -466,9 +469,11 @@ pub fn verify_input_scripts_gated_with_wtxid_at(
     let witnesses = core::sighash::check_input_witnesses(tx, prevouts, version).map_err(AdmissionError::Rejected)?;
     let key = sig_cache_key_for(tx_wtxid, version, core::activation::is_active_at(block_height, act), prevouts);
     if sig_cache().lock().0.contains(&key) {
+        count_signature_inputs(|c| c.cached += tx.inputs.len() as u64);
         return Ok(());
     }
     gate(tx)?;
+    count_signature_inputs(|c| c.verified += tx.inputs.len() as u64);
     core::sighash::verify_input_signatures(tx, prevouts, &witnesses, version, core::node_chain_id())
         .map_err(AdmissionError::Rejected)?;
     let mut g = sig_cache().lock();
@@ -482,6 +487,61 @@ pub fn verify_input_scripts_gated_with_wtxid_at(
         }
     }
     Ok(())
+}
+
+/// The input-script rule of [`verify_input_scripts_at`] WITHOUT its
+/// signature step: the version rule (`core::sighash::check_tx_version`) and
+/// every witness check (`core::sighash::check_input_witnesses`: the
+/// `script_sig` framing, canonical from the hardening activation; the public
+/// key hashed against the spent 20-byte script; a revealed spend policy
+/// hashed against the spent policy output, its signature count and key
+/// indices). Only `core::sighash::verify_input_signatures` is left out —
+/// exactly what a verified-signature cache hit skips. The block connect runs
+/// this for a block whose signatures are assumed valid (`crate::assumevalid`,
+/// Bitcoin Core's `-assumevalid`); nothing else calls it.
+pub fn check_input_scripts_without_signatures_at(
+    tx: &Transaction,
+    prevouts: &[TxOutput],
+    block_height: u64,
+    act: u64,
+) -> Result<(), String> {
+    let version = core::sighash::check_tx_version(tx.version, block_height, act)?;
+    core::sighash::check_input_witnesses(tx, prevouts, version)?;
+    count_signature_inputs(|c| c.assumed += tx.inputs.len() as u64);
+    Ok(())
+}
+
+/// Inputs whose signature step the calling thread ran, by outcome (P5-G
+/// measurement: what the assumed-valid block saves).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SignatureInputCounts {
+    /// Signature verifications run (`core::sighash::verify_input_signatures`,
+    /// valid or not), counted per input.
+    pub verified: u64,
+    /// Inputs of transactions answered by the verified-signature cache.
+    pub cached: u64,
+    /// Inputs whose signatures were assumed valid
+    /// ([`check_input_scripts_without_signatures_at`]).
+    pub assumed: u64,
+}
+
+thread_local! {
+    static SIGNATURE_INPUTS: std::cell::Cell<SignatureInputCounts> =
+        const { std::cell::Cell::new(SignatureInputCounts { verified: 0, cached: 0, assumed: 0 }) };
+}
+
+fn count_signature_inputs(f: impl FnOnce(&mut SignatureInputCounts)) {
+    SIGNATURE_INPUTS.with(|c| {
+        let mut v = c.get();
+        f(&mut v);
+        c.set(v);
+    });
+}
+
+/// [`SignatureInputCounts`] of the calling thread since it started (block
+/// validation runs on the thread that accepts the block).
+pub fn signature_inputs_on_this_thread() -> SignatureInputCounts {
+    SIGNATURE_INPUTS.with(|c| c.get())
 }
 
 /// Standardness rules that need no chain state (steps 1–3).
@@ -796,14 +856,10 @@ pub fn check_transaction_gated_with_wtxid(
     // not satisfied. Relative timelocks count confirmations in the connect
     // path's measure for the next block (re-audit B1-T14).
     let confirmations = |t: &[u8; 32]| -> Result<Option<u64>, String> {
-        confirmations_for_next_block(store, t, policy.next_block_height).map_err(|e| e.0)
+        confirmations_for_next_block(store, t, policy.next_block_height).map_err(|e| e.msg)
     };
     crate::blockval::check_tx_chain_rules_with_confirmations(tx, &prevouts, policy.next_block_height, &confirmations)
-        .map_err(|e| if e.starts_with(crate::blockval::STORAGE_ERR) {
-            AdmissionError::Pool(e)
-        } else {
-            AdmissionError::Rejected(e)
-        })?;
+        .map_err(|e| classify_chain_rule_failure(tx, &prevouts, policy.next_block_height, &confirmations, e))?;
 
     // Value + fees.
     let total_out = core::limits::check_tx_money_range(tx).map_err(AdmissionError::Rejected)?;
@@ -855,6 +911,42 @@ pub fn check_transaction_gated_with_wtxid(
     Ok(fee)
 }
 
+/// The admission error for a failure `e` of this chain's rules
+/// (`blockval::check_tx_chain_rules_with_confirmations`) at the next block's
+/// height: a storage failure is `Pool`; a failure of the PF-4 key-identity
+/// rule of the second hardening upgrade ALONE (the transaction passes every
+/// other chain rule: `blockval::check_tx_chain_rules_without_key_identity_rule`)
+/// is a policy refusal, `NonStandard`; anything else is `Rejected`.
+///
+/// The identity rule depends on the next block's height and only tightens
+/// the rules: a peer one block behind across the hardening-2 height, and
+/// every release without the rule, accepts and relays a spend of a
+/// twin-key policy honestly, so refusing it must not penalise the peer
+/// (module docs; Bitcoin Core's standard / mandatory script-flag split,
+/// `PolicyScriptChecks`). Below the hardening-2 height the rule is off and
+/// the second check is skipped.
+fn classify_chain_rule_failure(
+    tx: &Transaction,
+    prevouts: &[TxOutput],
+    next_block_height: u64,
+    confirmations: &crate::blockval::ConfirmationsLookup<'_>,
+    e: String,
+) -> AdmissionError {
+    if e.starts_with(crate::blockval::STORAGE_ERR) {
+        return AdmissionError::Pool(e);
+    }
+    if core::activation::hardening2_active_at(next_block_height) {
+        match crate::blockval::check_tx_chain_rules_without_key_identity_rule(
+            tx, prevouts, next_block_height, confirmations)
+        {
+            Ok(()) => return AdmissionError::NonStandard(e),
+            Err(other) if other.starts_with(crate::blockval::STORAGE_ERR) => return AdmissionError::Pool(other),
+            Err(_) => {}
+        }
+    }
+    AdmissionError::Rejected(e)
+}
+
 /// Coinbase maturity of `tx` for the next block, at header height
 /// `next_block_height` (`0` skips it), under the connect path's own rule
 /// (`accept::check_coinbase_maturity_in_view`, re-audit B1-T14): below the
@@ -881,7 +973,7 @@ pub fn coinbase_maturity_for_next_block(
         MaturityRule::HeaderHeights(next_block_height)
     };
     check_coinbase_maturity_in_view(tx, store, rule)
-        .map_err(|e| crate::storage::StorageError::ReadFailed(e.0))
+        .map_err(|e| crate::storage::StorageError::ReadFailed(e.msg))
 }
 
 /// The confirmations the outputs of the confirmed transaction `txid` have at
@@ -911,11 +1003,11 @@ pub fn confirmations_for_next_block(
 /// record) plus one.
 fn next_block_dag_height(store: &Storage) -> Result<u64, crate::reorg::ViewError> {
     use crate::reorg::{UtxoView, ViewError};
-    let tip = store.get_meta("tip_hash").map_err(|e| ViewError(e.to_string()))?
+    let tip = store.get_meta("tip_hash").map_err(|e| ViewError::from_storage(&e))?
         .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
-        .ok_or_else(|| ViewError("no applied tip pointer".into()))?;
+        .ok_or_else(|| ViewError::inconsistent("no applied tip pointer"))?;
     let data = store.view_dag_data(&tip)?
-        .ok_or_else(|| ViewError(format!("applied tip {} has no DAG record", hex::encode(&tip[..8]))))?;
+        .ok_or_else(|| ViewError::inconsistent(format!("applied tip {} has no DAG record", hex::encode(&tip[..8]))))?;
     Ok(data.height + 1)
 }
 
@@ -935,7 +1027,7 @@ pub fn coinbase_height_for_wallets(
     next_block_height: u64,
 ) -> Result<Option<u64>, crate::storage::StorageError> {
     use crate::reorg::UtxoView;
-    let read = |e: crate::reorg::ViewError| crate::storage::StorageError::ReadFailed(e.0);
+    let read = |e: crate::reorg::ViewError| crate::storage::StorageError::ReadFailed(e.msg);
     if next_block_height == 0 || !core::block_rules::rules_active_at(next_block_height, activation_height()) {
         return store.view_coinbase_height(txid).map_err(read);
     }

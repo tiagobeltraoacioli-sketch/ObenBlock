@@ -13,15 +13,20 @@ signatures. Built from three pieces:
 
 ## Status
 
-Implemented and consensus from `core::powit_height()`. **Mainnet keeps it
-OFF** (`POWIT_HEIGHT_MAINNET = u64::MAX`) until a release fixes the height;
-a testnet node sets it with `--testnet --powit-height <h>`.
+Implemented and consensus from `core::powit_height()`: mainnet from height
+10,000 (`POWIT_HEIGHT_MAINNET`, since ef123fd); testnet off unless a node sets
+it with `--testnet --powit-height <h>` (`POWIT_HEIGHT_TESTNET = u64::MAX`).
 
 Implementation choices that refine the design below:
 
-- **Witness set size 64** (not 256): every attestation carries a hybrid
-  public key and signature (~8 KiB), so 64 members keep a full round of votes
-  under ~0.5 MB per checkpoint.
+- **Witness set size 64** (not 256) before the second hardening activation:
+  every attestation carries a hybrid public key and signature (~8 KiB), so
+  64 members keep a full round of votes under ~0.5 MB per checkpoint. The
+  cap let a minority split over many keys own the set (PoWit audit finding
+  4), so from the second hardening activation (mainnet: not scheduled;
+  testnet and regtest: 0) every share key with weight is a member and two
+  thirds are measured over the total window weight (§3, §4, §7.9); the
+  per-block cap of 32 attestations keeps the signature cost bounded.
 - **Checkpoint slots.** Slot `c` names the highest selected-chain block with
   height strictly below `c`. Heights along a selected chain can skip, so a
   slot always resolves, identically on every node sharing that chain.
@@ -33,7 +38,9 @@ Implementation choices that refine the design below:
   (escrow) is not implemented.
 - **Witness node.** `--witness-wallet <gnb-cli wallet> --witness-password-file <f>`
   mines shares paying that key (`--share-threads`, default 2) and signs the
-  newest checkpoint once it is a member, with a persistent vote record that
+  newest checkpoint once it is a member (from the second hardening
+  activation: the justified checkpoint's direct child while a vote for it
+  can still be included, else the newest; §7.9), with a persistent vote record that
   refuses any double or surround vote, across restarts and reorgs (written
   durably; an unreadable record refuses to start; the highest signed source
   and target heights are also kept beside the key file and enforced).
@@ -56,7 +63,7 @@ Parameters (`core::powit::MAINNET_PARAMS` / `TESTNET_PARAMS`):
 | Epoch | 720 blocks (~6 h) | 20 |
 | Checkpoint interval | 60 (~30 min) | 5 |
 | Window | 28 epochs (~7 days) | 3 |
-| Witnesses | 64 | 64 |
+| Witnesses (cap before the second hardening activation; none from it) | 64 | 64 |
 | Attestations / block | 32 | 32 |
 | Vote lifetime | 720 blocks | 20 |
 | Decay starts after | 4 epochs without finality | 4 |
@@ -100,18 +107,29 @@ names the witness id it credits and pays any valid script. See
 - W_e = the **64** heaviest witness ids (ties by id), minus barred ids, with
   inactivity decay applied. Every node computes the same W_e from the chain:
   no registration, no stake, no vote.
+- From the second hardening activation (blocks at or above it): W_e = every
+  witness id with weight, minus barred ids, decay applied (no cap). With the
+  cap, 30% of the share work split over 60 keys of 0.5% against 200 honest
+  keys of 0.35% held 95.5% of W_e (finding 4).
 
 ## 4. Checkpoint attestations
 
 - A checkpoint slot every 60 heights from activation. Slot `c` names the
   highest selected-chain block with height strictly below `c`.
 - Each member of W_e signs a link `source → target` (source = the chain's
-  current justified checkpoint) over `DS ‖ chain_id ‖ source ‖ target`. The
-  signature uses its forward-secure KES key, with the leaf of the target's
-  epoch ([DESIGN-powit-kes.md](DESIGN-powit-kes.md)).
+  current justified checkpoint) over `DS ‖ chain_id ‖ source ‖ target`; for a
+  target at or above the second hardening activation over
+  `DS_v2 ‖ chain_id ‖ depth ‖ root ‖ source ‖ target`, which also commits its
+  KES key (finding 1: without it one leaf signature, re-rooted under any
+  sibling hash, was a signature by unlimited keys). Byte layouts:
+  docs/CONSENSUS.md, "PoWit", "Attestation messages". The signature uses its
+  forward-secure KES key, with the leaf of the target's epoch
+  ([DESIGN-powit-kes.md](DESIGN-powit-kes.md)).
 - Attestations are gossiped as `NewPowitItem` (kind 2), validated before
   relay, and included in blocks (up to 32 per block).
-- Links worth ≥ 2/3 of W_e's weight **justify** the target. A justified
+- Links worth ≥ 2/3 of W_e's weight **justify** the target (from the second
+  hardening activation W_e has no cap, so this is two thirds of the total
+  window weight of every share key, as Casper FFG counts all stake). A justified
   target exactly one interval above its source **finalizes** the source.
   Nodes never reorganise below the finalized block.
 
@@ -119,7 +137,11 @@ names the witness id it credits and pays any valid script. See
 
 Two attestations by one witness with the same target slot and different
 blocks (double vote), or one link surrounding another (surround vote), form
-an equivocation proof. Any block may carry it (kind 3 on the wire). The
+an equivocation proof. Any block may carry it (kind 3 on the wire); from
+the second hardening activation only against a key that is a member of
+W(E-1), W(E) or W(E+1), E the including block's epoch (a key nobody holds
+share work for cannot be barred, finding 1; the rule and why those three
+sets: docs/CONSENSUS.md, "PoWit", "Equivocation proofs"). The
 witness is barred from the witness set and from share rewards for
 `ban_epochs` (28 epochs on mainnet).
 
@@ -161,7 +183,7 @@ fast/probabilistic (LOG_avail) or deterministic (LOG_fin).
 | Messages | Attestations signed with ML-DSA-65 ‖ Falcon-1024 (unforgeable, also against quantum adversaries) |
 | Traitors | Any member; tolerated while their weight is < 1/3 of W_e |
 | Agreement | Two checkpoints at the same height can never both finalize unless ≥ 1/3 of the weight signed both, and that is provable on chain |
-| Sybil generals | Weight is work, so splitting a key into many keys gains nothing |
+| Sybil generals | Weight is work, so splitting a key into many keys gains nothing: true from the second hardening activation (two thirds of all the weight); before it, the 64-key cap let a minority split over many keys own W_e (finding 4) |
 
 ### 7.3 Vote rule with accountable safety
 
@@ -176,7 +198,9 @@ Each attestation is a link `source → target` between two checkpoints
   link by the same key (surround vote).
 
 Theorem (as in Casper's accountable safety): two conflicting final
-checkpoints imply that keys holding ≥ 1/3 of W_e broke one of the two rules,
+checkpoints imply that keys holding ≥ 1/3 of W_e broke one of the two rules
+(from the second hardening activation ≥ 1/3 of the total window weight;
+before it ≥ 1/3 of the 64 heaviest keys' weight only),
 and the evidence is publishable in any block. The voters here are earned by
 PoW custody work; there is no stake and no appointed validator.
 
@@ -185,6 +209,13 @@ PoW custody work; there is no stake and no appointed validator.
 W_e is computed only from **LOG_fin as of the end of epoch e-2**. Every honest
 node therefore derives the same set, even while LOG_avail tips disagree. If
 nothing has finalized for two epochs, W_e = W_{e-1}.
+
+This holds from the second hardening activation (PoWit audit finding 3;
+docs/CONSENSUS.md, "Witness set from finalized history"): the share window
+of W_e ends at the last epoch entirely below the state's finalized
+checkpoint, so it freezes while finality lags. Before it, W_e came from each
+chain's own share work up to epoch e-2, so a private fork mined its own
+witness set and could finalize its own checkpoints.
 
 ### 7.5 Finality liveness: inactivity decay
 
@@ -195,9 +226,38 @@ resumes, so > 1/3 offline or withholding can only delay finality, not stop it.
 
 ### 7.6 Fork choice
 
-Heaviest blue-work DAG **among the branches that contain the latest final
-checkpoint**. A partitioned side may keep producing blocks (LOG_avail), but
-at most one side can finalize, and the other side rejoins it on heal.
+Heaviest blue-work DAG **among the branches that contain the pinned
+checkpoint**. The pin is node-local and a pure function of the blocks the
+node holds (PoWit audit findings 2 and 3; docs/CONSENSUS.md, "Selected
+parent and fork choice"):
+
+- the highest finalized checkpoint carried by the PoWit state of ANY stored,
+  not disqualified block (as Gasper's fork choice starts from the highest
+  checkpoint learned from any branch), not only the node's applied chain;
+- only from sources with at least the minimum chain work, and never one
+  that conflicts with the weak-subjectivity anchor (the release finality
+  checkpoint, or the operator's);
+- two conflicting finalized checkpoints (accountable-safety evidence, or two
+  chains with different witness sets) pin their latest common block, so the
+  most work decides above it, and the node reports the conflict;
+- rebuilt from persisted rows on restart; the operator can set a pin aside
+  or change the anchor (`ignorefinalized`, `reconsiderfinalized`,
+  `setfinalitycheckpoint`).
+
+A partitioned side may keep producing blocks (LOG_avail), but at most one
+side can finalize. After the heal every node that holds both sides learns
+that side's finalization from its blocks, pins the same checkpoint and
+converges on the same chain, whatever the arrival order. Before this
+(finding 2) the pin came from the node's own applied chain only, so the
+lighter-but-finalized side and the heavier side split for good.
+
+Guarantees and limits: the pin never reverts LOG_fin while less than a third
+of the witness weight is Byzantine and the node holds the finalizing blocks.
+A node that syncs only an attacker's chain while eclipsed can be held on it
+until it sees the honest chain. The minimum chain work and the release
+checkpoint bound that (as `nMinimumChainWork` and `-assumevalid` do for
+Bitcoin Core). Both are unset on mainnet until a release reads them from
+independent nodes.
 
 ### 7.7 Other attacks
 
@@ -205,8 +265,9 @@ at most one side can finalize, and the other side rejoins it on heal.
   proof, so small miners earn without pools and withheld blocks forfeit
   their share slots.
 - **Long-range rewrite**: impossible past LOG_fin for online nodes; new
-  nodes start from `MIN_CHAIN_WORK` + the release checkpoint (weak
-  subjectivity, as every finality protocol).
+  nodes start from `MIN_CHAIN_WORK` + the release finality checkpoint
+  (`powit::MAINNET_FINALITY_CHECKPOINT`, weak subjectivity, as every finality
+  protocol); a finalization that conflicts with the checkpoint never pins.
 - **Bribing witnesses**: the bribe must exceed the 7-day escrow of ≥ 1/3 of
   the weight, and the attack is attributable.
 - **Data withholding**: a block whose data no one can sample earns no shares
@@ -218,6 +279,38 @@ at most one side can finalize, and the other side rejoins it on heal.
 - A hashrate majority still controls LOG_avail after the last final checkpoint.
 - Finality needs partial synchrony: during long partitions, LOG_fin stalls
   (by design it never forks).
+
+### 7.9 Witness-set size and finality liveness (second hardening activation)
+
+From the activation every share key with weight may vote and two thirds are
+counted over all of them. Signature cost stays bounded per block (32
+attestations and 4 proofs, at most 40 KES verifications), so what the
+uncapped set costs is inclusion bandwidth: a vote for slot `t` is includable
+in blocks `t ..= t + vote_ttl`, at most 23,072 votes per target on mainnet
+(672 on testnet). With `K` the smallest number of keys (heaviest first)
+holding two thirds of the weight, a slot takes `ceil(K / 32)` blocks to
+justify:
+
+- `K <= 32 × checkpoint_interval` (1,920 keys on mainnet, 160 on testnet):
+  finality keeps pace with the chain, one interval per interval.
+- Above that, finality falls behind and becomes intermittent: the witness
+  duty votes for the justified checkpoint's direct child (the only target
+  whose justification finalizes, as in Casper FFG) while a block can still
+  include the vote, then for the newest slot.
+- Above `32 × (vote_ttl + 1)`, no slot is justified until the inactivity
+  leak (§7.5) has decayed the keys whose votes were not included.
+
+The 64-key cap bounded `K` by 64 but measured two thirds over those 64 only,
+so a minority split over many keys controlled or stalled finality
+(finding 4). The rule from the activation keeps the guarantee Casper FFG
+states, two thirds of all the weight, and pays for it with finality latency
+when the share work is spread over thousands of keys. Templates take a
+target's heaviest votes first and a full pool evicts the entry closest to
+expiry, lightest first, so a flood of one-share keys cannot push honest
+weight out of honest blocks; an attacker
+with under a third of the weight can neither justify alone nor stall
+finality (the honest keys justify without it). Numbers and tests:
+docs/CONSENSUS.md, "PoWit", "Safety and liveness from the activation".
 
 ## What it buys against a 51% attacker
 
@@ -237,4 +330,6 @@ Honest limits:
 - Long-range forks that rebuild W from far back are stopped by nodes already
   online and, for new nodes, by `MIN_CHAIN_WORK` and the release checkpoint
   (weak subjectivity).
-- Not externally reviewed; parameters (window, epoch, 2/3, 64) need simulation at mainnet scale.
+- Not externally reviewed; parameters (window, epoch, 2/3, the 32 votes per
+  block that bound finality latency from the second hardening activation)
+  need simulation at mainnet scale.

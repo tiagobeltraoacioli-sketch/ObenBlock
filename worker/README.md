@@ -20,6 +20,30 @@ a fixed, short TTL per method (at most 300 s); errors are never cached and
 redirects are not followed. Every response carries HSTS and a strict
 Content-Security-Policy (WAL-3).
 
+`/api/sendrawtransaction` (re-audit B2-R2-2) accepts only `POST` with
+`Content-Type: application/json` from the site's own pages (a browser request
+must be same-origin: `Sec-Fetch-Site` `same-origin` or `none`, and an `Origin`
+header, when present, equal to the host the request was made to) or from a
+non-browser client (no `Origin`, no `Sec-Fetch-Site`); anything else is
+answered 415 / 403 before the body is read or forwarded. A cross-origin page
+can no longer make its visitors' browsers broadcast through the site with a
+CORS "simple request" (`fetch` in `no-cors` mode, `navigator.sendBeacon`, an
+HTML form), which charged each broadcast to the visitor's rate-limit bucket
+instead of the attacker's. Broadcast answers carry no
+`access-control-allow-origin`; read answers keep `*` (public explorer data).
+The explorer API refuses non-JSON and cross-site broadcasts too
+(`broadcast_refusal` in `deploy/explorer-api/gnb_explorer_api.py`).
+
+The read variant of the same trick (a page making its visitors' browsers
+send uncached per-address reads such as `getutxos` with a fresh `p` each
+time, each charged to that visitor's own read budget) is bounded as well: a
+read a browser marks as coming from another site's page (`isCrossSite`: the
+same `Sec-Fetch-Site` / `Origin` test as the broadcast route) is forwarded
+with `X-GnB-Cross-Site: 1`, and the explorer API charges it to one budget
+shared by every cross-site read (`GNB_API_CROSS_SITE_PER_MIN`) as well as to
+the visitor's own. Same-origin pages and non-browser clients are unchanged,
+and read answers keep `access-control-allow-origin: *`.
+
 ## Origin TLS: the zone must use "Full (strict)" (audit WAL-2)
 
 The Worker's `fetch()` to an `https://` origin goes through Cloudflare's edge,
@@ -54,4 +78,5 @@ the origin to Cloudflare and so does not replace "Full (strict)".
 ## Tests
 
 `node --test site/tests/*.test.mjs` (`worker.test.mjs`: origins, TTLs,
-headers; `worker-ssl-mode.test.mjs`: the SSL-mode check).
+headers; `worker-broadcast-csrf.test.mjs`: the broadcast route's
+cross-site refusals; `worker-ssl-mode.test.mjs`: the SSL-mode check).

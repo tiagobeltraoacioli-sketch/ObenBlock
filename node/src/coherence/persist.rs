@@ -272,8 +272,10 @@ impl ShieldedPool {
                     hex::encode(&tip[..8]), hex::encode(&start[..8]))));
             }
         }
+        // A body that cannot be read is typed (review of PR #15, finding 6):
+        // the acceptance pipeline attributes it to the block.
         let body = |h: &[u8; 32]| -> Result<crate::core::Block, ConnectError> {
-            store.get_block(h).map_err(|e| ConnectError::Failed(e.to_string()))?
+            store.get_block(h).map_err(|e| ConnectError::body_unreadable(*h, true, &e))?
                 .ok_or_else(|| ConnectError::Failed(format!(
                     "{}: block body {} missing for the shielded state",
                     crate::reorg::ERR_MISSING_BODIES, hex::encode(&h[..8]))))
@@ -288,7 +290,7 @@ impl ShieldedPool {
             // then the persisted shielded undo record answers (every applied
             // block that carried shielded transactions has one, and undo
             // records are never pruned).
-            let had_shielded = match store.get_block(h).map_err(|e| ConnectError::Failed(e.to_string()))? {
+            let had_shielded = match store.get_block(h).map_err(|e| ConnectError::body_unreadable(*h, false, &e))? {
                 Some(block) => !block.shielded_transactions.is_empty(),
                 None => match store.get_pruned_body_record(h).map_err(|e| ConnectError::Failed(e.to_string()))? {
                     Some(rec) => rec.had_shielded,

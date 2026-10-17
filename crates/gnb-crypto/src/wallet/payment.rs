@@ -15,7 +15,13 @@
 //!     carryover, bodies pruned on non-archival nodes) stay *unverified*; they
 //!     are reported to the user, avoided by coin selection when possible and
 //!     refused when [`PaymentOptions::require_verified_inputs`] is set. This
-//!     check is needed only for version-1 (sighash v2) transactions.
+//!     check is needed only for version-1 (sighash v2) transactions. Every
+//!     front end signs an unverified input only after an explicit
+//!     acknowledgement: the web wallet's checkbox, the interactive
+//!     confirmation of `gnb-cli send` / `gnb-wallet send` (or
+//!     `--allow-unverified-inputs` with `--yes`), and, for the library path
+//!     with no confirmation step, `WalletClient::send_payment_with` with
+//!     `SendOptions::allow_unverified_inputs` (refused by default).
 //!   - **Full fix: sighash v3.** From the hardening activation height the
 //!     builder produces version-3 transactions whose signatures commit to
 //!     every spent amount and `script_pubkey`

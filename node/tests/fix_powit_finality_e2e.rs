@@ -376,9 +376,11 @@ fn producers_follow_the_witness_set_rule_of_the_next_block() {
     let s = stalled(m.id(), k.id());
     let next = 112u64;
     let target = Checkpoint { height: 108, hash: s.hashes[107] };
-    let att = k.attest(Checkpoint { height: 43, hash: s.hashes[42] }, target);
     for (h2, member) in [(next + 1, true), (next, false)] {
         let _g = activation::scoped_override_v2(h2);
+        // Signed under the message rule of this second hardening height
+        // (`Attestation::sign` reads it: v2 for a target at or above it).
+        let att = k.attest(Checkpoint { height: 43, hash: s.hashes[42] }, target);
         let pool = PowitPool::new();
         let r = pool.admit_attestation(att.clone(), &s.dag, &s.store);
         assert_eq!(r.is_ok(), member, "H = {h2}: pool admission {r:?}");

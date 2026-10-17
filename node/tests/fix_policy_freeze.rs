@@ -24,9 +24,11 @@
 //! Fixed: the revealed policy is checked against the output first (a
 //! witness failure, classified like every other one), genesis-ledger
 //! outputs are confirmed at the genesis, a move that cannot apply the new
-//! branch returns to the applied tip it started from, and a block that keeps
-//! failing without a verdict stops the node loudly (Bitcoin Core's
-//! `AbortNode`) instead of looping. Audit F5 (the relay's signature budget
+//! branch returns to the applied tip it started from, and a block without a
+//! verdict is parked and retried on a bounded schedule instead of looping;
+//! only repeated storage-engine failures stop the node (Bitcoin Core's
+//! `AbortNode`; the review's follow-up, `fix_no_verdict_hardening.rs`).
+//! Audit F5 (the relay's signature budget
 //! counts policy signatures) is in `fix_ingress_dos.rs`.
 
 mod fix_common;
@@ -413,57 +415,65 @@ fn no_verdict_fixture() -> NoVerdict {
 
 /// The move commits its rollback of `T`, then cannot judge `B_nv`: it
 /// returns to `T` (HEAD stopped on `P`, an ancestor of both branches), marks
-/// nothing (re-audit B1-T12), and a block that keeps failing without a
-/// verdict stops the node (Bitcoin Core's `AbortNode`): acceptance and
-/// templates refuse with the operator's message; a restart that meets the
-/// same failure refuses to start, still on `T`.
+/// nothing (re-audit B1-T12), and parks `B_nv` with its descendants (review
+/// of the hotfix, findings 1 and 2; `fix_no_verdict_hardening.rs`): `T` is
+/// the selected tip again and templates are built on it. The failure is an
+/// inconsistent index, not a storage-engine failure, so however often the
+/// block is retried the node never stops (only repeated engine failures do,
+/// `fix_no_verdict_hardening::repeated_storage_engine_failures_stop_the_node`),
+/// and a restart starts, still on `T`.
 #[test]
-fn a_repeated_no_verdict_keeps_the_applied_tip_and_stops_the_node() {
+fn a_repeated_no_verdict_keeps_the_applied_tip_and_parks_the_block() {
     let _g = activation::scoped_override(0);
     let NoVerdict { n, t, b_nv, a2, .. } = no_verdict_fixture();
 
     let _ = accept(&n, &a2);
     assert_eq!(applied_tip(&n), Some(t), "back on the applied tip the move started from");
-    assert_eq!(sel_tip(&n), Some(a2.block_hash()), "no verdict: A2 is still the best block");
-    assert!(build(&n).unwrap_err().contains("chain move in progress"));
+    assert_eq!(sel_tip(&n), Some(t), "no verdict: B_nv and A2 are parked");
+    assert!(n.dag.read().is_no_verdict_parked(&b_nv.block_hash()));
+    assert_eq!(build(&n).expect("templates on T").parents.first(), Some(&t));
     assert_eq!(n.store.invalid_block_reason(&b_nv.block_hash()).unwrap(), None, "B1-T12: no mark");
-    assert!(n.store.abort_reason().is_none(), "one failure may be transient");
+    assert!(n.store.abort_reason().is_none());
 
     let mut tip = a2.block_hash();
-    for i in 1..accept::NO_VERDICT_ABORT_AFTER {
+    for i in 1..=2 * accept::NO_VERDICT_ABORT_AFTER {
+        accept::unpark_due_no_verdicts(&n.dag, &n.store,
+            std::time::Instant::now() + std::time::Duration::from_secs(10 * 3600));
         let b = empty_child(&n, tip, &format!("c{i}"));
         let _ = accept(&n, &b);
         tip = b.block_hash();
         assert_eq!(applied_tip(&n), Some(t));
+        assert_eq!(n.store.no_verdict_record(&b_nv.block_hash()).unwrap().attempts, 1 + i);
     }
-    let reason = n.store.abort_reason().expect("the node stopped");
-    assert!(reason.contains(&hex::encode(b_nv.block_hash())), "{reason}");
-    assert!(reason.contains("not a verdict"), "{reason}");
+    assert!(n.store.abort_reason().is_none(), "an inconsistent index never stops the node");
     assert_eq!(n.store.invalid_block_reason(&b_nv.block_hash()).unwrap(), None, "B1-T12: no mark");
+    assert!(n.store.has_block_body(&b_nv.block_hash()).unwrap(), "body kept");
 
-    let e = accept(&n, &empty_child(&n, tip, "after")).unwrap_err();
-    assert!(e.starts_with("node stopped:"), "{e}");
-    assert!(build(&n).unwrap_err().starts_with("node stopped:"));
-
-    // Restart: the same failure, loudly; the applied tip is still T.
+    // Restart: the start-up resolution parks B_nv again and the node starts
+    // on T.
     let (n, r) = reopen(n);
-    let e = r.expect_err("a restart that meets the failure refuses to start");
-    assert!(e.contains("no verdict"), "{e}");
+    r.expect("an inconsistent index does not refuse the start");
     assert_eq!(applied_tip(&n), Some(t));
+    assert!(n.dag.read().is_no_verdict_parked(&b_nv.block_hash()));
     assert_eq!(n.store.invalid_block_reason(&b_nv.block_hash()).unwrap(), None);
 }
 
 /// A no-verdict that clears (the index is repaired) leaves nothing behind:
-/// the next acceptance connects the best chain and the failure count goes.
+/// the acceptance after the block's retry comes due connects the best chain
+/// and the failure record goes.
 #[test]
 fn a_no_verdict_that_clears_leaves_no_trace() {
     let _g = activation::scoped_override(0);
-    let NoVerdict { n, t, a2, prev, .. } = no_verdict_fixture();
+    let NoVerdict { n, t, b_nv, a2, prev } = no_verdict_fixture();
     let _ = accept(&n, &a2);
     assert_eq!(applied_tip(&n), Some(t));
     // Repair: the output's confirmation point is known again.
     let genesis_hash: [u8; 32] = n.store.get_meta("genesis_hash").unwrap().unwrap().try_into().unwrap();
     n.store.put_tx_index(&prev, &genesis_hash, 0).unwrap();
+    // B_nv is retried on a bounded schedule (1 minute first), not by every
+    // acceptance: make the retry due.
+    accept::unpark_due_no_verdicts(&n.dag, &n.store,
+        std::time::Instant::now() + std::time::Duration::from_secs(3600));
     let c = empty_child(&n, a2.block_hash(), "c");
     accept(&n, &c).expect("the best chain connects");
     assert_eq!(applied_tip(&n), Some(c.block_hash()));
@@ -472,5 +482,6 @@ fn a_no_verdict_that_clears_leaves_no_trace() {
         accept(&n, &d).unwrap();
     }
     assert!(n.store.abort_reason().is_none());
+    assert!(n.store.no_verdict_record(&b_nv.block_hash()).is_none(), "validated: the record goes");
     build(&n).expect("templates");
 }

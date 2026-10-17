@@ -110,7 +110,34 @@ impl Default for PowLimits {
 /// 64 MiB (v1) or 4 MiB (v3) scratchpad; the miner and the rest of the node
 /// need the others).
 pub fn default_workers() -> usize {
-    std::thread::available_parallelism().map(|n| n.get() / 2).unwrap_or(1).clamp(1, 4)
+    default_workers_for(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
+}
+
+/// [`default_workers`] for `cpus` logical CPUs.
+pub fn default_workers_for(cpus: usize) -> usize {
+    (cpus / 2).clamp(1, 4)
+}
+
+/// Most evaluations the block scheduler runs at once during initial block
+/// download ([`ibd_workers`]): eight GnB-SMH v1 scratchpads are 512 MiB.
+pub const MAX_IBD_WORKERS: usize = 8;
+
+/// Evaluations at once while the node is in initial block download
+/// ([`PowScheduler::set_initial_block_download`], P5-G): every logical CPU
+/// but one, at least [`default_workers`] and at most [`MAX_IBD_WORKERS`].
+/// A syncing node mines nothing (the miner and the witness duties wait for
+/// the IBD latch; the miner resumes only after a 90 s sync stall, when few
+/// blocks arrive to verify) and its connect runs on one thread, so the
+/// proofs, the dearest check of every block (GnB-SMH v1: 64 MiB, about half
+/// a second), get the CPUs the miner leaves idle; Bitcoin Core likewise
+/// verifies with every core during IBD (`-par`, its script-check threads).
+pub fn ibd_workers() -> usize {
+    ibd_workers_for(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
+}
+
+/// [`ibd_workers`] for `cpus` logical CPUs.
+pub fn ibd_workers_for(cpus: usize) -> usize {
+    cpus.saturating_sub(1).clamp(default_workers_for(cpus), MAX_IBD_WORKERS)
 }
 
 impl PowLimits {
@@ -250,6 +277,9 @@ pub struct PowScheduler<T> {
     results:      HashMap<([u8; 32], u64), bool>,
     result_order: VecDeque<([u8; 32], u64)>,
     stats:        PowStats,
+    /// Workers while the node is in initial block download
+    /// ([`Self::set_initial_block_download`]).
+    ibd_workers:  Option<usize>,
 }
 
 impl<T> PowScheduler<T> {
@@ -267,7 +297,24 @@ impl<T> PowScheduler<T> {
             results: HashMap::new(),
             result_order: VecDeque::new(),
             stats: PowStats::default(),
+            ibd_workers: None,
         }
+    }
+
+    /// Initial block download (P5-G): with `Some(n)`, up to `n` evaluations
+    /// run at once (never fewer than [`PowLimits::workers`]); with `None`,
+    /// the limits' own count. The node's processor sets it from its IBD
+    /// latch before it starts queued evaluations ([`ibd_workers`]).
+    /// Evaluations already running above the new count finish; no new one
+    /// starts until they are below it.
+    pub fn set_initial_block_download(&mut self, workers: Option<usize>) {
+        self.ibd_workers = workers;
+    }
+
+    /// Evaluations that may run at once now.
+    pub fn worker_cap(&self) -> usize {
+        let base = self.limits.workers.max(1);
+        self.ibd_workers.map_or(base, |w| w.max(base))
     }
 
     /// Counters since start.
@@ -414,7 +461,7 @@ impl<T> PowScheduler<T> {
     /// [`PowLimits::verdict_ttl`] is returned as [`StartNext::Expired`]
     /// instead (call again for the next one).
     pub fn start_next(&mut self, now: Instant) -> StartNext<T> {
-        if self.in_flight >= self.limits.workers.max(1) {
+        if self.in_flight >= self.worker_cap() {
             return StartNext::Idle;
         }
         let job = match self.solicited.pop_front() {
@@ -682,6 +729,53 @@ mod tests {
         assert!(!evaluate_block_frame(&v1_framed.to_wire_bytes()), "judged with v1 one height lower");
         assert!(evaluate_block_frame(&block.to_wire_bytes()), "v3 proof at a v3 height");
         assert!(!evaluate_block_frame(b"not a block"));
+    }
+
+    /// P5-G: a node in initial block download verifies proofs on every CPU
+    /// but one (at most eight), since its miner waits; outside it the
+    /// default half. On a 16-CPU machine the default is 4 at once, IBD 8;
+    /// leaving IBD lets the running evaluations finish and starts no new one
+    /// until fewer than the default run.
+    #[test]
+    fn initial_block_download_verifies_on_the_idle_cpus() {
+        assert_eq!([1, 2, 3, 4, 8, 16, 64].map(default_workers_for), [1, 1, 1, 2, 4, 4, 4]);
+        assert_eq!([1, 2, 3, 4, 8, 16, 64].map(ibd_workers_for), [1, 1, 2, 3, 7, 8, 8]);
+        for cpus in 1..=64 {
+            assert!(ibd_workers_for(cpus) >= default_workers_for(cpus) && ibd_workers_for(cpus) <= MAX_IBD_WORKERS);
+        }
+        let t0 = Instant::now();
+        let mut lim = limits();
+        lim.workers = default_workers_for(16);
+        lim.max_queued_solicited = 32;
+        let mut s: PowScheduler<u8> = PowScheduler::new(lim);
+        for i in 0..20u8 {
+            s.submit(job(i, src(None, 1), true, t0), t0).unwrap();
+        }
+        let mut running = Vec::new();
+        let start_all = |s: &mut PowScheduler<u8>, running: &mut Vec<PowJob<u8>>| {
+            while let StartNext::Start(j) = s.start_next(t0) {
+                running.push(j);
+            }
+        };
+        start_all(&mut s, &mut running);
+        assert_eq!((running.len(), s.in_flight()), (4, 4), "outside IBD: the default");
+        s.set_initial_block_download(Some(ibd_workers_for(16)));
+        assert_eq!(s.worker_cap(), 8);
+        start_all(&mut s, &mut running);
+        assert_eq!(s.in_flight(), 8, "in IBD: every CPU but one, at most eight");
+        // A count below the default never lowers it.
+        s.set_initial_block_download(Some(1));
+        assert_eq!(s.worker_cap(), 4);
+        // Leaving IBD: the eight finish; none starts until fewer than four run.
+        s.set_initial_block_download(None);
+        for _ in 0..4 {
+            let j = running.remove(0);
+            s.complete(j.outcome(true), t0);
+            assert!(matches!(s.start_next(t0), StartNext::Idle), "{} running", s.in_flight());
+        }
+        let j = running.remove(0);
+        s.complete(j.outcome(true), t0);
+        assert!(matches!(s.start_next(t0), StartNext::Start(_)), "three running: one more starts");
     }
 
     /// Review finding (NET-2): the result is remembered per (id, height): an

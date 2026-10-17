@@ -103,11 +103,27 @@ def public_key(text):
     return raw
 
 
-class _Parser:
-    """Fixed-depth grammar: one expression, with only policy leaves in trees."""
+def key_identity(raw):
+    """PF-4: the identity of a policy key is its enveloped encoding.
 
-    def __init__(self, text):
-        self.text, self.offset = text, 0
+    A raw hybrid key (3,745 bytes) and its envelope ``b10c0100 || raw`` are
+    one signer (sighash v3 verifies a signature under either encoding), so a
+    policy may not list both (docs/CONSENSUS.md, "Spend-policy key identity
+    (PF-4)"). Exact raw length takes priority, as in public_key().
+    """
+    return bytes.fromhex("b10c0100") + raw if len(raw) == RAW_KEY_BYTES else raw
+
+
+class _Parser:
+    """Fixed-depth grammar: one expression, with only policy leaves in trees.
+
+    ``strict`` (create) refuses a policy or branch listing one key in its raw
+    and enveloped encodings (PF-4); otherwise (inspect, export, import: an
+    existing descriptor is restored) it is accepted and ``twin`` is set.
+    """
+
+    def __init__(self, text, strict=True):
+        self.text, self.offset, self.strict, self.twin = text, 0, strict, False
 
     def literal(self, value):
         if not self.text.startswith(value, self.offset):
@@ -144,6 +160,10 @@ class _Parser:
             key = public_key(self.token())
             if key in keys:
                 raise DescriptorError("duplicate serialized key")
+            if key_identity(key) in (key_identity(k) for k in keys):
+                if self.strict:
+                    raise DescriptorError("one key in raw and enveloped encodings (PF-4)")
+                self.twin = True
             keys.append(key)
         self.literal(")")
         if not 1 <= threshold <= len(keys):
@@ -183,11 +203,11 @@ def _network(network):
     return network
 
 
-def _info(body, expected_network):
+def _info(body, expected_network, strict=True):
     _ascii(body, MAX_DESCRIPTOR_BYTES - 9)
     if body != body.lower() or any(char.isspace() for char in body):
         raise DescriptorError("noncanonical text")
-    parser = _Parser(body)
+    parser = _Parser(body, strict)
     parser.literal("gnbd1(")
     network = _network(parser.token())
     if network != expected_network:
@@ -203,7 +223,12 @@ def _info(body, expected_network):
     else:
         payload, prefix, v2_kind = script[1:], ("gnb1m" if network == "mainnet" else "gnb1n"), "policy"
         checksum = _sha3(_sha3(prefix.encode("ascii") + payload))[:4]
-    return {"descriptor": add_checksum(body), "network": network, "kind": kind, "script_pubkey": script.hex(), "address": prefix + (payload + checksum).hex(), "bech32m": address_v2.encode(network, v2_kind, payload), "requires_policy_tree_activation": kind == "tree"}
+    info = {"descriptor": add_checksum(body), "network": network, "kind": kind, "script_pubkey": script.hex(), "address": prefix + (payload + checksum).hex(), "bech32m": address_v2.encode(network, v2_kind, payload), "requires_policy_tree_activation": kind == "tree"}
+    # PF-4: only on a restored descriptor whose policy or a tree branch lists
+    # one key twice (raw and enveloped); absent otherwise.
+    if parser.twin:
+        info["twin_key_encodings"] = True
+    return info
 
 
 def _strict_object(pairs):
@@ -230,7 +255,7 @@ def compact(value):
 def _pool(network, descriptors):
     if not isinstance(descriptors, list) or not 1 <= len(descriptors) <= MAX_POOL_ENTRIES:
         raise DescriptorError("pool entry count")
-    entries = [_info(check_checksum(item), network) for item in descriptors]
+    entries = [_info(check_checksum(item), network, strict=False) for item in descriptors]
     if len({entry["script_pubkey"] for entry in entries}) != len(entries):
         raise DescriptorError("duplicate script identity")
     bundle = compact({"format": POOL_FORMAT, "network": network, "descriptors": [entry["descriptor"] for entry in entries]})
@@ -256,7 +281,7 @@ def public_request(request):
     if action == "create":
         return _info(value, network)
     if action == "inspect":
-        return _info(check_checksum(value), network)
+        return _info(check_checksum(value), network, strict=False)
     if action == "export":
         return _pool(network, value)
     if action == "pool":

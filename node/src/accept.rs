@@ -45,13 +45,26 @@
 //! selected parent is disqualified is disqualified on arrival. `accept_block`
 //! reports such blocks as rejected (`Err`). A failure to READ the UTXO view
 //! (`reorg::ViewError`: I/O error, corrupted row) is no verdict
-//! ([`ConnectFailure::Storage`]): nothing is marked or persisted, the connect
-//! fails as a storage failure and the trigger is rolled back (re-audit
-//! B1-T12). It is never a silent permanent stall (audit F1): a move that
-//! committed its rollbacks and then cannot judge the first block of the new
-//! branch returns to the applied tip it started from, and a block that keeps
-//! failing without a verdict ([`NO_VERDICT_ABORT_AFTER`] times in a row)
-//! stops the node, like Bitcoin Core's `AbortNode`.
+//! ([`ConnectFailure::Storage`]): nothing is marked or persisted and the
+//! connect fails as a storage failure (re-audit B1-T12). It is never a
+//! silent permanent stall (audit F1 and its review): the block keeps its
+//! body and is parked in memory with its descendants, the node connects and
+//! mines on the best chain it can judge (re-applying an old branch whose
+//! rollback committed), and the block is retried on a bounded schedule
+//! ([`unpark_due_no_verdicts`]). Only storage-engine failures
+//! (`reorg::ViewErrorKind::Io`), [`NO_VERDICT_ABORT_AFTER`] in a row, stop
+//! the node, like Bitcoin Core's `AbortNode`; an inconsistent index never
+//! does ([`note_no_verdict`]), and the RPC warns while such a parked branch
+//! is heavier than the applied tip ([`no_verdict_branch_warning`]). A stored
+//! body of a block to apply that cannot be read is attributed the same way
+//! (review of PR #15, finding 6): an engine error is that block's
+//! no-verdict, a body that does not decode is dropped and fetched again
+//! (`drop_undecodable_body`). A block whose judgement fails is therefore
+//! given a verdict, parked (retried on schedule, counted toward the stop
+//! when the engine failed) or made to wait for a body; what remains (a
+//! failed write, a rollback-only chunk that cannot read a body) fails that
+//! acceptance with an error, and a move stopped after committed chunks
+//! resumes with the next one.
 //!
 //! **Witness-dependent failures below the hardening activation**: there the
 //! block id does not commit to non-coinbase `script_sig` bytes, so a relay
@@ -133,16 +146,17 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use parking_lot::RwLock;
 use tokio::sync::broadcast;
 
+pub use crate::assumevalid::ScriptChecks;
 use crate::coherence::ShieldedPool;
 use crate::consensus::{self, BlockHash};
 use crate::core;
 use crate::mempool::{self, admission};
 use crate::pow;
-use crate::reorg::{self, ConnectError, ConnectHooks, ConnectOutcome, UtxoView, ValidationFailure, ViewError};
+use crate::reorg::{self, ConnectError, ConnectHooks, ConnectOutcome, UtxoView, ValidationFailure, ViewError, ViewErrorKind};
 use crate::rpc;
 use crate::storage;
 use crate::tip;
@@ -345,11 +359,12 @@ pub enum ConnectFailure {
     /// see [`BlockInvalidity`]).
     Invalid(BlockInvalidity),
     /// The UTXO view could not be read (`reorg::ViewError`: I/O error,
-    /// corrupted row, inconsistent index). NOT a verdict: nothing is marked
-    /// or persisted, the connect fails as a storage failure and the block is
-    /// validated again later (re-audit B1-T12; Bitcoin Core aborts on a
-    /// coins-database read error instead of caching BLOCK_FAILED_VALID).
-    Storage(String),
+    /// corrupted row, inconsistent index; its `kind` says which class).
+    /// NOT a verdict: nothing is marked or persisted, the connect fails as a
+    /// storage failure and the block is validated again later (re-audit
+    /// B1-T12; Bitcoin Core aborts on a coins-database read error instead of
+    /// caching BLOCK_FAILED_VALID).
+    Storage(ViewError),
 }
 
 impl ConnectFailure {
@@ -366,7 +381,12 @@ impl ConnectFailure {
     pub fn into_message(self) -> String {
         match self {
             ConnectFailure::Invalid(b) => b.reason,
-            ConnectFailure::Storage(m) => format!("storage read failed, no verdict: {m}"),
+            ConnectFailure::Storage(e) => match e.kind {
+                ViewErrorKind::Io => format!("storage read failed, no verdict: {}", e.msg),
+                ViewErrorKind::Inconsistent => {
+                    format!("storage read failed, no verdict (inconsistent chain state): {}", e.msg)
+                }
+            },
         }
     }
 }
@@ -409,7 +429,7 @@ impl TxFailure {
             TxFailure::Invalid { reason, witness } => {
                 ConnectFailure::Invalid(BlockInvalidity { reason, witness_dependent: witness && !witnesses_fixed })
             }
-            TxFailure::Storage(e) => ConnectFailure::Storage(e.0),
+            TxFailure::Storage(e) => ConnectFailure::Storage(e),
         }
     }
 
@@ -465,9 +485,9 @@ pub fn coinbase_dag_height(view: &dyn UtxoView, txid: &[u8; 32]) -> Result<Optio
     if view.view_coinbase_height(txid)?.is_none() {
         return Ok(None);
     }
-    let block = view.view_tx_block(txid)?.ok_or_else(|| ViewError(format!(
+    let block = view.view_tx_block(txid)?.ok_or_else(|| ViewError::inconsistent(format!(
         "coinbase {} has no tx-index row", hex::encode(&txid[..8]))))?;
-    let data = view.view_dag_data(&block)?.ok_or_else(|| ViewError(format!(
+    let data = view.view_dag_data(&block)?.ok_or_else(|| ViewError::inconsistent(format!(
         "block {} of coinbase {} has no DAG record", hex::encode(&block[..8]), hex::encode(&txid[..8]))))?;
     Ok(Some(data.height))
 }
@@ -480,14 +500,14 @@ pub fn coinbase_dag_height(view: &dyn UtxoView, txid: &[u8; 32]) -> Result<Optio
 pub fn block_dag_height(view: &dyn UtxoView, block: &core::Block) -> Result<u64, ViewError> {
     let mut best: Option<((u128, u64, BlockHash), u64)> = None;
     for p in &block.header.parents {
-        let d = view.view_dag_data(p)?.ok_or_else(|| ViewError(format!(
+        let d = view.view_dag_data(p)?.ok_or_else(|| ViewError::inconsistent(format!(
             "parent {} of block {} has no DAG record", hex::encode(&p[..8]), hex::encode(&block.block_hash()[..8]))))?;
         let key = (d.blue_work, d.blue_score, *p);
         if best.as_ref().is_none_or(|(k, _)| key > *k) {
             best = Some((key, d.height));
         }
     }
-    best.map(|(_, h)| h + 1).ok_or_else(|| ViewError("a block without parents has no selected parent".into()))
+    best.map(|(_, h)| h + 1).ok_or_else(|| ViewError::inconsistent("a block without parents has no selected parent"))
 }
 
 /// THE coinbase-maturity rule (re-audit B1-T14), shared by the connect path
@@ -563,7 +583,7 @@ pub fn confirmations_in_view(
     txid: &[u8; 32],
 ) -> Result<Option<u64>, ViewError> {
     match rule {
-        MaturityRule::Skip => Err(ViewError("no confirmation measure (MaturityRule::Skip)".into())),
+        MaturityRule::Skip => Err(ViewError::inconsistent("no confirmation measure (MaturityRule::Skip)")),
         MaturityRule::HeaderHeights(height) => match view.view_tx_height(txid)? {
             Some(c) => Ok(Some(height.saturating_sub(c))),
             // Confirmed at the genesis: header height 0.
@@ -578,7 +598,7 @@ pub fn confirmations_in_view(
                 }
                 return Ok(None);
             };
-            let data = view.view_dag_data(&block)?.ok_or_else(|| ViewError(format!(
+            let data = view.view_dag_data(&block)?.ok_or_else(|| ViewError::inconsistent(format!(
                 "block {} of transaction {} has no DAG record", hex::encode(&block[..8]), hex::encode(&txid[..8]))))?;
             Ok(Some(spend_dag_height()?.saturating_sub(data.height)))
         }
@@ -672,7 +692,7 @@ fn validate_tx_in_view(
         tx, view, earlier, spent_in_block, block_height, maturity, same_block_coinbase, activation_height,
     )?;
     check_tx_policy_spends(tx, &committed, block_height, view, timelocks)?;
-    check_tx_witnesses(tx, &committed, block_height, activation_height)?;
+    check_tx_witnesses(tx, &committed, block_height, activation_height, ScriptChecks::Full)?;
     Ok(committed.fee)
 }
 
@@ -704,7 +724,7 @@ fn check_tx_policy_spends(
             return Ok(Some(0));
         }
         confirmations_in_view(view, timelocks, t).map_err(|e| {
-            let m = e.0.clone();
+            let m = e.msg.clone();
             read_error.borrow_mut().get_or_insert(e);
             m
         })
@@ -718,8 +738,8 @@ fn check_tx_policy_spends(
     match verdict {
         Ok(()) => Ok(()),
         // An output found in the view without a confirmation: an
-        // inconsistent index, not a rule.
-        Err(e) if e.starts_with(crate::blockval::STORAGE_ERR) => Err(TxFailure::Storage(ViewError(e))),
+        // inconsistent index, not a rule (and not an engine failure).
+        Err(e) if e.starts_with(crate::blockval::STORAGE_ERR) => Err(TxFailure::Storage(ViewError::inconsistent(e))),
         Err(e) => Err(TxFailure::witness(e)),
     }
 }
@@ -807,7 +827,11 @@ pub fn validate_block_in_view_at(
 /// whether the block id is disqualified (persisted) or only this body is
 /// dropped, and a read failure of the view ([`ConnectFailure::Storage`]) is
 /// no verdict at all. The verdict (`Ok` / `Err`) is exactly
-/// `validate_block_in_view`'s.
+/// `validate_block_in_view`'s. The pipeline itself calls
+/// [`validate_block_in_view_classified_with`] (the assumed-valid block's
+/// script mode, P5-G); this full-check form is library API
+/// (`blockval::validate_block_transactions`, tests).
+#[allow(dead_code)] // library API; the node binary compiles this module too
 pub fn validate_block_in_view_classified(view: &dyn UtxoView, block: &core::Block) -> Result<(), ConnectFailure> {
     validate_block_in_view_classified_at(view, block, core::activation::hardening_activation_height())
 }
@@ -818,10 +842,32 @@ pub fn validate_block_in_view_classified_at(
     block: &core::Block,
     activation_height: u64,
 ) -> Result<(), ConnectFailure> {
+    validate_block_in_view_classified_with(view, block, activation_height, ScriptChecks::Full)
+}
+
+/// [`validate_block_in_view_classified_at`] with the input scripts checked
+/// as `scripts` says. [`ScriptChecks::SignaturesAssumed`] (the connect path,
+/// for a block the assumed-valid block vouches for, `crate::assumevalid`,
+/// Bitcoin Core's `-assumevalid`) leaves out the signature verification of
+/// every input and nothing else: the version rule, every witness check
+/// (framing, public key hash, policy hash), the policy timelocks, the
+/// size-based minimum fee and every id-committed rule run as always. It
+/// applies only where the block id commits to every witness byte
+/// ([`witnesses_fixed_at`]): below that, a relay can swap `script_sig` bytes
+/// without changing the id, so the body held need not be the one the
+/// assumed-valid chain was validated with, and the block is checked in full.
+/// A valid block gets the same verdict either way.
+pub fn validate_block_in_view_classified_with(
+    view: &dyn UtxoView,
+    block: &core::Block,
+    activation_height: u64,
+    scripts: ScriptChecks,
+) -> Result<(), ConnectFailure> {
     let committed = |reason: String| ConnectFailure::Invalid(BlockInvalidity { reason, witness_dependent: false });
     let height = block.height;
     let hardened = core::block_rules::rules_active_at(height, activation_height);
     let witnesses_fixed = witnesses_fixed_at(height, activation_height);
+    let scripts = if witnesses_fixed { scripts } else { ScriptChecks::Full };
     // BIP30 and no spend of the block's own coinbase: this chain's rules from
     // genesis (the audit's VAL-2 / VAL-3 at the activation), so at every
     // height here. A read failure of the view is no verdict (B1-T12).
@@ -880,7 +926,7 @@ pub fn validate_block_in_view_classified_at(
     // the scripts and the size-based minimum fee.
     for (tx, c) in &checked {
         check_tx_policy_spends(tx, c, height, view, maturity).map_err(|f| f.into_connect(witnesses_fixed))?;
-        check_tx_witnesses(tx, c, height, activation_height).map_err(|f| f.into_connect(witnesses_fixed))?;
+        check_tx_witnesses(tx, c, height, activation_height, scripts).map_err(|f| f.into_connect(witnesses_fixed))?;
     }
     Ok(())
 }
@@ -1191,45 +1237,190 @@ enum ChunkFailure {
     Invalid { block: BlockHash, reason: String, witness: Option<[u8; 32]> },
     /// Storage / missing-data failure. `no_verdict`: the block whose
     /// validation could not be completed (a read failure of the view, no
-    /// verdict, re-audit B1-T12), when that is what failed.
-    Failed { reason: String, no_verdict: Option<BlockHash> },
+    /// verdict, re-audit B1-T12; or a body that could not be read, review of
+    /// PR #15, finding 6) and the class of that failure, when that is what
+    /// failed.
+    Failed { reason: String, no_verdict: Option<(BlockHash, ViewErrorKind)> },
+    /// The stored body of `block`, a block of the chunk to apply, does not
+    /// decode (review of PR #15, finding 6). No verdict: the body is dropped
+    /// and fetched again ([`drop_undecodable_body`]).
+    Undecodable { block: BlockHash, reason: String },
 }
 
 impl ChunkFailure {
     fn failed(reason: String) -> Self {
         ChunkFailure::Failed { reason, no_verdict: None }
     }
+
+    /// Review of PR #15, finding 6: a body read failure of `sub`, attributed
+    /// to the block whose judgement it prevents, so it is never a silent
+    /// stall. A block to APPLY: an engine error is a no-verdict of the
+    /// block (`ViewErrorKind::Io`: parked, counted toward the stop), a body
+    /// that does not decode is dropped and fetched again
+    /// ([`ChunkFailure::Undecodable`]). A block to ROLL BACK: the first block
+    /// the chunk applies cannot be judged without that rollback, so the
+    /// failure is that block's no-verdict, of the same class (the deepest
+    /// rollbacks share their chunk with the first apply blocks,
+    /// `ReorgPlan::chunks_with_rollback_tail`); a chunk that only rolls back
+    /// has no block to attribute it to.
+    fn body_unreadable(sub: &reorg::ReorgPlan, block: BlockHash, applying: bool, error: ViewError) -> Self {
+        let reason = ConnectError::BodyUnreadable { block, applying, error: error.clone() }.to_string();
+        match (applying, error.kind) {
+            (true, ViewErrorKind::Inconsistent) => ChunkFailure::Undecodable { block, reason },
+            (true, kind) => ChunkFailure::Failed { reason, no_verdict: Some((block, kind)) },
+            (false, kind) => ChunkFailure::Failed { reason, no_verdict: sub.to_apply.first().map(|b| (*b, kind)) },
+        }
+    }
 }
 
-/// Audit F1: how many validations in a row of one block may end without a
-/// verdict before the node stops ([`note_no_verdict`]).
+/// Audit F1: how many validations in a row of one block may end on a
+/// storage-engine failure ([`ViewErrorKind::Io`]) before the node stops
+/// ([`note_no_verdict`]).
 pub const NO_VERDICT_ABORT_AFTER: u32 = 3;
 
-/// Audit F1: `block`'s validation ended without a verdict (`reason`). A read
-/// failure is never a verdict (re-audit B1-T12): nothing is marked. But a
-/// failure that repeats on the same block is not transient, and retrying it
-/// on every acceptance (each one rolled back) is a silent permanent stall;
-/// after [`NO_VERDICT_ABORT_AFTER`] in a row the node stops instead, loudly,
-/// like Bitcoin Core's `AbortNode` on a coins-database read error
-/// (`Storage::abort_node`: acceptance and templates refuse, the `gnb` binary
-/// exits with this message; a restart that meets the same failure refuses to
-/// start). The count is cleared when the block is validated.
-fn note_no_verdict(store: &storage::Storage, block: &BlockHash, reason: &str) {
-    let n = store.note_no_verdict(block);
-    if n < NO_VERDICT_ABORT_AFTER {
-        warn!("block {} could not be validated (no verdict, attempt {} of {}): {}",
-            hex::encode(&block[..8]), n, NO_VERDICT_ABORT_AFTER, reason);
-        return;
+/// The operator message of the stop (review of audit F1, finding 4): it
+/// names the recovery that works. The start-up rebuild of the chain state
+/// (`rebuild_chain_state`) only runs when `check_chain_state` finds the
+/// footprint of an interrupted commit, so a restart with
+/// `--carryover-snapshot` repairs nothing here; a node whose storage engine
+/// keeps failing is resynchronized (docs/RUNNING.md, "Blocks without a verdict").
+pub fn no_verdict_abort_message(block: &BlockHash, failures: u32, reason: &str) -> String {
+    format!(
+        "block {} could not be validated {} times in a row because the storage engine failed ({}). \
+         This is not a verdict on the block (nothing is marked invalid): the node cannot read its own \
+         chain state. Stopping the node instead of running on it. Check the disk (free space, \
+         permissions, I/O errors in the system log), then restart; if the failure persists, the data \
+         directory is damaged: stop the node and resynchronize into a fresh, empty --data-dir (or start \
+         from a copy of an archival node's data directory)",
+        hex::encode(block), failures, reason)
+}
+
+/// Audit F1 (and its review, findings 1 and 2): `block`'s validation ended
+/// without a verdict (`kind`, `reason`). A read failure is never a verdict
+/// (re-audit B1-T12): nothing is marked or persisted, and the block keeps
+/// its body. It is PARKED (`GhostDAG::park_no_verdict`, in memory, with its
+/// selected-chain descendants) so the node selects, connects and mines on
+/// the best chain it can judge, and it is retried on a bounded schedule
+/// (`Storage::note_no_verdict`: 1 minute doubling up to 1 hour;
+/// [`unpark_due_no_verdicts`]). Only a storage-engine failure
+/// ([`ViewErrorKind::Io`]: a RocksDB read/write error, a missing column
+/// family) counts toward the stop: [`NO_VERDICT_ABORT_AFTER`] in a row stop
+/// the node, like Bitcoin Core's `AbortNode` / `FatalError`
+/// (`Storage::abort_node`: acceptance and templates refuse, the `gnb`
+/// binary exits with [`no_verdict_abort_message`]). An inconsistent index
+/// ([`ViewErrorKind::Inconsistent`]: a row an invariant requires is absent,
+/// or a row does not decode) never does: if such a miss ever became
+/// reachable from block data, one block would stop every node that receives
+/// it. It is logged loudly (rate-limited) and shown by `getdaginfo`
+/// (`no_verdict`). The record is cleared when the block is validated.
+fn note_no_verdict(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+    block: &BlockHash,
+    kind: ViewErrorKind,
+    reason: &str,
+) {
+    let now = std::time::Instant::now();
+    let rec = store.note_no_verdict(block, kind == ViewErrorKind::Io, reason, now);
+    let parked = dag.write().park_no_verdict(*block);
+    let retry = rec.retry_at.saturating_duration_since(now).as_secs();
+    match kind {
+        ViewErrorKind::Io if rec.io_failures >= NO_VERDICT_ABORT_AFTER => {
+            let msg = no_verdict_abort_message(block, rec.io_failures, reason);
+            error!("FATAL: {}", msg);
+            store.abort_node(msg);
+        }
+        ViewErrorKind::Io => warn!(
+            "block {} could not be validated: the storage engine failed (no verdict, attempt {} of {} \
+             before the node stops): {}; parked with {} selected-chain descendant(s), retried in {} s",
+            hex::encode(&block[..8]), rec.io_failures, NO_VERDICT_ABORT_AFTER, reason,
+            parked.len().saturating_sub(1), retry),
+        ViewErrorKind::Inconsistent => match store.no_verdict_log_permit(now) {
+            Some(suppressed) => error!(
+                "block {} could not be validated: the local chain state is INCONSISTENT ({}). No verdict: \
+                 the block is NOT marked invalid and keeps its body; it is parked with {} selected-chain \
+                 descendant(s) and retried in {} s (attempt {}), and the node follows the best chain it can \
+                 judge meanwhile. A node on a consistent index never gets here: report it, and see \
+                 `getdaginfo` (no_verdict){}",
+                hex::encode(&block[..8]), reason, parked.len().saturating_sub(1), retry, rec.attempts,
+                if suppressed > 0 { format!(" ({suppressed} similar line(s) suppressed)") } else { String::new() }),
+            None => debug!("block {} could not be validated (inconsistent chain state, attempt {}): {}",
+                hex::encode(&block[..8]), rec.attempts, reason),
+        },
     }
-    let msg = format!(
-        "block {} could not be validated {} times in a row ({}). This is not a verdict on the block \
-         (nothing is marked invalid): the local chain state cannot be read consistently (a storage \
-         I/O error or an inconsistent index). Stopping the node instead of retrying on every block. \
-         Check the disk and the log above, then restart; if the failure persists, rebuild the chain \
-         state (restart with --carryover-snapshot) or resynchronize this data directory",
-        hex::encode(block), n, reason);
-    error!("FATAL: {}", msg);
-    store.abort_node(msg);
+}
+
+/// Review of audit F1, finding 2: unpark every block parked without a
+/// verdict whose retry is due at `now` (`Storage::no_verdict_due`), so the
+/// next resolution validates it again, re-deriving the disqualified set once
+/// for all of them (review of PR #15, finding 1). The acceptance pipeline
+/// calls it right before its resolution (the node's own blocks included, so
+/// a parked block is retried while the node mines on the chain it can
+/// judge) and parks them again ([`repark_no_verdicts`]) if that resolution
+/// fails before judging them. Returns the blocks unparked.
+pub fn unpark_due_no_verdicts(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+    now: std::time::Instant,
+) -> Vec<BlockHash> {
+    let parked = dag.read().no_verdict_parked();
+    let due: Vec<BlockHash> = parked.into_iter().filter(|h| store.no_verdict_due(h, now)).collect();
+    if !due.is_empty() {
+        dag.write().unpark_no_verdicts(&due);
+        info!("retrying {} block(s) parked without a verdict (first {})", due.len(), hex::encode(&due[0][..8]));
+    }
+    due
+}
+
+/// Review of PR #15, finding 1: park `due` (unparked by
+/// [`unpark_due_no_verdicts`] for a resolution that then failed before
+/// judging them) again, so the DAG never selects a branch nobody validated
+/// while the applied tip stays where it is (templates would be refused).
+/// Their records are kept, still due: the next acceptance retries them. A
+/// block whose record is gone (it reached a verdict) stays unparked.
+fn repark_no_verdicts(dag: &Arc<RwLock<consensus::GhostDAG>>, store: &storage::Storage, due: &[BlockHash]) {
+    let mut d = dag.write();
+    for h in due {
+        if !d.is_no_verdict_parked(h) && store.no_verdict_record(h).is_some() {
+            d.park_no_verdict(*h);
+        }
+    }
+}
+
+/// Review of PR #15, finding 2: the operator warning while a branch parked
+/// without a verdict has more chain work than the applied tip. The node then
+/// follows, mines and serves templates on a chain it knows is not the
+/// heaviest, because it could not judge a block of the heavier one; the IBD
+/// latch counts that branch as servable (the node does not claim to be
+/// synced), and `getblocktemplate`, `getdaginfo` and `getnetworkinfo` carry
+/// this text in `warnings` (Bitcoin Core's `GetWarnings`). The node never
+/// stops for it: only repeated storage-engine failures stop it
+/// ([`note_no_verdict`]), so no peer can stop a node with a block.
+pub fn no_verdict_branch_warning(d: &consensus::GhostDAG, store: &storage::Storage) -> Option<String> {
+    let (best, root) = d.best_no_verdict_branch()?;
+    let best_work = d.get_block_data(&best)?.blue_work;
+    let applied = store.get_meta("tip_hash").ok().flatten()
+        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+        .filter(|t| d.has_block(t))
+        .or_else(|| d.selected_tip())?;
+    let applied_work = d.get_block_data(&applied).map_or(0, |x| x.blue_work);
+    if best_work <= applied_work {
+        return None;
+    }
+    let (class, reason, retry) = match store.no_verdict_record(&root) {
+        Some(r) => (
+            if r.last_io { "the storage engine failed" } else { "inconsistent chain state" },
+            r.reason,
+            r.retry_at.saturating_duration_since(std::time::Instant::now()).as_secs(),
+        ),
+        None => ("no verdict", String::new(), 0),
+    };
+    Some(format!(
+        "a branch with more chain work than the applied tip is parked without a verdict: block {} could not \
+         be validated ({}: {}); the node follows and mines on the lighter chain it can judge (applied tip {}, \
+         heaviest parked block {}) and retries it in {} s. See getdaginfo no_verdict and docs/RUNNING.md \
+         (\"Blocks without a verdict\")",
+        hex::encode(&root[..8]), class, reason, hex::encode(&applied[..8]), hex::encode(&best[..8]), retry))
 }
 
 /// Commit ONE chunk (`sub`, at most `reorg::MAX_BLOCKS_PER_COMMIT` blocks)
@@ -1256,15 +1447,36 @@ fn commit_chunk(
         Err(ConnectError::Invalid { block, reason, .. }) => {
             return Err(ChunkFailure::Invalid { block, reason, witness: None });
         }
+        Err(ConnectError::BodyUnreadable { block, applying, error }) => {
+            return Err(ChunkFailure::body_unreadable(sub, block, applying, error));
+        }
         Err(e) => return Err(ChunkFailure::failed(e.to_string())),
     };
 
+    // The assumed-valid block (Bitcoin Core's `-assumevalid`, P5-G): the
+    // blocks of this chunk whose signature checks are skipped, decided once
+    // with Core's conditions on the DAG as it stands (the assumed-valid
+    // block's header in the DAG, each block on its selected chain and on the
+    // best block's, the best block at the minimum chain work and two weeks
+    // of proof-equivalent time above the block; `crate::assumevalid`). One
+    // hash lookup without an assumed-valid block or while its header is
+    // unknown.
+    let assumed = crate::assumevalid::assumed_valid_blocks(&dag.read(), &sub.to_apply);
+    if !assumed.is_empty() {
+        info!("connecting {} block(s) with their signatures assumed valid (ancestors of the assumed-valid block)",
+            assumed.len());
+    }
     // The validator reports, beside the verdict, whether the failure
     // depends on witness bytes (block id, witness root of the body).
     let witness_failure: std::cell::Cell<Option<(BlockHash, [u8; 32])>> = std::cell::Cell::new(None);
-    let no_verdict: std::cell::Cell<Option<BlockHash>> = std::cell::Cell::new(None);
+    let no_verdict: std::cell::Cell<Option<(BlockHash, ViewErrorKind)>> = std::cell::Cell::new(None);
     let validate = |view: &dyn UtxoView, b: &core::Block| -> Result<(), ValidationFailure> {
-        match validate_block_in_view_classified(view, b) {
+        let scripts = if !assumed.is_empty() && assumed.contains(&b.block_hash()) {
+            ScriptChecks::SignaturesAssumed
+        } else {
+            ScriptChecks::Full
+        };
+        match validate_block_in_view_classified_with(view, b, core::activation::hardening_activation_height(), scripts) {
             Ok(()) => Ok(()),
             Err(ConnectFailure::Invalid(e)) => {
                 witness_failure.set(e.witness_dependent.then(|| {
@@ -1274,14 +1486,13 @@ fn commit_chunk(
             }
             // No verdict (re-audit B1-T12): `connect_plan` fails the chunk
             // as a storage failure (`ChunkFailure::Failed`): nothing of it is
-            // written or marked. `resolve_best_chain` returns to the applied
-            // tip the move started from when nothing of the new branch was
-            // applied, and stops the node if the same block keeps failing
-            // (audit F1, [`note_no_verdict`]).
-            Err(ConnectFailure::Storage(m)) => {
+            // written or marked. `resolve_best_chain` parks the block and
+            // goes on with the best chain it can judge (audit F1,
+            // [`note_no_verdict`]).
+            Err(ConnectFailure::Storage(e)) => {
                 witness_failure.set(None);
-                no_verdict.set(Some(b.block_hash()));
-                Err(ValidationFailure::Storage(m))
+                no_verdict.set(Some((b.block_hash(), e.kind)));
+                Err(ValidationFailure::Storage(e.msg))
             }
         }
     };
@@ -1349,42 +1560,10 @@ fn commit_chunk(
             Err(ChunkFailure::Invalid { block, reason, witness })
         }
         Err(ConnectError::Failed(reason)) => Err(ChunkFailure::Failed { reason, no_verdict: no_verdict.take() }),
-    }
-}
-
-/// Audit F1: put the applied chain back on `origin`, the applied tip a
-/// resolution started from, after it committed rollback chunks (and no chunk
-/// applying blocks) and then failed without a verdict on the first block of
-/// a new branch: the node would otherwise sit on an ancestor of its best
-/// valid chain (lighter than both branches; no template is built while the
-/// applied tip is not the selected tip) until the failure clears. The blocks
-/// re-applied are the ones the rollback chunks disconnected, re-validated in
-/// their own context like every connect, in chunks, each recorded into
-/// `delta` and `applied`.
-fn restore_applied_tip(
-    dag: &Arc<RwLock<consensus::GhostDAG>>,
-    store: &storage::Storage,
-    shielded: &Arc<RwLock<ShieldedPool>>,
-    applied: &mut BlockHash,
-    origin: BlockHash,
-    delta: &mut reorg::ChainDelta,
-) -> Result<(), String> {
-    let plan = reorg::compute_connect_plan(&dag.read(), applied, &origin)
-        .ok_or_else(|| "no plan back to the previous applied tip".to_string())?;
-    for sub in plan.chunks(reorg::MAX_BLOCKS_PER_COMMIT) {
-        match commit_chunk(dag, store, shielded, &sub, None, &[], &[]) {
-            Ok(outcome) => {
-                delta.record(&outcome);
-                *applied = sub.target();
-            }
-            Err(ChunkFailure::Invalid { block, reason, .. }) => {
-                return Err(format!("block {} of the previous applied chain failed: {}",
-                    hex::encode(&block[..8]), reason));
-            }
-            Err(ChunkFailure::Failed { reason, .. }) => return Err(reason),
+        Err(ConnectError::BodyUnreadable { block, applying, error }) => {
+            Err(ChunkFailure::body_unreadable(sub, block, applying, error))
         }
     }
-    Ok(())
 }
 
 /// Move the applied chain to the best valid block, marking blocks invalid as
@@ -1423,16 +1602,28 @@ fn restore_applied_tip(
 /// caller rolls its trigger back); after a commit the failure is reported as
 /// `Connected { stopped: Some(..) }`.
 ///
-/// A failure without a verdict (audit F1) is never a silent stall: when the
-/// resolution committed rollback chunks and then failed before applying any
-/// block of a new branch, the disconnected blocks are applied again
-/// ([`restore_applied_tip`]; not when `applied_tip` itself was disqualified
-/// meanwhile), so the applied tip stays the valid block it was instead of an
-/// ancestor of both branches; and a block whose
-/// validation ends without a verdict [`NO_VERDICT_ABORT_AFTER`] times in a row
-/// stops the node ([`note_no_verdict`], Bitcoin Core's `AbortNode`) instead
-/// of being retried, and rolled back, on every acceptance. Neither marks
-/// anything (re-audit B1-T12).
+/// A failure without a verdict (audit F1) is never a silent stall: the block
+/// is parked in memory with its selected-chain descendants
+/// ([`note_no_verdict`]: nothing marked or persisted, re-audit B1-T12, the
+/// body kept) and the best chain the node can judge is resolved again from
+/// where the applied chain now is, exactly as after an invalid block: a
+/// move that had committed rollback chunks re-applies the old branch, and
+/// templates are built on it. The parked block is retried on a bounded
+/// schedule ([`unpark_due_no_verdicts`]), and repeated storage-engine
+/// failures stop the node (Bitcoin Core's `AbortNode`). A body of a block
+/// to apply that cannot be read is attributed too (review of PR #15,
+/// finding 6): an engine error is that block's no-verdict, a body that does
+/// not decode is dropped and fetched again ([`drop_undecodable_body`]). The
+/// deepest rollbacks (at most `reorg::MAX_BLOCKS_PER_COMMIT`) are committed
+/// in ONE batch with the first apply chunk
+/// (`ReorgPlan::chunks_with_rollback_tail`; review of audit F1, finding 3,
+/// and of PR #15, finding 5), so a reorg up to that depth is one commit: a
+/// first apply chunk that fails, for any reason, never leaves the applied
+/// tip at the fork point, and a pruned node never commits a rollback it
+/// could not undo. (A deeper rollback commits its first part in earlier
+/// chunks; if their bodies were pruned, only a re-fetch can undo it: the old
+/// branch then waits for them like any best chain without bodies,
+/// `MissingBodies::Wait`.)
 ///
 /// PoWit finality (`consensus::finality`): the candidate is always the best
 /// block whose selected chain passes through the pin, and the pin is
@@ -1457,9 +1648,6 @@ fn resolve_best_chain(
     let mut committed_any = false;
     let mut trigger_pending = trigger.is_some();
     let mut clears_pending = true;
-    // Audit F1: whether a chunk that APPLIES blocks has committed yet (see
-    // the no-verdict case below).
-    let mut applied_new = false;
     let mut first_lca: Option<BlockHash> = None;
 
     // What was committed; disqualifications found after the last commit are
@@ -1514,10 +1702,34 @@ fn resolve_best_chain(
 
         // A block without a stored body cannot be connected.
         let mut bodiless = Vec::new();
+        let mut unreadable = None;
         for h in &plan.to_apply {
-            if !store.has_block_body(h).map_err(|e| e.to_string())? {
-                bodiless.push(*h);
+            match store.has_block_body(h) {
+                Ok(true) => {}
+                Ok(false) => bodiless.push(*h),
+                Err(e) => {
+                    unreadable = Some((*h, ViewError::from_storage(&e)));
+                    break;
+                }
             }
+        }
+        if let Some((h, e)) = unreadable {
+            // Review of PR #15, findings 4 and 6: the storage engine failed
+            // reading whether a block to apply has a body. No verdict on it:
+            // it is parked and counted toward the stop like any engine
+            // failure (`note_no_verdict`), and the best chain the node can
+            // judge is resolved again. Never a bare `Err` once chunks have
+            // committed: the caller would take the committed move for
+            // nothing (and roll its trigger back).
+            let m = format!("the stored body of block {} could not be read: {}", hex::encode(&h[..8]), e);
+            note_no_verdict(dag, store, &h, e.kind, &m);
+            if store.abort_reason().is_none() {
+                continue 'resolve;
+            }
+            if committed_any {
+                return Ok(finish(&delta, log, Some(m), first_lca));
+            }
+            return Err(m);
         }
         if let Some(first) = bodiless.first() {
             match missing {
@@ -1551,7 +1763,21 @@ fn resolve_best_chain(
         }
         first_lca.get_or_insert(plan.lca);
 
-        for sub in plan.chunks(reorg::MAX_BLOCKS_PER_COMMIT) {
+        // Review of audit F1, finding 3, and of PR #15, finding 5: a
+        // rollback that commits before the first block of the new branch is
+        // judged leaves the applied tip at the fork point if that chunk then
+        // fails for any reason (an unreadable body, a failed commit), and
+        // undoing it needs the old branch's bodies (gone on a pruned node).
+        // The deepest rollbacks (up to `MAX_BLOCKS_PER_COMMIT`) therefore go
+        // into the batch of the first apply chunk: a reorg up to that depth
+        // is one commit. (Deeper rollbacks commit in earlier chunks, each a
+        // consistent applied tip the move resumes from.)
+        if plan.to_rollback.len() > reorg::MAX_BLOCKS_PER_COMMIT && !plan.to_apply.is_empty() {
+            info!("chain move: the rollback of {} of {} block(s) commits before the new branch is judged",
+                plan.to_rollback.len() - reorg::MAX_BLOCKS_PER_COMMIT, plan.to_rollback.len());
+        }
+
+        for sub in plan.chunks_with_rollback_tail(reorg::MAX_BLOCKS_PER_COMMIT, plan.to_rollback.len()) {
             let t = if trigger_pending { trigger } else { None };
             let always: &[BlockHash] = if clears_pending { &clears.always } else { &[] };
             let log_snapshot = log.invalid.clone();
@@ -1562,7 +1788,6 @@ fn resolve_best_chain(
                     committed_any = true;
                     trigger_pending = false;
                     clears_pending = false;
-                    applied_new |= !sub.to_apply.is_empty();
                     // Marks were persisted in the batch.
                     log.invalid.clear();
                 }
@@ -1578,28 +1803,23 @@ fn resolve_best_chain(
                     }
                     continue 'resolve;
                 }
-                Err(ChunkFailure::Failed { reason: mut m, no_verdict }) => {
+                Err(ChunkFailure::Undecodable { block, reason }) => {
                     if reorg_depth > 0 { crate::metrics::inc_reorg_failure(); }
-                    if let Some(b) = no_verdict {
-                        note_no_verdict(store, &b, &m);
-                    }
-                    // Audit F1: the move disconnected blocks and then could
-                    // not apply the first block of a new branch: return to
-                    // the applied tip it started from (unless that tip was
-                    // disqualified meanwhile) rather than stop on an
-                    // ancestor of both branches.
-                    if !applied_new && applied != applied_tip && !sub.to_apply.is_empty()
-                        && !dag.read().is_invalid(&applied_tip)
-                    {
-                        match restore_applied_tip(dag, store, shielded, &mut applied, applied_tip, &mut delta) {
-                            Ok(()) => {
-                                warn!("chain move abandoned: the new branch could not be applied ({}); \
-                                       the applied tip is back at {}", m, hex::encode(&applied[..8]));
-                            }
-                            Err(e) => {
-                                m = format!("{m}; returning to the previous applied tip {} failed too: {e}",
-                                    hex::encode(&applied_tip[..8]));
-                            }
+                    drop_undecodable_body(dag, store, block, reason, missing == MissingBodies::Stop,
+                        &mut log.body_rejected);
+                    continue 'resolve;
+                }
+                Err(ChunkFailure::Failed { reason: m, no_verdict }) => {
+                    if reorg_depth > 0 { crate::metrics::inc_reorg_failure(); }
+                    // Audit F1 (review, finding 2): a block without a verdict
+                    // is parked, not a reason to stop the move where it is:
+                    // the best chain the node can judge is resolved again from
+                    // the applied tip it is on (which re-applies an old branch
+                    // whose rollback committed), like after an invalid block.
+                    if let Some((b, kind)) = no_verdict {
+                        note_no_verdict(dag, store, &b, kind, &m);
+                        if store.abort_reason().is_none() {
+                            continue 'resolve;
                         }
                     }
                     if committed_any {
@@ -1665,6 +1885,48 @@ fn drop_body_and_wait(
     );
     body_log.push((block, reason));
 }
+
+/// Review of PR #15, finding 6: the stored body of `block`, a block to
+/// apply, does not decode (the row was written that way, or corrupted
+/// before RocksDB checksummed it). That is no verdict on the block (its id
+/// commits to its transactions; the node's copy is bad): nothing is marked
+/// or persisted, the body is deleted, and the block, with its selected-chain
+/// descendants, waits for a copy from peers like a block whose body is
+/// missing (`GhostDAG::mark_body_pending`; the processor requests it while a
+/// chain through it can still become the best one, [`awaits_body`], and the
+/// copy goes through `accept_block`'s body replacement). The node meanwhile
+/// follows the best chain it can judge. Bitcoin Core stops on a block it
+/// cannot read back (`FatalError`); fetching the block again is the repair
+/// a node with peers has, and it keeps the node running.
+fn drop_undecodable_body(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &storage::Storage,
+    block: BlockHash,
+    reason: String,
+    operator: bool,
+    body_log: &mut Vec<(BlockHash, String)>,
+) {
+    let marked = {
+        let mut d = dag.write();
+        let marked = d.mark_body_pending(block, None);
+        if operator {
+            d.request_body(block);
+        }
+        marked
+    };
+    if let Err(e) = store.delete_block_body(&block) {
+        error!("could not delete the undecodable body of {}: {}", hex::encode(&block[..8]), e);
+    }
+    error!(
+        "block {} could not be judged: {}. No verdict (it is NOT marked invalid): the stored body is \
+         dropped and fetched again from peers ({} selected-chain descendant(s) wait with it)",
+        hex::encode(&block[..8]), reason, marked.len().saturating_sub(1)
+    );
+    body_log.push((block, format!("{UNDECODABLE_BODY_REASON}: {reason}")));
+}
+
+/// The reason [`drop_undecodable_body`] logs for a dropped body.
+const UNDECODABLE_BODY_REASON: &str = "stored body does not decode";
 
 /// Disqualify `block` (and its selected-chain descendants) in memory and
 /// remember the root + reason for persistence.
@@ -1987,7 +2249,12 @@ pub fn accept_block_tracking(
         .map_err(|e| format!("consensus rejection: {}", e))?;
 
     // ── Proof of work (expensive: 64 MiB GnB-SMH, cached by block id) ─
-    if !block.validate_pow() {
+    //    A body for a block already in the DAG (`replacing`: same id, so the
+    //    same proof preimage and nonce, and the height just bound to the
+    //    same parents) carries the proof its DAG record already verified:
+    //    only the cheap checks run again (`pow::proof_recorded_in_dag`, P5-G).
+    let proof_ok = if replacing { pow::proof_recorded_in_dag(block) } else { block.validate_pow() };
+    if !proof_ok {
         return Err("consensus rejection: invalid GnB-SMH proof of work".into());
     }
 
@@ -2129,6 +2396,13 @@ pub fn accept_block_tracking(
 
     // ── Connect the best valid chain (any depth, audit DAG-6) ────────
     let trigger = (!replacing).then_some(TriggerRecord { hash: block_hash, powit: powit_state.as_ref() });
+    // Review of audit F1, finding 2: blocks parked without a verdict whose
+    // retry is due compete again in this resolution. Unparked HERE (review
+    // of PR #15, finding 1): after every early refusal of the arriving block
+    // (a junk frame unparks nothing) and after `old_tip` was taken (a retry
+    // that moves the selected tip is signalled like any move), and parked
+    // again if the resolution fails before judging them.
+    let due = unpark_due_no_verdicts(dag, store, std::time::Instant::now());
     let resolution = resolve_best_chain(
         dag, store, shielded, applied_tip, trigger,
         &mut log, &MarkClears::default(), MissingBodies::Wait,
@@ -2137,6 +2411,7 @@ pub fn accept_block_tracking(
     let resolution = match resolution {
         Ok(r) => r,
         Err(m) => {
+            repark_no_verdicts(dag, store, &due);
             // Storage failure: roll the in-memory change back (nothing was
             // committed), drop the body, but keep any deterministic invalid
             // marks discovered on the way.
@@ -2210,17 +2485,36 @@ pub fn accept_block_tracking(
     // arrives.
     let trigger_invalid: Option<String> = if !dag.read().is_invalid(&block_hash) {
         None
+    } else if dag.read().is_no_verdict_parked(&block_hash) {
+        // Audit F1 (review, findings 1 and 2): kept in the DAG with its body,
+        // parked, not marked; reported as not connected (nothing is relayed
+        // or penalized for it: `ingress::verdict_for_accept_error` ignores
+        // this message).
+        let reason = store.no_verdict_record(&block_hash).map(|r| r.reason)
+            .unwrap_or_else(|| "storage read failed".to_string());
+        Some(format!(
+            "block {} could not be validated (no verdict: {}); it is not marked invalid, it is kept \
+             and retried later",
+            hex::encode(&block_hash[..8]), reason
+        ))
     } else if dag.read().is_body_pending(&block_hash) {
         let reason = log.body_rejected.iter().rev()
             .find(|(h, _)| *h == block_hash)
             .map(|(_, r)| r.clone())
             .unwrap_or_else(|| "body missing".to_string());
-        Some(format!(
-            "consensus rejection: block {} body rejected ({}); the block id commits to no witness \
-             bytes below the hardening activation, so it is not disqualified and a different body \
-             will be re-evaluated",
-            hex::encode(&block_hash[..8]), reason
-        ))
+        if reason.starts_with(UNDECODABLE_BODY_REASON) {
+            // A local fault, not the sender's (review of PR #15, finding 6):
+            // no "consensus rejection" (nothing is penalized for it).
+            Some(format!("block {} could not be judged ({}); it waits for a copy from peers",
+                hex::encode(&block_hash[..8]), reason))
+        } else {
+            Some(format!(
+                "consensus rejection: block {} body rejected ({}); the block id commits to no witness \
+                 bytes below the hardening activation, so it is not disqualified and a different body \
+                 will be re-evaluated",
+                hex::encode(&block_hash[..8]), reason
+            ))
+        }
     } else if dag.read().is_invalid_persistently(&block_hash) {
         let reason = store.invalid_block_reason(&block_hash).ok().flatten()
             .unwrap_or_else(|| "descends from an invalid block".to_string());
@@ -2229,7 +2523,7 @@ pub fn accept_block_tracking(
             hex::encode(&block_hash[..8]), reason
         ))
     } else {
-        info!("block {} waits for the body of an ancestor before it can be connected",
+        info!("block {} waits for an ancestor (a body, or a verdict) before it can be connected",
             hex::encode(&block_hash[..8]));
         None
     };
@@ -2736,6 +3030,18 @@ pub fn reconcile_on_startup(
             }
         }
     }
+    // Audit F1 (review, finding 1): a block that could not be judged because
+    // the storage engine failed refuses the start, like Bitcoin Core's init
+    // when it cannot connect the best block; an inconsistent index does not
+    // (the block stays parked and is retried while the node runs). Checked
+    // whatever the tips (review of PR #15, finding 3): a block parked by the
+    // resolution above, or by a chain-state rebuild that ran before this
+    // call, makes the applied tip the selected one.
+    if let Some((b, r)) = store.no_verdict_records().into_iter().find(|(_, r)| r.last_io) {
+        return Err(format!(
+            "block {} could not be validated: the storage engine failed (no verdict): {}",
+            hex::encode(&b[..8]), r.reason));
+    }
     Ok(())
 }
 
@@ -3225,6 +3531,23 @@ pub fn rebuild_chain_state(
             0
         }
     };
+    // Review of PR #15, finding 3: a block of the best chain that could not
+    // be judged (no verdict, parked) left the rebuild on a shorter chain:
+    // the rebuild is not complete. The flag stays set (the next start
+    // resumes from the applied tip; `check_chain_state` reports
+    // `RebuildInterrupted` meanwhile, so the node never starts on the
+    // shortened chain) and the failure is reported, like Bitcoin Core's
+    // init when a reindex cannot connect the best block.
+    let parked = dag.read().no_verdict_parked();
+    if let Some(first) = parked.first() {
+        let reason = store.no_verdict_record(first).map(|r| r.reason).unwrap_or_default();
+        let at = store.get_meta("tip_hash").ok().flatten()
+            .map(|v| hex::encode(&v[..v.len().min(8)])).unwrap_or_default();
+        return Err(format!(
+            "chain-state rebuild incomplete: {} block(s) could not be validated (no verdict; first {}: {}); \
+             the rebuild stays pending and resumes from the applied tip {} at the next start",
+            parked.len(), hex::encode(&first[..8]), reason, at));
+    }
     store.rebuild_aggregates(&std::sync::atomic::AtomicBool::new(false)).map_err(|e| e.to_string())?;
     store.put_meta(REBUILD_PENDING_META, &[0u8]).map_err(|e| e.to_string())?;
     warn!("chain state rebuilt from block bodies: {} row(s) cleared, {} consensus mark(s) re-derived, \
@@ -3782,7 +4105,7 @@ pub fn validate_tx_inputs(
     block_height: u64,
 ) -> Result<u64, String> {
     // A lookup error is a read failure, reported as such (no verdict).
-    let lookup = |txid: &[u8; 32], idx: u32| utxo_lookup(txid, idx).map_err(ViewError);
+    let lookup = |txid: &[u8; 32], idx: u32| utxo_lookup(txid, idx).map_err(ViewError::io);
     validate_tx_inputs_classified(
         tx, &lookup, spent_set, block_height, core::activation::hardening_activation_height(),
     )
@@ -3804,7 +4127,7 @@ fn validate_tx_inputs_classified(
     activation_height: u64,
 ) -> Result<u64, TxFailure> {
     let committed = check_tx_inputs_committed(tx, utxo_lookup, spent_set, block_height, activation_height)?;
-    check_tx_witnesses(tx, &committed, block_height, activation_height)?;
+    check_tx_witnesses(tx, &committed, block_height, activation_height, ScriptChecks::Full)?;
     Ok(committed.fee)
 }
 
@@ -3911,15 +4234,26 @@ fn check_tx_inputs_committed(
 /// public key hash, signature; `admission::verify_input_scripts_at`) and the
 /// minimum fee measured on the full wire size (`core::check_min_fee`).
 /// Witness-dependent (the caller clears the flag at/after the activation,
-/// where the block's witness commitment fixes every `script_sig`).
+/// where the block's witness commitment fixes every `script_sig`). With
+/// [`ScriptChecks::SignaturesAssumed`] the signature step is left out
+/// (`admission::check_input_scripts_without_signatures_at`; see
+/// [`validate_block_in_view_classified_with`]).
 fn check_tx_witnesses(
     tx: &core::Transaction,
     committed: &CommittedTx,
     block_height: u64,
     activation_height: u64,
+    scripts: ScriptChecks,
 ) -> Result<(), TxFailure> {
-    admission::verify_input_scripts_at(tx, &committed.prevouts, block_height, activation_height)
-        .map_err(TxFailure::witness)?;
+    match scripts {
+        ScriptChecks::Full => {
+            admission::verify_input_scripts_at(tx, &committed.prevouts, block_height, activation_height)
+        }
+        ScriptChecks::SignaturesAssumed => admission::check_input_scripts_without_signatures_at(
+            tx, &committed.prevouts, block_height, activation_height,
+        ),
+    }
+    .map_err(TxFailure::witness)?;
     core::check_min_fee(tx, committed.fee).map_err(TxFailure::witness)?;
     Ok(())
 }

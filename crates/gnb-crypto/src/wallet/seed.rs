@@ -23,6 +23,7 @@
 //!   - Multi-language wordlists. English only for v0.5.4; consider for v0.6.
 
 use super::errors::WalletError;
+use crate::crypto::SecretBytes;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 use serde::{Serialize, Deserialize};
 use sha2::Sha512;
@@ -97,11 +98,17 @@ fn fresh_entropy() -> Zeroizing<[u8; 32]> {
 //     bip39 = "2.0"
 
 /// A BIP39 seed phrase. Sensitive — zeroed on drop.
-#[derive(Zeroize, ZeroizeOnDrop, Clone)]
+///
+/// CRY-4: neither `Copy` nor `Clone` (it used to derive `Clone`: every
+/// clone was another copy of the phrase); the static assertion below turns
+/// a regression into a build failure.
+#[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SeedPhrase {
     /// The raw phrase as a space-separated string.
     phrase: String,
 }
+
+gnb_secret::assert_not_copy_or_clone!(SeedPhrase);
 
 impl SeedPhrase {
     /// Generate a new 24-word seed phrase using OS-level CSPRNG.
@@ -154,7 +161,7 @@ impl SeedPhrase {
     /// only reports `InvalidLength` when the requested output exceeds
     /// `(2^32 - 1) * hash_output_len` bytes, which a fixed 64-byte output can
     /// never hit.
-    pub fn to_seed_bytes(&self) -> [u8; 64] {
+    pub fn to_seed_bytes(&self) -> SecretBytes {
         self.to_seed_bytes_versioned(SeedVersion::V2Bip39Sha512, "")
             .expect("PBKDF2-HMAC-SHA512 with a 64-byte output cannot fail")
     }
@@ -171,17 +178,23 @@ impl SeedPhrase {
     /// lows) — for these fixed-size, non-empty parameters PBKDF2-HMAC cannot
     /// actually fail, but a future change to the output length or PRF must
     /// not be able to silently swallow a real error into wrong key bytes.
+    ///
+    /// CRY-4: the seed is written by PBKDF2 straight into a
+    /// [`SecretBytes`] (locked where the platform allows, wiped on drop)
+    /// and returned by moving that owner: it used to be a `[u8; 64]`
+    /// returned by value, each move another unwiped copy of the wallet's
+    /// master secret on the stack.
     pub fn to_seed_bytes_versioned(
         &self,
         version: SeedVersion,
         passphrase: &str,
-    ) -> Result<[u8; 64], WalletError> {
+    ) -> Result<SecretBytes, WalletError> {
         // BIP39 salt = "mnemonic" || passphrase (empty passphrase == plain
         // "mnemonic", matching every external BIP39 tool and the pinned
         // vectors below).
         let salt = bip39_salt(passphrase);
 
-        let mut out = [0u8; 64];
+        let mut out = SecretBytes::zeroed(64);
         match version {
             SeedVersion::V2Bip39Sha512 => {
                 pbkdf2::<Hmac<Sha512>>(self.phrase.as_bytes(), &salt, 2048, &mut out)
@@ -193,6 +206,8 @@ impl SeedPhrase {
                     .map_err(|e| WalletError::Crypto(format!("pbkdf2 (seed v1): {}", e)))?;
             }
         }
+        // The HMAC states held keyed copies of the phrase.
+        gnb_secret::scrub_stack();
         Ok(out)
     }
 
@@ -209,7 +224,7 @@ impl SeedPhrase {
         note = "not BIP39 (SHA-256 PRF); use SeedVersion::V1LegacyPbkdf2Sha256 via \
                 to_seed_bytes_versioned. Never for new wallets."
     )]
-    pub fn to_seed_bytes_legacy_sha256(&self) -> [u8; 64] {
+    pub fn to_seed_bytes_legacy_sha256(&self) -> SecretBytes {
         self.to_seed_bytes_versioned(SeedVersion::V1LegacyPbkdf2Sha256, "")
             .expect("PBKDF2-HMAC-SHA256 with a 64-byte output cannot fail")
     }

@@ -39,14 +39,16 @@ impl Key {
     fn id(&self) -> KeyId {
         self.signer.borrow().public().witness_id()
     }
-    fn attest(&self, source: Checkpoint, target: Checkpoint) -> Attestation {
+    /// The attestation message of `target`'s height under the second
+    /// hardening height `h2` (v2 from it, PoWit finding 1).
+    fn attest(&self, source: Checkpoint, target: Checkpoint, h2: u64) -> Attestation {
         let e = P.epoch(ACT, target.height);
         let mut s = self.signer.borrow_mut();
         if e > s.epoch() {
             s.evolve_to(e).unwrap();
         }
         assert_eq!(e, s.epoch(), "keys sign epochs in order");
-        Attestation::sign(CHAIN, source, target, &s).unwrap()
+        Attestation::sign_at(CHAIN, h2, source, target, &s).unwrap()
     }
 }
 
@@ -102,7 +104,7 @@ fn honest_chain(keys: &[Key], to: u64, h2: u64) -> Vec<PowitState> {
     for h in ACT + 1..=to {
         let shares: Vec<(KeyId, u128)> = ids.iter().map(|k| (*k, 1_000)).collect();
         let atts: Vec<Attestation> = match open_slot(&st, h) {
-            Some(t) if P.epoch(ACT, t) >= 2 => keys.iter().map(|k| k.attest(st.justified, cp(0, t))).collect(),
+            Some(t) if P.epoch(ACT, t) >= 2 => keys.iter().map(|k| k.attest(st.justified, cp(0, t), h2)).collect(),
             _ => Vec::new(),
         };
         st = step(&st, h, 0, &shares, &atts, h2).unwrap_or_else(|e| panic!("honest h={h}: {e}"));
@@ -121,7 +123,7 @@ fn private_fork(base: &PowitState, z: &Key, to: u64, h2: u64) -> PowitState {
     for h in FORK_AT + 1..=to {
         let shares = [(z.id(), 2_000u128)];
         let with_vote = open_slot(&st, h).and_then(|t| {
-            let a = z.attest(st.justified, cp(1, t));
+            let a = z.attest(st.justified, cp(1, t), h2);
             step(&st, h, 1, &shares, &[a], h2).ok()
         });
         st = match with_vote {
@@ -258,12 +260,12 @@ fn a_stall_freezes_the_witness_set_and_resumed_finality_refreshes_it() {
         for h in FORK_AT + 1..=RESUME + 10 {
             let shares = [(ids[0], 1_000u128), (ids[1], 1_000), (n.id(), 2_000)];
             let atts: Vec<Attestation> = match open_slot(&st, h) {
-                Some(t) if h > RESUME => keys.iter().map(|k| k.attest(st.justified, cp(0, t))).collect(),
+                Some(t) if h > RESUME => keys.iter().map(|k| k.attest(st.justified, cp(0, t), h2)).collect(),
                 _ => Vec::new(),
             };
             if h == 1_201 {
                 // N signs slot 1200 (epoch 10) during the stall.
-                let vote = n.attest(st.justified, cp(0, 1_200));
+                let vote = n.attest(st.justified, cp(0, 1_200), h2);
                 let r = step(&st, h, 0, &shares, std::slice::from_ref(&vote), h2);
                 assert_eq!(r.is_ok(), h2 == activation::NEVER,
                     "h2 {h2}: a stall lets a new key vote only under the first rule: {r:?}");

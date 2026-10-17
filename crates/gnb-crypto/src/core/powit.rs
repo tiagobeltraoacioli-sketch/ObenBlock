@@ -30,6 +30,27 @@
 //! - **Inactivity decay**: when nothing has finalized for `leak_after_epochs`,
 //!   members whose attestations were not included in the previous epoch lose
 //!   1/16 of their weight per epoch until finality resumes.
+//!
+//! # Second hardening activation ([`Regime::Hardening2`])
+//!
+//! From `activation::hardening2_activation_height()` (mainnet: not yet
+//! scheduled; testnet and regtest: 0), PoWit audit findings 1 and 4
+//! (docs/CONSENSUS.md, "PoWit"; docs/DESIGN-pow-powit.md, §4-§5):
+//!
+//! - **The signed message commits the witness key** (attestations whose
+//!   *target* height is at or above the activation,
+//!   [`attestation_message_v2`]): a leaf signature is valid for exactly one
+//!   KES key, so a leaf can no longer be re-rooted into unlimited keys.
+//! - **Evidence only against witnesses** (blocks at or above the
+//!   activation): a block of epoch `E` may carry an equivocation proof only
+//!   against a member of `W(E-1)`, `W(E)` or `W(E+1)`.
+//! - **Two thirds of all the weight** (blocks at or above the activation):
+//!   `W(e)` is every unbarred share key with weight (no 64-key cap), so the
+//!   justification threshold is two thirds of the total window weight, as
+//!   Casper FFG measures two thirds of all stake.
+//!
+//! Below the activation every rule is the one above, bit for bit
+//! (`hardening2_tests::old_regime_transition_is_pinned`).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -126,6 +147,31 @@ impl PowitParams {
     }
 }
 
+// ── Rules in force ───────────────────────────────────────────────────────────
+
+/// The PoWit rules a block is checked under: before or from the second
+/// hardening activation (module docs). A block's regime compares its header
+/// height with the activation height ([`Regime::at`]); an attestation's
+/// message version compares its *target* height instead
+/// ([`Attestation::message_at`]), so a witness, which signs before any block
+/// includes its vote, knows which message to sign.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Regime {
+    /// Below the second hardening activation: the rules that produced the
+    /// existing chain.
+    V1,
+    /// From the second hardening activation.
+    Hardening2,
+}
+
+impl Regime {
+    /// The regime of a block at `height` when the second hardening upgrade
+    /// activates at `hardening2_height` (`activation::is_active_at`).
+    pub fn at(height: u64, hardening2_height: u64) -> Regime {
+        if activation::is_active_at(height, hardening2_height) { Regime::Hardening2 } else { Regime::V1 }
+    }
+}
+
 // ── Checkpoints, attestations, equivocations ─────────────────────────────────
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -135,6 +181,7 @@ pub struct Checkpoint {
 }
 
 const DS_ATTEST: &[u8] = b"GNB-POWIT-v1/attest";
+const DS_ATTEST_V2: &[u8] = b"GNB-POWIT-v2/attest";
 const DS_BODY: &[u8] = b"GNB-POWIT-v1/body";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,7 +194,10 @@ pub struct Attestation {
     pub sig: KesSignature,
 }
 
-/// The digest a witness signs for a link.
+/// The digest a witness signs for a link whose target is below the second
+/// hardening activation (v1). It does not commit the witness key: PoWit
+/// audit finding 1 (a leaf's signature verifies under every root its path
+/// can be re-hashed to). Kept bit for bit for those targets.
 pub fn attestation_message(chain: ChainId, source: &Checkpoint, target: &Checkpoint) -> [u8; 32] {
     let mut h = Sha3_256::new();
     h.update((DS_ATTEST.len() as u32).to_le_bytes());
@@ -158,6 +208,47 @@ pub fn attestation_message(chain: ChainId, source: &Checkpoint, target: &Checkpo
     h.update(target.height.to_le_bytes());
     h.update(target.hash);
     h.finalize().into()
+}
+
+/// The digest a witness signs for a link whose target is at or above the
+/// second hardening activation (v2): v1's fields plus the witness's KES
+/// public key, so a signature is valid for exactly one key.
+///
+/// ```text
+/// SHA3-256( u32le(19) ‖ "GNB-POWIT-v2/attest" ‖ u32le(chain_id)
+///           ‖ u8(depth) ‖ root[32]
+///           ‖ u64le(source.height) ‖ source.hash[32]
+///           ‖ u64le(target.height) ‖ target.hash[32] )             // 140-byte preimage
+/// ```
+///
+/// Binding the key in the signed message is what every signature scheme
+/// whose verification key is not fixed by the signature needs (Bitcoin's
+/// BIP-340 commits the public key in the challenge for the same reason).
+pub fn attestation_message_v2(chain: ChainId, witness: &KesPublic, source: &Checkpoint, target: &Checkpoint)
+    -> [u8; 32]
+{
+    let mut h = Sha3_256::new();
+    h.update((DS_ATTEST_V2.len() as u32).to_le_bytes());
+    h.update(DS_ATTEST_V2);
+    h.update(chain.to_le_bytes());
+    h.update([witness.depth]);
+    h.update(witness.root);
+    h.update(source.height.to_le_bytes());
+    h.update(source.hash);
+    h.update(target.height.to_le_bytes());
+    h.update(target.hash);
+    h.finalize().into()
+}
+
+/// The message `witness` signs for `source -> target`: v2 iff the target
+/// height is at or above `hardening2_height`.
+pub fn attestation_message_at(chain: ChainId, hardening2_height: u64, witness: &KesPublic,
+                              source: &Checkpoint, target: &Checkpoint) -> [u8; 32] {
+    if activation::is_active_at(target.height, hardening2_height) {
+        attestation_message_v2(chain, witness, source, target)
+    } else {
+        attestation_message(chain, source, target)
+    }
 }
 
 impl Attestation {
@@ -176,17 +267,41 @@ impl Attestation {
         (self.target.height >= act).then(|| p.epoch(act, self.target.height))
     }
 
-    /// Link shape + forward-secure signature by the target epoch's leaf.
-    pub fn verify_signature(&self, chain: ChainId, p: &PowitParams, act: u64) -> bool {
-        let Some(e) = self.kes_epoch(p, act) else { return false };
-        self.target.height > self.source.height
-            && kes::verify(&self.witness, e, &attestation_message(chain, &self.source, &self.target), &self.sig)
+    /// The message this attestation's signature must cover
+    /// ([`attestation_message_at`]).
+    pub fn message_at(&self, chain: ChainId, hardening2_height: u64) -> [u8; 32] {
+        attestation_message_at(chain, hardening2_height, &self.witness, &self.source, &self.target)
     }
 
-    /// Sign a link with a KES signer already evolved to the target's epoch.
+    /// [`Self::verify_signature_at`] under the process-wide second hardening
+    /// height (`activation::hardening2_activation_height`).
+    pub fn verify_signature(&self, chain: ChainId, p: &PowitParams, act: u64) -> bool {
+        self.verify_signature_at(chain, p, act, activation::hardening2_activation_height())
+    }
+
+    /// Link shape + forward-secure signature by the target epoch's leaf over
+    /// the message of the target's height ([`Self::message_at`]).
+    pub fn verify_signature_at(&self, chain: ChainId, p: &PowitParams, act: u64, hardening2_height: u64) -> bool {
+        let Some(e) = self.kes_epoch(p, act) else { return false };
+        self.target.height > self.source.height
+            && kes::verify(&self.witness, e, &self.message_at(chain, hardening2_height), &self.sig)
+    }
+
+    /// [`Self::sign_at`] under the process-wide second hardening height. A
+    /// signer that is not a node (no chain id set) passes
+    /// `activation::hardening2_activation_height_for_signer(chain)` to
+    /// [`Self::sign_at`] instead.
     pub fn sign(chain: ChainId, source: Checkpoint, target: Checkpoint, signer: &KesSigner) -> Result<Self, String> {
-        let sig = signer.sign(&attestation_message(chain, &source, &target))?;
-        Ok(Attestation { source, target, witness: signer.public(), sig })
+        Self::sign_at(chain, activation::hardening2_activation_height(), source, target, signer)
+    }
+
+    /// Sign a link with a KES signer already evolved to the target's epoch,
+    /// over the message of the target's height.
+    pub fn sign_at(chain: ChainId, hardening2_height: u64, source: Checkpoint, target: Checkpoint,
+                   signer: &KesSigner) -> Result<Self, String> {
+        let witness = signer.public();
+        let sig = signer.sign(&attestation_message_at(chain, hardening2_height, &witness, &source, &target))?;
+        Ok(Attestation { source, target, witness, sig })
     }
 
     pub fn to_wire_bytes(&self) -> Vec<u8> {
@@ -219,16 +334,27 @@ pub struct Equivocation {
 }
 
 impl Equivocation {
-    /// Both signatures valid under the same witness key, and a double or
-    /// surround vote.
+    /// [`Self::verify_at`] under the process-wide second hardening height.
     pub fn verify(&self, chain: ChainId, p: &PowitParams, act: u64) -> Result<KeyId, &'static str> {
+        self.verify_at(chain, p, act, activation::hardening2_activation_height())
+    }
+
+    /// Both signatures valid under the same witness key (each over the
+    /// message of its own target's height), and a double or surround vote.
+    /// Context-free; whether a block may carry the proof is
+    /// [`PowitState::apply_at`]'s question (the evidence epochs).
+    pub fn verify_at(&self, chain: ChainId, p: &PowitParams, act: u64, hardening2_height: u64)
+        -> Result<KeyId, &'static str>
+    {
         if self.a.witness != self.b.witness {
             return Err("equivocation: different witnesses");
         }
         if self.a == self.b {
             return Err("equivocation: identical attestations");
         }
-        if !self.a.verify_signature(chain, p, act) || !self.b.verify_signature(chain, p, act) {
+        if !self.a.verify_signature_at(chain, p, act, hardening2_height)
+            || !self.b.verify_signature_at(chain, p, act, hardening2_height)
+        {
             return Err("equivocation: invalid signature");
         }
         let (a, b) = (&self.a, &self.b);
@@ -441,9 +567,48 @@ impl PowitState {
         self.banned.get(key).is_some_and(|&until| epoch < until)
     }
 
-    /// Witness set for `epoch`: (key, weight), heaviest first, at most
-    /// `max_witnesses`, banned keys excluded, decay applied.
+    /// Witness set for `epoch` under the rules before the second hardening
+    /// activation ([`Regime::V1`]): (key, weight), heaviest first, at most
+    /// `max_witnesses`, banned keys excluded, decay applied. Code that runs
+    /// for a block (or a next block) uses [`Self::witness_set_in`] with that
+    /// block's regime.
     pub fn witness_set(&self, p: &PowitParams, epoch: u64) -> Vec<(KeyId, u128)> {
+        self.witness_set_in(p, epoch, Regime::V1)
+    }
+
+    /// Witness set for `epoch` under `regime`: (key, weight), heaviest first
+    /// (ties by key), banned keys excluded, decay applied. Weight = the share
+    /// work credited to the key in epochs `epoch-1-window ..= epoch-2`.
+    /// [`Regime::V1`] keeps the `max_witnesses` heaviest;
+    /// [`Regime::Hardening2`] keeps every key with weight (PoWit finding 4:
+    /// the cap let a minority split over many keys own the set).
+    ///
+    /// Under [`Regime::Hardening2`] the window is the one of
+    /// [`h2_window_epoch`](Self::h2_window_epoch): finalized history (PoWit
+    /// finding 3), frozen while finality lags.
+    pub fn witness_set_in(&self, p: &PowitParams, epoch: u64, regime: Regime) -> Vec<(KeyId, u128)> {
+        let mut v = match regime {
+            Regime::V1 => self.window_weights(p, epoch),
+            Regime::Hardening2 => self.window_weights_at(p, self.h2_window_epoch(p, epoch), epoch),
+        };
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        if regime == Regime::V1 {
+            v.truncate(p.max_witnesses);
+        }
+        v
+    }
+
+    /// Every unbarred key with positive decayed window weight for `epoch`,
+    /// in key order (`W(epoch)` before sorting and capping).
+    fn window_weights(&self, p: &PowitParams, epoch: u64) -> Vec<(KeyId, u128)> {
+        self.window_weights_at(p, epoch, epoch)
+    }
+
+    /// The window weights of `window_epoch`'s share window with bars applied
+    /// at `bar_epoch` (the epoch the set is used for; under
+    /// [`Regime::Hardening2`] the window may be an earlier, frozen one).
+    fn window_weights_at(&self, p: &PowitParams, window_epoch: u64, bar_epoch: u64) -> Vec<(KeyId, u128)> {
+        let epoch = window_epoch;
         if epoch < 2 {
             return Vec::new();
         }
@@ -456,15 +621,12 @@ impl PowitState {
                 *e = e.saturating_add(*w);
             }
         }
-        let mut v: Vec<(KeyId, u128)> = total
+        total
             .into_iter()
-            .filter(|(k, _)| !self.is_banned(k, epoch))
+            .filter(|(k, _)| !self.is_banned(k, bar_epoch))
             .map(|(k, w)| (k, decayed(w, self.decay.get(&k).copied().unwrap_or(0))))
             .filter(|(_, w)| *w > 0)
-            .collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        v.truncate(p.max_witnesses);
-        v
+            .collect()
     }
 
     /// Epochs entirely below the finalized checkpoint's slot: every block of
@@ -503,31 +665,38 @@ impl PowitState {
         }
     }
 
-    /// The witness set a block uses for a target in `epoch`: under the
-    /// first rule (`from_finalized == false`) `witness_set(epoch)`; from the
-    /// second hardening upgrade `witness_set(finalized_window_epoch(epoch))`.
-    /// A frozen window with no share work left in it (possible only across
-    /// the upgrade, for a chain whose finality had stalled long enough for
-    /// the first rule to prune that window, or one whose shares all fell in
-    /// the epoch the frozen window drops) gives way to `epoch`'s own window,
-    /// so finality can always start again; a frozen window is never empty
-    /// on a chain that finalized with its members (bans aside).
-    pub fn witness_set_at(&self, p: &PowitParams, epoch: u64, from_finalized: bool) -> Vec<(KeyId, u128)> {
-        let anchored = if from_finalized { self.finalized_window_epoch(p, epoch) } else { epoch };
-        if anchored == epoch {
-            return self.witness_set(p, epoch);
+    /// The epoch whose share window `W(epoch)` reads under
+    /// [`Regime::Hardening2`]: [`finalized_window_epoch`](Self::finalized_window_epoch),
+    /// except that a frozen window with no share work left in it (possible
+    /// only across the upgrade, for a chain whose finality had stalled long
+    /// enough for the first rule to prune that window, or one whose shares
+    /// all fell in the epoch the frozen window drops) gives way to `epoch`'s
+    /// own window, so finality can always start again; a frozen window is
+    /// never empty on a chain that finalized with its members (bans aside).
+    pub fn h2_window_epoch(&self, p: &PowitParams, epoch: u64) -> u64 {
+        let anchored = self.finalized_window_epoch(p, epoch);
+        if anchored != epoch && self.window_weights_at(p, anchored, epoch).is_empty() {
+            epoch
+        } else {
+            anchored
         }
-        let w = self.witness_set(p, anchored);
-        if w.is_empty() { self.witness_set(p, epoch) } else { w }
     }
 
-    /// [`witness_set_at`](Self::witness_set_at) for a block at header height
+    /// The witness set a block uses for a target in `epoch`: the first rule
+    /// (`from_finalized == false`, [`Regime::V1`]) or the second hardening
+    /// rule ([`Regime::Hardening2`]: every key with weight in the window of
+    /// [`h2_window_epoch`](Self::h2_window_epoch), finalized history).
+    pub fn witness_set_at(&self, p: &PowitParams, epoch: u64, from_finalized: bool) -> Vec<(KeyId, u128)> {
+        self.witness_set_in(p, epoch, if from_finalized { Regime::Hardening2 } else { Regime::V1 })
+    }
+
+    /// [`witness_set_in`](Self::witness_set_in) for a block at header height
     /// `block_height` under the process-wide second hardening height
     /// (`activation::hardening2_activation_height`): what every producer
     /// (pool admission, the witness duty, templates through `apply`, RPC)
     /// reads for the block it builds or admits for.
     pub fn witness_set_for_block(&self, p: &PowitParams, epoch: u64, block_height: u64) -> Vec<(KeyId, u128)> {
-        self.witness_set_at(p, epoch, activation::hardening2_active_at(block_height))
+        self.witness_set_in(p, epoch, Regime::at(block_height, activation::hardening2_activation_height()))
     }
 
     /// The epochs of the frozen window from the second hardening upgrade
@@ -540,28 +709,78 @@ impl PowitState {
         }
     }
 
-    /// Apply one block (height > activation) on top of its selected parent's
-    /// state. Any rule violation makes the block invalid. The second
-    /// hardening upgrade applies from the process-wide height
-    /// (`activation::hardening2_activation_height`); see [`Self::apply_at`].
+    /// `key`'s weight in `W(epoch)` under [`Regime::Hardening2`] (`None` if it
+    /// is not a member), without building the set: the sum of its window
+    /// work, decayed, if positive and the key is not barred at `epoch`.
+    ///
+    /// The window is the one of [`h2_window_epoch`](Self::h2_window_epoch)
+    /// (finalized history, PoWit finding 3); bars apply at `epoch`.
+    pub fn member_weight_h2(&self, p: &PowitParams, epoch: u64, key: &KeyId) -> Option<u128> {
+        if self.is_banned(key, epoch) {
+            return None;
+        }
+        let we = self.h2_window_epoch(p, epoch);
+        if we < 2 {
+            return None;
+        }
+        let hi = we - 2;
+        let lo = (we - 1).saturating_sub(p.window_epochs);
+        let w = self.epoch_work.range(lo..=hi)
+            .filter_map(|(_, m)| m.get(key))
+            .fold(0u128, |acc, w| acc.saturating_add(*w));
+        let w = decayed(w, self.decay.get(key).copied().unwrap_or(0));
+        (w > 0).then_some(w)
+    }
+
+    /// Total weight of `W(epoch)` under [`Regime::Hardening2`]: the
+    /// justification threshold is two thirds of it.
+    pub fn total_weight_h2(&self, p: &PowitParams, epoch: u64) -> u128 {
+        self.window_weights_at(p, self.h2_window_epoch(p, epoch), epoch).iter()
+            .fold(0u128, |acc, (_, w)| acc.saturating_add(*w))
+    }
+
+    /// The epochs whose witness sets a block of PoWit epoch `epoch` checks
+    /// an equivocation proof's key against under [`Regime::Hardening2`]:
+    /// `epoch-1 ..= epoch+1`. They are exactly the sets the block's state can
+    /// compute (it keeps `window + 2` epochs of share work), they hold the
+    /// target epoch of every vote the chain can still include (`vote_ttl <=
+    /// epoch_len`), and a key in one of them is a voter now, was one for the
+    /// open votes, or is about to be one.
+    pub fn evidence_epochs(epoch: u64) -> std::ops::RangeInclusive<u64> {
+        epoch.saturating_sub(1)..=epoch + 1
+    }
+
+    /// Whether a block of PoWit epoch `epoch` (after its epoch step) may
+    /// carry an equivocation proof against `key` under
+    /// [`Regime::Hardening2`]: `key` is a member of `W(e)` for some `e` in
+    /// [`Self::evidence_epochs`]. Ethereum's slashing likewise accepts
+    /// evidence only against a validator that is slashable at the current
+    /// epoch (`is_slashable_validator`); the old rule accepted any key.
+    pub fn may_be_proven_h2(&self, p: &PowitParams, epoch: u64, key: &KeyId) -> bool {
+        Self::evidence_epochs(epoch).any(|e| self.member_weight_h2(p, e, key).is_some())
+    }
+
+    /// [`Self::apply_at`] under the process-wide second hardening height
+    /// (`activation::hardening2_activation_height`).
     pub fn apply(&self, p: &PowitParams, chain: ChainId, b: &BlockInput<'_>, view: &dyn ChainView)
         -> Result<PowitState, String>
     {
-        self.apply_at(p, chain, b, view, activation::hardening2_activation_height())
+        self.apply_at(p, chain, activation::hardening2_activation_height(), b, view)
     }
 
-    /// [`apply`](Self::apply) with the second hardening activation height
-    /// `h2` explicit. From `h2` (compared with the block's header height
-    /// `b.height`, as the upgrade's block rules) every witness set the block
-    /// reads (attester weights, justification totals, inactivity-decay
-    /// membership) comes from finalized history
-    /// ([`witness_set_at`](Self::witness_set_at)), and the epochs of the
-    /// frozen window are kept. Below `h2` this is the first rule, bit for
-    /// bit.
-    pub fn apply_at(&self, p: &PowitParams, chain: ChainId, b: &BlockInput<'_>, view: &dyn ChainView, h2: u64)
-        -> Result<PowitState, String>
+    /// Apply one block (height > activation) on top of its selected parent's
+    /// state, under the rules of its height (`Regime::at(b.height,
+    /// hardening2_height)`; attestation messages by their target heights).
+    /// From the second hardening height every witness set the block reads
+    /// (attester weights, justification totals, inactivity-decay membership,
+    /// equivocation evidence) is uncapped (finding 4) and comes from
+    /// finalized history ([`Self::h2_window_epoch`], finding 3), and the
+    /// epochs of the frozen window are kept. Below it this is the first
+    /// rule, bit for bit. Any rule violation makes the block invalid.
+    pub fn apply_at(&self, p: &PowitParams, chain: ChainId, hardening2_height: u64, b: &BlockInput<'_>,
+                    view: &dyn ChainView) -> Result<PowitState, String>
     {
-        let from_finalized = activation::is_active_at(b.height, h2);
+        let regime = Regime::at(b.height, hardening2_height);
         let act = self.activation;
         if b.height < act {
             return Err("powit: block below activation".into());
@@ -572,6 +791,11 @@ impl PowitState {
         if b.evidence.len() > p.max_evidence_per_block {
             return Err("powit: too many equivocation proofs".into());
         }
+        let h2 = regime == Regime::Hardening2;
+        // Message versions in this block: below the activation every message
+        // is v1 (the old rule, also for an equivocation's links that target
+        // a later height); from it, by each attestation's target height.
+        let msg_h2 = if h2 { hardening2_height } else { activation::NEVER };
         let mut s = self.clone();
         let epoch = p.epoch(act, b.height);
 
@@ -580,8 +804,7 @@ impl PowitState {
             for e in s.epoch..epoch {
                 let stalled = b.height.saturating_sub(s.finalized_at) >= p.leak_after_epochs * p.epoch_len;
                 if stalled {
-                    let members: Vec<KeyId> =
-                        s.witness_set_at(p, e, from_finalized).into_iter().map(|(k, _)| k).collect();
+                    let members: Vec<KeyId> = s.witness_set_in(p, e, regime).into_iter().map(|(k, _)| k).collect();
                     for k in members {
                         if !s.active_this_epoch.contains(&k) {
                             *s.decay.entry(k).or_insert(0) += 1;
@@ -593,15 +816,23 @@ impl PowitState {
             s.epoch = epoch;
             let keep_from = epoch.saturating_sub(p.window_epochs + 2);
             let mut kept = s.epoch_work.split_off(&keep_from);
-            if let Some((lo, hi)) = from_finalized.then(|| s.finalized_window(p)).flatten() {
-                // Hardening 2: the frozen window, older than the first
-                // rule's horizon while finality lags. Nothing else below it
-                // is ever read again: a newly finalized checkpoint lies at
+            if let Some((lo, hi)) = h2.then(|| s.finalized_window(p)).flatten() {
+                // Hardening 2 (finding 3): the frozen window, older than the
+                // first rule's horizon while finality lags. Nothing else below
+                // it is ever read again: a newly finalized checkpoint lies at
                 // most `vote_ttl + checkpoint_interval` (under two epochs)
                 // below the block, so its window starts within the horizon.
                 kept.extend(std::mem::take(&mut s.epoch_work).into_iter().filter(|(e, _)| (lo..=hi).contains(e)));
             }
             s.epoch_work = kept;
+            if h2 {
+                // Every share key with weight is a member (and decays while
+                // finality stalls): a decay entry outlives the key's work
+                // only until here, so `decay` holds at most the keys of
+                // `epoch_work` instead of every key a stall ever touched.
+                let live: BTreeSet<KeyId> = s.epoch_work.values().flat_map(|m| m.keys().copied()).collect();
+                s.decay.retain(|k, _| live.contains(k));
+            }
             s.banned.retain(|_, until| *until > epoch);
             let link_floor = b.height.saturating_sub((p.window_epochs + 2) * p.epoch_len);
             for v in s.links.values_mut() {
@@ -612,7 +843,24 @@ impl PowitState {
 
         // ── Equivocation proofs ──────────────────────────────────────────
         for ev in b.evidence {
-            let k = ev.verify(chain, p, act).map_err(|e| format!("powit: {e}"))?;
+            let k = if h2 {
+                // PoWit finding 1: only against a witness of the evidence
+                // epochs, checked before the two signatures.
+                if ev.a.witness != ev.b.witness {
+                    return Err("powit: equivocation: different witnesses".into());
+                }
+                let k = ev.a.key_id();
+                if s.is_banned(&k, epoch) {
+                    return Err("powit: equivocation for an already barred key".into());
+                }
+                if !s.may_be_proven_h2(p, epoch, &k) {
+                    return Err("powit: equivocation proof against a key that is not a member of the \
+                                witness sets of epochs E-1..=E+1".into());
+                }
+                ev.verify_at(chain, p, act, msg_h2).map_err(|e| format!("powit: {e}"))?
+            } else {
+                ev.verify_at(chain, p, act, msg_h2).map_err(|e| format!("powit: {e}"))?
+            };
             if s.is_banned(&k, epoch) {
                 return Err("powit: equivocation for an already barred key".into());
             }
@@ -652,8 +900,12 @@ impl PowitState {
             if s.is_banned(&k, epoch) {
                 return Err("powit: attestation by a barred key".into());
             }
-            let weight = s.witness_set_at(p, te, from_finalized).into_iter().find(|(m, _)| *m == k).map(|(_, w)| w)
-                .ok_or("powit: attester is not in the witness set")?;
+            let weight = if h2 {
+                s.member_weight_h2(p, te, &k)
+            } else {
+                s.witness_set(p, te).into_iter().find(|(m, _)| *m == k).map(|(_, w)| w)
+            }
+            .ok_or("powit: attester is not in the witness set")?;
             if !seen_in_block.insert((k, t)) || s.votes.get(&t).is_some_and(|v| v.contains_key(&k)) {
                 return Err("powit: duplicate attestation".into());
             }
@@ -668,7 +920,7 @@ impl PowitState {
                     }
                 }
             }
-            if !a.verify_signature(chain, p, act) {
+            if !a.verify_signature_at(chain, p, act, msg_h2) {
                 return Err("powit: invalid attestation signature (KES leaf must be the target's epoch)".into());
             }
             s.votes.entry(t).or_default().insert(k, weight);
@@ -679,13 +931,21 @@ impl PowitState {
         // ── Justification and finality ───────────────────────────────────
         let mut newly: Option<Checkpoint> = None;
         for (t, votes) in &s.votes {
-            let total: u128 =
-                s.witness_set_at(p, p.epoch(act, t.height), from_finalized).iter().map(|(_, w)| *w).sum();
+            // From hardening 2 two thirds of ALL the window weight (finding 4).
+            let total: u128 = if h2 {
+                s.total_weight_h2(p, p.epoch(act, t.height))
+            } else {
+                s.witness_set(p, p.epoch(act, t.height)).iter().map(|(_, w)| *w).sum()
+            };
             if total == 0 {
                 continue;
             }
-            let got: u128 = votes.values().sum();
-            if got.saturating_mul(3) >= total.saturating_mul(2) && t.height > s.justified.height
+            let got: u128 = if h2 {
+                votes.values().fold(0u128, |acc, w| acc.saturating_add(*w))
+            } else {
+                votes.values().sum()
+            };
+            if two_thirds(got, total) && t.height > s.justified.height
                 && newly.is_none_or(|n| t.height > n.height)
             {
                 newly = Some(*t);
@@ -706,7 +966,17 @@ impl PowitState {
     }
 }
 
-fn decayed(w: u128, steps: u32) -> u128 {
+/// The justification threshold: `got` is at least two thirds of `total`
+/// (`3 got >= 2 total`, saturating) and `total` is not zero. `total` is the
+/// weight of `W(epoch(target))`: of the 64 heaviest keys before the second
+/// hardening activation, of every key with weight from it.
+pub fn two_thirds(got: u128, total: u128) -> bool {
+    total != 0 && got.saturating_mul(3) >= total.saturating_mul(2)
+}
+
+/// A weight after `steps` inactivity-decay steps (each keeps 15/16, integer
+/// division; at most 64 steps count).
+pub fn decayed(w: u128, steps: u32) -> u128 {
     let mut w = w;
     for _ in 0..steps.min(64) {
         w -= w / 16;
@@ -716,5 +986,7 @@ fn decayed(w: u128, steps: u32) -> u128 {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod hardening2_tests;
 #[cfg(test)]
 mod finalized_history_tests;

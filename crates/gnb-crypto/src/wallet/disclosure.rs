@@ -68,7 +68,6 @@ use crate::address::{Address, Network};
 use crate::crypto;
 use sha3::{Sha3_256, Digest};
 use serde::{Serialize, Deserialize};
-use zeroize::Zeroizing;
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use thiserror::Error;
 
@@ -196,22 +195,26 @@ pub enum DisclosureKeyConvention {
 ///
 /// `master_seed` is the 64-byte BIP39 seed (`SeedPhrase::to_seed_bytes()`);
 /// any `&[u8]` of length >= 32 is accepted.
+///
+/// CRY-4: the secret key is generated in place in a [`crypto::SecretBytes`]
+/// (locked where possible, wiped on drop, never `Copy` or `Clone`).
 pub fn keypair_at(master_seed: &[u8], index: u32)
-    -> Result<(Vec<u8>, Vec<u8>), crypto::CryptoError>
+    -> Result<(Vec<u8>, crypto::SecretBytes), crypto::CryptoError>
 {
     keypair_at_with_convention(master_seed, index, DisclosureKeyConvention::SingleKeyWallet)
 }
 
+/// [`keypair_at`] under an explicit key convention.
 pub fn keypair_at_with_convention(master_seed: &[u8], index: u32, convention: DisclosureKeyConvention)
-    -> Result<(Vec<u8>, Vec<u8>), crypto::CryptoError>
+    -> Result<(Vec<u8>, crypto::SecretBytes), crypto::CryptoError>
 {
     if master_seed.len() < 32 {
         return Err(crypto::CryptoError::InvalidKey("master seed too short (need >= 32 bytes)".into()));
     }
     if index == 0 && convention == DisclosureKeyConvention::SingleKeyWallet {
-        crypto::generate_keypair_from_seed(&master_seed[..32.min(master_seed.len())])
+        crypto::generate_keypair_from_seed_secret(&master_seed[..32.min(master_seed.len())])
     } else {
-        crypto::diversified_keypair(master_seed, index)
+        crypto::diversified_keypair_secret(master_seed, index)
     }
 }
 
@@ -292,13 +295,13 @@ impl DisclosureBundle {
                 "too many entries: {} > {}", sorted.len(), MAX_DISCLOSURE_ENTRIES)));
         }
 
-        // Derive all keypairs first (secrets in Zeroizing so any early-return
-        // path still wipes them).
-        let mut keyed: Vec<(u32, Vec<u8>, Zeroizing<Vec<u8>>)> = Vec::with_capacity(sorted.len());
+        // Derive all keypairs first (secrets in secret memory, CRY-4, so any
+        // early-return path still wipes them).
+        let mut keyed: Vec<(u32, Vec<u8>, crypto::SecretBytes)> = Vec::with_capacity(sorted.len());
         for &index in &sorted {
             let (pk, sk) = keypair_at_with_convention(master_seed, index, convention)
                 .map_err(|e| DisclosureError::Crypto(e.to_string()))?;
-            keyed.push((index, pk, Zeroizing::new(sk)));
+            keyed.push((index, pk, sk));
         }
 
         let created_at = chrono::Utc::now().to_rfc3339();
@@ -319,7 +322,7 @@ impl DisclosureBundle {
                 sig_b64: B64.encode(&sig),
             });
         }
-        // `keyed` drops here; every Zeroizing<sk> wipes.
+        // `keyed` drops here; every secret key is wiped (SecretBytes).
 
         Ok(DisclosureBundle {
             version: DISCLOSURE_VERSION,

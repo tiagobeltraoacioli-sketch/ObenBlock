@@ -117,7 +117,10 @@ impl PolicySpend {
             tx.outputs.pop(); // sub-dust change goes to the fee
         }
         let amounts = inputs.iter().map(|(_, _, v)| *v).collect();
-        Ok(Self { network, policy, tree: None, tx, signatures: vec![BTreeMap::new(); inputs.len()], amounts })
+        let spend = Self { network, policy, tree: None, tx, signatures: vec![BTreeMap::new(); inputs.len()], amounts };
+        // PF-4: never valid where hardening 2 holds from genesis.
+        spend.check_key_identities_for_height(0)?;
+        Ok(spend)
     }
 
     /// Unsigned spend of policy-tree `inputs` through branch `branch`, paying
@@ -169,7 +172,10 @@ impl PolicySpend {
             tx.outputs.pop();
         }
         let amounts = inputs.iter().map(|(_, _, v)| *v).collect();
-        Ok(Self { network, policy, tree: Some((tree, branch)), tx, signatures: vec![BTreeMap::new(); inputs.len()], amounts })
+        let spend = Self { network, policy, tree: Some((tree, branch)), tx, signatures: vec![BTreeMap::new(); inputs.len()], amounts };
+        // PF-4: never valid where hardening 2 holds from genesis.
+        spend.check_key_identities_for_height(0)?;
+        Ok(spend)
     }
 
     /// The script the inputs are locked by (and change returns to).
@@ -193,12 +199,36 @@ impl PolicySpend {
     /// block at `next_block_height` (the node's getdaginfo
     /// `next_block_height`): 3 / sighash v3 at/after the hardening
     /// activation, 1 / sighash v2 below it. Only before anyone signed.
+    ///
+    /// PF-4: refused when the spent policy (or revealed branch) lists one
+    /// key twice and the second hardening rules hold at `next_block_height`
+    /// ([`Self::check_key_identities_for_height`]).
     pub fn target_height(&mut self, next_block_height: u64) -> Result<(), String> {
         if self.signatures.iter().any(|m| !m.is_empty()) {
             return Err("the spend already carries signatures; its version is fixed".into());
         }
+        self.check_key_identities_for_height(next_block_height)?;
         let act = core::activation::hardening_activation_height_for_signer(self.chain_id());
         self.tx.version = core::sighash::tx_version_for_height(next_block_height, act);
+        Ok(())
+    }
+
+    /// PF-4 for producers: from the second hardening height
+    /// (`activation::hardening2_activation_height_for_signer`) a spend whose
+    /// policy (or revealed branch) lists one key twice, in its raw and its
+    /// enveloped encoding, is consensus-invalid (`SpendPolicy::
+    /// check_key_identities`, applied by the node's policy-spend rule), so
+    /// no tool builds, signs or finalizes one for a block at or above that
+    /// height. Below it such a spend is valid, as before, and is not refused
+    /// (it is how the owner of such an output moves it before the height).
+    /// `next_block_height` is the height of the block the spend targets.
+    pub fn check_key_identities_for_height(&self, next_block_height: u64) -> Result<(), String> {
+        let h2 = core::activation::hardening2_activation_height_for_signer(self.chain_id());
+        if core::activation::is_active_at(next_block_height, h2) && self.policy.check_key_identities().is_err() {
+            return Err(format!(
+                "the policy names the same key twice (raw and enveloped encodings): such a spend is \
+                 invalid from the second hardening height {h2} (PF-4)"));
+        }
         Ok(())
     }
 
@@ -333,6 +363,11 @@ impl PolicySpend {
             Ok(())
         };
         check_policy(&self.policy)?;
+        // PF-4: where the second hardening rules hold from genesis (testnet,
+        // regtest: active at height 0, so at every height), a twin-key spend
+        // can never be valid. Elsewhere the roles that know the target
+        // height refuse it (`target_height`, `PqPsbt::review`).
+        self.check_key_identities_for_height(0)?;
         if let Some((tree, branch)) = &self.tree {
             if !(2..=core::policy::MAX_POLICY_BRANCHES).contains(&tree.branches.len()) {
                 return Err("invalid policy tree size".into());

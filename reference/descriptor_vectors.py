@@ -40,7 +40,7 @@ def cases():
     def policy(count=1, threshold=1, after=0, older=0):
         return f"policy({threshold},{after},{older},{','.join(keys[f'raw{i}'] for i in range(count))})"
 
-    expressions = {"pkh-raw": f"pkh({k0})", "pkh-envelope": f"pkh({keys['enveloped0']})", "pkh-magic-raw": f"pkh({keys['raw_magic']})", "policy-1": policy(), "policy-2of3": policy(3, 2, 17500, 144), "policy-u32-max-7": policy(7, 7, 0xFFFFFFFF, 0xFFFFFFFF), "policy-exact-key-distinction": f"policy(2,0,0,{k0},{keys['enveloped0']})", "policy-reordered": f"policy(2,17500,144,{keys['raw2']},{k1},{k0})"}
+    expressions = {"pkh-raw": f"pkh({k0})", "pkh-envelope": f"pkh({keys['enveloped0']})", "pkh-magic-raw": f"pkh({keys['raw_magic']})", "policy-1": policy(), "policy-2of3": policy(3, 2, 17500, 144), "policy-u32-max-7": policy(7, 7, 0xFFFFFFFF, 0xFFFFFFFF), "policy-mixed-encodings": f"policy(2,0,0,{k0},b10c0100{k1})", "policy-reordered": f"policy(2,17500,144,{keys['raw2']},{k1},{k0})"}
     for count in (2, 3, 4):
         expressions[f"tree-{count}"] = "tree(" + ",".join(policy(i + 1, 1, i, i * 17) for i in range(count)) + ")"
     expressions["tree-largest-4x7"] = "tree(" + ",".join(policy(7, 7, 0xFFFFFFFF, i) for i in range(4)) + ")"
@@ -52,6 +52,18 @@ def cases():
             descriptors[network, label] = descriptor
             yield row(f"{network}/{label}/create", {"action": "create", "network": network, "body": text}, True)
             yield row(f"{network}/{label}/inspect", {"op": "descriptor", "action": "inspect", "network": network, "descriptor": descriptor}, True)
+        # PF-4: a raw key and its envelope are one signer; no policy or tree
+        # branch may list both in a descriptor being created. An existing one
+        # (an earlier release created it) is still inspected and restored,
+        # flagged with twin_key_encodings.
+        twin = f"policy(2,0,0,{k0},{keys['enveloped0']})"
+        twins = {"policy-twin-encoding": body(network, twin), "tree-twin-encoding": body(network, f"tree({policy()},{twin})")}
+        for label, text in twins.items():
+            yield row(f"{network}/{label}/create", {"action": "create", "network": network, "body": text}, False)
+            yield row(f"{network}/{label}/inspect", {"op": "descriptor", "action": "inspect", "network": network, "descriptor": d.add_checksum(text)}, True)
+        restored = [descriptors[network, "pkh-raw"], d.add_checksum(twins["policy-twin-encoding"]), d.add_checksum(twins["tree-twin-encoding"])]
+        yield row(f"{network}/export-twin-encoding", {"action": "export", "network": network, "descriptors": restored}, True)
+        yield row(f"{network}/import-twin-encoding", {"action": "import", "network": network, "bundle": d.compact({"format": d.POOL_FORMAT, "network": network, "descriptors": restored})}, True)
         ds = [descriptors[network, label] for label in ("pkh-raw", "pkh-envelope", "policy-2of3", "tree-3")]
         yield row(f"{network}/export", {"action": "export", "network": network, "descriptors": ds}, True)
         bundle = d.compact({"format": d.POOL_FORMAT, "network": network, "descriptors": ds})
@@ -144,7 +156,7 @@ def vectors():
         row = {"name": name, "accepted": accepted, "request_sha256": hashlib.sha256(line.encode()).hexdigest(), "response_sha256": hashlib.sha256(d.compact(actual).encode()).hexdigest()}
         if accepted and "descriptor" in actual["result"]:
             info = actual["result"]
-            row.update({key: info[key] for key in ("network", "kind", "script_pubkey", "address", "bech32m", "requires_policy_tree_activation")})
+            row.update({key: info[key] for key in ("network", "kind", "script_pubkey", "address", "bech32m", "requires_policy_tree_activation", "twin_key_encodings") if key in info})
             row["checksum"] = info["descriptor"][-8:]
         rows.append(row)
     return {"format": "gnb-descriptor-reference-v1", "fixture_note": "Synthetic public byte shapes only; no proof of key possession or spendability.", "public_keys": fixtures(), "cases": rows}

@@ -52,8 +52,6 @@ use hkdf::Hkdf;
 use libp2p::core::upgrade::{InboundConnectionUpgrade, OutboundConnectionUpgrade, UpgradeInfo};
 use libp2p::identity;
 use libp2p::PeerId;
-use pqcrypto_mlkem::mlkem768;
-use pqcrypto_traits::kem::{Ciphertext as _, PublicKey as _, SharedSecret as _};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -61,6 +59,7 @@ use sha3::{Digest, Sha3_256};
 use zeroize::Zeroizing;
 
 use crate::crypto;
+use crate::crypto::SecretBytes;
 use crate::transport::identity::{fingerprint, PeerPins, PinError, PqIdentity};
 use crate::transport::{stream::KyberStream, RxStream, TxStream, STREAM_KEY_SIZE};
 
@@ -79,6 +78,8 @@ const LABEL_R2I: &[u8] = b"GNB-P2P-PQ-v2 r->i";
 /// ML-KEM-768 (FIPS 203) sizes.
 pub const MLKEM768_PK_SIZE: usize = 1184;
 pub const MLKEM768_CT_SIZE: usize = 1088;
+const _: () = assert!(MLKEM768_PK_SIZE == gnb_secret::pq::MLKEM768_PUBLIC_KEY_BYTES
+    && MLKEM768_CT_SIZE == gnb_secret::pq::MLKEM768_CIPHERTEXT_BYTES);
 const NONCE_SIZE: usize = 32;
 
 /// Defensive bound on one handshake message. The largest (`Resp`) carries an
@@ -245,6 +246,45 @@ fn derive_keys(ss_mlkem: &[u8], ss_x25519: &[u8; 32], th_r: &[u8; 32])
     (k_i2r, k_r2i)
 }
 
+// ── ML-KEM-768 on secret memory (CRY-4) ─────────────────────────────────────
+//
+// The `pqcrypto_mlkem` wrapper hands out the ephemeral decapsulation key and
+// both shared secrets as `Copy` arrays that live in the handshake future (on
+// the heap) until it is freed, never wiped: the transport's forward secrecy
+// rests on erasing them. Here they are generated and used in `SecretBytes`
+// regions through PQClean's C functions (`gnb_secret::pq`), and the stack the
+// C code used is scrubbed after each call.
+
+/// Ephemeral ML-KEM-768 key pair; the decapsulation key in secret memory.
+fn kem_keypair() -> (Vec<u8>, SecretBytes) {
+    let mut pk = vec![0u8; MLKEM768_PK_SIZE];
+    let mut sk = SecretBytes::zeroed(gnb_secret::pq::MLKEM768_SECRET_KEY_BYTES);
+    // PQClean's key generator cannot fail on these lengths (the wrapper
+    // asserted the same).
+    gnb_secret::pq::mlkem768_keypair(&mut pk, &mut sk).expect("ML-KEM-768 key generation");
+    gnb_secret::scrub_stack();
+    (pk, sk)
+}
+
+/// Encapsulate to the initiator's key: `(shared secret, ciphertext)`, or
+/// `None` for a key of the wrong size (`PqUpgradeError::BadKemPk`).
+fn kem_encapsulate(pk: &[u8]) -> Option<(SecretBytes, Vec<u8>)> {
+    let mut ct = vec![0u8; MLKEM768_CT_SIZE];
+    let mut ss = SecretBytes::zeroed(gnb_secret::pq::MLKEM768_SHARED_SECRET_BYTES);
+    let r = gnb_secret::pq::mlkem768_encapsulate(pk, &mut ct, &mut ss);
+    gnb_secret::scrub_stack();
+    r.ok().map(|()| (ss, ct))
+}
+
+/// Decapsulate the responder's ciphertext with the ephemeral key, or `None`
+/// for a ciphertext of the wrong size (`PqUpgradeError::BadKemCt`).
+fn kem_decapsulate(sk: &[u8], ct: &[u8]) -> Option<SecretBytes> {
+    let mut ss = SecretBytes::zeroed(gnb_secret::pq::MLKEM768_SHARED_SECRET_BYTES);
+    let r = gnb_secret::pq::mlkem768_decapsulate(sk, ct, &mut ss);
+    gnb_secret::scrub_stack();
+    r.ok().map(|()| ss)
+}
+
 fn x25519_ephemeral() -> (x25519_dalek::StaticSecret, [u8; 32]) {
     let mut seed = Zeroizing::new([0u8; 32]);
     rand::rng().fill_bytes(seed.as_mut());
@@ -327,13 +367,13 @@ where
 
     fn upgrade_outbound(self, mut socket: T, _info: Self::Info) -> Self::Future {
         Box::pin(async move {
-            let (kem_pk, kem_sk) = mlkem768::keypair();
+            let (kem_pk, kem_sk) = kem_keypair();
             let (x_sk, x_pk) = x25519_ephemeral();
             let mut nonce = [0u8; NONCE_SIZE];
             rand::rng().fill_bytes(&mut nonce);
             let init = Init {
                 version: PQ_HANDSHAKE_VERSION,
-                mlkem_pk: kem_pk.as_bytes().to_vec(),
+                mlkem_pk: kem_pk,
                 x25519_pk: x_pk,
                 ed_pk: self.keypair.public().encode_protobuf(),
                 pq_pk: self.pq.public_key().to_vec(),
@@ -357,14 +397,14 @@ where
             }
             self.pins.check_and_pin(&peer_id, fingerprint(&resp.pq_pk)).map_err(PqUpgradeError::Pin)?;
 
-            let ct = mlkem768::Ciphertext::from_bytes(&resp.mlkem_ct).map_err(|_| PqUpgradeError::BadKemCt)?;
-            let ss_m = mlkem768::decapsulate(&ct, &kem_sk);
+            let ss_m = kem_decapsulate(&kem_sk, &resp.mlkem_ct).ok_or(PqUpgradeError::BadKemCt)?;
+            drop(kem_sk); // CRY-4: the ephemeral key is wiped as soon as it is used
             let ss_x = Zeroizing::new(x25519_shared(&x_sk, &resp.x25519_pk)?);
 
             let (ed_sig, pq_sig) = sign_both(&self, &th_finish(&th_r))?;
             write_msg(&mut socket, &Finish { ed_sig, pq_sig }).await?;
 
-            let (k_i2r, k_r2i) = derive_keys(ss_m.as_bytes(), &ss_x, &th_r);
+            let (k_i2r, k_r2i) = derive_keys(&ss_m, &ss_x, &th_r);
             Ok((peer_id, KyberStream::new(socket, TxStream::from_owned_key(k_i2r), RxStream::from_owned_key(k_r2i))))
         })
     }
@@ -396,15 +436,14 @@ where
             }
             let th_i = th_init(&init);
 
-            let kem_pk = mlkem768::PublicKey::from_bytes(&init.mlkem_pk).map_err(|_| PqUpgradeError::BadKemPk)?;
-            let (ss_m, ct) = mlkem768::encapsulate(&kem_pk);
+            let (ss_m, ct) = kem_encapsulate(&init.mlkem_pk).ok_or(PqUpgradeError::BadKemPk)?;
             let (x_sk, x_pk) = x25519_ephemeral();
             let ss_x = Zeroizing::new(x25519_shared(&x_sk, &init.x25519_pk)?);
             let mut nonce = [0u8; NONCE_SIZE];
             rand::rng().fill_bytes(&mut nonce);
 
             let mut resp = Resp {
-                mlkem_ct: ct.as_bytes().to_vec(),
+                mlkem_ct: ct,
                 x25519_pk: x_pk,
                 ed_pk: self.keypair.public().encode_protobuf(),
                 pq_pk: self.pq.public_key().to_vec(),
@@ -425,7 +464,7 @@ where
             }
             self.pins.check_and_pin(&peer_id, fingerprint(&init.pq_pk)).map_err(PqUpgradeError::Pin)?;
 
-            let (k_i2r, k_r2i) = derive_keys(ss_m.as_bytes(), &ss_x, &th_r);
+            let (k_i2r, k_r2i) = derive_keys(&ss_m, &ss_x, &th_r);
             Ok((peer_id, KyberStream::new(socket, TxStream::from_owned_key(k_r2i), RxStream::from_owned_key(k_i2r))))
         })
     }
@@ -435,6 +474,42 @@ where
 mod key_ownership_tests {
     use super::*;
     use zeroize::Zeroize;
+
+    /// CRY-4: the ephemeral ML-KEM-768 decapsulation key and both shared
+    /// secrets are `SecretBytes` (the wrapper's were `Copy` arrays kept,
+    /// unwiped, in the handshake future), the two sides agree, and no copy
+    /// of a secret is left in the dead stack frames of the C code (read back
+    /// with the test-only probe right after each call).
+    #[test]
+    fn kem_secrets_live_in_secret_memory_and_leave_no_stack_residue() {
+        use gnb_secret::test_support::{dead_stack_below_caller, residue};
+        // Secret parts of a decapsulation key: dk_pke (1,152 bytes) and the
+        // implicit-rejection seed z (last 32); ek and H(ek) are public.
+        fn secret_parts(sk: &[u8]) -> [&[u8]; 2] {
+            [&sk[..1152], &sk[sk.len() - 32..]]
+        }
+        gnb_secret::scrub_stack();
+        let (pk, sk) = kem_keypair();
+        let stack = dead_stack_below_caller();
+        assert_eq!((pk.len(), sk.len()), (MLKEM768_PK_SIZE, 2400));
+        for part in secret_parts(&sk) {
+            assert!(residue(&stack, part).is_empty(), "kem_keypair left its key on the stack");
+        }
+        gnb_secret::scrub_stack();
+        let (ss_r, ct) = kem_encapsulate(&pk).unwrap();
+        let stack = dead_stack_below_caller();
+        assert!(residue(&stack, &ss_r).is_empty(), "kem_encapsulate left the shared secret on the stack");
+        gnb_secret::scrub_stack();
+        let ss_i = kem_decapsulate(&sk, &ct).unwrap();
+        let stack = dead_stack_below_caller();
+        assert_eq!(ss_i, ss_r, "both sides derive one shared secret");
+        assert!(residue(&stack, &ss_i).is_empty(), "kem_decapsulate left the shared secret on the stack");
+        for part in secret_parts(&sk) {
+            assert!(residue(&stack, part).is_empty(), "kem_decapsulate left the key on the stack");
+        }
+        assert!(kem_encapsulate(&pk[1..]).is_none(), "wrong-size key");
+        assert!(kem_decapsulate(&sk, &ct[1..]).is_none(), "wrong-size ciphertext");
+    }
 
     // Independent one-block HKDF-SHA256 fixture: Python stdlib hmac/hashlib,
     // extract(salt=[0x33;32], ikm=[0x11;32] || [0x22;32]), then expand each

@@ -1022,6 +1022,18 @@ pub struct GhostDAG {
     /// ([`request_body`](Self::request_body)): wanted whatever the weight of
     /// their chain, until a body arrives. A subset of `body_pending`'s keys.
     body_requested: HashSet<BlockHash>,
+    /// Blocks parked without a verdict (review of audit F1, finding 2): their
+    /// validation could not be completed (a read failure of the chain state,
+    /// `accept`'s no-verdict guard). Like `body_pending`, roots of `invalid`
+    /// (with their selected-chain descendants) in memory only, so the best
+    /// chain the node CAN judge is selected and mined on meanwhile; nothing
+    /// is persisted and the block keeps its body. The acceptance pipeline
+    /// unparks a block when its retry is due.
+    no_verdict: HashSet<BlockHash>,
+    /// Instrumentation, never consensus state: how many times the
+    /// disqualified set was re-derived from its roots (`recompute_invalid`,
+    /// O(disqualified blocks) each). Regression tests bound it.
+    invalid_recomputes: u64,
 }
 
 /// Rejected-body witness roots remembered per body-pending block.
@@ -1059,6 +1071,8 @@ impl GhostDAG {
             reach_hint: None,
             query_visits: std::sync::atomic::AtomicU64::new(0),
             body_requested: HashSet::new(),
+            no_verdict: HashSet::new(),
+            invalid_recomputes: 0,
         }
     }
 
@@ -1982,6 +1996,7 @@ impl GhostDAG {
         self.body_pending.remove(hash);
         self.body_requested.remove(hash);
         self.forget_finality_source(hash);
+        self.no_verdict.remove(hash);
         if self.reach_hint == Some(*hash) {
             self.reach_hint = None;
         }
@@ -3008,6 +3023,120 @@ impl GhostDAG {
         self.mark_body_pending(hash, None)
     }
 
+    /// Park `hash` without a verdict (see the `no_verdict` field): it and its
+    /// selected-chain descendants are disqualified IN MEMORY ONLY until
+    /// [`unpark_no_verdicts`](Self::unpark_no_verdicts). Returns the blocks
+    /// newly marked invalid. Unknown hashes are ignored.
+    pub fn park_no_verdict(&mut self, hash: BlockHash) -> Vec<BlockHash> {
+        if !self.store.has(&hash) {
+            return Vec::new();
+        }
+        self.no_verdict.insert(hash);
+        self.propagate_invalid(hash)
+    }
+
+    /// Unpark every block of `hashes` (their retries are due) and re-derive
+    /// the disqualified set ONCE for all of them, so they and the blocks
+    /// parked only through them are candidates again (review of PR #15, finding
+    /// 1: one `recompute_invalid` per block was O(parked x disqualified)).
+    /// Returns how many of them were parked.
+    pub fn unpark_no_verdicts(&mut self, hashes: &[BlockHash]) -> usize {
+        let n = hashes.iter().filter(|h| self.no_verdict.remove(*h)).count();
+        if n > 0 {
+            self.recompute_invalid();
+        }
+        n
+    }
+
+    /// True iff `hash` is disqualified ONLY because a block parked without
+    /// a verdict lies on its selected chain (itself included), with no
+    /// persistent root, all-edges block or body-pending block on the way
+    /// (review of PR #15, finding 2). Such a block was not judged: once the
+    /// parked block is, its chain may be the best one (a peer serving it is
+    /// ahead of this node, not on an invalid chain). O(selected-chain steps
+    /// to the root).
+    pub fn is_no_verdict_branch(&self, hash: &BlockHash) -> bool {
+        let mut cur = *hash;
+        let mut parked = false;
+        loop {
+            if !self.invalid.contains(&cur) {
+                return parked;
+            }
+            if self.invalid_roots.contains(&cur) || self.invalid_all_edges.contains(&cur)
+                || self.body_pending.contains_key(&cur)
+            {
+                return false;
+            }
+            parked |= self.no_verdict.contains(&cur);
+            match self.store.get(&cur).and_then(|d| d.selected_parent) {
+                Some(sp) => cur = sp,
+                None => return parked,
+            }
+        }
+    }
+
+    /// The heaviest block (GhostDAG's tip order, `(blue_work, blue_score,
+    /// hash)`) of the branches parked without a verdict
+    /// ([`is_no_verdict_branch`](Self::is_no_verdict_branch)), with the
+    /// parked block on its selected chain; `None` when nothing is parked
+    /// (review of PR #15, finding 2). Walks the parked blocks' selected-chain
+    /// descendants only (what `park_no_verdict` marked).
+    pub fn best_no_verdict_branch(&self) -> Option<(BlockHash, BlockHash)> {
+        if self.no_verdict.is_empty() {
+            return None;
+        }
+        let mut roots: Vec<BlockHash> = self.no_verdict.iter().copied().collect();
+        roots.sort_unstable();
+        let mut best: Option<((u128, u64, BlockHash), BlockHash)> = None;
+        let mut seen: HashSet<BlockHash> = HashSet::new();
+        for root in roots {
+            if !self.is_no_verdict_branch(&root) {
+                continue;
+            }
+            let mut stack = vec![root];
+            while let Some(h) = stack.pop() {
+                if !seen.insert(h) {
+                    continue;
+                }
+                // A disqualification below the parked block ends the branch.
+                if h != root && (self.invalid_roots.contains(&h) || self.invalid_all_edges.contains(&h)
+                    || self.body_pending.contains_key(&h))
+                {
+                    continue;
+                }
+                let key = self.order_key(&h);
+                if best.as_ref().is_none_or(|(k, _)| key > *k) {
+                    best = Some((key, root));
+                }
+                if let Some(children) = self.store.children.get(&h) {
+                    stack.extend(children.iter()
+                        .filter(|c| self.store.get(c).and_then(|d| d.selected_parent) == Some(h))
+                        .copied());
+                }
+            }
+        }
+        best.map(|((_, _, h), root)| (h, root))
+    }
+
+    /// How many times the disqualified set was re-derived from its roots
+    /// (instrumentation for tests; see the `invalid_recomputes` field).
+    #[allow(dead_code)] // library API (tests)
+    pub fn invalid_recomputes(&self) -> u64 {
+        self.invalid_recomputes
+    }
+
+    /// True iff `hash` itself is parked without a verdict.
+    pub fn is_no_verdict_parked(&self, hash: &BlockHash) -> bool {
+        self.no_verdict.contains(hash)
+    }
+
+    /// The blocks parked without a verdict, sorted.
+    pub fn no_verdict_parked(&self) -> Vec<BlockHash> {
+        let mut v: Vec<BlockHash> = self.no_verdict.iter().copied().collect();
+        v.sort_unstable();
+        v
+    }
+
     /// True iff `hash` waits for a body (see `mark_body_pending`).
     pub fn is_body_pending(&self, hash: &BlockHash) -> bool {
         self.body_pending.contains_key(hash)
@@ -3224,6 +3353,7 @@ impl GhostDAG {
     /// `mark_body_pending` and `add_block` only ever extend a root's
     /// selected-chain (or, for all-edges roots, any-edge) descendants.
     fn recompute_invalid(&mut self) {
+        self.invalid_recomputes += 1;
         self.invalid.clear();
         self.invalid_all_edges.clear();
         let mut all_edges: Vec<BlockHash> = self.invalid_all_edges_roots.iter().copied().collect();
@@ -3233,6 +3363,7 @@ impl GhostDAG {
         }
         let mut roots: Vec<BlockHash> = self.invalid_roots.iter()
             .chain(self.body_pending.keys())
+            .chain(self.no_verdict.iter())
             .copied()
             .collect();
         roots.sort_unstable();

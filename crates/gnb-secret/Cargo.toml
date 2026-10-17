@@ -1,0 +1,39 @@
+[package]
+name = "gnb-secret"
+version = "0.1.0"
+edition = "2021"
+description = "GnB secret memory (audit CRY-4): non-Copy, non-Clone byte buffers for key material that are locked in RAM where the platform allows (mlock, excluded from core dumps) and wiped before release, plus ML-DSA-65 / Falcon-1024 key generation and signing directly on those buffers (no Copy pqcrypto SecretKey values)"
+license = "AGPL-3.0-or-later"
+publish = false
+
+[features]
+# Tests of dependent crates only: `test_support::Quarantine` keeps the
+# regions released on the calling thread mapped, so a test can check that a
+# dropped secret was wiped. Never enabled by a build artifact (dev-dependency
+# feature, resolver 2).
+test-support = []
+# ML-KEM-768 key generation, encapsulation and decapsulation on secret
+# buffers (the node's P2P handshake). Off by default: the wallet crates and
+# the WebAssembly wallet do not link ML-KEM.
+mlkem = ["dep:pqcrypto-mlkem"]
+
+[dependencies]
+zeroize = "1"
+log = "0.4"
+# The `clean` PQClean variants only, exactly like gnb-crypto (see its
+# Cargo.toml: the AVX2 ML-DSA verifier is not FIPS 204 and the native
+# floating-point Falcon signer is forbidden). Pinned to the same exact
+# releases: this crate calls their C functions directly.
+pqcrypto-mldsa  = { version = "=0.1.2", default-features = false, features = ["std"] }
+pqcrypto-falcon = { version = "=0.4.1", default-features = false, features = ["std"] }
+# The node's exact pin (node/Cargo.toml); the portable `clean` functions are
+# called directly (see `pq`).
+pqcrypto-mlkem  = { version = "=0.1.1", default-features = false, features = ["std"], optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# Equivalence tests against the pqcrypto wrappers under a seeded RNG.
+pqcrypto-traits    = "0.3"
+pqcrypto-internals = "0.2"

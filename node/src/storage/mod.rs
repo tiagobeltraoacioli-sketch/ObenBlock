@@ -257,15 +257,63 @@ pub struct Storage {
     /// Fault injection ([`Storage::inject_batch_failures`]): how many of the
     /// next atomic batch commits fail. Always 0 outside tests.
     injected_batch_failures: std::sync::atomic::AtomicU32,
-    /// Audit F1: consecutive validations of a block that ended without a
-    /// verdict (a read failure of the chain state, re-audit B1-T12), by
-    /// block (`accept`'s no-verdict guard). In memory only: never a mark.
-    no_verdicts: parking_lot::Mutex<std::collections::HashMap<[u8; 32], u32>>,
+    /// Audit F1: the blocks whose validation ended without a verdict (a
+    /// read failure of the chain state, re-audit B1-T12) since their last
+    /// one that reached one, with the retry schedule (`accept`'s no-verdict
+    /// guard). In memory only: never a mark.
+    no_verdicts: parking_lot::Mutex<std::collections::HashMap<[u8; 32], NoVerdictRecord>>,
+    /// Rate limit of the no-verdict error log: (last line, lines suppressed
+    /// since).
+    no_verdict_log: parking_lot::Mutex<(Option<std::time::Instant>, u64)>,
+    /// Fault injection ([`Storage::inject_utxo_read_failure`]): UTXO rows
+    /// whose reads fail with `StorageError::ReadFailed`. Empty outside
+    /// tests; `read_faults_armed` keeps the hot path to one atomic load.
+    injected_read_faults: parking_lot::Mutex<std::collections::HashSet<[u8; 32]>>,
+    /// Fault injection ([`Storage::inject_body_read_failure`]): block hashes
+    /// whose body reads (`get_block`, `get_block_wire_bytes`) fail, and block
+    /// hashes whose body presence checks (`has_block_body`) fail, with
+    /// `StorageError::ReadFailed`. Empty outside tests.
+    injected_body_faults: parking_lot::Mutex<InjectedBodyFaults>,
+    read_faults_armed: std::sync::atomic::AtomicBool,
     /// Audit F1: set when the node must stop (Bitcoin Core's `AbortNode`):
     /// the reason, for the operator. Acceptance and templates refuse from
     /// then on and the `gnb` binary exits.
     abort_reason: parking_lot::Mutex<Option<String>>,
 }
+
+/// Fault injection ([`Storage::inject_body_read_failure`]): the block hashes
+/// whose body reads fail, and those whose body presence checks fail.
+#[derive(Default)]
+struct InjectedBodyFaults {
+    reads: std::collections::HashSet<[u8; 32]>,
+    presence: std::collections::HashSet<[u8; 32]>,
+}
+
+/// Audit F1 (review finding 2): what the node remembers of a block whose
+/// validation ended without a verdict (`Storage::note_no_verdict`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NoVerdictRecord {
+    /// Validations that ended without a verdict since the last one that
+    /// reached one.
+    pub attempts: u32,
+    /// Of those, the latest consecutive ones on which the storage engine
+    /// failed (`reorg::ViewErrorKind::Io`): the count the node's stop reads.
+    pub io_failures: u32,
+    /// Whether the last failure was a storage-engine failure.
+    pub last_io: bool,
+    /// The last failure (at most 512 characters).
+    pub reason: String,
+    /// When the block may be validated again.
+    pub retry_at: std::time::Instant,
+}
+
+/// First retry delay of a block without a verdict; it doubles with every
+/// attempt up to [`NO_VERDICT_RETRY_MAX`].
+pub const NO_VERDICT_RETRY_BASE: std::time::Duration = std::time::Duration::from_secs(60);
+/// Longest retry delay of a block without a verdict.
+pub const NO_VERDICT_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(3600);
+/// At most one no-verdict error line per this interval.
+pub const NO_VERDICT_LOG_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Upper bound on the entries of the body-verdict memo. Reaching it clears
 /// the memo (the verdicts are recomputable; only the cost changes).
@@ -294,23 +342,140 @@ impl Storage {
             reads: std::sync::atomic::AtomicU64::new(0),
             injected_batch_failures: std::sync::atomic::AtomicU32::new(0),
             no_verdicts: Default::default(),
+            no_verdict_log: parking_lot::Mutex::new((None, 0)),
+            injected_read_faults: Default::default(),
+            injected_body_faults: Default::default(),
+            read_faults_armed: std::sync::atomic::AtomicBool::new(false),
             abort_reason: parking_lot::Mutex::new(None),
         }
     }
 
     /// Audit F1: record one more validation of `block` that ended without a
-    /// verdict; returns how many in a row (since its last validation that
-    /// reached one, [`Storage::clear_no_verdict`]).
-    pub fn note_no_verdict(&self, block: &[u8; 32]) -> u32 {
+    /// verdict at `now` (`io`: the storage engine failed, `reason`: the
+    /// failure), and schedule its next attempt (bounded exponential backoff,
+    /// [`NO_VERDICT_RETRY_BASE`] doubling up to [`NO_VERDICT_RETRY_MAX`]).
+    /// Returns the updated record (counts since the block's last validation
+    /// that reached a verdict, [`Storage::clear_no_verdict`]).
+    pub fn note_no_verdict(&self, block: &[u8; 32], io: bool, reason: &str, now: std::time::Instant) -> NoVerdictRecord {
         let mut m = self.no_verdicts.lock();
-        // Bounded: a guard against a flood of distinct failing blocks (the
-        // count only has to reach the abort threshold for one of them).
+        // Bounded: a guard against a flood of distinct failing blocks (a
+        // block without a record is due for a retry, so losing records
+        // only retries sooner).
         if m.len() >= 4096 && !m.contains_key(block) {
             m.clear();
         }
-        let n = m.entry(*block).or_insert(0);
-        *n = n.saturating_add(1);
-        *n
+        let r = m.entry(*block).or_insert_with(|| NoVerdictRecord {
+            attempts: 0, io_failures: 0, last_io: false, reason: String::new(), retry_at: now,
+        });
+        r.attempts = r.attempts.saturating_add(1);
+        // "In a row": a failure of the other class in between restarts it.
+        r.io_failures = if io { r.io_failures.saturating_add(1) } else { 0 };
+        r.last_io = io;
+        r.reason = reason.chars().take(512).collect();
+        let shift = r.attempts.saturating_sub(1).min(16);
+        let backoff = NO_VERDICT_RETRY_BASE.saturating_mul(1u32 << shift).min(NO_VERDICT_RETRY_MAX);
+        r.retry_at = now + backoff;
+        r.clone()
+    }
+
+    /// The no-verdict record of `block`, if its last validation ended
+    /// without a verdict.
+    pub fn no_verdict_record(&self, block: &[u8; 32]) -> Option<NoVerdictRecord> {
+        self.no_verdicts.lock().get(block).cloned()
+    }
+
+    /// Every no-verdict record, by block hash (RPC `getdaginfo`).
+    pub fn no_verdict_records(&self) -> Vec<([u8; 32], NoVerdictRecord)> {
+        let mut v: Vec<_> = self.no_verdicts.lock().iter().map(|(h, r)| (*h, r.clone())).collect();
+        v.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
+    /// Whether `block` may be validated again at `now` (its backoff has
+    /// elapsed, or it has no record).
+    pub fn no_verdict_due(&self, block: &[u8; 32], now: std::time::Instant) -> bool {
+        self.no_verdicts.lock().get(block).is_none_or(|r| r.retry_at <= now)
+    }
+
+    /// Whether a no-verdict error line may be logged at `now` (at most one
+    /// per [`NO_VERDICT_LOG_INTERVAL`]); `Some(n)`: yes, `n` lines were
+    /// suppressed since the last one.
+    pub fn no_verdict_log_permit(&self, now: std::time::Instant) -> Option<u64> {
+        let mut g = self.no_verdict_log.lock();
+        match g.0 {
+            Some(last) if now.saturating_duration_since(last) < NO_VERDICT_LOG_INTERVAL => {
+                g.1 = g.1.saturating_add(1);
+                None
+            }
+            _ => {
+                let suppressed = std::mem::take(&mut g.1);
+                g.0 = Some(now);
+                Some(suppressed)
+            }
+        }
+    }
+
+    /// Fault injection for tests (review of audit F1): every read of an
+    /// output of `txid` through [`Storage::get_utxo`] fails with
+    /// `StorageError::ReadFailed` (an engine error) until
+    /// [`Storage::clear_injected_read_failures`]. The node never calls it.
+    #[allow(dead_code)] // library API (tests)
+    pub fn inject_utxo_read_failure(&self, txid: [u8; 32]) {
+        self.injected_read_faults.lock().insert(txid);
+        self.read_faults_armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Fault injection for tests (review of PR #15, findings 4-6): reads of
+    /// the stored body of `hash` fail with `StorageError::ReadFailed` (an
+    /// engine error) until [`Storage::clear_injected_read_failures`]: its
+    /// presence check ([`Storage::has_block_body`]) when `presence`, else
+    /// its reads ([`Storage::get_block`], [`Storage::get_block_wire_bytes`]).
+    /// The node never calls it.
+    #[allow(dead_code)] // library API (tests)
+    pub fn inject_body_read_failure(&self, hash: [u8; 32], presence: bool) {
+        let mut g = self.injected_body_faults.lock();
+        if presence { g.presence.insert(hash); } else { g.reads.insert(hash); }
+        self.read_faults_armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Ends [`Storage::inject_utxo_read_failure`] and
+    /// [`Storage::inject_body_read_failure`].
+    #[allow(dead_code)] // library API (tests)
+    pub fn clear_injected_read_failures(&self) {
+        self.injected_read_faults.lock().clear();
+        *self.injected_body_faults.lock() = Default::default();
+        self.read_faults_armed.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[inline]
+    fn injected_body_failure(&self, hash: &[u8; 32], presence: bool) -> Result<(), StorageError> {
+        if self.read_faults_armed.load(std::sync::atomic::Ordering::Relaxed) {
+            let g = self.injected_body_faults.lock();
+            if (if presence { &g.presence } else { &g.reads }).contains(hash) {
+                return Err(StorageError::ReadFailed("injected body read failure (test fault injection)".into()));
+            }
+        }
+        Ok(())
+    }
+
+    /// Make every block parked without a verdict due for its retry at `now`
+    /// (its backoff is cut short; the attempt counts are kept). Tests use it
+    /// to let the next acceptance retry a parked block.
+    #[allow(dead_code)] // library API (tests)
+    pub fn make_no_verdict_retries_due(&self, now: std::time::Instant) {
+        for r in self.no_verdicts.lock().values_mut() {
+            r.retry_at = r.retry_at.min(now);
+        }
+    }
+
+    #[inline]
+    fn injected_read_failure(&self, txid: &[u8]) -> Result<(), StorageError> {
+        if self.read_faults_armed.load(std::sync::atomic::Ordering::Relaxed)
+            && <[u8; 32]>::try_from(txid).is_ok_and(|t| self.injected_read_faults.lock().contains(&t))
+        {
+            return Err(StorageError::ReadFailed("injected read failure (test fault injection)".into()));
+        }
+        Ok(())
     }
 
     /// Audit F1: `block` was validated (a verdict was reached).
@@ -743,6 +908,7 @@ impl Storage {
 
     /// Whether a body is stored for `hash` (no decoding).
     pub fn has_block_body(&self, hash: &[u8; 32]) -> Result<bool, StorageError> {
+        self.injected_body_failure(hash, true)?;
         let cf = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
         Ok(self.db.get_pinned_cf(&cf, hash)
             .map_err(|e| StorageError::ReadFailed(e.to_string()))?
@@ -751,6 +917,7 @@ impl Storage {
 
     pub fn get_block(&self, hash: &[u8; 32]) -> Result<Option<Block>, StorageError> {
         self.note_reads(1);
+        self.injected_body_failure(hash, false)?;
         let cf = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
         match self.db.get_cf(&cf, hash).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
             Some(d) => Ok(Some(
@@ -767,6 +934,7 @@ impl Storage {
     /// it used to decode the block and encode it again for every request).
     pub fn get_block_wire_bytes(&self, hash: &[u8; 32]) -> Result<Option<Vec<u8>>, StorageError> {
         self.note_reads(1);
+        self.injected_body_failure(hash, false)?;
         let cf = self.db.cf_handle(CF_BLOCKS).ok_or(StorageError::CfNotFound(CF_BLOCKS.into()))?;
         self.db.get_cf(&cf, hash).map_err(|e| StorageError::ReadFailed(e.to_string()))
     }
@@ -815,6 +983,7 @@ impl Storage {
 
     pub fn get_utxo(&self, txid: &[u8], index: u32) -> Result<Option<TxOutput>, StorageError> {
         self.note_reads(1);
+        self.injected_read_failure(txid)?;
         let cf = self.db.cf_handle(CF_UTXO).ok_or(StorageError::CfNotFound(CF_UTXO.into()))?;
         match self.db.get_cf(&cf, &utxo_key(txid, index)).map_err(|e| StorageError::ReadFailed(e.to_string()))? {
             Some(d) => Ok(Some(decode(&d)?)),

@@ -164,7 +164,11 @@ fn main() {
             rand::fill(&mut seed[..]);
             let total = 1u64 << depth;
             eprintln!("Generating {} epoch keys (hybrid ML-DSA-65 + Falcon-1024)...", total);
-            let signer = gnb::core::kes::KesSigner::generate(depth, *seed, |i| {
+            // CRY-4: the seed is borrowed, never copied out of its wiping
+            // owner (passing the array by value, as clippy suggests for a
+            // `Borrow` argument, would leave an unwiped copy).
+            #[allow(clippy::needless_borrows_for_generic_args)]
+            let signer = gnb::core::kes::KesSigner::generate(depth, &*seed, |i| {
                 if i % 256 == 0 || i == total { eprint!("\r  {}/{}", i, total); }
             }).unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
             eprintln!();
@@ -212,7 +216,12 @@ fn main() {
                 eprintln!("epoch {} already erased (key is at {}): forward security", e, signer.epoch());
                 process::exit(1);
             }
-            let att = gnb::core::powit::Attestation::sign(chain, src, tgt, &signer)
+            // The message of the target's height on `chain`'s schedule: from
+            // the second hardening activation it commits the witness key
+            // (PoWit audit finding 1). A signer has no node chain id, so the
+            // schedule comes from the chain named here.
+            let h2 = gnb::core::activation::hardening2_activation_height_for_signer(chain);
+            let att = gnb::core::powit::Attestation::sign_at(chain, h2, src, tgt, &signer)
                 .unwrap_or_else(|er| { eprintln!("{}", er); process::exit(1) });
             println!("{}", hex::encode(att.to_wire_bytes()));
             return;

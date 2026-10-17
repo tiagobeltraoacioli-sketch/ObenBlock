@@ -97,6 +97,10 @@ argon2 = "0.5"
 aes-gcm = "0.10"
 
 # Secrets / encoding.
+# CRY-4: locked, wiped, non-Copy secret buffers and ML-DSA-65 / Falcon-1024
+# key generation and signing on them (the crate holds the FFI `unsafe`, so
+# this one keeps `#![forbid(unsafe_code)]`).
+gnb-secret = { path = "../gnb-secret" }
 zeroize = { version = "1", features = ["derive"] }
 # CRY-4: `zeroize` makes `bip39::Mnemonic` wipe its word indices on drop.
 bip39   = { version = "2", features = ["zeroize"] }
@@ -135,6 +139,8 @@ rustls       = { version = "0.23", default-features = false, features = ["ring",
 webpki-roots = { version = "1", optional = true }
 
 [dev-dependencies]
+# CRY-4 tests read the memory a dropped secret leaves (test quarantine).
+gnb-secret = { path = "../gnb-secret", features = ["test-support"] }
 tempfile = "3"
 tokio    = { version = "1", features = ["full"] }
 # Property-based invariant tests for the Genesis-locked emission / halving /

@@ -639,7 +639,7 @@ fn self_check(
         if created(&(*t, 0)).is_some() {
             return Ok(Some(0));
         }
-        admission::confirmations_for_next_block(store, t, height).map_err(|e| e.0)
+        admission::confirmations_for_next_block(store, t, height).map_err(|e| e.msg)
     };
     match crate::blockval::check_tx_chain_rules_with_confirmations(tx, &prevouts, height, &confirmations) {
         Ok(()) => {}

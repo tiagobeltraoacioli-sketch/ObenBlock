@@ -113,6 +113,9 @@ pqcrypto-traits  = "0.3"
 # P2P key exchange: ML-KEM-768 (FIPS 203), hybrid with X25519. Pinned exact,
 # like the other PQClean crates.
 pqcrypto-mlkem   = "=0.1.1"
+# CRY-4: locked, wiped secret buffers for the node's long-lived secrets (P2P
+# identity key, witness-key password) and ML-KEM-768 on them (handshake).
+gnb-secret       = { path = "../crates/gnb-secret", features = ["mlkem"] }
 x25519-dalek     = { version = "2", features = ["static_secrets", "zeroize"] }
 # Sprint T.1: direct dep on pqcrypto-internals so KATs can call `with_seeded_rng_scope`
 # from the pqcrypto-internals fork (see [patch.crates-io] at bottom). Upstream also
@@ -202,6 +205,9 @@ sev = { version = "8", default-features = false, features = ["snp"], optional = 
 
 [dev-dependencies]
 gnb-crypto = { path = "../crates/gnb-crypto", features = ["test-pow-limit"] }
+# CRY-4 tests read what a dropped secret leaves behind (test quarantine,
+# dead-stack probe).
+gnb-secret = { path = "../crates/gnb-secret", features = ["mlkem", "test-support"] }
 tempfile = "3"
 # test-util enables tokio::test(start_paused) for the stratum session
 # lifetime tests (virtual clock through the 600s read-poll windows).

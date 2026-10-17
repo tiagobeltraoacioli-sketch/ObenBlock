@@ -24,11 +24,20 @@ use crate::consensus::finality::{Anchor, AnchorSetting, PinOutcome, PinPolicy};
 use crate::consensus::GhostDAG;
 use crate::storage::Storage;
 use gnb_crypto::core::powit::{self, Attestation, BlockInput, ChainView, Checkpoint, Equivocation,
-                              KeyId, PowitBody, PowitParams, PowitState};
+                              KeyId, PowitBody, PowitParams, PowitState, Regime};
 use gnb_crypto::core::witness_share::{self, WitnessShare, SHARE_WINDOW};
-use gnb_crypto::core::{self, Block};
+use gnb_crypto::core::{self, activation, Block};
 
 type Hash = [u8; 32];
+
+/// The second hardening activation height the PoWit rules switch at
+/// (`core::powit::Regime`; process-wide, the node's chain schedule):
+/// consensus (`block_state`), the pool, templates and the witness duty all
+/// read this one value, so each judges an item by the rules of the block
+/// that may include it.
+fn hardening2_height() -> u64 {
+    activation::hardening2_activation_height()
+}
 
 /// Longest selected-chain walk any lookup performs.
 const MAX_WALK: usize = 8_192;
@@ -220,7 +229,7 @@ pub fn block_state(block: &Block, block_hash: &Hash, dag: &GhostDAG, store: &Sto
         evidence: &block.powit.evidence,
     };
     let view = DagChainView { dag, start: sp };
-    base.apply(&powit::params(), core::node_chain_id(), &input, &view).map(Some)
+    base.apply_at(&powit::params(), core::node_chain_id(), hardening2_height(), &input, &view).map(Some)
 }
 
 // ── Pools ────────────────────────────────────────────────────────────────────
@@ -268,45 +277,101 @@ pub const EVIDENCE_NOT_A_WITNESS: &str = "equivocation proof against a key outsi
 /// justified checkpoint, the barred keys, and the witness sets of every
 /// epoch a gossiped item may concern (`witness_set` is O(N log N) in the
 /// share keys; it was recomputed for every gossiped attestation).
+///
+/// Each item is judged by the rules of the earliest block that may include
+/// it (`Regime::at`, second hardening activation): an attestation by those of
+/// height `max(target, next block)`, an equivocation proof by the next
+/// block's. Before the activation `W(e)` is the 64 heaviest keys, held here
+/// per epoch; from it every key with weight is a member, looked up in the
+/// tip's state directly (`PowitState::member_weight_h2`, no set to build),
+/// and a proof is held only against a member of the next block's evidence
+/// epochs (`PowitState::may_be_proven_h2`), the consensus rule.
 pub struct TipWitnesses {
     pub tip: Hash,
     pub tip_h: u64,
     activation: u64,
+    hardening2: u64,
     justified: Checkpoint,
-    banned: BTreeMap<KeyId, u64>,
     /// Epoch of the next block.
     epoch: u64,
-    /// W(e) for the epochs from `EVIDENCE_MEMBER_EPOCHS` (or the oldest open
-    /// target) before the next block's to the newest open target's.
+    /// The tip's state (barred keys; witness weights from the activation).
+    state: PowitState,
+    /// Old-rule W(e) (the 64 heaviest) for the epochs from
+    /// `EVIDENCE_MEMBER_EPOCHS` (or the oldest open target) before the next
+    /// block's to the newest open target's; empty once the next block is at
+    /// or above the second hardening activation.
     sets: BTreeMap<u64, HashMap<KeyId, u128>>,
 }
 
 impl TipWitnesses {
-    pub fn of(tip: Hash, tip_h: u64, st: &PowitState, p: &PowitParams) -> Self {
+    /// From the tip's state (kept), under the second hardening activation
+    /// height `hardening2`.
+    pub fn of_at(tip: Hash, tip_h: u64, st: PowitState, p: &PowitParams, hardening2: u64) -> Self {
         let act = st.activation;
         let next = tip_h.max(act) + 1;
         let epoch = p.epoch(act, next);
-        let oldest_open = p.epoch(act, next.saturating_sub(p.vote_ttl).max(act));
-        let lo = epoch.saturating_sub(EVIDENCE_MEMBER_EPOCHS).min(oldest_open);
-        let hi = p.epoch(act, tip_h.max(act) + p.checkpoint_interval).max(epoch);
-        // The sets the next block reads (from the second hardening upgrade,
-        // from finalized history: `PowitState::witness_set_at`).
-        let sets = (lo..=hi).map(|e| (e, st.witness_set_for_block(p, e, next).into_iter().collect())).collect();
-        TipWitnesses { tip, tip_h, activation: act, justified: st.justified, banned: st.banned.clone(), epoch, sets }
+        let sets = if Regime::at(next, hardening2) == Regime::V1 {
+            let oldest_open = p.epoch(act, next.saturating_sub(p.vote_ttl).max(act));
+            let lo = epoch.saturating_sub(EVIDENCE_MEMBER_EPOCHS).min(oldest_open);
+            let hi = p.epoch(act, tip_h.max(act) + p.checkpoint_interval).max(epoch);
+            (lo..=hi).map(|e| (e, st.witness_set(p, e).into_iter().collect())).collect()
+        } else {
+            BTreeMap::new()
+        };
+        TipWitnesses { tip, tip_h, activation: act, hardening2, justified: st.justified, epoch, state: st, sets }
     }
 
-    /// `key`'s weight in W(`epoch`), if it is a member.
-    pub fn weight_in(&self, epoch: u64, key: &KeyId) -> Option<u128> {
-        self.sets.get(&epoch)?.get(key).copied()
+    fn next_height(&self) -> u64 {
+        self.tip_h.max(self.activation) + 1
     }
 
-    /// `key`'s highest weight over the recent witness sets, if it is in one.
-    pub fn recent_weight(&self, key: &KeyId) -> Option<u128> {
-        self.sets.values().filter_map(|s| s.get(key)).max().copied()
+    /// The rules of the next block.
+    fn regime(&self) -> Regime {
+        Regime::at(self.next_height(), self.hardening2)
+    }
+
+    /// `key`'s weight in W(epoch of `target`) under the rules of the earliest
+    /// block that may include a vote for `target`, if it is a member.
+    pub fn weight_for(&self, p: &PowitParams, target: &Checkpoint, key: &KeyId) -> Option<u128> {
+        let e = p.epoch(self.activation, target.height.max(self.activation));
+        match Regime::at(target.height.max(self.next_height()), self.hardening2) {
+            Regime::V1 => self.sets.get(&e)?.get(key).copied(),
+            Regime::Hardening2 => self.state.member_weight_h2(p, e, key),
+        }
+    }
+
+    /// Whether the next block may carry an equivocation proof against `key`,
+    /// and the key's weight for ordering: before the second hardening
+    /// activation, its highest weight over the recent witness sets (node
+    /// policy); from it, over the next block's evidence epochs (consensus).
+    pub fn evidence_weight(&self, p: &PowitParams, key: &KeyId) -> Option<u128> {
+        match self.regime() {
+            Regime::V1 => self.sets.values().filter_map(|s| s.get(key)).max().copied(),
+            Regime::Hardening2 => PowitState::evidence_epochs(self.epoch)
+                .filter_map(|e| self.state.member_weight_h2(p, e, key))
+                .max(),
+        }
     }
 
     fn is_banned(&self, key: &KeyId) -> bool {
-        self.banned.get(key).is_some_and(|&until| self.epoch < until)
+        self.state.is_banned(key, self.epoch)
+    }
+
+    /// Verify an equivocation proof's signatures as the next block will, or
+    /// (next block below the activation, a link targeting at or above it)
+    /// as a block from the activation will: such a proof is valid there and
+    /// is kept for it (templates include what their own block accepts).
+    fn verify_evidence(&self, ev: &Equivocation, chain: core::ChainId, p: &PowitParams) -> Result<KeyId, String> {
+        let act = self.activation;
+        match self.regime() {
+            Regime::Hardening2 => ev.verify_at(chain, p, act, self.hardening2).map_err(str::to_string),
+            Regime::V1 => match ev.verify_at(chain, p, act, activation::NEVER) {
+                Err(_) if ev.a.target.height.max(ev.b.target.height) >= self.hardening2 => {
+                    ev.verify_at(chain, p, act, self.hardening2).map_err(str::to_string)
+                }
+                r => r.map_err(str::to_string),
+            },
+        }
     }
 
     /// A target the next block (or the one after, from a peer one block
@@ -464,7 +529,7 @@ impl PoolInner {
             if x.att.source != v.justified || !v.open_target(p, &t) {
                 return false;
             }
-            match v.weight_in(p.epoch(v.activation, t.height), &x.key) {
+            match v.weight_for(p, &t, &x.key) {
                 Some(w) => {
                     x.weight = w;
                     true
@@ -473,7 +538,7 @@ impl PoolInner {
             }
         });
         self.evidence.retain(|k, _| !v.is_banned(k));
-        self.seen_links.retain_keys(|k| v.recent_weight(k).is_some());
+        self.seen_links.retain_keys(|k| v.evidence_weight(p, k).is_some());
     }
 }
 
@@ -536,7 +601,7 @@ impl PowitPool {
             }
         }
         let p = powit::params();
-        let view = load_state(store, &tip).map(|st| Arc::new(TipWitnesses::of(tip, tip_h, &st, &p)));
+        let view = load_state(store, &tip).map(|st| Arc::new(TipWitnesses::of_at(tip, tip_h, st, &p, hardening2_height())));
         let mut g = self.inner.lock();
         g.prune_to(view.as_deref(), tip_h, &p);
         // An activated tip whose state is not readable yet is retried on the
@@ -605,12 +670,13 @@ impl PowitPool {
             return Err("invalid attestation signature".into());
         }
         let key = att.key_id();
-        let weight = view.weight_in(p.epoch(view.activation, t.height), &key)
-            .ok_or("attester is not in the witness set")?;
+        let weight = view.weight_for(&p, &t, &key).ok_or("attester is not in the witness set")?;
         if !view.open_target(&p, &t) {
             return Err("attestation target is not an open checkpoint slot".into());
         }
-        if !att.verify_signature(chain, &p, act) {
+        // The message of the target's height (v2 from the second hardening
+        // activation: it commits the witness key).
+        if !att.verify_signature_at(chain, &p, act, view.hardening2) {
             return Err("invalid attestation signature".into());
         }
         {
@@ -642,14 +708,15 @@ impl PowitPool {
         }
         let key = ev.a.key_id();
         let view = self.follow_tip(dag, store).ok_or("PoWit not active at the tip")?;
-        let weight = view.recent_weight(&key).ok_or(EVIDENCE_NOT_A_WITNESS)?;
+        let p = powit::params();
+        let weight = view.evidence_weight(&p, &key).ok_or(EVIDENCE_NOT_A_WITNESS)?;
         if view.is_banned(&key) {
             return Err("equivocation proof against an already barred key".into());
         }
         if self.inner.lock().evidence.contains_key(&key) {
             return Err("equivocation proof for this key already held".into());
         }
-        let k = ev.verify(core::node_chain_id(), &powit::params(), core::powit_height()).map_err(|e| e.to_string())?;
+        let k = view.verify_evidence(&ev, core::node_chain_id(), &p)?;
         debug_assert_eq!(k, key);
         self.inner.lock().insert_evidence(key, ev, weight)?;
         Ok(key)
@@ -670,12 +737,17 @@ impl PowitPool {
         }
     }
 
-    /// Shares; attestations by target height; proofs heaviest key first
-    /// (then KeyId), by the weights of the tip they were admitted at.
+    /// Shares; attestations by target height, then heaviest key first (then
+    /// id): from the second hardening activation every share key may vote
+    /// and a block holds 32 votes, so the votes that carry the most weight
+    /// toward two thirds go first; proofs heaviest key first (then KeyId),
+    /// by the weights of the tip they were admitted at.
     pub fn snapshot(&self) -> (Vec<WitnessShare>, Vec<Attestation>, Vec<Equivocation>) {
         let g = self.inner.lock();
-        let mut atts: Vec<Attestation> = g.attestations.values().map(|x| x.att.clone()).collect();
-        atts.sort_by_key(|a| a.target.height);
+        let mut held: Vec<(&Hash, &PendingAttestation)> = g.attestations.iter().collect();
+        held.sort_by(|a, b| a.1.att.target.height.cmp(&b.1.att.target.height)
+            .then(b.1.weight.cmp(&a.1.weight)).then(a.0.cmp(b.0)));
+        let atts: Vec<Attestation> = held.into_iter().map(|(_, x)| x.att.clone()).collect();
         let mut ev: Vec<(&KeyId, &HeldEvidence)> = g.evidence.iter().collect();
         ev.sort_by(|a, b| b.1.weight.cmp(&a.1.weight).then(a.0.cmp(b.0)));
         (g.shares.values().map(|(s, _)| s.clone()).collect(), atts, ev.into_iter().map(|(_, h)| h.ev.clone()).collect())
@@ -695,16 +767,17 @@ pub fn template_body(pool: &PowitPool, dag: &GhostDAG, store: &Storage, tip: Has
     let Ok(base) = base_state(dag, store, Some(tip)) else { return PowitBody::default() };
     let p = powit::params();
     let chain = core::node_chain_id();
+    let h2 = hardening2_height();
     let epoch = p.epoch(base.activation, height);
     let recent = selected_chain_since(dag, Some(tip), height.saturating_sub(SHARE_WINDOW));
     let Ok(included) = included_share_ids(store, &recent) else { return PowitBody::default() };
     let (shares, atts, mut evidence) = pool.snapshot();
     if !evidence.is_empty() {
         let tip_h = dag.get_block_data(&tip).map(|d| d.height).unwrap_or(height.saturating_sub(1));
-        let w = pool.view_of(&tip).unwrap_or_else(|| Arc::new(TipWitnesses::of(tip, tip_h, &base, &p)));
+        let w = pool.view_of(&tip).unwrap_or_else(|| Arc::new(TipWitnesses::of_at(tip, tip_h, base.clone(), &p, h2)));
         evidence.sort_by_cached_key(|e| {
             let k = e.a.key_id();
-            (std::cmp::Reverse(w.recent_weight(&k).unwrap_or(0)), k)
+            (std::cmp::Reverse(w.evidence_weight(&p, &k).unwrap_or(0)), k)
         });
     }
 
@@ -725,7 +798,7 @@ pub fn template_body(pool: &PowitPool, dag: &GhostDAG, store: &Storage, tip: Has
     let try_apply = |b: &PowitBody, sw: &[(KeyId, u128)]| {
         let input = BlockInput { height, hash: [0; 32], share_work: sw, attestations: &b.attestations,
                                  evidence: &b.evidence };
-        base.apply(&p, chain, &input, &view).is_ok()
+        base.apply_at(&p, chain, h2, &input, &view).is_ok()
     };
     for ev in evidence {
         if body.evidence.len() >= p.max_evidence_per_block {
@@ -836,11 +909,23 @@ pub struct WitnessDuty {
     pub key_id: KeyId,
     pub payout_script: Vec<u8>,
     key_path: PathBuf,
-    password: zeroize::Zeroizing<String>,
+    /// CRY-4: the key-file password is kept for the node's whole run (it
+    /// re-opens the KES key file at every epoch), so it lives in a
+    /// `SecretBytes` region: locked in RAM where the platform allows, wiped
+    /// on drop (Bitcoin Core keeps wallet passphrases in `SecureString`,
+    /// secure-allocator memory, for the same reason).
+    password: gnb_crypto::crypto::SecretBytes,
     signer: Mutex<gnb_crypto::core::kes::KesSigner>,
     record_path: PathBuf,
     highwater_path: PathBuf,
     signed: Mutex<(Vec<(Checkpoint, Checkpoint)>, HighWater)>,
+}
+
+/// The witness password held in secret memory, as the `&str` the key file
+/// API takes. It was read as UTF-8 text and trimmed at character
+/// boundaries, so it is always valid UTF-8.
+fn password_str(password: &gnb_crypto::crypto::SecretBytes) -> &str {
+    std::str::from_utf8(password).expect("the witness password was read as UTF-8")
 }
 
 impl WitnessDuty {
@@ -852,9 +937,10 @@ impl WitnessDuty {
         // CRY-4: the file's contents are wiped once the first line is copied.
         let pw = zeroize::Zeroizing::new(
             std::fs::read_to_string(password_file).map_err(|e| format!("witness password file: {e}"))?);
-        let password = zeroize::Zeroizing::new(pw.lines().next().unwrap_or("").trim().to_string());
+        let password = gnb_crypto::crypto::SecretBytes::from_slice(pw.lines().next().unwrap_or("").trim().as_bytes());
+        drop(pw);
         let file = gnb_crypto::core::kes::KesKeyFile::load(key)?;
-        let signer = file.open(&password)?;
+        let signer = file.open(password_str(&password))?;
         let key_id = signer.public().witness_id();
         let record_path = data_dir.join(format!("powit-votes-{}.json", hex::encode(key_id)));
         let mut hw_name = key.file_name().ok_or("witness key path has no file name")?.to_os_string();
@@ -886,8 +972,12 @@ impl WitnessDuty {
         })
     }
 
-    /// If this key is a witness for the newest checkpoint above the tip's
-    /// justified one, sign that link once. Returns the new attestation.
+    /// If this key is a witness for the checkpoint to vote for above the
+    /// tip's justified one, sign that link once (the message of the target's
+    /// height). Returns the new attestation. The checkpoint is the newest slot
+    /// at or below the next block's height; from the second hardening
+    /// activation, the justified checkpoint's direct child while a vote for
+    /// it can still be included.
     pub fn maybe_attest(&self, dag: &GhostDAG, store: &Storage) -> Result<Option<Attestation>, String> {
         let Some((tip, tip_h)) = tip_context(dag) else { return Ok(None) };
         let Some(st) = load_state(store, &tip) else { return Ok(None) };
@@ -898,41 +988,73 @@ impl WitnessDuty {
         }
         // Newest checkpoint slot at or below the next block's height.
         let next = tip_h + 1;
-        let slot = act + (next - act) / p.checkpoint_interval * p.checkpoint_interval;
-        if slot <= st.justified.height {
-            return Ok(None);
+        let newest = act + (next - act) / p.checkpoint_interval * p.checkpoint_interval;
+        let h2 = hardening2_height();
+        let regime = Regime::at(next, h2);
+        // The slots to vote for, in order of preference.
+        let mut candidates = vec![newest];
+        if regime == Regime::Hardening2 {
+            // From the second hardening activation every share key may vote
+            // and a block holds 32 votes, so justifying a slot can take more
+            // than one checkpoint interval. A justified checkpoint is final
+            // only once its direct child is justified (Casper FFG), so the
+            // duty votes for that child while a block can still include the
+            // vote, and for the newest slot otherwise (also when this key
+            // can no longer sign the child): votes that move on to the newest
+            // slot each interval justify slots two intervals apart and
+            // finalize nothing.
+            let child = st.justified.height + p.checkpoint_interval;
+            if child < newest && next <= child + p.vote_ttl {
+                candidates.insert(0, child);
+            }
         }
-        let te = p.epoch(act, slot);
-        // Membership as the next block will judge it (the second hardening
-        // upgrade reads the witness set from finalized history).
-        if !st.witness_set_for_block(&p, te, next).iter().any(|(k, _)| *k == self.key_id) {
-            return Ok(None);
-        }
+        let source = st.justified;
         // The next block's view of the slot: its selected chain starts at tip.
         let view = DagChainView { dag, start: Some(tip) };
-        let Some(hash) = view.selected_at(slot) else { return Ok(None) };
-        let target = Checkpoint { height: slot, hash };
-        let source = st.justified;
-        if self.signed.lock().0.iter().any(|(s, t)| *s == source && *t == target) {
-            return Ok(None);
-        }
-        if self.conflicts(&source, &target) {
-            return Ok(None);
-        }
         let mut signer = self.signer.lock();
-        if te < signer.epoch() {
-            return Ok(None); // that epoch's leaf is gone: forward security
+        let mut chosen = None;
+        for slot in candidates {
+            if slot <= st.justified.height {
+                return Ok(None);
+            }
+            let te = p.epoch(act, slot);
+            // A member under the rules of the block that will include the
+            // vote (from the next block on: slot <= next).
+            let member = match regime {
+                Regime::V1 => st.witness_set(&p, te).iter().any(|(k, _)| *k == self.key_id),
+                Regime::Hardening2 => st.member_weight_h2(&p, te, &self.key_id).is_some(),
+            };
+            // Not a member for this slot's epoch, no block for it, a conflict
+            // with the record, or an epoch whose leaf is gone (forward
+            // security): try the next slot, if any.
+            if !member {
+                continue;
+            }
+            let Some(hash) = view.selected_at(slot) else { continue };
+            let target = Checkpoint { height: slot, hash };
+            if self.signed.lock().0.iter().any(|(s, t)| *s == source && *t == target) {
+                return Ok(None); // signed: waiting for it to be included
+            }
+            if self.conflicts(&source, &target) || te < signer.epoch() {
+                continue;
+            }
+            chosen = Some((target, te));
+            break;
         }
+        let Some((target, te)) = chosen else { return Ok(None) };
         if te > signer.epoch() {
             // Erase every earlier seed, ON DISK FIRST (durably), then in memory.
-            let mut next_state = gnb_crypto::core::kes::KesKeyFile::load(&self.key_path)?.open(&self.password)?;
+            let password = password_str(&self.password);
+            let mut next_state = gnb_crypto::core::kes::KesKeyFile::load(&self.key_path)?.open(password)?;
             next_state.evolve_to(te)?;
-            let sealed = gnb_crypto::core::kes::KesKeyFile::seal(&next_state, &self.password)?;
+            let sealed = gnb_crypto::core::kes::KesKeyFile::seal(&next_state, password)?;
             let json = serde_json::to_vec_pretty(&sealed).map_err(|e| format!("kes save: {e}"))?;
             write_durable(&self.key_path, &json).map_err(|e| format!("kes save: {e}"))?;
             *signer = next_state;
         }
-        let att = Attestation::sign(core::node_chain_id(), source, target, &signer)?;
+        // The message of the target's height (v2, committing this key, from
+        // the second hardening activation).
+        let att = Attestation::sign_at(core::node_chain_id(), h2, source, target, &signer)?;
         {
             let mut g = self.signed.lock();
             g.0.push((source, target));
@@ -997,16 +1119,23 @@ pub fn info_json(dag: &GhostDAG, store: &Storage) -> serde_json::Value {
         "hash": hex::encode(c.hash),
         "block_height": dag.get_block_data(&c.hash).map(|d| d.height),
     });
-    // The witness set the next block reads for a target in the state's epoch.
-    let ws = st.as_ref().map(|s| s.witness_set_for_block(&p, s.epoch, tip_h + 1)).unwrap_or_default();
-    let total: u128 = ws.iter().map(|(_, w)| *w).sum();
+    // The witness set the next block is checked against (second hardening
+    // activation: every key with weight, two thirds of the total).
+    let h2 = hardening2_height();
+    let regime = Regime::at(tip_h + 1, h2);
+    let ws = st.as_ref().map(|s| s.witness_set_in(&p, s.epoch, regime)).unwrap_or_default();
+    let total: u128 = ws.iter().fold(0u128, |a, (_, w)| a.saturating_add(*w));
     serde_json::json!({
         "activation_height": if act == u64::MAX { serde_json::Value::Null } else { act.into() },
         "active": core::powit_active(tip_h + 1),
         "pow": core::pow_algo(tip_h + 1).name(),
+        "hardening2_activation_height": if h2 == activation::NEVER { serde_json::Value::Null } else { h2.into() },
+        "rules": match regime { Regime::V1 => "v1", Regime::Hardening2 => "hardening2" },
         "params": {
             "epoch_len": p.epoch_len, "checkpoint_interval": p.checkpoint_interval,
-            "window_epochs": p.window_epochs, "max_witnesses": p.max_witnesses,
+            "window_epochs": p.window_epochs,
+            // The 64-key cap applies only before the second hardening activation.
+            "max_witnesses": p.max_witnesses,
         },
         "tip_height": tip_h,
         "epoch": st.as_ref().map(|s| s.epoch),
@@ -1101,6 +1230,16 @@ pub struct ReleaseCheckpoint {
     /// DAG height (`getblockdag` `height` of a selected-chain block).
     pub height: u64,
     pub hash: Hash,
+}
+
+impl ReleaseCheckpoint {
+    /// From the 64 hex digits the RPC prints and the block's DAG height, the
+    /// line `tools/release/min_chain_work.py` prints (a malformed literal is
+    /// a compile error where the constant is defined).
+    #[allow(dead_code)] // the form a release sets `MAINNET_FINALITY_CHECKPOINT` in
+    pub const fn from_hex(hex: &str, height: u64) -> Self {
+        ReleaseCheckpoint { height, hash: crate::assumevalid::hash_from_hex(hex) }
+    }
 }
 
 /// Mainnet release finality checkpoint. None yet: this tree was cut with no
@@ -1470,6 +1609,25 @@ mod tests {
         let mut kept: Vec<u64> = g.attestations.values().map(|x| x.att.target.height).collect();
         kept.sort();
         assert_eq!(kept, vec![55, 60]);
+    }
+
+    /// Templates take a target's votes heaviest first (then id): from the
+    /// second hardening activation every share key may vote and a block holds
+    /// 32 votes, so the 32 that carry the most weight toward two thirds go
+    /// first; older targets still go before newer ones.
+    #[test]
+    fn snapshot_orders_votes_by_target_then_weight() {
+        let pool = PowitPool::new();
+        {
+            let mut g = pool.inner.lock();
+            for (w, t, weight) in [(1u64, 20u64, 5u128), (2, 20, 50), (3, 15, 1), (4, 20, 7)] {
+                let a = link(w, 0, t);
+                g.insert_attestation(a.id(), PendingAttestation { key: a.key_id(), att: a, weight }).unwrap();
+            }
+        }
+        let (_, atts, _) = pool.snapshot();
+        let order: Vec<(u64, u8)> = atts.iter().map(|a| (a.target.height, a.witness.root[0])).collect();
+        assert_eq!(order, vec![(15, 3), (20, 2), (20, 4), (20, 1)]);
     }
 
     /// Seen links: at most `SEEN_LINKS_PER_KEY` per witness and

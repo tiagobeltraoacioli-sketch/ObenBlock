@@ -176,6 +176,9 @@ allow = ["AGPL-3.0-or-later"]
 [[licenses.exceptions]]
 name = "coherence-core"     # crates/coherence-core
 allow = ["AGPL-3.0-or-later"]
+[[licenses.exceptions]]
+name = "gnb-secret"         # crates/gnb-secret
+allow = ["AGPL-3.0-or-later"]
 
 # ── Third-party permissive-data license ─────────────────────────────────────
 # webpki-roots (Mozilla CA set, via reqwest / libp2p-websocket) ships the CA

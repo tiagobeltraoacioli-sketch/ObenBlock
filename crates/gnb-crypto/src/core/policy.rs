@@ -12,7 +12,8 @@
 //! A [`SpendPolicy`] is:
 //!
 //! - `threshold`-of-`pubkeys` hybrid ML-DSA-65 ‖ Falcon-1024 keys (1 ≤ m ≤ n ≤
-//!   [`MAX_POLICY_KEYS`], keys distinct, each a hybrid key);
+//!   [`MAX_POLICY_KEYS`], keys distinct, each a hybrid key; from the second
+//!   hardening upgrade distinct by [`key_identity`], not only by bytes);
 //! - `after`: absolute timelock — spendable only by a transaction whose
 //!   `locktime ≥ after`, and a transaction is only valid in a block at height
 //!   `≥ locktime`. `0` = none;
@@ -24,6 +25,31 @@
 //! witness byte string per signature set.
 
 use sha3::{Digest, Sha3_256};
+use std::borrow::Cow;
+
+/// The identity of a policy key (PF-4): its enveloped hybrid encoding.
+///
+/// A policy key is accepted in two encodings of the same key: the enveloped
+/// hybrid key `B1 0C 01 00 ‖ mldsa_pk(1,952) ‖ falcon_pk(1,793)` (3,749
+/// bytes, every current key) and the raw hybrid key `mldsa_pk ‖ falcon_pk`
+/// (3,745 bytes) of a genesis carry-over wallet, told apart by their exact
+/// lengths (`crypto::public_key_suite`). The sighash-v3 verifier
+/// (`crypto::verify_bound`) accepts a signature under either encoding and
+/// does not bind which one, so the two encodings are one signer:
+///
+/// ```text
+/// key_identity(k) = k                   if len(k) = 3,749 (enveloped)
+///                 = B1 0C 01 00 ‖ k     if len(k) = 3,745 (raw hybrid)
+/// ```
+///
+/// (Any other length is not a policy key; it is returned unchanged.)
+pub fn key_identity(key: &[u8]) -> Cow<'_, [u8]> {
+    if key.len() == crate::crypto::legacy_hybrid_pubkey_len() {
+        Cow::Owned(crate::crypto::wrap_envelope(crate::crypto::SUITE_MLDSA65_FALCON1024, key))
+    } else {
+        Cow::Borrowed(key)
+    }
+}
 
 /// Maximum keys in one policy (a hybrid key is 3,749 bytes).
 pub const MAX_POLICY_KEYS: usize = 7;
@@ -110,13 +136,44 @@ pub struct SpendPolicy {
 }
 
 impl SpendPolicy {
-    /// Build and validate a policy.
+    /// Build and validate a policy (wallets, CLIs, the bridge vault: every
+    /// tool that CREATES a policy). Besides the consensus checks of
+    /// [`Self::decode`] it refuses, at every height, two keys with the same
+    /// [`key_identity`] (PF-4): such a policy names one signer twice, and
+    /// from the second hardening upgrade it can no longer be spent.
     pub fn new(threshold: u8, pubkeys: Vec<Vec<u8>>, after: u32, older: u32) -> Result<Self, PolicyError> {
         let p = Self { threshold, pubkeys, after, older };
         p.check()?;
+        p.check_key_identities()?;
         Ok(p)
     }
 
+    /// PF-4: [`PolicyError::DuplicateKey`] when two keys have the same
+    /// [`key_identity`] (the raw and the enveloped encoding of one key).
+    ///
+    /// The byte-wise distinctness of [`Self::decode`] let a policy list one
+    /// key twice, once raw and once enveloped; under sighash v3 one signer
+    /// then fills both slots, so an "m-of-n" whose participants see n
+    /// distinct keys is spendable with fewer signers. Consensus from the
+    /// second hardening height (`activation::hardening2_*`, applied by the
+    /// node's policy-spend rule `blockval::check_policy_spends_with_confirmations`
+    /// to the revealed policy or branch); [`Self::new`] at every height.
+    /// Bitcoin Core's analogue: one encoding per key in a script context
+    /// (compressed-only keys in segwit v0 standardness, BIP340 x-only keys in
+    /// tapscript) and miniscript's duplicate-key sanity check.
+    pub fn check_key_identities(&self) -> Result<(), PolicyError> {
+        let ids: Vec<Cow<'_, [u8]>> = self.pubkeys.iter().map(|k| key_identity(k)).collect();
+        for (i, id) in ids.iter().enumerate() {
+            if ids[..i].contains(id) {
+                return Err(PolicyError::DuplicateKey);
+            }
+        }
+        Ok(())
+    }
+
+    /// The consensus checks of a policy at every height: threshold range,
+    /// key count, hybrid keys, byte-wise distinct keys. (The identity rule,
+    /// [`Self::check_key_identities`], is height-gated and not part of it.)
     fn check(&self) -> Result<(), PolicyError> {
         let n = self.pubkeys.len();
         if n > MAX_POLICY_KEYS {
@@ -166,7 +223,12 @@ impl SpendPolicy {
         let after = r.u32()?;
         let older = r.u32()?;
         r.end()?;
-        Self::new(threshold, pubkeys, after, older)
+        // Consensus decoding: the checks of every height only. The PF-4
+        // identity rule is applied by the spend rule from its activation
+        // height, so a revealed policy below it decodes exactly as before.
+        let p = Self { threshold, pubkeys, after, older };
+        p.check()?;
+        Ok(p)
     }
 
     /// `SHA3-256("GNB-POLICY-v1" ‖ encode())`.
@@ -574,6 +636,44 @@ mod tests {
         short.truncate(short.len() - 1793); // ML-DSA half only
         assert_eq!(SpendPolicy::new(1, vec![short], 0, 0), Err(PolicyError::NotHybridKey(0)));
     }
+
+    /// PF-4 golden vectors: the identity of the raw encoding of a key is its
+    /// enveloped encoding (`B1 0C 01 00 ‖ raw`), the enveloped one is itself;
+    /// consensus decoding keeps the byte-wise rule of every height while the
+    /// tooling constructor and the hardening-2 rule refuse the twin.
+    #[test]
+    fn key_identity_vectors_and_the_twin_encoding_policy() {
+        let (pk, _) = crate::crypto::generate_keypair_from_seed(&[0x42; 32]).unwrap();
+        assert_eq!(pk.len(), 3_749);
+        assert_eq!(pk[..4], [0xB1, 0x0C, 0x01, 0x00]);
+        let raw = pk[4..].to_vec();
+        assert_eq!(raw.len(), 3_745);
+        assert_eq!(&*key_identity(&raw), pk.as_slice());
+        assert!(matches!(key_identity(&pk), Cow::Borrowed(k) if k == pk.as_slice()));
+        assert!(matches!(key_identity(b"short"), Cow::Borrowed(b"short")));
+        // Pinned: SHA3-256 of the identity of the seed-0x42 hybrid key.
+        assert_eq!(hex::encode(Sha3_256::digest(&*key_identity(&raw))), PIN_IDENTITY_SHA3);
+
+        let twin = SpendPolicy { threshold: 2, pubkeys: vec![raw.clone(), pk.clone()], after: 0, older: 0 };
+        // Consensus decoding (every height): unchanged, the bytes differ.
+        assert_eq!(SpendPolicy::decode(&twin.encode()), Ok(twin.clone()));
+        // Pinned: the policy hash of that twin policy (its encoding).
+        assert_eq!(hex::encode(twin.hash()), PIN_TWIN_POLICY_HASH);
+        // The identity rule refuses it, in either order.
+        assert_eq!(twin.check_key_identities(), Err(PolicyError::DuplicateKey));
+        let swapped = SpendPolicy { pubkeys: vec![pk.clone(), raw.clone()], ..twin.clone() };
+        assert_eq!(swapped.check_key_identities(), Err(PolicyError::DuplicateKey));
+        assert_eq!(SpendPolicy::new(2, twin.pubkeys.clone(), 0, 0), Err(PolicyError::DuplicateKey));
+        assert_eq!(SpendPolicy::new(1, vec![pk.clone(), raw.clone()], 0, 0), Err(PolicyError::DuplicateKey));
+        // A raw key next to another key is fine.
+        let (other, _) = crate::crypto::generate_keypair_from_seed(&[0x43; 32]).unwrap();
+        assert!(SpendPolicy::new(2, vec![raw.clone(), other.clone()], 0, 0).is_ok());
+        assert_eq!(SpendPolicy { threshold: 2, pubkeys: vec![raw, other], after: 0, older: 0 }
+            .check_key_identities(), Ok(()));
+    }
+
+    const PIN_IDENTITY_SHA3: &str = "2aeeb67335c518247b6a7c92dbe857f3a72e7806609a2c179ce87aa95de2ccd8";
+    const PIN_TWIN_POLICY_HASH: &str = "f27d1c6e16aaa5eda18ef3372bd38e56397f8f857b62f8cdaa82d34742dbaf6f";
 
     #[test]
     fn decoding_is_strict() {

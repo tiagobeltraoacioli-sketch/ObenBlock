@@ -200,8 +200,10 @@ impl WalletClient {
     /// Convenience: send a full tx from an address, signed by a Wallet.
     ///
     /// Handles: utxo fetch → coin selection → previous-transaction
-    /// verification → sign → broadcast, under the default maximum-fee guard.
-    /// See [`Self::send_payment`] for the actual fee and an explicit guard.
+    /// verification → sign → broadcast, under the default maximum-fee guard
+    /// and [`SendOptions::default`]: an input whose value cannot be verified
+    /// is refused (see [`Self::send_payment_with`]). See
+    /// [`Self::send_payment`] for the actual fee and an explicit guard.
     pub async fn send(
         &self,
         wallet: &super::Wallet,
@@ -209,20 +211,13 @@ impl WalletClient {
         amount: u64,
         fee_rate_preference: FeePreference,
     ) -> Result<[u8; 32], WalletError> {
-        self.send_payment(wallet, to, amount, fee_rate_preference, &FeePolicy::DEFAULT)
+        self.send_payment_with(wallet, to, amount, fee_rate_preference, &SendOptions::default())
             .await
             .map(|(txid, _)| txid)
     }
 
-    /// Send and report what was actually paid.
-    ///
-    /// WAL-1/WAL-6: the fee is size-aware from the consensus formula at the
-    /// rate `fee_rate_preference` selects (never a node-chosen absolute fee),
-    /// and `fee_policy` caps the actual fee. The next block's height
-    /// (`getdaginfo`) selects the version: a version-3 signature commits to
-    /// every spent value, so nothing else is fetched; for version 1 the
-    /// claimed values of the selected UTXOs are verified against their
-    /// creating transactions where the node can serve them.
+    /// Send and report what was actually paid, under `fee_policy` and the
+    /// default refusal of unverifiable inputs ([`Self::send_payment_with`]).
     pub async fn send_payment(
         &self,
         wallet: &super::Wallet,
@@ -230,6 +225,40 @@ impl WalletClient {
         amount: u64,
         fee_rate_preference: FeePreference,
         fee_policy: &FeePolicy,
+    ) -> Result<([u8; 32], BuiltPayment), WalletError> {
+        let opts = SendOptions { fee_policy: *fee_policy, ..SendOptions::default() };
+        self.send_payment_with(wallet, to, amount, fee_rate_preference, &opts).await
+    }
+
+    /// Send and report what was actually paid.
+    ///
+    /// WAL-1/WAL-6: the fee is size-aware from the consensus formula at the
+    /// rate `fee_rate_preference` selects (never a node-chosen absolute fee),
+    /// and `opts.fee_policy` caps the actual fee. The next block's height
+    /// (`getdaginfo`) selects the version: a version-3 signature commits to
+    /// every spent value, so nothing else is fetched; for version 1 the
+    /// claimed values of the selected UTXOs are verified against their
+    /// creating transactions where the node can serve them.
+    ///
+    /// WAL-1 residual: a version-1 input whose creating transaction the node
+    /// does not serve (genesis carryover, pruned body, or a node that simply
+    /// withholds it) can be signed only on the node's claimed value, which
+    /// the fee guard cannot check when it is under-reported (the difference
+    /// silently becomes fee). This library path has no confirmation step, so
+    /// such a payment is refused before anything is signed or broadcast
+    /// unless `opts.allow_unverified_inputs` is set: the caller's explicit
+    /// acknowledgement, the same one every front end asks for (the web
+    /// wallet's checkbox, `gnb-cli send` / `gnb-wallet send` confirmation or
+    /// `--allow-unverified-inputs`). From the hardening activation (version
+    /// 3) every input is committed by the signature and the option has no
+    /// effect.
+    pub async fn send_payment_with(
+        &self,
+        wallet: &super::Wallet,
+        to: &Address,
+        amount: u64,
+        fee_rate_preference: FeePreference,
+        opts: &SendOptions,
     ) -> Result<([u8; 32], BuiltPayment), WalletError> {
         let fee = fee_rate_preference.fee_choice();
         let next_block_height = self.next_block_height().await?;
@@ -247,14 +276,15 @@ impl WalletClient {
                 .map_err(WalletError::Payment)?;
             self.fetch_prev_txs(&planned).await?
         };
-        let opts = PaymentOptions {
+        let payment_opts = PaymentOptions {
             fee,
-            fee_policy: *fee_policy,
+            fee_policy: opts.fee_policy,
             prev_txs: Some(&prevs),
+            require_verified_inputs: !opts.allow_unverified_inputs,
             next_block_height: Some(next_block_height),
             ..PaymentOptions::default()
         };
-        let built = wallet.build_payment(&utxos, to, amount, &opts)?;
+        let built = wallet.build_payment(&utxos, to, amount, &payment_opts)?;
         let txid = self.broadcast(&built.tx).await?;
         if txid != built.tx.txid() {
             return Err(WalletError::BadResponse("broadcast: node reported a different txid".into()));
@@ -441,6 +471,21 @@ pub fn fee_estimate_from_response(response: &Value) -> FeeEstimate {
         medium:     field("medium_priority"),
         slow:       field("slow_priority"),
     }
+}
+
+/// Options of [`WalletClient::send_payment_with`]. `Default`: the default
+/// maximum-fee guard and no unverified inputs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SendOptions {
+    /// Maximum-fee guard on the actual fee.
+    pub fee_policy: FeePolicy,
+    /// The caller's explicit acknowledgement (WAL-1 residual) that a
+    /// version-1 payment may spend inputs whose value comes only from the
+    /// node's claim, because their creating transaction could not be fetched
+    /// and hashed against its txid. Set it only after showing the user the
+    /// [`BuiltPayment`]-style summary another way, as the front ends do;
+    /// `false` (the default) refuses such a payment before signing.
+    pub allow_unverified_inputs: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -837,6 +882,53 @@ mod audit_2026_10_send_tests {
         let seen = seen.lock().unwrap();
         assert!(seen.iter().any(|m| m == "sendrawtransaction"));
         assert!(!seen.iter().any(|m| m == "getrawtransaction"), "{seen:?}");
+    }
+
+    /// WAL-1 residual (re-audit challenge): below the activation (version 1,
+    /// the signature does not commit to spent values) the library path
+    /// signed and broadcast inputs whose value could not be verified, with
+    /// no acknowledgement, and reported them only afterwards. The finding's
+    /// scenario: a lying node reports a 100 GNB coin as 1.0005 GNB and does
+    /// not serve its creating transaction; paying 1 GNB burnt 99 GNB as fee.
+    /// Now nothing is signed or broadcast unless the caller acknowledges
+    /// unverified inputs explicitly, as every front end requires (the web
+    /// checkbox, the interactive CLI confirmation, `--allow-unverified-inputs`).
+    #[tokio::test]
+    async fn send_refuses_unverifiable_inputs_unless_acknowledged() {
+        let (wallet, _) = crate::wallet::Wallet::generate(Network::Mainnet).unwrap();
+        let utxo_txid = hex::encode([5u8; 32]);
+        // getrawtransaction is not served (the mock answers an error object
+        // without `hex`, as a pruned or lying node would).
+        let responses = || std::collections::HashMap::from([
+            ("getdaginfo", json!({"tip_height": 10, "next_block_height": 11})),
+            ("getutxos", json!({"utxos": [{"txid": utxo_txid, "index": 0, "value": "100050000"}]})),
+            ("sendrawtransaction", json!({"txid": "00"})),
+        ]);
+        let to = Address::from_hash([7; 20], Network::Mainnet);
+
+        let (url, seen) = serve(responses());
+        let client = WalletClient::new(url);
+        let err = client.send(&wallet, &to, 100_000_000, FeePreference::Slow).await.unwrap_err();
+        assert!(matches!(&err, WalletError::Payment(m) if m.contains("could not be verified")), "{err}");
+        {
+            let seen = seen.lock().unwrap();
+            assert!(seen.iter().any(|m| m == "getrawtransaction"), "verification was attempted: {seen:?}");
+            assert!(!seen.iter().any(|m| m == "sendrawtransaction"), "nothing is broadcast: {seen:?}");
+        }
+        let err = client.send_payment(&wallet, &to, 100_000_000, FeePreference::Slow, &FeePolicy::DEFAULT)
+            .await.unwrap_err();
+        assert!(matches!(&err, WalletError::Payment(m) if m.contains("could not be verified")), "{err}");
+
+        // An explicit acknowledgement signs on the claimed value (and the
+        // result reports the unverified input). The mock echoes a wrong txid,
+        // so the call fails AFTER the broadcast.
+        let (url, seen) = serve(responses());
+        let opts = SendOptions { allow_unverified_inputs: true, ..SendOptions::default() };
+        let err = WalletClient::new(url)
+            .send_payment_with(&wallet, &to, 100_000_000, FeePreference::Slow, &opts).await.unwrap_err();
+        assert!(matches!(err, WalletError::BadResponse(_)), "{err}");
+        assert!(seen.lock().unwrap().iter().any(|m| m == "sendrawtransaction"));
+        assert!(!SendOptions::default().allow_unverified_inputs, "refusal is the default");
     }
 
     #[test]

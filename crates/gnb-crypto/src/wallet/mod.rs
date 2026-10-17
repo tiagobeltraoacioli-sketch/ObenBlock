@@ -36,6 +36,7 @@ use crate::core::{Transaction, TxInput, TxOutput, TESTNET_PREFIX};
 use crate::crypto;
 use sha3::{Sha3_256, Digest};
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+use crate::crypto::SecretBytes;
 use serde::{Serialize, Deserialize};
 
 pub mod seed;
@@ -126,17 +127,17 @@ pub struct Wallet {
 
 #[derive(Zeroize, ZeroizeOnDrop)]
 struct KeyMaterial {
-    /// ML-DSA-65 private key.
-    secret: Vec<u8>,
-    /// ML-DSA-65 public key.
+    /// Hybrid ML-DSA-65 ‖ Falcon-1024 secret key (CRY-4: locked where the
+    /// platform allows, wiped on drop, never `Copy` or `Clone`).
+    secret: SecretBytes,
+    /// Hybrid public key.
     public: Vec<u8>,
 }
 
-/// Take ownership of a repository-produced wallet secret immediately, without
-/// cloning its allocation, until it can be transferred into `KeyMaterial`.
-fn wallet_secret_owner(secret: Vec<u8>) -> Zeroizing<Vec<u8>> {
-    Zeroizing::new(secret)
-}
+// CRY-4: secret holders are never duplicated implicitly.
+gnb_secret::assert_not_copy_or_clone!(KeyMaterial);
+gnb_secret::assert_not_copy_or_clone!(Wallet);
+gnb_secret::assert_not_copy_or_clone!(Keypair);
 
 impl Wallet {
     /// Generate a new wallet with a fresh random seed phrase.
@@ -179,15 +180,14 @@ impl Wallet {
         version: SeedVersion,
         network: Network,
     ) -> Result<Self, WalletError> {
-        // Own the returned master-seed copy under zeroizing drop for the
+        // CRY-4: the master seed is derived straight into secret memory
+        // (locked where possible, wiped on drop) and stays there for the
         // complete (potentially slow) hybrid key-generation call.
-        let seed_bytes = Zeroizing::new(
-            seed.to_seed_bytes_versioned(version, passphrase)?,
-        );
-        // ML-DSA-65 keygen from 32-byte seed
-        let (public, secret) = crypto::generate_keypair_from_seed(&seed_bytes[..32])
+        let seed_bytes = seed.to_seed_bytes_versioned(version, passphrase)?;
+        // Hybrid keygen from the 32-byte seed, the secret generated in place
+        // in secret memory (CRY-4).
+        let (public, secret) = crypto::generate_keypair_from_seed_secret(&seed_bytes[..32])
             .map_err(|e| WalletError::Crypto(e.to_string()))?;
-        let mut secret = wallet_secret_owner(secret);
 
         let hash_full = Sha3_256::digest(&public);
         let mut addr_hash = [0u8; 20];
@@ -196,7 +196,7 @@ impl Wallet {
 
         Ok(Wallet {
             keypair: KeyMaterial {
-                secret: std::mem::take(&mut *secret),
+                secret,
                 public,
             },
             address: addr,
@@ -279,7 +279,7 @@ impl Wallet {
         let ef: encryption::EncryptedKeyfile = serde_json::from_slice(&bytes)
             .map_err(|e| WalletError::Parse(e.to_string()))?;
 
-        let (mut secret, public, network) = ef.decrypt_zeroizing(password)?;
+        let (secret, public, network) = ef.decrypt_zeroizing(password)?;
         let hash_full = Sha3_256::digest(&public);
         let mut addr_hash = [0u8; 20];
         addr_hash.copy_from_slice(&hash_full[..20]);
@@ -287,7 +287,9 @@ impl Wallet {
 
         Ok(Wallet {
             keypair: KeyMaterial {
-                secret: std::mem::take(&mut *secret),
+                // CRY-4: into secret memory; the decrypted `Zeroizing`
+                // buffer is wiped when it drops here.
+                secret: SecretBytes::from_slice(&secret),
                 public,
             },
             address: addr,
@@ -524,22 +526,29 @@ impl Wallet {
 mod tests {
     use super::*;
 
+    /// CRY-4: a wallet's and a keypair's secret key lives in secret memory,
+    /// and the memory a dropped `Wallet` / `Keypair` leaves behind is all
+    /// zeros (read after the drop through the test quarantine). Replaces the
+    /// ownership-type test of the removed `wallet_secret_owner` helper.
     #[test]
-    fn wallet_secret_owner_preserves_allocation_and_wipes_while_live() {
-        let _: fn(Vec<u8>) -> Zeroizing<Vec<u8>> = wallet_secret_owner;
-        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
-
-        let secret = Vec::from([0x19, 0x27, 0x43, 0x61, 0x7f]);
-        let pointer = secret.as_ptr();
-        let capacity = secret.capacity();
-        let expected = secret.clone();
-        let mut owner = wallet_secret_owner(secret);
-
-        assert_eq!(owner.as_ptr(), pointer);
-        assert_eq!(owner.capacity(), capacity);
-        assert_eq!(owner.as_slice(), expected.as_slice());
-        owner.zeroize();
-        assert!(owner.iter().all(|byte| *byte == 0));
+    fn dropped_wallets_and_keypairs_leave_no_secret_behind() {
+        let q = gnb_secret::test_support::Quarantine::start();
+        let (wallet, _phrase) = Wallet::generate(Network::Testnet).unwrap();
+        let kp = generate_keypair(false);
+        let legacy_raw = Keypair {
+            private_key: kp.private_key[crypto::SUITE_HEADER_LEN..].to_vec().into(),
+            public_key: kp.public_key.clone(),
+            address: kp.address.clone(),
+        };
+        // Signing with a raw legacy key builds its enveloped copy in secret
+        // memory as well.
+        assert!(legacy_raw.sign(b"m").is_ok());
+        let copy = kp.duplicate();
+        assert_eq!(copy.private_key, kp.private_key);
+        let moved = wallet.into_keypair();
+        drop((moved, kp, legacy_raw, copy));
+        assert!(q.released().len() >= 5);
+        assert!(q.all_released_zeroed(), "a dropped wallet or keypair left secret bytes behind");
     }
 
     #[test]
@@ -600,19 +609,19 @@ mod tests {
         assert_eq!(default.address().to_string(), v2.address().to_string());
     }
 
+    /// The master seed a wallet derives from is a `SecretBytes` (CRY-4:
+    /// it used to be a `[u8; 64]` returned by value), and the wallet's key
+    /// is the hybrid key of its first 32 bytes.
     #[test]
-    fn wallet_master_seed_consumer_uses_exact_zeroizing_array() {
+    fn wallet_master_seed_is_secret_memory_and_drives_the_key() {
         let seed = SeedPhrase::parse(
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
         ).unwrap();
-        let mut seed_bytes = Zeroizing::new(
-            seed.to_seed_bytes_versioned(SeedVersion::V2Bip39Sha512, "TREZOR")
-                .unwrap(),
-        );
-        assert!(std::mem::needs_drop::<Zeroizing<[u8; 64]>>());
+        let mut seed_bytes: SecretBytes =
+            seed.to_seed_bytes_versioned(SeedVersion::V2Bip39Sha512, "TREZOR").unwrap();
+        assert_eq!(seed_bytes.len(), 64);
         let (expected_public, expected_secret) =
-            crypto::generate_keypair_from_seed(&seed_bytes[..32]).unwrap();
-        let expected_secret = Zeroizing::new(expected_secret);
+            crypto::generate_keypair_from_seed_secret(&seed_bytes[..32]).unwrap();
         let wallet = Wallet::from_seed_versioned(
             &seed,
             "TREZOR",
@@ -622,10 +631,8 @@ mod tests {
         assert_eq!(wallet.keypair.public, expected_public);
         assert_eq!(wallet.keypair.secret.as_slice(), expected_secret.as_slice());
 
-        // Structural evidence only: this proves the production owner type and
-        // its array implement Zeroize, not the contents of storage after Drop.
         seed_bytes.zeroize();
-        assert!(seed_bytes.iter().all(|byte| *byte == 0));
+        assert!(seed_bytes.is_empty());
     }
 
     /// K-M3: `recover_ambiguous` must return BOTH candidates, never guess.
@@ -857,9 +864,16 @@ impl Drop for BorrowedKeystorePayload<'_> {
 
 // ── Keypair ───────────────────────────────────────────────────────────────────
 
-#[derive(Clone, Deserialize)]
+/// A signing key pair with its address.
+///
+/// CRY-4: the secret key is a [`SecretBytes`] (locked in RAM where the
+/// platform allows, wiped on drop) and `Keypair` is neither `Clone` nor
+/// `Deserialize` (it used to derive both: every clone was another unwiped
+/// copy of the secret). Build one from a `Vec` with `private_key:
+/// vec.into()` (the `Vec` is wiped), and copy one deliberately with
+/// [`Keypair::duplicate`].
 pub struct Keypair {
-    pub private_key: Vec<u8>,
+    pub private_key: SecretBytes,
     pub public_key:  Vec<u8>,
     pub address:     String,
 }
@@ -888,6 +902,16 @@ impl Drop for Keypair {
 }
 
 impl Keypair {
+    /// A deliberate copy (with its own secret region). `Keypair` is not
+    /// `Clone`, so a secret is never duplicated by accident (CRY-4).
+    pub fn duplicate(&self) -> Keypair {
+        Keypair {
+            private_key: self.private_key.duplicate(),
+            public_key: self.public_key.clone(),
+            address: self.address.clone(),
+        }
+    }
+
     pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, String> {
         // Legacy v2 keystores stored the RAW private key (no 4-byte suite envelope),
         // while newer keys and crypto::sign use the enveloped form. If this key is
@@ -940,9 +964,11 @@ impl Keypair {
         })?;
         let raw_len = crypto::raw_secret_key_len(suite)
             .ok_or_else(|| format!("public key suite {suite:#06x} has no secret-key encoding"))?;
-        let sk = &self.private_key;
+        let sk: &[u8] = &self.private_key;
         if sk.len() == raw_len {
-            let wrapped = Zeroizing::new(crypto::wrap_envelope(suite, sk));
+            // CRY-4: the enveloped copy of a legacy raw key lives in secret
+            // memory too (it is the whole secret).
+            let wrapped = crypto::wrap_envelope_secret(suite, sk);
             return f(&wrapped).map_err(|e| e.to_string());
         }
         match crypto::parse_envelope(sk) {
@@ -1320,7 +1346,7 @@ impl Keypair {
         decrypt_keystore_in_place_with_aad(&enc_k, &nonce_b, &aad, &mut plain)?;
         drop(enc_k);
 
-        let (mut private_key, public_key) = decode_legacy_keystore_payload(plain)?;
+        let (private_key, public_key) = decode_legacy_keystore_payload(plain)?;
 
         // Bloch keystores record a bloch1q/bloch1t address: same key, same
         // hash, GnB prefix.
@@ -1328,7 +1354,7 @@ impl Keypair {
         let testnet = address.starts_with(TESTNET_PREFIX);
         let derived = crypto::address_from_pubkey(&public_key, testnet);
         if derived != address { return Err("address mismatch — keystore may be tampered".into()); }
-        Ok(Keypair { private_key: std::mem::take(&mut *private_key), public_key, address })
+        Ok(Keypair { private_key: SecretBytes::from_slice(&private_key), public_key, address })
     }
 
     /// Open a keystore file for SPENDING or signing (CRY-7 migration).
@@ -1778,12 +1804,12 @@ impl TxBuilder {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 pub fn generate_keypair(testnet: bool) -> Keypair {
-    // CRY-4: the secret is produced under wiping ownership and moved (not
-    // copied) into the `Keypair`, whose `Drop` wipes it.
-    let (public_key, mut private_key) = crypto::generate_keypair_zeroizing();
+    // CRY-4: the secret is generated in place in secret memory and moved
+    // (never copied) into the `Keypair`.
+    let (public_key, private_key) = crypto::generate_keypair_secret();
     let address = crypto::address_from_pubkey(&public_key, testnet);
     Keypair {
-        private_key: std::mem::take(&mut *private_key),
+        private_key,
         public_key,
         address,
     }
@@ -2453,7 +2479,7 @@ mod legacy_sign_tests {
         let raw_sk = sk_env[4..].to_vec();
         assert!(crypto::parse_envelope(&raw_sk).map(|(s,_)| s) != Some(0xB10C_u16) , "raw sk must look un-enveloped");
         let kp = Keypair {
-            private_key: raw_sk,
+            private_key: raw_sk.into(),
             public_key: pk_env.clone(),
             address: crypto::address_from_pubkey(&pk_env, false),
         };
@@ -2477,7 +2503,7 @@ mod legacy_sign_tests {
         let (_, unrelated_sk_env) = crypto::generate_keypair();
         let raw_sk = unrelated_sk_env[crypto::SUITE_HEADER_LEN..].to_vec();
         let kp = Keypair {
-            private_key: raw_sk,
+            private_key: raw_sk.into(),
             public_key: pk_env.clone(),
             address: crypto::address_from_pubkey(&pk_env, false),
         };
@@ -2503,7 +2529,7 @@ mod legacy_sign_tests {
         let script_pubkey = Sha3_256::digest(&raw_pk)[..20].to_vec();
 
         let kp = Keypair {
-            private_key: raw_sk,
+            private_key: raw_sk.into(),
             public_key: raw_pk.clone(),      // the CLI puts THIS raw pk in script_sig
             address: crypto::address_from_pubkey(&raw_pk, false),
         };
@@ -2546,7 +2572,7 @@ mod legacy_sign_tests {
     fn raw_key_starting_with_the_envelope_magic_signs_everything() {
         let (raw_pk, raw_sk) = raw_keypair_with_magic_prefix();
         let kp = Keypair {
-            private_key: raw_sk.clone(),
+            private_key: raw_sk.clone().into(),
             public_key: raw_pk.clone(),
             address: crypto::address_from_pubkey(&raw_pk, false),
         };
@@ -2583,7 +2609,7 @@ mod legacy_sign_tests {
         // witnesses are verified with the enveloped canonical verifier).
         let policy_pk = crypto::wrap_envelope(crypto::SUITE_MLDSA65_FALCON1024, &raw_pk);
         let policy_signer = Keypair {
-            private_key: raw_sk.clone(),
+            private_key: raw_sk.clone().into(),
             public_key: policy_pk.clone(),
             address: crypto::address_from_pubkey(&policy_pk, false),
         };
@@ -2609,7 +2635,7 @@ mod legacy_sign_tests {
         let env_pk = crypto::wrap_envelope(crypto::SUITE_MLDSA65_FALCON1024, &raw_pk);
         let env_sk = crypto::wrap_envelope(crypto::SUITE_MLDSA65_FALCON1024, &raw_sk);
         for (sk, pk) in [(raw_sk.clone(), env_pk.clone()), (env_sk.clone(), raw_pk.clone()), (env_sk, env_pk)] {
-            let kp = Keypair { private_key: sk, public_key: pk.clone(), address: crypto::address_from_pubkey(&pk, false) };
+            let kp = Keypair { private_key: sk.into(), public_key: pk.clone(), address: crypto::address_from_pubkey(&pk, false) };
             let sig = kp.sign(b"m").expect("mixed encodings sign");
             assert!(crypto::verify(&pk, b"m", &sig));
         }
@@ -2623,7 +2649,7 @@ mod legacy_sign_tests {
         let (raw_pk, raw_sk) = raw_keypair_with_magic_prefix();
         let env_pk = crypto::wrap_envelope(crypto::SUITE_MLDSA65_FALCON1024, &raw_pk);
         let refused = |sk: Vec<u8>, pk: &[u8]| {
-            let kp = Keypair { private_key: sk, public_key: pk.to_vec(), address: crypto::address_from_pubkey(pk, false) };
+            let kp = Keypair { private_key: sk.into(), public_key: pk.to_vec(), address: crypto::address_from_pubkey(pk, false) };
             kp.sign(b"m").unwrap_err()
         };
         // One byte short of the raw length: neither encoding.
@@ -3212,7 +3238,7 @@ mod sighash_v3_signers {
         let (pk_env, sk_env) = crypto::generate_keypair();
         let raw_pk = pk_env[4..].to_vec();
         let kp = Keypair {
-            private_key: sk_env[4..].to_vec(),
+            private_key: sk_env[4..].to_vec().into(),
             public_key: raw_pk.clone(),
             address: crypto::address_from_pubkey(&raw_pk, true),
         };

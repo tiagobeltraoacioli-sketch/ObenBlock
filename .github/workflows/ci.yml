@@ -76,6 +76,14 @@ jobs:
         run: |
           python3 reference/descriptor_test.py -v
           python3 reference/descriptor_vectors.py --check
+      # docs/CONSENSUS.md "PoWit" (PoWit audit findings 1 and 4, second
+      # hardening activation): attestation messages, witness sets, the
+      # two-thirds threshold and the evidence epochs; the Rust code checks the
+      # same file in crates/gnb-crypto/tests/powit_vectors.rs.
+      - name: PoWit reference and reproducible vectors
+        run: |
+          python3 reference/powit_reference_test.py -v
+          python3 reference/powit_reference.py --check
 
   rust:
     runs-on: ubuntu-latest

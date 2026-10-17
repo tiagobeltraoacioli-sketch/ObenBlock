@@ -195,7 +195,12 @@ checks that its block is on every node's selected chain with the same blue
 work, rounds it down to two significant digits, refuses a value below the
 one the nodes already run, and prints the line for `core::MIN_CHAIN_WORK`
 (`crates/gnb-crypto/src/core/mod.rs`) and its `--minimumchainwork` hex form
-(`--depth 20160` takes a block a week deep; deeper is only lower). Update the
+(`--depth 20160` takes a block a week deep; deeper is only lower). It also
+prints the assumed-valid block of the release, the same block (Core sets
+`defaultAssumeValid` and `nMinimumChainWork` from one block): the line for
+`MAINNET_ASSUME_VALID` (`node/src/assumevalid.rs`, its id and DAG height)
+and its `--assumevalid` form; reviewers check the id with `getblockdag` on
+their own nodes. Update the
 reading in the constant's documentation, docs/MAINNET-READINESS.md §1 and
 the test `min_chain_work_cross_check`, then confirm that a node started on
 an empty data dir syncs from the seeds and leaves initial block download.
@@ -205,9 +210,15 @@ adjustment for either.
 
 Block proofs of work (GnB-SMH v1, 64 MiB, below the PoW + PoWit activation;
 v3, 4 MiB, from it) are evaluated on a bounded pool of threads (half the
-logical CPUs, 1 to 4), each peer and each network group (IPv4 /16, IPv6 /32)
-with a small budget of failed evaluations. A peer that delivers a block it
-authored that fails validation is disconnected, and both its identity and
+logical CPUs, 1 to 4; while the IBD latch holds and the miner waits, every
+CPU but one, at most 8, which with v1 holds up to 512 MiB of scratchpads),
+each peer and each network group (IPv4 /16, IPv6 /32) with a small budget of
+failed evaluations. A body the node fetches again for a block already in its
+DAG (a pruned body a reorg needs again, or a body rejected for a
+witness-dependent reason) costs no evaluation: the DAG record is the
+verified proof, also after a restart. Proofs are never skipped, not below
+the assumed-valid block either (Bitcoin Core never skips them). A peer that
+delivers a block it authored that fails validation is disconnected, and both its identity and
 its address (IPv4 address, IPv6 /64) are refused for 24 hours; loopback
 addresses are never refused (only disconnected) and `--peer` peers are
 exempt. The same happens to a peer whose misbehaviour score (one shared
@@ -228,14 +239,54 @@ counts against its sender like an invalid block.
 The PoWit pool that holds them is bounded and follows the selected tip on
 every node (not only witnesses): each tip change forgets shares out of the
 window, attestations no next block can include and proofs against barred
-keys. An attestation is held only by a member of its target's witness set,
-for a checkpoint slot at most one interval above the tip and not expired,
-from the tip's justified checkpoint; a key holds at most two (its newest
-targets). An equivocation proof is held and relayed only against a key in a
-recent witness set (checked before its signatures; a refused proof keeps its
-sender's verification-budget charge, as a forged one is free to make), at
-most 256 of them, one per key, and templates take the heaviest witnesses'
-proofs first. Full pools evict their worst entry for a better one.
+keys. An attestation is held only by a member of its target's witness set
+(under the rules of the block that may include it: from the second hardening
+activation every share key with weight is a member), for a checkpoint slot
+at most one interval above the tip and not expired, from the tip's justified
+checkpoint; a key holds at most two (its newest targets), and templates take
+a target's heaviest votes first. An equivocation proof is held and relayed
+only against a key in a recent witness set (from the second hardening
+activation, a member of the next block's evidence epochs, the consensus rule;
+checked before its signatures; a refused proof keeps its sender's
+verification-budget charge, as a forged one is free to make), at most 256 of
+them, one per key, and templates take the heaviest witnesses' proofs first.
+Full pools evict their worst entry for a better one.
+
+### The assumed-valid block (`--assumevalid`)
+
+As Bitcoin Core's `-assumevalid`, a release can name a block of the real
+chain (`assumevalid::MAINNET_ASSUME_VALID`, its id and DAG height). When the
+node connects a block that block vouches for, it does not verify that
+block's transaction signatures; every other check runs as always (proof of
+work, difficulty, height, timestamps, commitments, amounts, UTXO existence,
+double spends, coinbase maturity, timelocks, the public key and policy
+hashes a spend reveals, fees, the coinbase value). A block is vouched for,
+with Bitcoin Core's conditions, when the assumed-valid block is in the
+node's DAG, the block is it or lies on its selected chain and on the
+selected chain of the node's best block, the best block has at least the
+minimum chain work, and the best block is more than two weeks of
+proof-equivalent time above it (its chain work above the block at the best
+block's difficulty, 30 s per block: 40,320 blocks at constant difficulty).
+A block whose id does not commit to its witnesses (below height 5,000 and
+the hardening activation) is always checked in full, and an assumed-valid
+block this node has found invalid (or that the operator invalidated)
+vouches for nothing. The node logs "connecting N block(s) with their
+signatures assumed valid" when it applies.
+
+- `--assumevalid <id>` (64 hex digits, as `getblockdag` prints it) names
+  another block; `--assumevalid 0` checks every signature.
+- Mainnet has no release value yet: the relaunched chain is younger than two
+  weeks, so no block would qualify. The release step above prints one.
+- It is node-local, not consensus: a valid chain is accepted either way; the
+  setting only saves signature checks (docs/CONSENSUS.md, "Assumed-valid
+  block").
+- Where it helps today: the node connects a block as soon as it has its
+  parents (there is no header-first download yet), so during a fresh initial
+  sync the assumed-valid block's header is not known when its ancestors
+  connect and they are checked in full. It applies when the node connects
+  blocks with that block already in its DAG: a chain-state rebuild, the move
+  onto the real chain of a node that sat on another branch (a partition or
+  an eclipse), bodies fetched again, and a restart that resumes a chain move.
 
 ## Peers and connections
 
@@ -697,8 +748,53 @@ If start-up reconciliation cannot connect the best valid chain (a storage
 error), the node refuses to start ("Refusing to start: the best valid chain
 cannot be connected"), as Bitcoin Core does when it fails to connect the
 best block at init; fix the cause it names (disk space, permissions) and
-restart. Later acceptances always connect from the applied tip recorded on
-disk, so a move that failed once is retried by the next block.
+restart. If it persists, the data directory is damaged: resynchronize into
+a fresh, empty `--data-dir` (or start from a copy of an archival node's data
+directory). A restart with `--carryover-snapshot` does not help here: the
+start-up rebuild below only runs when the chain-state check finds the
+footprint of an interrupted commit. Later acceptances always connect from
+the applied tip recorded on disk, so a move that failed once is retried by
+the next block.
+
+### Blocks without a verdict, and "gnb stopped"
+
+A block the node cannot judge because it cannot read its own chain state is
+never marked invalid (docs/CONSENSUS.md, the no-verdict paragraphs under
+"Coinbase commitment"). It keeps its body and is parked with its
+descendants: the node stays on (and mines on)
+the best chain it can judge and retries the block after 1 minute, then
+2, 4, ... up to every hour. `getdaginfo` lists such blocks under
+`no_verdict` (`class`, `attempts`, `reason`, `retry_in_secs`) and reports
+`stopped` when the node has stopped. While a parked branch has more chain
+work than the tip the node mines on, `getblocktemplate`, `getdaginfo` and
+`getnetworkinfo` say so in `warnings` ("a branch with more chain work than
+the applied tip is parked without a verdict ..."), and the node does not
+report itself synced to a peer serving that branch (the IBD latch counts it).
+A block whose stored body cannot be read is handled the same way (an engine
+error is its `storage-engine` no-verdict); a stored body that does not
+decode is deleted and fetched again from peers (`getdaginfo` shows nothing
+for it; the log says "the stored body is dropped and fetched again").
+
+* `class: "inconsistent-chain-state"` (a row the node's indexes require is
+  missing, or a row does not decode) never stops the node. It is logged at
+  error level ("the local chain state is INCONSISTENT", at most once a
+  minute). A node whose own writes are intact never gets there: report it.
+  If the block stays parked and the network moves on without this node,
+  resynchronize as below.
+* `class: "storage-engine"` (a RocksDB read or write error, a missing column
+  family): three failures in a row on one block stop the node, like Bitcoin
+  Core's `AbortNode`. Acceptance and templates refuse at once and the
+  process exits with `gnb stopped: block <hash> could not be validated 3
+  times in a row because the storage engine failed ...`; a restart that
+  meets the same failure refuses to start. Check the disk (free space,
+  permissions, I/O errors in the system log) and restart. If the failure
+  persists, the data directory is damaged: stop the node and resynchronize
+  into a fresh, empty `--data-dir` (or start from a copy of an archival
+  node's data directory). The node has no `-reindex-chainstate`, and
+  `--carryover-snapshot` alone rebuilds nothing in this case. A chain-state
+  rebuild (below) during which a block cannot be validated does not complete:
+  it says `chain-state rebuild incomplete ... the rebuild stays pending`, the
+  node refuses to start, and the next start resumes the rebuild.
 
 At every start the node checks its chain state for the footprint of an
 interrupted or failed commit written by releases before the 2026-10 audit
@@ -812,6 +908,61 @@ graylist threshold) the peer is disconnected and its identity refused for
 discourages a misbehaving peer the same way; it also discourages the
 address, which this release does not do.
 
+## Secret key memory (audit CRY-4)
+
+Every long-lived secret key, seed and password GnB itself keeps lives in
+its own `gnb_secret::SecretBytes` region (crate `crates/gnb-secret`), the
+analogue of Bitcoin Core's secure allocator (`LockedPoolManager`: `mlock`,
+`MADV_DONTDUMP`, `memory_cleanse` before release); the exceptions are listed
+at the end of this section:
+
+- on Unix each region is whole pages of an anonymous mapping, locked in RAM
+  with `mlock` (never written to swap) and, on Linux and FreeBSD, left out
+  of core dumps (`MADV_DONTDUMP` / `MADV_NOCORE`); it is wiped with volatile
+  writes before it is unmapped. Other targets (Windows, the WebAssembly
+  wallet) get wiped heap memory;
+- the holders are neither `Copy` nor `Clone` (a static assertion fails the
+  build otherwise): wallet and HD-wallet keys, the BIP39 seed and the HD
+  master key, the node's P2P identity key, the KES witness seed and every
+  leaf key derived from it, the witness key-file password, and the
+  ephemeral ML-KEM-768 key and shared secrets of every P2P handshake;
+- ML-DSA-65, Falcon-1024 and ML-KEM-768 keys are generated and used directly
+  in those regions through PQClean's C functions (`gnb_secret::pq`): the
+  `pqcrypto` wrapper types hold secret keys in `Copy` arrays that every call
+  copies and nothing can wipe, so production code never builds one (the
+  `secret_hygiene` test fails the build if it does). After a signature,
+  key generation or KEM operation the stack the C code and the hash
+  functions used is overwritten (`gnb_secret::scrub_stack`, 128 KiB, like
+  libsodium's `sodium_stackzero`), and tests read the dead stack back to
+  check that no copy of the secret is left. Registers and copies the
+  compiler makes outside these paths are out of reach: this is best effort,
+  like Core's.
+
+Locking is best effort. The locked-memory limit (`ulimit -l`, systemd
+`LimitMEMLOCK`) bounds it: a node needs a few pages for its long-lived
+secrets plus two per concurrent P2P handshake, a wallet two per key. When
+`mlock` fails the secret is still wiped on release, the failure is counted
+and logged once ("could not lock secret key memory in RAM"), exactly as
+Core warns. `deploy/gnb-node.service` sets `LimitMEMLOCK=16M`; for a manual
+start raise `ulimit -l` if the warning appears.
+
+Not in secret memory (wiped on drop where the code owns them, but neither
+locked nor kept out of core dumps):
+
+- short-lived secrets: passwords and phrases typed into the CLIs, decrypted
+  keystore buffers (`Zeroizing`);
+- the node's libp2p Ed25519 identity key (`p2p_identity.bin`, the key of its
+  `PeerId`): libp2p holds it in its own `identity::Keypair` for the whole
+  run, and libp2p offers no way to place it in memory the node allocates.
+  It authenticates the node's libp2p identity only; the post-quantum
+  transport identity (`PqIdentity`) is in secret memory;
+- the ChaCha20-Poly1305 keys of each P2P connection's two cipher streams
+  (`transport::TxStream` / `RxStream`), alive as long as the connection:
+  `Zeroizing`, wiped when the connection closes. Bitcoin Core keeps its
+  BIP324 session keys in ordinary memory the same way (`FSChaCha20Poly1305`,
+  wiped with `memory_cleanse`); only its wallet keys use the secure
+  allocator.
+
 ## Upgrading and downgrading
 
 The upgrade to a release that keeps the shielded-pool state on disk (audit
@@ -877,31 +1028,29 @@ must also keep, or offer for download, the original v2 bytes).
 A GnB address is `gnb1q` (mainnet) or `gnb1t` (testnet) followed by the hex
 of the 20-byte key hash and a 4-byte checksum, `SHA3-256(SHA3-256(hash))[..4]`.
 The checksum does not cover the prefix, so `gnb1q…` and `gnb1t…` forms of one
-hash both pass `Address::parse`. A new address version whose checksum commits
-to the network (bech32m-style) was evaluated and is **not** introduced:
+hash both pass `Address::parse`. An opt-in second encoding whose checksum
+commits to the network, address v2 (Bech32m, human-readable part `gnb` /
+`tgnb`, `docs/ADDRESS-V2.md`), is accepted by the node, the wallets, the
+explorer API and the Worker as an additional encoding of the same
+destination. The legacy form stays the default output: released GnB wallets,
+the Bloch wallets that share these keys and third-party integrations parse
+only it.
 
-- it could only be emitted where every consumer parses it, and they do not:
-  every released GnB wallet and node, the Bloch wallets that share these keys,
-  the explorer and its API (`^gnb1[qt][0-9a-f]{48}$`), the Cloudflare Worker's
-  path filter and third-party integrations would all reject it, so a payment
-  to a new-format address from any of them fails;
-- parsing both forms while emitting only the old one adds nothing: the old
-  form would stay the one users copy;
-- the risk it would remove is already closed where it matters: every payment
-  path compares the destination's network with the wallet's own network,
-  which is authenticated (keystore v3, keyfile v1, or the network the caller
-  states for a v2 file): `TxBuilder::build_payment`, `Wallet` payments,
-  `gnb-cli send`, `gnb-wallet send` and the web wallet's `pay` refuse a
-  destination of the other network, and the node's `--miner-address` uses
-  `Address::parse_for_network`. The policy and bridge-vault commands do the
-  same against the network of the spend: `gnb-cli policyspend` (the network
-  stated with `--testnet` / `--mainnet`, mainnet by default),
-  `vaultrelease`, `vaultrecover` and `vaultcheckrelease` (the vault file's
-  network) refuse a destination of the other network, `vaultlock` opens the
-  paying keystore for the vault's network and `policysign` for the spend's.
-  A prefix typo therefore fails before anything
-  is signed, and a transaction signed for one chain is invalid on the other
-  (the chain id is in every sighash).
+The prefix risk is closed where it matters, in either encoding: every payment
+path compares the destination's network with the wallet's own network,
+which is authenticated (keystore v3, keyfile v1, or the network the caller
+states for a v2 file): `TxBuilder::build_payment`, `Wallet` payments,
+`gnb-cli send`, `gnb-wallet send` and the web wallet's `pay` refuse a
+destination of the other network, and the node's `--miner-address` uses
+`Address::parse_for_network`. The policy and bridge-vault commands do the
+same against the network of the spend: `gnb-cli policyspend` (the network
+stated with `--testnet` / `--mainnet`, mainnet by default),
+`vaultrelease`, `vaultrecover` and `vaultcheckrelease` (the vault file's
+network) refuse a destination of the other network, `vaultlock` opens the
+paying keystore for the vault's network and `policysign` for the spend's.
+A prefix typo therefore fails before anything
+is signed, and a transaction signed for one chain is invalid on the other
+(the chain id is in every sighash).
 
 Policy addresses (multisig / timelocks: `gnb1m` mainnet, `gnb1n` testnet,
 `address::PolicyAddress`) are newer and already commit to the network: their

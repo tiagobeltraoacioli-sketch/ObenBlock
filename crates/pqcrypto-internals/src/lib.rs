@@ -70,6 +70,19 @@ struct SeededEntry {
     rng: ChaCha20Rng,
 }
 
+impl SeededEntry {
+    /// Overwrite the ChaCha20 state in place before the entry is removed
+    /// (audit CRY-4). The state is keyed with the seed of a deterministic
+    /// key generation (a wallet's BIP39-derived seed, a KES leaf seed), and
+    /// `ChaCha20Rng` has no destructor that wipes it: dropping the entry
+    /// left the key and the buffered output in the freed `Vec` slot.
+    /// `black_box` keeps the store from being elided as dead.
+    fn wipe(&mut self) {
+        self.rng = ChaCha20Rng::from_seed([0u8; 32]);
+        core::hint::black_box(&self.rng);
+    }
+}
+
 thread_local! {
     /// Per-thread seeded RNG override STACK for `PQCRYPTO_RUST_randombytes`
     /// (I-2: a LIFO stack, not a single `Option`, so nesting is well-defined
@@ -96,6 +109,7 @@ impl Drop for SeededRngGuard {
         let _ = SEEDED_RNG_STACK.try_with(|stack| {
             let mut stack = stack.borrow_mut();
             if let Some(index) = stack.iter().position(|entry| Rc::ptr_eq(&entry.id, &self.id)) {
+                stack[index].wipe();
                 stack.remove(index);
             }
         });
@@ -146,8 +160,9 @@ fn with_seeded_rng(seed: &[u8; 32]) -> SeededRngGuard {
 /// returned from the closure is already inactive. This does not clean up
 /// overrides forgotten *before* this scope, or promise cleanup after abort.
 /// Do not return an async future expecting the override to cover its polling.
-/// The ChaCha byte stream and C ABI are unchanged; opaque RNG state erasure
-/// remains unsupported by the current dependency.
+/// The ChaCha byte stream and C ABI are unchanged. The RNG state of every
+/// scope that ends is overwritten in place before it is removed (CRY-4;
+/// `ChaCha20Rng` has no wiping destructor of its own).
 ///
 /// The old manual guard is deliberately not part of the public API:
 ///
@@ -163,6 +178,9 @@ pub fn with_seeded_rng_scope<T>(seed: &[u8; 32], operation: impl FnOnce() -> T) 
             let _ = SEEDED_RNG_STACK.try_with(|stack| {
                 let mut stack = stack.borrow_mut();
                 if let Some(index) = stack.iter().position(|entry| Rc::ptr_eq(&entry.id, &self.0.id)) {
+                    // CRY-4: wipe every RNG state this scope ends, in place
+                    // (truncation drops them without moving them).
+                    stack[index..].iter_mut().for_each(SeededEntry::wipe);
                     stack.truncate(index);
                 }
             });
@@ -312,6 +330,31 @@ pub unsafe extern "C" fn PQCRYPTO_RUST_randombytes(buf: *mut u8, len: size_t) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// CRY-4: the ChaCha20 state of an ended seeded scope (keyed with the
+    /// seed, so it reproduces the derived key pair) does not survive in the
+    /// thread-local stack's memory. The vacated slot is read raw (test-only
+    /// peek at bytes the truncation dropped in place): before the wipe it
+    /// still held the seed as the ChaCha key words.
+    #[test]
+    fn ended_scope_leaves_no_rng_state_behind() {
+        let seed = [0xABu8; 32];
+        with_seeded_rng_scope(&seed, || {
+            let mut out = [0u8; 100];
+            randombytes_fill(&mut out).unwrap();
+        });
+        let slot: Vec<u8> = SEEDED_RNG_STACK.with(|stack| {
+            let stack = stack.borrow();
+            assert!(stack.is_empty() && stack.capacity() > 0);
+            let p = stack.as_ptr().cast::<u8>();
+            // SAFETY (test only): the first slot of the allocation held the
+            // entry the scope removed; its bytes are still in this live
+            // allocation, read as plain bytes without forming a value.
+            unsafe { core::slice::from_raw_parts(p, core::mem::size_of::<SeededEntry>()) }.to_vec()
+        });
+        let key_words = [0xABu8; 32];
+        assert!(!slot.windows(32).any(|w| w == key_words), "the seeded RNG key survived the scope");
+    }
 
     /// A guard "forgotten" inside a scope: its `Drop` never runs there, exactly
     /// as with `std::mem::forget`. Unlike `mem::forget`, the test reclaims the

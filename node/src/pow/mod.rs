@@ -39,6 +39,28 @@ pub fn expected_bits(parent_timestamp: u64, height: u64) -> Result<u32, String> 
     gnb_crypto::core::expected_bits(parent_timestamp, height)
 }
 
+/// The proof-of-work check of a block whose id is ALREADY in the DAG: a body
+/// restored for it (`accept::accept_block`'s body replacement: a body pruned
+/// and needed again, audit DAG-6, or one rejected for a witness-dependent
+/// reason). Its header entered the DAG only after `Block::validate_pow`
+/// passed at this same header height: the id commits to the proof's
+/// preimage and nonce, and acceptance binds the copy's height to the parents
+/// the id commits before calling this. The DAG record is therefore the
+/// verified result of this very proof, kept across restarts for free (P5-G:
+/// a PoW result cache keyed by header hash). Only `validate_pow`'s cheap
+/// checks run again — canonical bits and a target within the pow limit of
+/// the height, which an older release may have judged under another limit —
+/// never the GnB-SMH evaluation (64 MiB and about half a second for v1),
+/// which used to run again for every restored body once the process cache
+/// had forgotten it (any restart). Bitcoin Core re-checks a header's proof
+/// when the block's data arrives because it costs one SHA-256d.
+pub fn proof_recorded_in_dag(block: &gnb_crypto::core::Block) -> bool {
+    match gnb_smh::difficulty::try_canonical_bits_to_target(block.header.bits) {
+        Some(t) => t.0 <= gnb_crypto::core::Block::pow_limit_target_for_height(block.height),
+        None => false,
+    }
+}
+
 /// Verify a (preimage, nonce) pair for a block at `height` against compact `bits`.
 pub fn verify(pow_preimage: &[u8], nonce: u64, bits: u32, height: u64) -> bool {
     match gnb_smh::difficulty::try_bits_to_target(bits) {

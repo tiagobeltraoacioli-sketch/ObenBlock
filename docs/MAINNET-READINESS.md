@@ -51,6 +51,13 @@ the real chain passes 7,000,000 by about height 9,900, some 4,500 blocks
 below the tip of 2026-10-16. Later releases: `tools/release/min_chain_work.py` on two or more
 independent nodes (docs/RUNNING.md, "Initial sync and minimum chain work").
 
+**Assumed-valid block (P5-G, not set).** The same tool prints the release's
+assumed-valid block (`assumevalid::MAINNET_ASSUME_VALID`, Bitcoin Core's
+`defaultAssumeValid`) from the same block. It saves signature checks only for
+blocks more than two weeks of chain work below a node's best block, so it has
+no effect before the chain is that deep; set it from the first release cut
+after that.
+
 ## 2. Seeds
 
 - **Hardcoded peers** in the release: at least three nodes run by different

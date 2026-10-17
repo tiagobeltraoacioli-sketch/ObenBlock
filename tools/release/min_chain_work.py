@@ -22,8 +22,17 @@ same with its unit, the selected-chain block's `blue_work`
    easy to review. It must not be below the value the nodes already run.
 
 It prints the readings and the line to put in
-crates/gnb-crypto/src/core/mod.rs, plus the `--minimumchainwork` hex form.
-Nothing is written. Standard library only.
+crates/gnb-crypto/src/core/mod.rs, plus the `--minimumchainwork` hex form,
+and the assumed-valid block of the release (Bitcoin Core's
+`defaultAssumeValid`, which Core's release process sets from the same block
+as `nMinimumChainWork`): the candidate block's hash and DAG height, as the
+line for `MAINNET_ASSUME_VALID` in node/src/assumevalid.rs and the
+`--assumevalid` form. The node skips signature checks only for that block's
+selected-chain ancestors buried two weeks below its best block
+(docs/RUNNING.md). The same block is the release finality checkpoint
+(weak subjectivity, PoWit finding 3): the line for
+`MAINNET_FINALITY_CHECKPOINT` in node/src/powit.rs. Nothing is written.
+Standard library only.
 
     python3 tools/release/min_chain_work.py \\
         --rpc http://127.0.0.1:17210 --rpc https://node2.example:17210
@@ -164,6 +173,26 @@ def choose(readings: list[dict], calls: dict, allow_single: bool = False) -> tup
     return cand, value, warnings
 
 
+def assume_valid_line(cand: dict) -> str:
+    """The `MAINNET_ASSUME_VALID` line of node/src/assumevalid.rs for the
+    candidate block (its id as the RPC prints it, and its DAG height)."""
+    h = cand["hash"]
+    if not (isinstance(h, str) and len(h) == 64 and all(c in "0123456789abcdef" for c in h)):
+        raise ReadingError(f"block id {h!r} is not 64 lowercase hex digits")
+    if not isinstance(cand["height"], int) or cand["height"] < 1:
+        raise ReadingError(f"block {h} has no DAG height above the genesis")
+    return (f"    pub const MAINNET_ASSUME_VALID: Option<AssumedValidBlock> =\n"
+            f"        Some(AssumedValidBlock::from_hex(\"{h}\", {cand['height']}));")
+
+
+def finality_checkpoint_line(cand: dict) -> str:
+    """The `MAINNET_FINALITY_CHECKPOINT` line of node/src/powit.rs (the
+    release finality checkpoint, weak subjectivity) for the candidate block."""
+    assume_valid_line(cand)  # the same checks on the block id and height
+    return (f"    pub const MAINNET_FINALITY_CHECKPOINT: Option<ReleaseCheckpoint> =\n"
+            f"        Some(ReleaseCheckpoint::from_hex(\"{cand['hash']}\", {cand['height']}));")
+
+
 def report(readings: list[dict], cand: dict, value: int, depth: int, warnings: list[str]) -> str:
     lines = [f"Readings (selected-chain block {depth} below each node's tip):"]
     for r in readings:
@@ -181,9 +210,18 @@ def report(readings: list[dict], cand: dict, value: int, depth: int, warnings: l
         f"    pub const MIN_CHAIN_WORK: u128 = {value:_};",
         f"--minimumchainwork {value:x}",
         "",
+        "node/src/assumevalid.rs (the assumed-valid block, the same block):",
+        assume_valid_line(cand),
+        f"--assumevalid {cand['hash']}",
+        "",
+        "node/src/powit.rs (the release finality checkpoint, the same block):",
+        finality_checkpoint_line(cand),
+        "",
         "Then update the reading in its documentation and in docs/MAINNET-READINESS.md §1,",
         "the arithmetic test (`min_chain_work_cross_check`) and the node tests that pin",
-        "the value, and confirm a fresh sync from the seeds leaves initial block download.",
+        "the value (`assumevalid::tests::release_values_and_core_burial` for the",
+        "assumed-valid block), and confirm a fresh sync from the seeds leaves initial",
+        "block download.",
     ]
     return "\n".join(lines)
 

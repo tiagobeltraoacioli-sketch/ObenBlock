@@ -277,6 +277,10 @@ impl PqPsbt {
         if self.spend.tx.locktime as u64 > context.next_height {
             return Err("transaction is not final at the supplied height".into());
         }
+        // PF-4: the second hardening upgrade's key-identity rule at the
+        // supplied height, like the version and finality rules above (every
+        // signer and the finalizer review through here).
+        self.spend.check_key_identities_for_height(context.next_height)?;
         let verified = self
             .inputs
             .iter()
@@ -1141,6 +1145,66 @@ mod tests {
             max_fee: 5_000_000,
         };
         (keys, p, context)
+    }
+
+    /// PF-4 producers (shared rule 3, review finding): a spend of a policy
+    /// listing one key twice (raw and enveloped) is reviewed, signed and
+    /// finalized for a block one below the second hardening height, as
+    /// before, and refused for a block at it, where every node refuses it.
+    /// Where hardening 2 holds from genesis (testnet, regtest) such a spend
+    /// is refused before any role runs. Before the fix every role accepted
+    /// it at every height.
+    #[test]
+    fn twin_key_policy_spends_are_refused_from_hardening2() {
+        use crate::core::activation;
+        let _h1 = activation::scoped_override(0); // version 3 / sighash v3
+        let k = generate_keypair(false);
+        let other = generate_keypair(false);
+        let raw = k.public_key[crate::crypto::SUITE_HEADER_LEN..].to_vec();
+        let twin = SpendPolicy { threshold: 2, pubkeys: vec![raw, k.public_key.clone()], after: 0, older: 0 };
+        let twin = SpendPolicy::decode(&twin.encode()).expect("consensus decoding accepts it");
+        let honest = SpendPolicy::new(2, vec![k.public_key.clone(), other.public_key.clone()], 0, 0).unwrap();
+        let build = |policy: SpendPolicy, next: u64| -> Result<PqPsbt, String> {
+            let mut spend = PolicySpend::new(Network::Mainnet, policy, &[([0x31; 32], 0, 5_000_000)],
+                vec![9; 20], 1_000_000, 0, 0)?;
+            spend.target_height(next)?;
+            PqPsbt::from_policy_spend(spend)
+        };
+        const H2: u64 = 40;
+        let _h2 = activation::scoped_override_v2(H2);
+        let context = |next_height| SignContext { network: Network::Mainnet, next_height, max_fee: 20_000_000 };
+
+        // One block below hardening 2: built, reviewed and signed.
+        let mut below = build(twin.clone(), H2 - 1).expect("valid below hardening 2");
+        assert_eq!(below.spend.tx.version, 3);
+        below.review(&context(H2 - 1)).expect("reviewed below hardening 2");
+        below.sign(&context(H2 - 1), &k.public_key, |d, v| k.sign_tx_digest(d, v)).expect("signed");
+        // At hardening 2: the builder, every reviewing role, the signer and
+        // the finalizer refuse it.
+        let e = build(twin.clone(), H2).unwrap_err();
+        assert!(e.contains("same key twice"), "{e}");
+        for h in [H2, H2 + 1, 1_000_000] {
+            let e = below.review(&context(h)).unwrap_err();
+            assert!(e.contains("same key twice"), "{h}: {e}");
+            let e = below.clone().sign(&context(h), &k.public_key, |d, v| k.sign_tx_digest(d, v)).unwrap_err();
+            assert!(e.contains("same key twice"), "{h}: {e}");
+            assert!(below.finalize(&context(h)).is_err_and(|e| e.contains("same key twice")));
+        }
+        // An honest 2-of-2 is unaffected on both sides.
+        for h in [H2 - 1, H2] {
+            build(honest.clone(), h).unwrap().review(&context(h)).expect("honest policy");
+        }
+        // Hardening 2 from genesis (testnet, regtest): refused by the spend
+        // builder, and by every role for a spend built past it.
+        let mut spend = PolicySpend::new(Network::Mainnet, twin.clone(), &[([0x31; 32], 0, 5_000_000)],
+            vec![9; 20], 1_000_000, 0, 0).unwrap();
+        spend.target_height(H2 - 1).unwrap();
+        let _genesis = activation::scoped_override_v2(0);
+        assert!(PolicySpend::new(Network::Mainnet, twin, &[([0x31; 32], 0, 5_000_000)],
+            vec![9; 20], 1_000_000, 0, 0).is_err_and(|e| e.contains("same key twice")));
+        assert!(PqPsbt::from_policy_spend(spend.clone()).is_err_and(|e| e.contains("same key twice")));
+        assert!(spend.sign_digest(&k.public_key, |d, v| k.sign_tx_digest(d, v))
+            .is_err_and(|e| e.contains("same key twice")));
     }
 
     #[test]

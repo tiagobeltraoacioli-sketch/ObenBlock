@@ -18,6 +18,7 @@
 //! stored in the file, never a re-derivation.
 
 use crate::crypto;
+use crate::crypto::SecretBytes;
 use crate::wallet::{Keypair, KdfParams, KeystoreCrypto};
 use crate::core::TESTNET_PREFIX;
 use serde::{Serialize, Deserialize};
@@ -147,10 +148,12 @@ pub struct HdWallet {
     mnemonic_crypto: KeystoreCrypto,
     // SECURITY (A4 lows): never read outside this module — no legitimate
     // external consumer needs the raw derived encryption key.
-    master_key: Vec<u8>,      // derived from mnemonic + passphrase + password
+    // CRY-4: secret memory (locked where possible, wiped on drop).
+    master_key: SecretBytes,  // derived from mnemonic + passphrase + password
     /// BIP39 seed (mnemonic + passphrase). Master seed for key DERIVATION —
     /// no password in it, so the mnemonic alone recovers the keys.
-    seed: Vec<u8>,
+    /// CRY-4: secret memory, like `master_key`.
+    seed: SecretBytes,
     pub addresses: Vec<(u32, Keypair, String)>, // (index, keypair, label)
     /// Indices whose key is NOT reproducible from `seed` (imported keys, and
     /// every address of a pre-v3 random-key wallet).
@@ -207,6 +210,10 @@ impl Drop for HdWallet {
     fn drop(&mut self) { self.master_key.zeroize(); self.seed.zeroize(); }
 }
 
+// CRY-4: an HD wallet (seed, master key, every address key) is never
+// duplicated implicitly.
+gnb_secret::assert_not_copy_or_clone!(HdWallet);
+
 impl HdWallet {
 
     /// Create a new HD wallet: generates a 24-word mnemonic and the first
@@ -226,11 +233,11 @@ impl HdWallet {
 
         // New wallets use the v2 per-wallet salt (v3 files keep it).
         let canonical_mnemonic = canonical_mnemonic_for_kdf(&mnemonic);
-        let mut master_key = derive_master_key(&canonical_mnemonic, passphrase.unwrap_or(""), password, WALLET_VERSION)?;
+        let master_key = derive_master_key(&canonical_mnemonic, passphrase.unwrap_or(""), password, WALLET_VERSION)?;
         drop(canonical_mnemonic);
 
         // Address 0 is DERIVED from the seed, so the mnemonic recovers it.
-        let mut seed = hd_seed_owner(&mnemonic, passphrase.unwrap_or(""));
+        let seed = hd_seed_owner(&mnemonic, passphrase.unwrap_or(""));
         let kp = derive_at(&seed, 0, testnet)?;
         let network = if testnet { "testnet" } else { "mainnet" }.to_string();
         let mnemonic_crypto = encrypt_mnemonic_for_save(&master_key, &mnemonic)?;
@@ -241,8 +248,10 @@ impl HdWallet {
             imported: BTreeSet::new(),
             network,
             file_version: WALLET_VERSION,
-            seed: std::mem::take(&mut *seed),
-            master_key: std::mem::take(&mut *master_key),
+            // CRY-4: both were derived straight into secret memory and
+            // are moved here (no copy).
+            seed,
+            master_key,
         }, mnemonic))
     }
 
@@ -263,9 +272,9 @@ impl HdWallet {
         let mnemonic = Mnemonic::parse(mnemonic_str)
             .map_err(|e| format!("invalid mnemonic: {}", e))?;
         let canonical_mnemonic = canonical_mnemonic_for_kdf(&mnemonic);
-        let mut master_key = derive_master_key(&canonical_mnemonic, passphrase.unwrap_or(""), password, WALLET_VERSION)?;
+        let master_key = derive_master_key(&canonical_mnemonic, passphrase.unwrap_or(""), password, WALLET_VERSION)?;
         drop(canonical_mnemonic);
-        let mut seed = hd_seed_owner(&mnemonic, passphrase.unwrap_or(""));
+        let seed = hd_seed_owner(&mnemonic, passphrase.unwrap_or(""));
 
         let mut addresses = Vec::with_capacity(count.max(1) as usize);
         for index in 0..count.max(1) {
@@ -281,8 +290,8 @@ impl HdWallet {
             imported: BTreeSet::new(),
             network: if testnet { "testnet" } else { "mainnet" }.to_string(),
             file_version: WALLET_VERSION,
-            seed: std::mem::take(&mut *seed),
-            master_key: std::mem::take(&mut *master_key),
+            seed,
+            master_key,
         })
     }
 
@@ -474,7 +483,7 @@ impl HdWallet {
 
         // Derive master key — route the salt by the file's version (v1 legacy
         // constant salt, v2+ per-wallet), so existing wallets still decrypt.
-        let mut master_key = derive_master_key(&canonical_mnemonic, passphrase.unwrap_or(""), password, wallet.version)?;
+        let master_key = derive_master_key(&canonical_mnemonic, passphrase.unwrap_or(""), password, wallet.version)?;
 
         // Verify mnemonic matches (by decrypting and comparing). Wrapped in
         // Zeroizing (A4 lows): this plaintext carries the full mnemonic in
@@ -494,7 +503,7 @@ impl HdWallet {
         // would silently hand back the wrong (empty) addresses.
         let mut addresses = Vec::with_capacity(wallet.addresses.len());
         let mut imported = BTreeSet::new();
-        let mut seed = hd_seed_owner(&mnemonic, passphrase.unwrap_or(""));
+        let seed = hd_seed_owner(&mnemonic, passphrase.unwrap_or(""));
         // CRY-4: the seed and master key are derived and the file is
         // authenticated: the phrase is not kept.
         drop(mnemonic);
@@ -504,7 +513,7 @@ impl HdWallet {
             // Consume the authenticated plaintext inside a short-lived
             // parsing boundary. Only the decoded keys survive into address
             // authentication and the potentially expensive derivation check.
-            let (mut priv_key, pub_key) = decode_keypair_plaintext(
+            let (priv_key, pub_key) = decode_keypair_plaintext(
                 decrypt_with_key(&master_key, &addr.keypair_crypto)?,
                 addr.index,
             )?;
@@ -522,9 +531,11 @@ impl HdWallet {
                     return Err(format!("derived keypair {} does not match mnemonic and index", addr.index));
                 }
             }
+            // CRY-4: into secret memory; the decoded `Zeroizing` buffer is
+            // wiped when it drops at the end of this iteration.
             let (loaded, is_imported) = into_loaded_address(
                 addr,
-                std::mem::take(&mut *priv_key),
+                SecretBytes::from_slice(&priv_key),
                 pub_key,
             );
             if is_imported { imported.insert(loaded.0); }
@@ -539,8 +550,8 @@ impl HdWallet {
             addresses, imported,
             network: wallet.network,
             file_version: wallet.version,
-            seed: std::mem::take(&mut *seed),
-            master_key: std::mem::take(&mut *master_key),
+            seed,
+            master_key,
         })
     }
 
@@ -578,7 +589,7 @@ fn validate_wallet_structure(wallet: &HdWalletFile) -> Result<(), String> {
 /// mnemonic/index checks happen before this helper is called.
 fn into_loaded_address(
     address: HdAddress,
-    private_key: Vec<u8>,
+    private_key: SecretBytes,
     public_key: Vec<u8>,
 ) -> ((u32, Keypair, String), bool) {
     let is_imported = !address.derived;
@@ -1007,24 +1018,18 @@ const WALLET_VERSION: u32 = 3;
 /// imported keypair. The signature is immediately discarded.
 const IMPORT_KEY_AUTH_CHALLENGE: &[u8] = b"BLOCH-HD-WALLET-IMPORT-AUTH-v1";
 
-/// Take ownership of a repository-derived HD private key immediately, without
-/// cloning its allocation, until it can be transferred into `Keypair`.
-fn hd_private_key_owner(private_key: Vec<u8>) -> Zeroizing<Vec<u8>> {
-    Zeroizing::new(private_key)
-}
-
 /// Derive the keypair for `index` from the BIP39 seed.
 ///
 /// Deterministic and domain-separated (`crypto::diversified_seed`), so the same
 /// mnemonic + passphrase yields the same address at the same index on every
 /// machine — which is what makes the mnemonic a real backup.
 fn derive_at(seed: &[u8], index: u32, testnet: bool) -> Result<Keypair, String> {
-    let (public_key, private_key) = crypto::diversified_keypair(seed, index)
+    // CRY-4: the key is generated in place in secret memory and moved.
+    let (public_key, private_key) = crypto::diversified_keypair_secret(seed, index)
         .map_err(|e| format!("key derivation failed at index {}: {}", index, e))?;
-    let mut private_key = hd_private_key_owner(private_key);
     let address = crypto::address_from_pubkey(&public_key, testnet);
     Ok(Keypair {
-        private_key: std::mem::take(&mut *private_key),
+        private_key,
         public_key,
         address,
     })
@@ -1036,9 +1041,17 @@ fn fresh_hd_entropy() -> Zeroizing<[u8; 32]> {
     entropy
 }
 
-fn hd_seed_owner(mnemonic: &Mnemonic, passphrase: &str) -> Zeroizing<Vec<u8>> {
-    let seed = Zeroizing::new(mnemonic.to_seed(passphrase));
-    Zeroizing::new(seed.to_vec())
+/// The BIP39 seed of `mnemonic` + `passphrase` in secret memory (CRY-4).
+///
+/// `bip39::Mnemonic::to_seed` returns a `[u8; 64]` by value: that copy is
+/// wiped as soon as it is in the [`SecretBytes`], and the stack the PBKDF2
+/// and the return moves used is scrubbed (`gnb_secret::scrub_stack`).
+fn hd_seed_owner(mnemonic: &Mnemonic, passphrase: &str) -> SecretBytes {
+    let returned = Zeroizing::new(mnemonic.to_seed(passphrase));
+    let seed = SecretBytes::from_slice(&returned[..]);
+    drop(returned);
+    gnb_secret::scrub_stack();
+    seed
 }
 
 fn canonical_mnemonic_for_kdf(mnemonic: &Mnemonic) -> Zeroizing<String> {
@@ -1063,7 +1076,10 @@ fn hd_master_key_salt(mnemonic: &str, version: u32) -> Zeroizing<[u8; 32]> {
 
 /// Derive the master encryption key from mnemonic + passphrase + password.
 /// This is what locks/unlocks the wallet file.
-fn derive_master_key(mnemonic: &str, passphrase: &str, password: &str, version: u32) -> Result<Zeroizing<Vec<u8>>, String> {
+///
+/// CRY-4: Argon2id writes the key straight into secret memory (it is the
+/// file key of an open wallet, held for the wallet's lifetime).
+fn derive_master_key(mnemonic: &str, passphrase: &str, password: &str, version: u32) -> Result<SecretBytes, String> {
     // Combine mnemonic + passphrase + password into the KDF input
     let mut combined = Zeroizing::new(Vec::with_capacity(mnemonic.len() + passphrase.len() + password.len() + 2));
     combined.extend_from_slice(mnemonic.as_bytes());
@@ -1080,7 +1096,7 @@ fn derive_master_key(mnemonic: &str, passphrase: &str, password: &str, version: 
 
     let params = Params::new(262144, 4, 4, Some(32)).map_err(|e| e.to_string())?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
-    let mut key = Zeroizing::new(vec![0u8; 32]);
+    let mut key = SecretBytes::zeroed(32);
     argon2.hash_password_into(&combined, &salt[..], &mut key).map_err(|e| e.to_string())?;
     Ok(key)
 }
@@ -1190,21 +1206,21 @@ fn decrypt_ciphertext_in_place(
 mod tests {
     use super::*;
 
+    /// CRY-4: an HD wallet's seed, master key and every address key live
+    /// in secret memory, and a dropped wallet leaves only zeros behind (read
+    /// after the drop through the test quarantine). Replaces the
+    /// ownership-type test of the removed `hd_private_key_owner` helper.
     #[test]
-    fn hd_private_key_owner_preserves_allocation_and_wipes_while_live() {
-        let _: fn(Vec<u8>) -> Zeroizing<Vec<u8>> = hd_private_key_owner;
-        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
-
-        let mut private_key = Vec::with_capacity(96);
-        private_key.extend_from_slice(&[0x31, 0x42, 0x53, 0x64]);
-        let pointer = private_key.as_ptr();
-        let capacity = private_key.capacity();
-        let mut owned = hd_private_key_owner(private_key);
-        assert_eq!(owned.as_ptr(), pointer);
-        assert_eq!(owned.capacity(), capacity);
-        assert_eq!(&owned[..], &[0x31, 0x42, 0x53, 0x64]);
-        owned.zeroize();
-        assert!(owned.is_empty());
+    fn a_dropped_hd_wallet_leaves_no_secret_behind() {
+        let q = gnb_secret::test_support::Quarantine::start();
+        let (mut wallet, _mnemonic) = HdWallet::create("Fixture-password-1!", None, true).unwrap();
+        wallet.new_address("second").unwrap();
+        let derived = derive_at(&wallet.seed, 5, true).unwrap();
+        assert!(!wallet.seed.is_empty() && !wallet.master_key.is_empty());
+        drop((wallet, derived));
+        // seed, master key, two address keys and the extra derived key
+        assert!(q.released().len() >= 5);
+        assert!(q.all_released_zeroed(), "a dropped HD wallet left secret bytes behind");
     }
 
     #[test]
@@ -1224,11 +1240,11 @@ mod tests {
         }
     }
 
+    /// CRY-4: the HD seed is a `SecretBytes` (it used to be a
+    /// `Zeroizing<Vec<u8>>` built from a second copy) with the BIP39 bytes.
     #[test]
-    fn hd_seed_has_exact_zeroizing_ownership_and_bip39_bytes() {
-        let _: fn(&Mnemonic, &str) -> Zeroizing<Vec<u8>> = hd_seed_owner;
-        assert!(std::mem::needs_drop::<Zeroizing<[u8; 64]>>());
-        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
+    fn hd_seed_is_secret_memory_with_the_bip39_bytes() {
+        let _: fn(&Mnemonic, &str) -> SecretBytes = hd_seed_owner;
 
         let mnemonic = Mnemonic::parse(
             "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
@@ -1249,7 +1265,7 @@ mod tests {
             ]
         );
         seed.zeroize();
-        assert!(seed.iter().all(|byte| *byte == 0));
+        assert!(seed.is_empty());
     }
 
     #[test]
@@ -1332,7 +1348,7 @@ mod tests {
         assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
 
         let keypair = Keypair {
-            private_key: vec![0xa1, 0xb2, 0xc3, 0xd4],
+            private_key: vec![0xa1, 0xb2, 0xc3, 0xd4].into(),
             public_key: vec![0x01, 0x02, 0x03, 0x04],
             address: "unused-test-address".into(),
         };
@@ -1350,7 +1366,7 @@ mod tests {
             serde_json::from_slice(&plaintext).unwrap();
         assert!(matches!(&parsed.private_key_hex, Cow::Borrowed(_)));
         assert!(matches!(&parsed.public_key_hex, Cow::Borrowed(_)));
-        assert_eq!(hex::decode(parsed.private_key_hex.as_ref()).unwrap(), keypair.private_key);
+        assert_eq!(keypair.private_key, hex::decode(parsed.private_key_hex.as_ref()).unwrap());
         assert_eq!(hex::decode(parsed.public_key_hex.as_ref()).unwrap(), keypair.public_key);
     }
 
@@ -1380,11 +1396,12 @@ mod tests {
         }
     }
 
+    /// The master key is derived into secret memory (CRY-4: it used to be a
+    /// `Zeroizing<Vec<u8>>` copied into the wallet) with stable bytes.
     #[test]
-    fn master_key_kdf_output_has_zeroizing_ownership_and_stable_bytes() {
-        let _: fn(&str, &str, &str, u32) -> Result<Zeroizing<Vec<u8>>, String> =
+    fn master_key_kdf_output_is_secret_memory_with_stable_bytes() {
+        let _: fn(&str, &str, &str, u32) -> Result<SecretBytes, String> =
             derive_master_key;
-        assert!(std::mem::needs_drop::<Zeroizing<Vec<u8>>>());
 
         for (version, expected) in [
             (1, [
@@ -1409,7 +1426,7 @@ mod tests {
             .unwrap();
             assert_eq!(&key[..], &expected);
             key.zeroize();
-            assert!(key.iter().all(|byte| *byte == 0));
+            assert!(key.is_empty());
         }
     }
 
@@ -1806,7 +1823,7 @@ mod audit_wallet_boundaries {
         let key = derive_at(&seed, u32::MAX, true).unwrap();
         let address = key.address.clone();
         let mnemonic_crypto = encrypt_mnemonic_for_save(&[0; 32], &mnemonic).unwrap();
-        let mut wallet = HdWallet { mnemonic_crypto, master_key:vec![0;32], seed,
+        let mut wallet = HdWallet { mnemonic_crypto, master_key:vec![0;32].into(), seed: seed.into(),
             addresses:vec![(u32::MAX,key,"last".into())], imported:BTreeSet::new(),
             network:"testnet".into(), file_version:WALLET_VERSION };
         assert!(wallet.new_address("overflow").err().unwrap().contains("exhausted"));
@@ -1827,7 +1844,7 @@ mod audit_wallet_boundaries {
         let mnemonic = Mnemonic::from_entropy(&[42;32]).unwrap();
         let seed = mnemonic.to_seed("").to_vec();
         let mnemonic_crypto = encrypt_mnemonic_for_save(&[0; 32], &mnemonic).unwrap();
-        let mut wallet = HdWallet { mnemonic_crypto, master_key:vec![0;32], seed,
+        let mut wallet = HdWallet { mnemonic_crypto, master_key:vec![0;32].into(), seed: seed.into(),
             addresses:Vec::new(), imported:BTreeSet::new(),
             network:"testnet".into(), file_version:WALLET_VERSION };
 
@@ -2046,7 +2063,7 @@ mod audit_wallet_boundaries {
             derived: false,
         };
 
-        let (loaded, is_imported) = into_loaded_address(record, vec![1, 2], vec![3, 4]);
+        let (loaded, is_imported) = into_loaded_address(record, vec![1, 2].into(), vec![3, 4]);
         assert_eq!(loaded.0, 7);
         assert!(is_imported);
         assert_eq!(loaded.1.address.as_ptr(), address_pointer);
@@ -2330,7 +2347,7 @@ mod audit_wallet_boundaries {
         let second = derive_at(&wallet.seed, 8, true).unwrap();
 
         let wrong_address = Keypair {
-            private_key: first.private_key.clone(),
+            private_key: first.private_key.duplicate(),
             public_key: first.public_key.clone(),
             address: second.address.clone(),
         };
@@ -2338,7 +2355,7 @@ mod audit_wallet_boundaries {
             "imported keypair public key does not match address");
 
         let mismatched_keys = Keypair {
-            private_key: first.private_key.clone(),
+            private_key: first.private_key.duplicate(),
             public_key: second.public_key.clone(),
             address: second.address.clone(),
         };
@@ -2355,7 +2372,7 @@ mod audit_wallet_boundaries {
         let third = derive_at(&wallet.seed, 9, true).unwrap();
         let raw_public = third.public_key[crypto::SUITE_HEADER_LEN..].to_vec();
         let raw_legacy = Keypair {
-            private_key: third.private_key[crypto::SUITE_HEADER_LEN..].to_vec(),
+            private_key: third.private_key[crypto::SUITE_HEADER_LEN..].to_vec().into(),
             address: crypto::address_from_pubkey(&raw_public, true),
             public_key: raw_public,
         };

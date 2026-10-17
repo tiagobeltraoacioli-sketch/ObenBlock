@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 use zeroize::Zeroizing;
 
+use crate::crypto::SecretBytes;
+
 use super::write_varint;
 
 const DS_STEP: &[u8] = b"GNB-KES-v1/step";
@@ -42,15 +44,25 @@ fn h(parts: &[&[u8]]) -> [u8; 32] {
     s.finalize().into()
 }
 
-fn step(seed: &[u8; 32]) -> [u8; 32] {
-    h(&[DS_STEP, seed])
+/// `seed <- SHA3("GNB-KES-v1/step" ‖ seed)` in place (CRY-4): the next seed
+/// is written over the current one, through a wiped temporary, so no copy
+/// of an earlier seed outlives the step (forward security). The hasher's
+/// stack state is dead after the call; callers scrub the stack once their
+/// loop is done (`gnb_secret::scrub_stack`).
+fn step_in_place(seed: &mut [u8]) {
+    let mut hasher = Sha3_256::new();
+    hasher.update(DS_STEP);
+    hasher.update(&*seed);
+    let mut next = Zeroizing::new([0u8; 32]);
+    hasher.finalize_into(sha3::digest::generic_array::GenericArray::from_mut_slice(&mut next[..]));
+    seed.copy_from_slice(&next[..]);
 }
 
-fn leaf_keypair(seed: &[u8; 32]) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>), String> {
+/// Leaf `i`'s key pair from `seed_i`, the secret key in secret memory.
+fn leaf_keypair(seed: &[u8]) -> Result<(Vec<u8>, SecretBytes), String> {
     let leaf_seed = Zeroizing::new(h(&[DS_LEAF, seed]));
-    let (pk, sk) = crate::crypto::generate_keypair_from_seed(&leaf_seed[..])
-        .map_err(|e| format!("kes leaf keygen: {e:?}"))?;
-    Ok((pk, Zeroizing::new(sk)))
+    crate::crypto::generate_keypair_from_seed_secret(&leaf_seed[..])
+        .map_err(|e| format!("kes leaf keygen: {e:?}"))
 }
 
 fn leaf_hash(pk: &[u8]) -> [u8; 32] {
@@ -151,13 +163,20 @@ pub fn verify(public: &KesPublic, index: u64, msg: &[u8], s: &KesSignature) -> b
 
 /// The secret side: current epoch, current seed, and the (public) leaf hashes
 /// needed for authentication paths. Never holds an earlier seed.
+///
+/// CRY-4: the seed lives in a [`SecretBytes`] (locked in RAM where the
+/// platform allows: a witness key stays in a node's memory for its whole
+/// run), evolves in place and is wiped on drop; the signer is neither
+/// `Copy` nor `Clone`.
 pub struct KesSigner {
     depth: u8,
     epoch: u64,
-    seed: Zeroizing<[u8; 32]>,
+    seed: SecretBytes,
     leaves: Vec<[u8; 32]>,
     root: [u8; 32],
 }
+
+gnb_secret::assert_not_copy_or_clone!(KesSigner);
 
 fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
     let mut level = leaves.to_vec();
@@ -170,21 +189,35 @@ fn merkle_root(leaves: &[[u8; 32]]) -> [u8; 32] {
 impl KesSigner {
     /// Derive all leaf public keys from `seed0` and keep only their hashes.
     /// `progress(i)` is called after each leaf (keygen is slow at depth 12+).
-    pub fn generate(depth: u8, seed0: [u8; 32], mut progress: impl FnMut(u64)) -> Result<Self, String> {
+    ///
+    /// CRY-4: production callers pass `seed0` by reference (`&seed`, from
+    /// wiping storage): taking it by value, as this function used to, left
+    /// an unwiped copy of the key's root secret in the callee's frame. A
+    /// by-value array is still accepted for test fixtures (public seeds).
+    /// The running seed and every leaf's secret key live in wiped secret
+    /// memory.
+    pub fn generate(
+        depth: u8,
+        seed0: impl std::borrow::Borrow<[u8; 32]>,
+        mut progress: impl FnMut(u64),
+    ) -> Result<Self, String> {
+        let seed0: &[u8; 32] = seed0.borrow();
         if depth == 0 || depth > MAX_DEPTH {
             return Err(format!("kes depth must be 1..={MAX_DEPTH}"));
         }
         let n = 1u64 << depth;
         let mut leaves = Vec::with_capacity(n as usize);
-        let mut s = Zeroizing::new(seed0);
+        let mut s = SecretBytes::from_slice(seed0);
         for i in 0..n {
             let (pk, _sk) = leaf_keypair(&s)?;
             leaves.push(leaf_hash(&pk));
-            *s = step(&s);
+            step_in_place(&mut s);
             progress(i + 1);
         }
+        drop(s);
+        gnb_secret::scrub_stack();
         let root = merkle_root(&leaves);
-        Ok(KesSigner { depth, epoch: 0, seed: Zeroizing::new(seed0), leaves, root })
+        Ok(KesSigner { depth, epoch: 0, seed: SecretBytes::from_slice(seed0), leaves, root })
     }
 
     pub fn public(&self) -> KesPublic {
@@ -204,9 +237,10 @@ impl KesSigner {
             return Err("kes: key exhausted; generate a new witness key".into());
         }
         for _ in self.epoch..epoch {
-            let next = step(&self.seed);
-            *self.seed = next;
+            step_in_place(&mut self.seed);
         }
+        // The hash states of the steps held the earlier seeds.
+        gnb_secret::scrub_stack();
         self.epoch = epoch;
         Ok(())
     }
@@ -227,12 +261,12 @@ impl KesSigner {
     }
 
     /// Secret state for encrypted storage: depth ‖ epoch ‖ seed (the leaves
-    /// are public and stored alongside in clear).
-    pub fn secret_bytes(&self) -> Zeroizing<Vec<u8>> {
-        let mut v = Zeroizing::new(Vec::with_capacity(41));
-        v.push(self.depth);
-        v.extend_from_slice(&self.epoch.to_le_bytes());
-        v.extend_from_slice(&self.seed[..]);
+    /// are public and stored alongside in clear), in secret memory.
+    pub fn secret_bytes(&self) -> SecretBytes {
+        let mut v = SecretBytes::zeroed(41);
+        v[0] = self.depth;
+        v[1..9].copy_from_slice(&self.epoch.to_le_bytes());
+        v[9..41].copy_from_slice(&self.seed);
         v
     }
 
@@ -250,8 +284,7 @@ impl KesSigner {
             return Err("kes: state does not match the public key".into());
         }
         let epoch = u64::from_le_bytes(secret[1..9].try_into().unwrap());
-        let mut seed = Zeroizing::new([0u8; 32]);
-        seed.copy_from_slice(&secret[9..41]);
+        let seed = SecretBytes::from_slice(&secret[9..41]);
         let root = merkle_root(&leaves);
         if root != expected.root {
             return Err("kes: leaves do not match the root".into());
@@ -287,7 +320,8 @@ impl KesKeyFile {
 
     pub fn open(&self, password: &str) -> Result<KesSigner, String> {
         let (secret, _public, _net) = self.secret.decrypt(password).map_err(|e| format!("kes open: {e:?}"))?;
-        let secret = Zeroizing::new(secret);
+        // CRY-4: into secret memory; the decrypted `Vec` is wiped.
+        let secret = SecretBytes::from_vec(secret);
         let raw = hex::decode(&self.leaves_hex).map_err(|e| format!("kes leaves: {e}"))?;
         if raw.len() % 32 != 0 {
             return Err("kes leaves: bad length".into());
@@ -316,6 +350,28 @@ mod tests {
 
     fn signer(depth: u8) -> KesSigner {
         KesSigner::generate(depth, [7u8; 32], |_| {}).unwrap()
+    }
+
+    /// CRY-4: evolving keeps no earlier seed in the signer (the seed is
+    /// overwritten in place), and a dropped signer, its stored state and
+    /// every transient leaf key leave only zeros behind (read after the drop
+    /// through the test quarantine).
+    #[test]
+    fn evolution_and_drop_leave_no_seed_behind() {
+        let q = gnb_secret::test_support::Quarantine::start();
+        let mut s = signer(2);
+        let seed0 = s.secret_bytes()[9..41].to_vec();
+        s.evolve_to(2).unwrap();
+        let mut seed2 = seed0.clone();
+        step_in_place(&mut seed2);
+        step_in_place(&mut seed2);
+        assert_eq!(&s.secret_bytes()[9..41], seed2.as_slice(), "seed_2 = step(step(seed_0))");
+        let _sig = s.sign(b"m").unwrap();
+        drop(s);
+        let released = q.released();
+        assert!(!released.is_empty());
+        assert!(q.all_released_zeroed(), "a dropped KES seed or leaf key left bytes behind");
+        assert!(!released.iter().any(|r| r.windows(32).any(|w| w == seed0.as_slice())));
     }
 
     #[test]

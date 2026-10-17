@@ -171,30 +171,30 @@
       "checksum": "kkjj5hq0"
     },
     {
-      "name": "mainnet/policy-exact-key-distinction/create",
+      "name": "mainnet/policy-mixed-encodings/create",
       "accepted": true,
-      "request_sha256": "6b1d43e3123c782d2363a6884eacbe122cf492539fb3a0d3adf0a73499cdba72",
-      "response_sha256": "f0e14dd4248e9867d4e0c2e77125714e0e147f85a6504e7ee2d4891cb76ea892",
+      "request_sha256": "3c3b311a2a2b488a85f43de9527bf36708370b1b1a536d2252d61d3fb63d59a6",
+      "response_sha256": "6cc85998de5295387096f91621250d252b201fb1845363afa11e13e09fb8a938",
       "network": "mainnet",
       "kind": "policy",
-      "script_pubkey": "02b0c83f940e2a5bdf4f904325fb59e8a90397bc015de34f4433a7c09b354a0b2d",
-      "address": "gnb1mb0c83f940e2a5bdf4f904325fb59e8a90397bc015de34f4433a7c09b354a0b2d95239b63",
-      "bech32m": "gnb1zpkryrl9qw9fda7nusgvjlkk0g4ype00qpth3573pn5lqfkd22pvksu4w409",
+      "script_pubkey": "022f6a7e28e04b123b9d02cdff15ec5aa2087c90ae70b6556fa9fc0ea8e6279fe2",
+      "address": "gnb1m2f6a7e28e04b123b9d02cdff15ec5aa2087c90ae70b6556fa9fc0ea8e6279fe21dae11fb",
+      "bech32m": "gnb1zp9a48u28qfvfrh8gzehl3tmz65gy8ey9wwzm92mafls823e38nl3q27g3dw",
       "requires_policy_tree_activation": false,
-      "checksum": "0zgngu8m"
+      "checksum": "v5kthwnm"
     },
     {
-      "name": "mainnet/policy-exact-key-distinction/inspect",
+      "name": "mainnet/policy-mixed-encodings/inspect",
       "accepted": true,
-      "request_sha256": "38490ba392fbbc72477cc52744b65b818770d4a1ac7ab540720caddb71af5334",
-      "response_sha256": "f0e14dd4248e9867d4e0c2e77125714e0e147f85a6504e7ee2d4891cb76ea892",
+      "request_sha256": "c5bdd401d84688c323ee1a4ea806e82b19afc7a418cdd4d5ff8f268e31b02330",
+      "response_sha256": "6cc85998de5295387096f91621250d252b201fb1845363afa11e13e09fb8a938",
       "network": "mainnet",
       "kind": "policy",
-      "script_pubkey": "02b0c83f940e2a5bdf4f904325fb59e8a90397bc015de34f4433a7c09b354a0b2d",
-      "address": "gnb1mb0c83f940e2a5bdf4f904325fb59e8a90397bc015de34f4433a7c09b354a0b2d95239b63",
-      "bech32m": "gnb1zpkryrl9qw9fda7nusgvjlkk0g4ype00qpth3573pn5lqfkd22pvksu4w409",
+      "script_pubkey": "022f6a7e28e04b123b9d02cdff15ec5aa2087c90ae70b6556fa9fc0ea8e6279fe2",
+      "address": "gnb1m2f6a7e28e04b123b9d02cdff15ec5aa2087c90ae70b6556fa9fc0ea8e6279fe21dae11fb",
+      "bech32m": "gnb1zp9a48u28qfvfrh8gzehl3tmz65gy8ey9wwzm92mafls823e38nl3q27g3dw",
       "requires_policy_tree_activation": false,
-      "checksum": "0zgngu8m"
+      "checksum": "v5kthwnm"
     },
     {
       "name": "mainnet/policy-reordered/create",
@@ -325,6 +325,58 @@
       "bech32m": "gnb1zp8ufz4n3fler3hysm865qr44fzhey3latvp2zsj6gc9gj269jclhqupzhdy",
       "requires_policy_tree_activation": true,
       "checksum": "lzta9etn"
+    },
+    {
+      "name": "mainnet/policy-twin-encoding/create",
+      "accepted": false,
+      "request_sha256": "6b1d43e3123c782d2363a6884eacbe122cf492539fb3a0d3adf0a73499cdba72",
+      "response_sha256": "38667e60226bf99701916900a2a265233dcc014e1206c173ade921d608824b53"
+    },
+    {
+      "name": "mainnet/policy-twin-encoding/inspect",
+      "accepted": true,
+      "request_sha256": "38490ba392fbbc72477cc52744b65b818770d4a1ac7ab540720caddb71af5334",
+      "response_sha256": "500e1a9dda65cccc3b11cfdc6641111242c28301bb76b53bbdce8c5030aa475b",
+      "network": "mainnet",
+      "kind": "policy",
+      "script_pubkey": "02b0c83f940e2a5bdf4f904325fb59e8a90397bc015de34f4433a7c09b354a0b2d",
+      "address": "gnb1mb0c83f940e2a5bdf4f904325fb59e8a90397bc015de34f4433a7c09b354a0b2d95239b63",
+      "bech32m": "gnb1zpkryrl9qw9fda7nusgvjlkk0g4ype00qpth3573pn5lqfkd22pvksu4w409",
+      "requires_policy_tree_activation": false,
+      "twin_key_encodings": true,
+      "checksum": "0zgngu8m"
+    },
+    {
+      "name": "mainnet/tree-twin-encoding/create",
+      "accepted": false,
+      "request_sha256": "f82833dc145bfc1e87866ab7596a75b7db49eb3062635355ea6765bf4181be06",
+      "response_sha256": "38667e60226bf99701916900a2a265233dcc014e1206c173ade921d608824b53"
+    },
+    {
+      "name": "mainnet/tree-twin-encoding/inspect",
+      "accepted": true,
+      "request_sha256": "36bae4e86d5adf12aed0ceaf912e9800f760d6f2bafe9eaeaf22a41319889c2c",
+      "response_sha256": "be1afee736f45375b5e380250c39d9989594849489283f65755a00137d67e59b",
+      "network": "mainnet",
+      "kind": "tree",
+      "script_pubkey": "023fa57ff86278eac5576abac8d5757e4da107832e910811e1c6988b70ab0095fc",
+      "address": "gnb1m3fa57ff86278eac5576abac8d5757e4da107832e910811e1c6988b70ab0095fcace25f48",
+      "bech32m": "gnb1zp87jhl7rz0r4v24m2htyd2at7fkss0qewjyyprcwxnz9hp2cqjh7qqu9dpz",
+      "requires_policy_tree_activation": true,
+      "twin_key_encodings": true,
+      "checksum": "g2luncrx"
+    },
+    {
+      "name": "mainnet/export-twin-encoding",
+      "accepted": true,
+      "request_sha256": "418eeb7aca6864cf1c8f4b23ce0fc9214cdb0b9e8f068904b1d82f0531011d00",
+      "response_sha256": "af8f90f6aee42e66f2431dbd2d81f421975f5b122d1b537717e03fc58e67952e"
+    },
+    {
+      "name": "mainnet/import-twin-encoding",
+      "accepted": true,
+      "request_sha256": "183c7c62502c46eea69aad6df001ede1ba0ab9cac978ebdcb98e62874961a1b3",
+      "response_sha256": "af8f90f6aee42e66f2431dbd2d81f421975f5b122d1b537717e03fc58e67952e"
     },
     {
       "name": "mainnet/export",
@@ -525,30 +577,30 @@
       "checksum": "eencdeht"
     },
     {
-      "name": "testnet/policy-exact-key-distinction/create",
+      "name": "testnet/policy-mixed-encodings/create",
       "accepted": true,
-      "request_sha256": "e4231b2cc200bb4f31731461a200a44e369d150cb8405dd8330d0f42c1f589d2",
-      "response_sha256": "ccaec68a67c775100198fb4da6aa294b7b6b18d611403a4a197cdd8a07cb9576",
+      "request_sha256": "8ab3af99598bdcad15385037b1cec994c1e30b3c1cf6a8cf44aaeaa508e5996f",
+      "response_sha256": "cc3745d85a6d690435a648cefaf574e417fd79e8d0fc6782fc2dc02a15a75ce5",
       "network": "testnet",
       "kind": "policy",
-      "script_pubkey": "02b0c83f940e2a5bdf4f904325fb59e8a90397bc015de34f4433a7c09b354a0b2d",
-      "address": "gnb1nb0c83f940e2a5bdf4f904325fb59e8a90397bc015de34f4433a7c09b354a0b2d39e7b189",
-      "bech32m": "tgnb1zpkryrl9qw9fda7nusgvjlkk0g4ype00qpth3573pn5lqfkd22pvksrkps28",
+      "script_pubkey": "022f6a7e28e04b123b9d02cdff15ec5aa2087c90ae70b6556fa9fc0ea8e6279fe2",
+      "address": "gnb1n2f6a7e28e04b123b9d02cdff15ec5aa2087c90ae70b6556fa9fc0ea8e6279fe2cc8fa8fe",
+      "bech32m": "tgnb1zp9a48u28qfvfrh8gzehl3tmz65gy8ey9wwzm92mafls823e38nl3q4a85gv",
       "requires_policy_tree_activation": false,
-      "checksum": "jaqtwx2h"
+      "checksum": "3t7n357h"
     },
     {
-      "name": "testnet/policy-exact-key-distinction/inspect",
+      "name": "testnet/policy-mixed-encodings/inspect",
       "accepted": true,
-      "request_sha256": "34be321b96840ed34bfc2187db0510b41e328d6c4621480120ac04ed78c282b5",
-      "response_sha256": "ccaec68a67c775100198fb4da6aa294b7b6b18d611403a4a197cdd8a07cb9576",
+      "request_sha256": "671595d41071c35d098973e4d100bcb719d084c60bdae1b78fc0cd1aa290616f",
+      "response_sha256": "cc3745d85a6d690435a648cefaf574e417fd79e8d0fc6782fc2dc02a15a75ce5",
       "network": "testnet",
       "kind": "policy",
-      "script_pubkey": "02b0c83f940e2a5bdf4f904325fb59e8a90397bc015de34f4433a7c09b354a0b2d",
-      "address": "gnb1nb0c83f940e2a5bdf4f904325fb59e8a90397bc015de34f4433a7c09b354a0b2d39e7b189",
-      "bech32m": "tgnb1zpkryrl9qw9fda7nusgvjlkk0g4ype00qpth3573pn5lqfkd22pvksrkps28",
+      "script_pubkey": "022f6a7e28e04b123b9d02cdff15ec5aa2087c90ae70b6556fa9fc0ea8e6279fe2",
+      "address": "gnb1n2f6a7e28e04b123b9d02cdff15ec5aa2087c90ae70b6556fa9fc0ea8e6279fe2cc8fa8fe",
+      "bech32m": "tgnb1zp9a48u28qfvfrh8gzehl3tmz65gy8ey9wwzm92mafls823e38nl3q4a85gv",
       "requires_policy_tree_activation": false,
-      "checksum": "jaqtwx2h"
+      "checksum": "3t7n357h"
     },
     {
       "name": "testnet/policy-reordered/create",
@@ -679,6 +731,58 @@
       "bech32m": "tgnb1zp8ufz4n3fler3hysm865qr44fzhey3latvp2zsj6gc9gj269jclhqrzdjgx",
       "requires_policy_tree_activation": true,
       "checksum": "uwmggk69"
+    },
+    {
+      "name": "testnet/policy-twin-encoding/create",
+      "accepted": false,
+      "request_sha256": "e4231b2cc200bb4f31731461a200a44e369d150cb8405dd8330d0f42c1f589d2",
+      "response_sha256": "38667e60226bf99701916900a2a265233dcc014e1206c173ade921d608824b53"
+    },
+    {
+      "name": "testnet/policy-twin-encoding/inspect",
+      "accepted": true,
+      "request_sha256": "34be321b96840ed34bfc2187db0510b41e328d6c4621480120ac04ed78c282b5",
+      "response_sha256": "f75b82e4010a286017620c74b676834f40561db929eaebb51bb173f94919b070",
+      "network": "testnet",
+      "kind": "policy",
+      "script_pubkey": "02b0c83f940e2a5bdf4f904325fb59e8a90397bc015de34f4433a7c09b354a0b2d",
+      "address": "gnb1nb0c83f940e2a5bdf4f904325fb59e8a90397bc015de34f4433a7c09b354a0b2d39e7b189",
+      "bech32m": "tgnb1zpkryrl9qw9fda7nusgvjlkk0g4ype00qpth3573pn5lqfkd22pvksrkps28",
+      "requires_policy_tree_activation": false,
+      "twin_key_encodings": true,
+      "checksum": "jaqtwx2h"
+    },
+    {
+      "name": "testnet/tree-twin-encoding/create",
+      "accepted": false,
+      "request_sha256": "5561d2822aaa24522c9faeea4e189556741c62972e7866d60e0a53a4a550f088",
+      "response_sha256": "38667e60226bf99701916900a2a265233dcc014e1206c173ade921d608824b53"
+    },
+    {
+      "name": "testnet/tree-twin-encoding/inspect",
+      "accepted": true,
+      "request_sha256": "d453770952f3723bfae370d7cf3b728b7383062fabbb554a9a7696cfb1e9b74d",
+      "response_sha256": "b354f3b0f2248dbe44b66f96f3187abcdff8f1539caf58404fdd204f6dc90c33",
+      "network": "testnet",
+      "kind": "tree",
+      "script_pubkey": "023fa57ff86278eac5576abac8d5757e4da107832e910811e1c6988b70ab0095fc",
+      "address": "gnb1n3fa57ff86278eac5576abac8d5757e4da107832e910811e1c6988b70ab0095fc42be95b1",
+      "bech32m": "tgnb1zp87jhl7rz0r4v24m2htyd2at7fkss0qewjyyprcwxnz9hp2cqjh7qll2gyq",
+      "requires_policy_tree_activation": true,
+      "twin_key_encodings": true,
+      "checksum": "9jq6dk38"
+    },
+    {
+      "name": "testnet/export-twin-encoding",
+      "accepted": true,
+      "request_sha256": "cf052d01720bb1e3da1993f3a21fa5b451b89aa1b80ce7baab9ae1355d768b4b",
+      "response_sha256": "dfc9be04bb195f04d6234b4be8a92921d82ebde3ae28237758ea2fb1221eea99"
+    },
+    {
+      "name": "testnet/import-twin-encoding",
+      "accepted": true,
+      "request_sha256": "0089cd6fced49a89166b45d5cd1ec541b796f3fc34cfb52d0940500810e84fdf",
+      "response_sha256": "dfc9be04bb195f04d6234b4be8a92921d82ebde3ae28237758ea2fb1221eea99"
     },
     {
       "name": "testnet/export",

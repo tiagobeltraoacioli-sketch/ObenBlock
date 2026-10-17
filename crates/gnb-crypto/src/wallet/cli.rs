@@ -356,8 +356,8 @@ pub fn main() {
             print!("  {}deriving {} keypair(s) + signing (slow: hybrid PQ keygen)...{}\r",
                 MUTED, idx.len(), RESET);
             // Disclosure key generation can be slow and derive many children;
-            // keep its returned master-seed copy zeroizing for that lifetime.
-            let seed_bytes = zeroize::Zeroizing::new(seed.to_seed_bytes());
+            // the master seed stays in secret memory for that lifetime (CRY-4).
+            let seed_bytes = seed.to_seed_bytes();
             let bundle = match crate::wallet::DisclosureBundle::create_with_convention(
                 &seed_bytes[..], &idx, network, &purpose, &audience,
                 CLI_DISCLOSURE_KEY_CONVENTION)

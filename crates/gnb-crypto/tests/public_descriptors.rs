@@ -79,18 +79,22 @@ fn exact_key_bytes_and_branch_order_are_not_normalized() {
         b.script_pubkey(),
         Address::from_pubkey(&envelope, Network::Mainnet).hash()
     );
-    // Preserve the pre-existing distinct-byte semantics; PF-4 is not closed.
+    // PF-4: the raw key and its envelope are one signer, so one policy may
+    // not list both (they used to be accepted as distinct bytes).
     let body = format!(
         "gnbd1(mainnet,policy(2,0,0,{},{}))",
         hex::encode(&raw),
         hex::encode(&envelope)
     );
-    assert_eq!(
-        create(&body).script_pubkey(),
-        SpendPolicy::new(2, vec![raw, envelope], 0, 0)
-            .unwrap()
-            .script_pubkey()
-    );
+    assert!(Descriptor::create(&body).is_err(), "twin-encoding policy descriptor");
+    assert!(Descriptor::create(&format!(
+        "gnbd1(mainnet,tree({},policy(1,0,0,{},{})))",
+        policy(1, 0),
+        hex::encode(&envelope),
+        hex::encode(&raw)
+    ))
+    .is_err(), "twin-encoding tree branch");
+    assert!(SpendPolicy::new(2, vec![raw, envelope], 0, 0).is_err());
     let a = create(&format!(
         "gnbd1(mainnet,tree({},{}))",
         policy(1, 0),
@@ -102,6 +106,49 @@ fn exact_key_bytes_and_branch_order_are_not_normalized() {
         policy(1, 0)
     ));
     assert_ne!(a.script_pubkey(), b.script_pubkey());
+}
+
+/// PF-4 review finding: `create` refuses a policy listing one key in both
+/// encodings, but an existing descriptor of that shape (main's tooling
+/// created and exported it) is still inspected, exported and imported, with
+/// `twin_key_encodings: true` in its info, so a pool holding one restores
+/// whole and its owner can find the output to move before the second
+/// hardening height. Before the fix inspect and the pool restore failed.
+#[test]
+fn existing_twin_key_descriptors_restore_flagged() {
+    let raw = key(4);
+    let envelope = [vec![0xb1, 0x0c, 0x01, 0x00], raw.clone()].concat();
+    let twin = format!("policy(2,0,0,{},{})", hex::encode(&raw), hex::encode(&envelope));
+    let bodies = [format!("gnbd1(mainnet,{twin})"), format!("gnbd1(mainnet,tree({},{twin}))", policy(1, 0))];
+    let mut texts = vec![create(&pkh(1, "mainnet")).as_str().to_string()];
+    for body in &bodies {
+        assert!(Descriptor::create(body).is_err(), "created: {body:.40}");
+        let text = format!("{body}#{}", descriptor::checksum(body).unwrap());
+        let parsed = Descriptor::parse(&text).expect("an existing descriptor is restored");
+        assert!(parsed.has_twin_key_encodings());
+        let info = parsed.info();
+        assert_eq!(info["twin_key_encodings"], true);
+        let inspected = descriptor::public_request(&request("inspect", "descriptor", json!(text))).unwrap();
+        assert_eq!(inspected, info);
+        texts.push(text);
+    }
+    // The twin policy's script is the one consensus decoding gives it.
+    let decoded = SpendPolicy::decode(&SpendPolicy { threshold: 2, pubkeys: vec![raw.clone(), envelope.clone()],
+        after: 0, older: 0 }.encode()).unwrap();
+    assert_eq!(Descriptor::parse(&texts[1]).unwrap().script_pubkey(), decoded.script_pubkey());
+    // The whole pool restores (export and import), each entry flagged or not.
+    let pool = PublicPool::from_descriptors(Network::Mainnet, &texts).expect("the pool restores");
+    let restored = PublicPool::from_bundle(&pool.to_bundle().unwrap(), Network::Mainnet).unwrap();
+    let entries = restored.response().unwrap()["entries"].clone();
+    let flags: Vec<_> = entries.as_array().unwrap().iter().map(|e| e.get("twin_key_encodings").cloned()).collect();
+    assert_eq!(flags, vec![None, Some(json!(true)), Some(json!(true))]);
+    // Every other descriptor's info has no such field.
+    let honest = create(&format!("gnbd1(mainnet,policy(2,0,0,{},{}))", hex::encode(key(5)), hex::encode(&envelope)));
+    assert!(!honest.has_twin_key_encodings());
+    assert!(honest.info().get("twin_key_encodings").is_none());
+    // Byte-identical keys stay a grammar error on every path.
+    let dup = format!("gnbd1(mainnet,policy(1,0,0,{},{}))", hex::encode(&raw), hex::encode(&raw));
+    assert!(Descriptor::parse(&format!("{dup}#{}", descriptor::checksum(&dup).unwrap())).is_err());
 }
 
 #[test]

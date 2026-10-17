@@ -9,6 +9,7 @@ members = [
     "crates/gnb-crypto",      # consensus types, transactions, wallet, signatures
     "crates/coherence-core",  # shielded-pool primitives used by the block format
     "crates/gnb-wallet-wasm", # browser wallet core (WebAssembly), served at /wallet
+    "crates/gnb-secret",      # secret memory: locked, wiped key buffers (audit CRY-4)
     "node",                   # the `gnb` full node, `gnb-cli`, `gnb-wallet`
     # Vendored fork, patched in through [patch.crates-io] below. A member so
     # its guard test runs in place (`cargo test -p pqcrypto-internals`:

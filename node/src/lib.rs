@@ -57,6 +57,10 @@ pub mod ingress;      // audit fixes: block-ingress / orphan / IBD-latch policy
 // moved out of main.rs so integration tests drive the real path.
 #[cfg(feature = "node")]
 pub mod accept;
+// Assumed-valid block (Bitcoin Core's -assumevalid): which connects skip the
+// signature checks (P5-G).
+#[cfg(feature = "node")]
+pub mod assumevalid;
 // Block-template construction shared by the miner and getblocktemplate
 // (audit MEM-2, DAG-2).
 #[cfg(feature = "node")]

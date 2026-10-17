@@ -547,8 +547,10 @@ fn b2_t0_crash_resume_restores_the_finality_pin() {
     deliver_all(&n, &fx.a);
     deliver_all(&n, &fx.fork[..20]);
 
-    // Commits 1-3 roll A back, 4 applies B[0..16]; the next one "crashes".
-    reorg::fault_injection::fail_after_commits(Some(4));
+    // Commits 1-2 roll A's 29 tip-most blocks back, 3 rolls back the last
+    // 16 with B[0..16] (one batch, review of PR #15, finding 5); the next
+    // one "crashes".
+    reorg::fault_injection::fail_after_commits(Some(3));
     let _ = accept(&n, &fx.fork[20]);
     reorg::fault_injection::fail_after_commits(None);
     assert_eq!(applied_tip(&n), Some(fx.fork[15].block_hash()), "stopped between two chunks");

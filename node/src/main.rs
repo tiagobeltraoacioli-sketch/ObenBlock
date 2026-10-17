@@ -42,6 +42,7 @@ mod tip;
 mod sync;         // Phase 2 — drop-in Kaspa sync-negotiation layer
 mod ingress;      // audit fixes: block-ingress / orphan / IBD-latch policy
 mod accept;       // Block acceptance pipeline (accept/connect split, DAG-1)
+mod assumevalid;  // assumed-valid block (Core's -assumevalid), P5-G
 mod template;     // Block templates for the miner + getblocktemplate (MEM-2, DAG-2)
 mod blockval;     // this chain's tx rules on top of the audit set (locktime, policy, BIP30)
 mod powit;        // PoW + PoWit: witness shares, attestations, finality (node side)
@@ -225,6 +226,15 @@ struct Cli {
     /// below the default is logged as a warning. Non-consensus — a
     /// node-local anti-DoS knob.
     #[arg(long = "minimumchainwork")]                    minimum_chain_work: Option<String>,
+    /// Assumed-valid block (Bitcoin Core's `-assumevalid`): the id (64 hex
+    /// digits, as `getblockdag` prints it) of a block whose selected-chain
+    /// ancestors buried two weeks below the best block are connected without
+    /// checking their transaction signatures (every other rule still runs),
+    /// once its header is in the DAG and the best block has the minimum
+    /// chain work. Default: the network's release value
+    /// (`assumevalid::MAINNET_ASSUME_VALID`, none until a release sets it);
+    /// `0` checks every signature. Non-consensus — node-local (docs/RUNNING.md).
+    #[arg(long = "assumevalid")]                         assume_valid: Option<String>,
 
 }
 
@@ -459,6 +469,17 @@ async fn main() {
         if let Some(w) = setting.below_default_warning() {
             warn!("⚠ {w}");
         }
+        // P5-G: the assumed-valid block (Bitcoin Core's -assumevalid), once,
+        // before any block is connected.
+        let av = match assumevalid::AssumeValidSetting::resolve(cli.assume_valid.as_deref(), net.into()) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("❌ --assumevalid: {e}");
+                std::process::exit(2);
+            }
+        };
+        let _ = assumevalid::set_assume_valid(av.block);
+        info!("{}", av.describe());
     }
 
     // FIX v0.5.1 BLK-3: apply --rpc-public escape hatch.
@@ -1002,9 +1023,13 @@ async fn main() {
             // with nothing to retry it but the next block; like Bitcoin Core
             // ("Failed to connect best block", an init error), refuse to start.
             error!("start-up chain-state reconciliation failed: {}", e);
+            // Review of audit F1, finding 4: the start-up rebuild only runs
+            // when `check_chain_state` finds faults, which it did not here,
+            // so a restart with --carryover-snapshot would repair nothing.
             error!("Refusing to start: the best valid chain cannot be connected. Fix the cause above \
-                    (disk space, permissions, storage errors) and restart; if it persists, rebuild with \
-                    --carryover-snapshot or resynchronize this data directory.");
+                    (disk space, permissions, storage errors) and restart; if it persists, the data \
+                    directory is damaged: resynchronize into a fresh, empty --data-dir (or start from a \
+                    copy of an archival node's data directory).");
             std::process::exit(1);
         } else {
             for f in &faults {
@@ -1423,6 +1448,7 @@ async fn main() {
             // reported then, or `Ignore` if it waited past gossipsub's cache.
             let mut pow_sched: pow::verifier::PowScheduler<network::Inbound> =
                 pow::verifier::PowScheduler::new(pow::verifier::PowLimits::default());
+            let ibd_pow_workers = pow::verifier::ibd_workers();
             let (pow_done_tx, mut pow_done_rx) = mpsc::unbounded_channel::<PowDone>();
             // B1-T5: the verdicts of buffered orphan frames are withheld until
             // the orphan connects (Accept), is refused, or leaves the pool.
@@ -1888,6 +1914,10 @@ async fn main() {
                     // B1-T5: verdicts of orphans the drain connected, refused or
                     // dropped; and of frames whose orphan left the pool.
                     settle_block_verdicts(&mut ingress_core, &mut deferred_blocks, &vtx2, &net_ctl_tx, &dag2, activation);
+                    // P5-G: while the IBD latch holds (the miner and the
+                    // witness duties wait), proofs are verified on every CPU
+                    // but one (`pow::verifier::ibd_workers`), else on half.
+                    pow_sched.set_initial_block_download(state2.read().is_syncing.then_some(ibd_pow_workers));
                     dispatch_pow(&mut pow_sched, &pow_done_tx, &vtx2);
                     // A body rejected for a witness-dependent reason, or found
                     // missing (pruned, DAG-6) during this acceptance: ask peers
@@ -2553,12 +2583,14 @@ async fn main() {
     }
 
     // Audit F1: Bitcoin Core's `AbortNode`. A block whose validation keeps
-    // ending without a verdict (the chain state cannot be read consistently)
-    // stops the node (`accept::NO_VERDICT_ABORT_AFTER`): acceptance and
-    // templates refuse at once, and the process exits here with the
-    // operator's message, under the acceptance lock (no chain move in
-    // flight; every commit is one atomic batch). A restart that meets the
-    // same failure refuses to start with it.
+    // ending on a storage-engine failure (the node cannot read its chain
+    // state) stops the node (`accept::NO_VERDICT_ABORT_AFTER`): acceptance
+    // and templates refuse at once, and the process exits here with the
+    // operator's message (`accept::no_verdict_abort_message`), under the
+    // acceptance lock (no chain move in flight; every commit is one atomic
+    // batch). A restart that meets the same failure refuses to start with
+    // it. An inconsistent index never stops the node: the block is parked
+    // and retried (review of audit F1, finding 1; `getdaginfo` no_verdict).
     let store_for_abort = store.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(1));
@@ -2931,9 +2963,17 @@ fn maybe_release_ibd_with(
         let our_score = selected.as_ref().map(|n| n.blue_score).unwrap_or(0);
         let our_height = selected.as_ref().map(|n| n.height).unwrap_or(0);
         // Disqualified blocks (DAG-1) are never selectable, so a peer frontier
-        // that only leads to them must not hold the IBD latch.
+        // that only leads to them must not hold the IBD latch. A block parked
+        // without a verdict (and its selected-chain descendants) is NOT
+        // disqualified (review of PR #15, finding 2): this node could not
+        // judge it (a local storage fault), so a peer serving that branch is
+        // ahead of us and holds the latch like any servable tip; one
+        // transient failure during sync must not release it (one-way) and
+        // report the node synced on a stale tip. The internal miner still
+        // resumes after a stall (`SYNC_STALL_SECS`) and the RPC warns
+        // (`accept::no_verdict_branch_warning`); the node never exits for it.
         let servable = peer_state.servable_blue_work(|h| {
-            if d.is_invalid(h) { None } else { d.get_node(h).map(|n| n.blue_work) }
+            if d.is_invalid(h) && !d.is_no_verdict_branch(h) { None } else { d.get_node(h).map(|n| n.blue_work) }
         });
         let advertised = peer_state.connected_advertised_tips();
         let have_frontier = !advertised.is_empty();
@@ -3665,6 +3705,38 @@ mod ingress_processor_tests {
         st.write().is_syncing = true;
         release_without_minimum(&dag, &ps, &fr, &st);
         assert!(!st.read().is_syncing, "a claim alone must not keep the node in IBD");
+    }
+
+    /// Review of PR #15, finding 2: a peer's tip on a branch parked without a
+    /// verdict (this node could not judge a block of it: a local storage
+    /// fault) is servable work, so it keeps the latch; pre-fix it counted as
+    /// a disqualified branch and the first such failure during sync released
+    /// the latch for good. A genuinely disqualified branch still does not.
+    #[test]
+    fn a_branch_parked_without_a_verdict_holds_the_ibd_latch() {
+        let (dag, ps, fr, st) = release_fixture();
+        {
+            let mut d = dag.write();
+            d.add_block([0xA1; 32], vec![[0xAA; 32]], 1_001, 10).expect("our chain");
+            d.add_block([0xB1; 32], vec![[0xAA; 32]], 1_001, 10).expect("the peer's branch");
+            d.add_block([0xB2; 32], vec![[0xB1; 32]], 1_002, 10).expect("the peer's tip");
+            d.park_no_verdict([0xB1; 32]);
+            assert_eq!(d.selected_tip(), Some([0xA1; 32]));
+        }
+        let peer = libp2p::PeerId::random();
+        let now = std::time::Instant::now();
+        ps.on_connect(peer, now);
+        ps.observe(peer, 2, 2, &[[0xB2; 32]], now);
+        // Evidence of a chain ahead: only "verified" can release the latch.
+        fr.lock().set_orphan_evidence(Some(sync::IBD_EXIT_LAG + 100));
+        st.write().is_syncing = true;
+        release_without_minimum(&dag, &ps, &fr, &st);
+        assert!(st.read().is_syncing, "the peer serves more work than our tip: still syncing");
+
+        // The same branch disqualified (a verdict): not servable, released.
+        dag.write().mark_invalid([0xB1; 32]);
+        release_without_minimum(&dag, &ps, &fr, &st);
+        assert!(!st.read().is_syncing);
     }
 
     /// NET-6: work-backed evidence (an orphan claiming to be well ahead) holds

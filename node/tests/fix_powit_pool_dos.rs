@@ -18,11 +18,19 @@
 //!
 //! This binary runs on the testnet PoWit clock (short epochs) with PoWit
 //! active from height 3 (process-wide overrides, once per binary).
+//!
+//! The re-rooting forgery of finding 1 exists only below the second
+//! hardening activation (from it the signed message commits the witness
+//! key and a block may carry a proof only against a witness:
+//! `node/tests/fix_powit_hardening2.rs`). The tests that use it run under the
+//! old regime (`old_regime()`, `activation::scoped_override_v2(NEVER)`),
+//! the rules mainnet runs until that activation is scheduled; testnet runs
+//! the second hardening rules from genesis.
 
 use gnb::consensus::GhostDAG;
 use gnb::core::kes::{KesKeyFile, KesPublic, KesSigner};
 use gnb::core::powit::{Attestation, Checkpoint, Equivocation, KeyId, PowitState, TESTNET_PARAMS};
-use gnb::core::{self, Block, BlockHeader, ChainId, MerkleRoot};
+use gnb::core::{self, activation, Block, BlockHeader, ChainId, MerkleRoot};
 use gnb::powit::{self, PowitPool};
 use gnb::storage::Storage;
 use sha3::{Digest, Sha3_256};
@@ -221,6 +229,11 @@ impl Forger {
     }
 }
 
+/// The PoWit rules before the second hardening activation, on this thread.
+fn old_regime() -> activation::OverrideGuardV2 {
+    activation::scoped_override_v2(activation::NEVER)
+}
+
 fn verify_ev(ev: &Equivocation) -> KeyId {
     ev.verify(CHAIN, &TESTNET_PARAMS, ACT).expect("a valid equivocation proof")
 }
@@ -237,6 +250,7 @@ fn verify_ev(ev: &Equivocation) -> KeyId {
 /// member is admitted.
 #[test]
 fn evidence_against_a_key_outside_the_witness_set_is_not_admitted() {
+    let _old = old_regime();
     let fx = Fx::new();
     let c = fx.chain(70, 70, 0);
     let f = Forger::new(1);
@@ -262,6 +276,7 @@ fn evidence_against_a_key_outside_the_witness_set_is_not_admitted() {
 /// valid equivocations; the pool held them all, forever, and relayed them.
 #[test]
 fn a_flood_of_forged_equivocations_is_bounded() {
+    let _old = old_regime();
     let fx = Fx::new();
     let c = fx.chain(70, 70, 0);
     let f = Forger::new(2);
@@ -282,6 +297,7 @@ fn a_flood_of_forged_equivocations_is_bounded() {
 /// the heaviest equivocator out of the four evidence slots.
 #[test]
 fn template_evidence_goes_to_the_heaviest_witnesses_first() {
+    let _old = old_regime();
     let fx = Fx::new();
     let c = fx.chain(70, 70, 0);
     let f = Forger::new(3);
@@ -308,6 +324,7 @@ fn template_evidence_goes_to_the_heaviest_witnesses_first() {
 /// wholesale), so its later double vote still becomes a proof.
 #[test]
 fn a_link_flood_does_not_wipe_the_links_double_votes_are_caught_against() {
+    let _old = old_regime();
     let fx = Fx::new();
     let c = fx.chain(70, 70, 0);
     let k = Key::new(4);

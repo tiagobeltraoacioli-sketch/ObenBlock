@@ -2389,7 +2389,7 @@ impl BlockIngress {
         pow: &mut dyn PowGate,
     ) -> Gated {
         if ctx.dag.read().has_block(&hash) {
-            return self.restore_body(block, hash, solicited, ctx, pow);
+            return self.restore_body(block, hash, solicited, ctx);
         }
         if self.orphans.contains(&hash) {
             return Gated::Done(BlockOutcome::Known);
@@ -2537,16 +2537,21 @@ impl BlockIngress {
     /// header height = max(parent DAG heights) + 1 (what the block was
     /// accepted at; `height` and `blue_score` are not committed by the block
     /// id), expected bits, timestamp, the hardening block rules (witness
-    /// commitment at/after the activation), the proof of work and the
-    /// rejected-witness-root memo; it is stored with the metadata
-    /// acceptance derives, and the chain through it is re-evaluated.
+    /// commitment at/after the activation), the proof of work's cheap checks
+    /// and the rejected-witness-root memo; it is stored with the metadata
+    /// acceptance derives, and the chain through it is re-evaluated. Its
+    /// proof is NOT evaluated again, here or on the PoW workers: the block's
+    /// DAG record is the verified result of that proof at that height, and
+    /// survives restarts (`pow::proof_recorded_in_dag`, P5-G). A restored
+    /// body used to cost a GnB-SMH evaluation whenever the process had
+    /// forgotten the proof (after any restart): one per body of a reorg back
+    /// onto a pruned branch.
     fn restore_body(
         &mut self,
         mut block: core::Block,
         hash: [u8; 32],
         solicited: bool,
         ctx: &AcceptCtx,
-        pow: &mut dyn PowGate,
     ) -> Gated {
         if !solicited || !crate::accept::awaits_body(ctx.dag, ctx.store, &hash) {
             return Gated::Done(BlockOutcome::Known);
@@ -2561,16 +2566,6 @@ impl BlockIngress {
         }
         // POW-8: the wire blue_score is replaced exactly as on acceptance.
         normalize_wire_metadata(&mut block, ctx.dag);
-        let pre_pow_ok = passes_pre_pow_checks(&block, &ctx.dag.read(), core::activation::hardening_activation_height());
-        if pre_pow_ok {
-            match pow.check(&block, &hash) {
-                PowCheck::Valid => {}
-                PowCheck::Invalid => {
-                    return Gated::Done(BlockOutcome::Invalid("consensus rejection: invalid GnB-SMH proof of work".into()));
-                }
-                PowCheck::Deferred => return Gated::PowPending(Box::new(block)),
-            }
-        }
         let height = block.height;
         let result = crate::accept::accept_block_tracking(
             &block, hash, height, ctx.dag, ctx.store, ctx.mempool, ctx.node_state,

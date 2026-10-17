@@ -1,7 +1,8 @@
 # PoWit KES: forward-secure witness keys ("Proof of Context and Time")
 
 Status: **implemented** (`crates/gnb-crypto/src/core/kes.rs`, commit 7feeb99) and
-consensus from `core::powit_height()`, which is off on mainnet. Tested by
+consensus from `core::powit_height()` (mainnet 10,000; testnet off unless
+`--powit-height`). Tested by
 unit tests and on a 3-node testnet, including signing with a stolen key file.
 
 ## Problem
@@ -39,7 +40,12 @@ witness id        = SHA3("GNB-KES-v1/id" ‖ u8(depth) ‖ root)[0..20]
   password (Argon2id + AES-256-GCM, the wallet format).
 - **Evolve to epoch `e`:** replace the stored seed with `seed_e` and write it
   to disk atomically **before** signing anything in `e`. Earlier seeds cannot
-  be recomputed from `seed_e`.
+  be recomputed from `seed_e`. In memory (audit CRY-4) the seed lives in a
+  locked, wiped `SecretBytes` region and each step overwrites it in place;
+  the hash states that held earlier seeds and every leaf key (generated in
+  secret memory for one signature) are wiped, and the stack is scrubbed
+  after key generation, evolution and signing, so an earlier seed is not
+  left in RAM, swap or a core dump (`docs/RUNNING.md`, "Secret key memory").
 - **Sign in epoch `e`:** `(e, pk_e, Sign(leaf_e, msg), auth_path_e)`.
 - **Verify:** `H(pk_e)` and the path must give `root`, `e` must equal the
   epoch of the attestation's target, and the hybrid signature must verify
@@ -68,6 +74,17 @@ mine shares again.
    Identity is separate from money.
 4. **Equivocation proofs:** unchanged in shape. Both attestations must verify
    under the same witness id.
+5. **The signed message commits the key** (from the second hardening
+   activation, for attestations whose target is at or above it; PoWit audit
+   finding 1). `kes::verify` checks only that the leaf hash and the supplied
+   path reach the root, so with a message that does not name the key, one
+   leaf's signature re-rooted under any sibling hash verified as a signature
+   by another key, one SHA3 per key: a single double vote gave an unlimited
+   supply of valid equivocation proofs against keys nobody holds. The v2
+   message adds `u8(depth) ‖ root` (docs/CONSENSUS.md, "PoWit", "Attestation
+   messages"), so a signature is valid for exactly one key; from the same
+   activation a block may carry a proof only against a witness of the
+   evidence epochs.
 
 ## Context binding (transactions, optional, later)
 

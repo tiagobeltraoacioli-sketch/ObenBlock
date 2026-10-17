@@ -96,6 +96,14 @@ fn utxo_row_key(txid: &[u8; 32], index: u32) -> Vec<u8> {
     k
 }
 
+/// Make every block parked without a verdict due for its retry (the
+/// schedule is 1 minute doubling to 1 hour), so the next acceptance
+/// validates it again.
+fn retry_due(n: &Node) {
+    gnb::accept::unpark_due_no_verdicts(&n.dag, &n.store,
+        std::time::Instant::now() + std::time::Duration::from_secs(10 * 3600));
+}
+
 /// Nothing about `id` was persisted or remembered as a verdict.
 fn assert_no_verdict(n: &Node, id: &gnb::consensus::BlockHash, what: &str) {
     assert!(n.store.invalid_block_reason(id).unwrap().is_none(), "{what}: no persisted invalid mark");
@@ -127,11 +135,16 @@ fn utxo_read_failure_while_connecting_is_not_a_verdict() {
         assert!(!err.contains("invalid in its own chain context"), "not a verdict: {err}");
         assert_no_verdict(&n, &id, "input lookup");
         assert_eq!(applied_tip(&n), Some(gh));
+        // Review of the F1 hotfix: kept (with its body) and parked, retried
+        // on a bounded schedule rather than deleted and re-downloaded.
+        assert!(n.dag.read().is_no_verdict_parked(&id) && n.store.has_block_body(&id).unwrap());
         let db = n.store.db();
         db.delete_cf(db.cf_handle("utxo").unwrap(), utxo_row_key(&fund.0, 0)).unwrap();
         n.store.put_utxo(&fund.0, 0, &fund.2).unwrap();
-        accept(&n, &b).expect("the same block once the row reads again");
-        assert_eq!(applied_tip(&n), Some(id));
+        retry_due(&n);
+        let c = empty_child(&n, id, "t12-next");
+        accept(&n, &c).expect("the next block, once the row reads again and the retry is due");
+        assert_eq!(applied_tip(&n), Some(c.block_hash()), "B connected with it");
     }
     // At/after the activation: BIP30 reads every outpoint the block creates.
     {
@@ -146,10 +159,13 @@ fn utxo_read_failure_while_connecting_is_not_a_verdict() {
         let err = accept(&n, &b).expect_err("BIP30 cannot be evaluated");
         assert!(!err.contains("invalid in its own chain context"), "not a verdict: {err}");
         assert_no_verdict(&n, &id, "BIP30 lookup");
+        assert!(n.dag.read().is_no_verdict_parked(&id) && n.store.has_block_body(&id).unwrap());
         let db = n.store.db();
         db.delete_cf(db.cf_handle("utxo").unwrap(), utxo_row_key(&cb, 0)).unwrap();
-        accept(&n, &b).expect("the same block once the row is gone");
-        assert_eq!(applied_tip(&n), Some(id));
+        retry_due(&n);
+        let c = empty_child(&n, id, "t12-bip30-next");
+        accept(&n, &c).expect("the next block, once the row is gone and the retry is due");
+        assert_eq!(applied_tip(&n), Some(c.block_hash()), "B connected with it");
     }
 }
 
@@ -235,9 +251,15 @@ fn coinbase_height_read_failure_never_skips_maturity() {
     assert_no_verdict(&n, &id, "coinbase height lookup");
     assert_eq!(applied_tip(&n), Some(b1.block_hash()), "not applied");
     n.store.put_coinbase_info(&cb, 1).unwrap();
-    let err = accept(&n, &b2).expect_err("immature");
-    assert!(err.contains("coinbase maturity"), "{err}");
-    assert!(n.store.invalid_block_reason(&id).unwrap().is_some(), "now a genuine verdict, persisted");
+    // Review of the F1 hotfix: B2 is kept and parked without a verdict, and
+    // judged at its (bounded) retry, not by a re-sent copy.
+    assert!(n.dag.read().is_no_verdict_parked(&id));
+    retry_due(&n);
+    let c = empty_child(&n, id, "t12-cb-next");
+    let _ = accept(&n, &c);
+    let reason = n.store.invalid_block_reason(&id).unwrap().expect("now a genuine verdict, persisted");
+    assert!(reason.contains("coinbase maturity"), "immature: {reason}");
+    assert_eq!(applied_tip(&n), Some(b1.block_hash()));
 }
 
 // ── B1-T13: classify witness-dependent failures by curability ──────────────
@@ -707,13 +729,27 @@ fn relative_timelock_confirmation_read_failure_is_not_a_verdict() {
             corrupt_row(&n, "tx_index", &pcoin.0, bytes);
         }
         match gnb::accept::validate_block_in_view_classified_at(view, &b, activation::NEVER) {
-            Err(gnb::accept::ConnectFailure::Storage(m)) => assert!(m.contains("storage") || m.contains("tx-index"), "{what}: {m}"),
+            Err(gnb::accept::ConnectFailure::Storage(m)) => {
+                let m = m.to_string();
+                assert!(m.contains("storage") || m.contains("tx-index"), "{what}: {m}")
+            }
             other => panic!("{what}: expected a storage failure, got {other:?}"),
         }
-        let err = accept(&n, &b).expect_err(what);
+        // The first case parks B (kept, not marked); the second meets it
+        // in the DAG and is retried there once due.
+        retry_due(&n);
+        let err = if n.dag.read().has_block(&id) {
+            let c = empty_child(&n, id, &format!("t12-older-{what}"));
+            let _ = accept(&n, &c);
+            assert_eq!(applied_tip(&n), Some(gh), "{what}");
+            n.store.no_verdict_record(&id).expect("no verdict recorded").reason
+        } else {
+            accept(&n, &b).expect_err(what)
+        };
         assert!(!err.contains("invalid in its own chain context"), "{what}: not a verdict: {err}");
         assert_no_verdict(&n, &id, what);
         assert!(!n.dag.read().is_body_pending(&id), "{what}: not waiting for another body either");
+        assert!(n.dag.read().is_no_verdict_parked(&id), "{what}: parked without a verdict");
     }
     n.store.put_tx_index(&pcoin.0, &gh, 0).unwrap();
     let e = classify_below(&n, &b);

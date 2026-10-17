@@ -16,6 +16,9 @@ ExecStart=/opt/gnb/bin/gnb-launch
 Restart=always
 RestartSec=5
 LimitNOFILE=65536
+# Secret keys are kept in mlock()ed pages (audit CRY-4, docs/RUNNING.md
+# "Secret key memory"): a few pages plus two per concurrent P2P handshake.
+LimitMEMLOCK=16M
 # 64 MiB per mining thread plus ~1-2 GB for the node.
 MemoryMax=6G
 Nice=10

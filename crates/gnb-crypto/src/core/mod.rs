@@ -3099,3 +3099,21 @@ impl Drop for RealExpectedBitsGuard {
 pub fn scoped_real_expected_bits() -> RealExpectedBitsGuard {
     RealExpectedBitsGuard { previous: REAL_EXPECTED_BITS.with(|c| c.replace(true)) }
 }
+
+// Test seam of package P5-G, kept at the END of the file like the fixtures
+// above (audit WAL-5: the code the browser wallet core compiles keeps its
+// line numbers).
+#[cfg(feature = "test-pow-limit")]
+impl Block {
+    /// TEST FIXTURES ONLY (`test-pow-limit`): forget this block's verified
+    /// proof of work in the process cache, as a restart of the node does, so
+    /// a test can tell whether the node evaluates the proof again
+    /// ([`Block::pow_is_cached`] afterwards).
+    pub fn test_only_forget_pow(&self) {
+        let id = self.block_hash();
+        if let Ok(mut cache) = pow_cache().lock() {
+            cache.set.remove(&id);
+            cache.order.retain(|x| *x != id);
+        }
+    }
+}

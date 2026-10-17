@@ -21,6 +21,7 @@ use sha3::{Digest, Sha3_256};
 use zeroize::Zeroizing;
 
 use crate::crypto;
+use crate::crypto::SecretBytes;
 
 /// On-disk identity file magic (format version 1).
 const IDENTITY_MAGIC: &[u8; 8] = b"GNBPQID1";
@@ -41,19 +42,27 @@ pub fn fingerprint(public_key: &[u8]) -> [u8; 32] {
 }
 
 /// The node's hybrid ML-DSA-65 ‖ Falcon-1024 transport identity.
+///
+/// CRY-4: the secret key is held for the node's whole run, so it lives in a
+/// [`SecretBytes`] region: locked in RAM where the platform allows (never
+/// swapped, excluded from core dumps) and wiped before release, like
+/// Bitcoin Core's keys in `secure_allocator` memory. It is generated in
+/// place there and never exists as a plain `Vec`.
 pub struct PqIdentity {
     public_key: Vec<u8>,
-    secret_key: Zeroizing<Vec<u8>>,
+    secret_key: SecretBytes,
 }
+
+gnb_secret::assert_not_copy_or_clone!(PqIdentity);
 
 impl PqIdentity {
     /// Fresh random identity.
     pub fn generate() -> Result<Self, String> {
-        let (pk, sk) = crypto::generate_keypair();
-        Self::from_parts(pk, Zeroizing::new(sk))
+        let (pk, sk) = crypto::generate_keypair_secret();
+        Self::from_parts(pk, sk)
     }
 
-    fn from_parts(public_key: Vec<u8>, secret_key: Zeroizing<Vec<u8>>) -> Result<Self, String> {
+    fn from_parts(public_key: Vec<u8>, secret_key: SecretBytes) -> Result<Self, String> {
         if !crypto::is_hybrid_public_key(&public_key) {
             return Err("PQ identity key is not a hybrid ML-DSA-65 ‖ Falcon-1024 key".into());
         }
@@ -105,14 +114,15 @@ fn encode_identity(pk: &[u8], sk: &[u8]) -> Zeroizing<Vec<u8>> {
     out
 }
 
-fn decode_identity(bytes: &[u8]) -> Option<(Vec<u8>, Zeroizing<Vec<u8>>)> {
+fn decode_identity(bytes: &[u8]) -> Option<(Vec<u8>, SecretBytes)> {
     let rest = bytes.strip_prefix(IDENTITY_MAGIC.as_slice())?;
     let (pk, rest) = take_field(rest)?;
     let (sk, rest) = take_field(rest)?;
     if !rest.is_empty() {
         return None;
     }
-    Some((pk.to_vec(), Zeroizing::new(sk.to_vec())))
+    // CRY-4: straight from the (wiping) file buffer into secret memory.
+    Some((pk.to_vec(), SecretBytes::from_slice(sk)))
 }
 
 fn take_field(buf: &[u8]) -> Option<(&[u8], &[u8])> {

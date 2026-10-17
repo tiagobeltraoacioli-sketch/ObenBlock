@@ -36,6 +36,15 @@
 //! minimum chain work, anchor and operator settings) therefore compute the
 //! same pin whatever the arrival order, and a restart rebuilds it from the
 //! persisted (source, checkpoint) rows (`powit::load_finality_index`).
+//!
+//! Cost: one computation is linear in the recorded candidates and their
+//! sources (`tests::measure_pin_computation_cost`: about 26 ms for 10,000
+//! candidates in a debug build). A candidate is one finalized checkpoint,
+//! at most one per checkpoint interval of a chain (60 blocks on mainnet,
+//! about 17,500 a year), and candidates at or below the anchor never count:
+//! each release that moves the release finality checkpoint up retires the
+//! history below it from the pin's decision. Skipping them in the scan is
+//! the follow-up if the cost ever matters.
 
 use std::collections::{HashMap, HashSet};
 
@@ -453,9 +462,13 @@ mod tests {
         assert_eq!((o.pin, o.anchor), (None, AnchorStatus::Invalid));
     }
 
+    /// Cost probe for the pin computation (run with `--ignored
+    /// --nocapture`): 10,000 finalized checkpoints on one chain, each with
+    /// two sources. About 26 ms per computation in a debug build on the
+    /// reference machine (module docs, "Cost").
     #[test]
-    #[ignore]
-    fn tmp_cost_probe() {
+    #[ignore = "timing probe: prints the cost of one pin computation"]
+    fn measure_pin_computation_cost() {
         let none = HashSet::new();
         let mut d = GhostDAG::with_default_k();
         d.add_genesis(h(0, 0), 0);

@@ -168,8 +168,10 @@ fn a_chunked_powit_reorg_resumes_after_a_crash() {
     }
     assert_eq!(applied_tip(&n), Some(a_tip));
 
-    // Rolling A back takes two commits (16 + 4 blocks); the first apply
-    // chunk "crashes".
+    // Two commits: the rollback of A's 4 tip-most blocks, then the last 16
+    // rollbacks together with B's first 16 blocks (one batch, review of PR
+    // #15, finding 5: a reorg never commits its whole rollback alone); the
+    // next apply chunk "crashes".
     reorg::fault_injection::fail_after_commits(Some(2));
     let mut trigger = None;
     for blk in &fork[19..] {
@@ -181,7 +183,7 @@ fn a_chunked_powit_reorg_resumes_after_a_crash() {
     }
     reorg::fault_injection::fail_after_commits(None);
     let trigger = trigger.unwrap();
-    assert_eq!(applied_tip(&n), Some(gh), "stopped after the rollback chunks");
+    assert_eq!(applied_tip(&n), Some(fork[15].block_hash()), "stopped after the first apply chunk");
     assert!(has_state(&n, &trigger), "the trigger's state was committed with the first chunk");
 
     restart(&mut n);

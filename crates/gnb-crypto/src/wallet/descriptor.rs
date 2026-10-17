@@ -2,8 +2,14 @@
 //!
 //! This is a GnB script language, not Bitcoin script descriptors. Only the
 //! checksum follows BIP380: <https://github.com/bitcoin/bips/blob/master/bip-0380.mediawiki>.
-//! No key derivation or signing occurs. Exact public key bytes are preserved;
-//! the existing policy distinct-key predicate (including PF-4) is unchanged.
+//! No key derivation or signing occurs. Exact public key bytes are preserved.
+//! `create` builds policies with `SpendPolicy::new`, which also refuses a raw
+//! key and its envelope in one policy (PF-4: one signer in two encodings).
+//! `parse` (inspect, export, import) restores existing descriptors under the
+//! consensus policy checks only, so a descriptor an earlier release created
+//! with such a policy can still be inspected and its pool restored; its info
+//! then carries `twin_key_encodings: true` (unspendable from the second
+//! hardening height, docs/DESCRIPTORS.md).
 
 use crate::address::{Address, Network, PolicyAddress};
 use crate::core::policy::{PolicyTree, SpendPolicy, MAX_POLICY_KEYS};
@@ -117,7 +123,11 @@ enum Expression {
     Tree(PolicyTree),
 }
 
-struct Parser<'a>(&'a str);
+/// Descriptor text plus how policies are checked: `strict` (creating a
+/// descriptor) refuses one key listed twice in its two encodings (PF-4,
+/// `SpendPolicy::new`); otherwise (restoring one) only the consensus policy
+/// checks apply.
+struct Parser<'a>(&'a str, bool);
 impl<'a> Parser<'a> {
     fn token(&mut self, token: &str) -> Result<(), String> {
         self.0 = self
@@ -159,7 +169,15 @@ impl<'a> Parser<'a> {
             keys.push(self.key()?);
         }
         self.token(")")?;
-        SpendPolicy::new(threshold, keys, after, older).map_err(|e| e.to_string())
+        if self.1 {
+            SpendPolicy::new(threshold, keys, after, older).map_err(|e| e.to_string())
+        } else {
+            // The consensus checks of every height (threshold, key count,
+            // hybrid keys, byte-distinct keys): what the chain accepts as a
+            // policy output, so what an earlier release may have created.
+            SpendPolicy::decode(&SpendPolicy { threshold, pubkeys: keys, after, older }.encode())
+                .map_err(|e| e.to_string())
+        }
     }
     fn expression(&mut self) -> Result<Expression, String> {
         if self.0.starts_with("pkh(") {
@@ -195,8 +213,14 @@ pub struct Descriptor {
     text: String,
 }
 impl Descriptor {
-    /// Create from a checksum-free, canonical body.
+    /// Create from a checksum-free, canonical body. A policy (or tree
+    /// branch) that lists one key in its raw and its enveloped encoding is
+    /// refused (PF-4).
     pub fn create(body: &str) -> Result<Self, String> {
+        Self::build(body, true)
+    }
+
+    fn build(body: &str, strict: bool) -> Result<Self, String> {
         if body.len() > MAX_DESCRIPTOR_BYTES - 9 {
             return Err("descriptor too large".into());
         }
@@ -207,7 +231,7 @@ impl Descriptor {
         {
             return Err("noncanonical descriptor text".into());
         }
-        let mut parser = Parser(body);
+        let mut parser = Parser(body, strict);
         parser.token("gnbd1(")?;
         let end = parser.0.find(',').ok_or("missing descriptor network")?;
         let network = parse_network(&parser.0[..end])?;
@@ -224,6 +248,12 @@ impl Descriptor {
         })
     }
     /// Import requires exactly one valid checksum and canonical spelling.
+    ///
+    /// Unlike [`Self::create`], a policy that lists one key in both
+    /// encodings is restored (PF-4 review finding): an earlier release
+    /// created and exported such descriptors, and refusing them would abort
+    /// the whole pool's restore and hide the output its owner must move
+    /// before the second hardening height. [`Self::info`] flags it.
     pub fn parse(text: &str) -> Result<Self, String> {
         if text.len() > MAX_DESCRIPTOR_BYTES {
             return Err("descriptor too large".into());
@@ -232,7 +262,18 @@ impl Descriptor {
         if supplied.len() != 8 || checksum(body)? != supplied {
             return Err("descriptor checksum mismatch".into());
         }
-        Self::create(body)
+        Self::build(body, false)
+    }
+
+    /// PF-4: `true` when the policy, or a branch of the tree, lists one key
+    /// twice (raw and enveloped encodings, `policy::key_identity`). A spend
+    /// of that policy or branch is invalid from the second hardening height.
+    pub fn has_twin_key_encodings(&self) -> bool {
+        match &self.expression {
+            Expression::Pkh(_) => false,
+            Expression::Policy(policy) => policy.check_key_identities().is_err(),
+            Expression::Tree(tree) => tree.branches.iter().any(|b| b.check_key_identities().is_err()),
+        }
     }
     pub fn network(&self) -> Network {
         self.network
@@ -267,9 +308,15 @@ impl Descriptor {
                 )
             }
         };
-        json!({"descriptor": self.text, "network": network_name(self.network), "kind": kind,
+        let mut info = json!({"descriptor": self.text, "network": network_name(self.network), "kind": kind,
             "script_pubkey": hex::encode(script), "address": address, "bech32m": bech32m,
-            "requires_policy_tree_activation": activation})
+            "requires_policy_tree_activation": activation});
+        // Present only when true, so the info of every other descriptor is
+        // byte-for-byte what it was (docs/DESCRIPTORS.md).
+        if self.has_twin_key_encodings() {
+            info["twin_key_encodings"] = Value::Bool(true);
+        }
+        info
     }
 }
 

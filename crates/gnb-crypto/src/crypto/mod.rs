@@ -9,9 +9,14 @@
 //!   Signature:   3309 bytes
 
 use pqcrypto_mldsa::mldsa65;
-use pqcrypto_traits::sign::{PublicKey, SecretKey, DetachedSignature};
+// CRY-4: no `SecretKey` here. The pqcrypto `SecretKey` types are `Copy`
+// arrays that cannot be wiped; secret keys are generated and used through
+// `gnb_secret::pq` on `SecretBytes` buffers instead (see `hybrid_keypair_into`).
+use pqcrypto_traits::sign::{PublicKey, DetachedSignature};
 use sha3::{Sha3_256, Digest};
 use log::debug;
+
+pub use gnb_secret::SecretBytes;
 
 // Hybrid signature layout (Sprint B6b-1): ML-DSA-65 ‖ Falcon-1024.
 // Public key = mldsa_pk(1952) ‖ falcon_pk. Secret = mldsa_sk(4032) ‖ falcon_sk.
@@ -20,6 +25,14 @@ use log::debug;
 pub const MLDSA_PUBKEY_LEN: usize = 1952;
 pub const MLDSA_SECRET_LEN: usize = 4032;
 pub const MLDSA_SIG_LEN:    usize = 3309;
+/// Falcon-1024 public-key length.
+pub const FALCON_PUBKEY_LEN: usize = gnb_secret::pq::FALCON1024_PUBLIC_KEY_BYTES;
+/// Falcon-1024 secret-key length.
+pub const FALCON_SECRET_LEN: usize = gnb_secret::pq::FALCON1024_SECRET_KEY_BYTES;
+/// Enveloped hybrid public key: 4 + 1,952 + 1,793 = 3,749 bytes.
+pub const HYBRID_PUBLIC_KEY_LEN: usize = SUITE_HEADER_LEN + MLDSA_PUBKEY_LEN + FALCON_PUBKEY_LEN;
+/// Enveloped hybrid secret key: 4 + 4,032 + 2,305 = 6,341 bytes.
+pub const HYBRID_SECRET_KEY_LEN: usize = SUITE_HEADER_LEN + MLDSA_SECRET_LEN + FALCON_SECRET_LEN;
 
 // ── Crypto-agility suite-ID envelope (Roadmap #1) ────────────────────────────
 //
@@ -71,53 +84,65 @@ pub(crate) fn wrap_envelope(suite: u16, body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Assemble the repository-owned hybrid secret body under wiping ownership.
-/// The public key-generation APIs still return their final secret-key `Vec`
-/// for compatibility; this protects the additional pre-envelope copy.
-fn hybrid_secret_body(mldsa: &[u8], falcon: &[u8]) -> zeroize::Zeroizing<Vec<u8>> {
-    let mut body = zeroize::Zeroizing::new(Vec::with_capacity(
-        mldsa.len().saturating_add(falcon.len()),
-    ));
-    body.extend_from_slice(mldsa);
-    body.extend_from_slice(falcon);
-    body
+/// [`wrap_envelope`] of a secret body into a [`SecretBytes`] (CRY-4: the
+/// enveloped copy of a legacy raw secret key is the whole secret).
+pub(crate) fn wrap_envelope_secret(suite: u16, body: &[u8]) -> SecretBytes {
+    let mut out = SecretBytes::zeroed(SUITE_HEADER_LEN.saturating_add(body.len()));
+    out[..2].copy_from_slice(&SUITE_MAGIC);
+    out[2..SUITE_HEADER_LEN].copy_from_slice(&suite.to_le_bytes());
+    out[SUITE_HEADER_LEN..].copy_from_slice(body);
+    out
 }
 
-/// Best-effort wipe of a `pqcrypto` ML-DSA secret-key value (CRY-4).
+/// Generate the enveloped hybrid key pair in place (CRY-4).
 ///
-/// The upstream `SecretKey` types are `Copy` and have no `Drop`, so they can
-/// never be zeroized by ownership. Overwriting the variable with an all-zero
-/// key (and keeping the store observable through `black_box`) clears the one
-/// copy this crate holds. Copies the compiler may have made elsewhere are out
-/// of reach without `unsafe`; every repository-owned *byte buffer* holding
-/// secret material is wrapped in `Zeroizing` instead.
-fn wipe_mldsa_secret(sk: &mut mldsa65::SecretKey) {
-    if let Ok(zero) = mldsa65::SecretKey::from_bytes(&[0u8; MLDSA_SECRET_LEN]) {
-        *sk = zero;
-    }
-    std::hint::black_box(&*sk);
+/// The C key generators write each half of the secret key straight into
+/// `sk` (`gnb_secret::pq`): no `pqcrypto` `SecretKey` value (a `Copy` array
+/// that can never be wiped) and no other copy of the secret exists. ML-DSA-65
+/// first, then Falcon-1024, the order (and so the randomness consumption)
+/// of the historical `mldsa65::keypair()` / `falcon1024::keypair()` calls,
+/// so seeded key generation is byte-identical. Layout: `pk = B1 0C ‖ 01 00
+/// ‖ mldsa_pk ‖ falcon_pk`, `sk = B1 0C ‖ 01 00 ‖ mldsa_sk ‖ falcon_sk`.
+fn hybrid_keypair_into(pk: &mut [u8], sk: &mut [u8]) {
+    let mut header = [0u8; SUITE_HEADER_LEN];
+    header[..2].copy_from_slice(&SUITE_MAGIC);
+    header[2..].copy_from_slice(&SUITE_MLDSA65_FALCON1024.to_le_bytes());
+    pk[..SUITE_HEADER_LEN].copy_from_slice(&header);
+    sk[..SUITE_HEADER_LEN].copy_from_slice(&header);
+    let (mpk, fpk) = pk[SUITE_HEADER_LEN..].split_at_mut(MLDSA_PUBKEY_LEN);
+    let (msk, fsk) = sk[SUITE_HEADER_LEN..].split_at_mut(MLDSA_SECRET_LEN);
+    // PQClean's key generators cannot fail on these lengths (they return
+    // 0 unconditionally); the wrappers asserted the same.
+    gnb_secret::pq::mldsa65_keypair(mpk, msk).expect("ML-DSA-65 key generation");
+    gnb_secret::pq::falcon1024_keypair(fpk, fsk).expect("Falcon-1024 key generation");
 }
 
+/// A fresh hybrid key pair (OS randomness) whose secret key lives only in
+/// a [`SecretBytes`]: locked in RAM where the platform allows, wiped on
+/// drop, never `Copy` or `Clone` (CRY-4). The entry point for new code.
+pub fn generate_keypair_secret() -> (Vec<u8>, SecretBytes) {
+    let mut pk = vec![0u8; HYBRID_PUBLIC_KEY_LEN];
+    let mut sk = SecretBytes::zeroed(HYBRID_SECRET_KEY_LEN);
+    hybrid_keypair_into(&mut pk, &mut sk);
+    // The C code's expanded keys and temporaries are dead stack now.
+    gnb_secret::scrub_stack();
+    (pk, sk)
+}
+
+/// Compatibility entry point: [`generate_keypair_secret`] with the secret
+/// copied into a plain `Vec` that the CALLER must wipe. Kept for existing
+/// callers and tests; wallet, KES and node code use the `SecretBytes`
+/// variants.
 pub fn generate_keypair() -> (Vec<u8>, Vec<u8>) {
-    // Moves the allocation out of its owner (no copy); the caller owns it.
-    let (pk, mut sk) = generate_keypair_zeroizing();
-    (pk, std::mem::take(&mut *sk))
+    let (pk, sk) = generate_keypair_secret();
+    (pk, sk.to_vec())
 }
 
 /// [`generate_keypair`] returning the secret key under wiping ownership
-/// (CRY-4). New code should prefer this entry point; the plain-`Vec` variant
-/// is kept for source compatibility.
+/// (CRY-4, compatibility; prefer [`generate_keypair_secret`]).
 pub fn generate_keypair_zeroizing() -> (Vec<u8>, zeroize::Zeroizing<Vec<u8>>) {
-    let (mpk, mut msk) = mldsa65::keypair();
-    let (fpk, fsk) = falcon::keypair_zeroizing();
-    let mut pk = mpk.as_bytes().to_vec(); pk.extend_from_slice(&fpk);
-    let sk = hybrid_secret_body(msk.as_bytes(), &fsk);
-    wipe_mldsa_secret(&mut msk);
-    // Enveloped under suite 0x0001 (magic ‖ 01 00 ‖ body). The enveloped pk is
-    // THE public key everywhere (keygen, address hashing, script_sig) so
-    // addresses become suite-committing (design §2.4).
-    (wrap_envelope(SUITE_MLDSA65_FALCON1024, &pk),
-     zeroize::Zeroizing::new(wrap_envelope(SUITE_MLDSA65_FALCON1024, &sk)))
+    let (pk, sk) = generate_keypair_secret();
+    (pk, zeroize::Zeroizing::new(sk.to_vec()))
 }
 
 /// Deterministic keypair generation from a 32-byte seed.
@@ -135,7 +160,8 @@ pub fn generate_keypair_zeroizing() -> (Vec<u8>, zeroize::Zeroizing<Vec<u8>>) {
 /// - Different seeds → independent keypairs (ChaCha20 gives cryptographic
 ///   separation).
 /// - The RNG state does not leak across calls: a thread-local RAII guard
-///   owns cleanup and clears the override on return or unwind.
+///   owns cleanup and clears the override on return or unwind (and wipes
+///   the ChaCha20 state, CRY-4).
 ///
 /// Both halves are reproducible across platforms: ML-DSA-65 keygen is integer
 /// arithmetic, and Falcon-1024 is pinned to PQClean's `clean` variant, whose
@@ -155,17 +181,28 @@ pub fn generate_keypair_zeroizing() -> (Vec<u8>, zeroize::Zeroizing<Vec<u8>>) {
 /// Accepts any `&[u8]` of length >= 32. Only the first 32 bytes are used as
 /// the ChaCha20 key. Callers deriving seeds from BIP39 24-word phrases should
 /// pass the 64-byte PBKDF2 output truncated to or hashed to 32 bytes.
+///
+/// Compatibility entry point: the secret is a plain `Vec` copy the caller
+/// must wipe; prefer [`generate_keypair_from_seed_secret`].
 pub fn generate_keypair_from_seed(seed: &[u8]) -> Result<(Vec<u8>, Vec<u8>), CryptoError> {
-    // Moves the allocation out of its owner (no copy); the caller owns it.
-    let (pk, mut sk) = generate_keypair_from_seed_zeroizing(seed)?;
-    Ok((pk, std::mem::take(&mut *sk)))
+    let (pk, sk) = generate_keypair_from_seed_secret(seed)?;
+    Ok((pk, sk.to_vec()))
 }
 
 /// [`generate_keypair_from_seed`] returning the secret key under wiping
-/// ownership (CRY-4). Byte-identical output.
+/// ownership (CRY-4, compatibility). Byte-identical output.
 pub fn generate_keypair_from_seed_zeroizing(
     seed: &[u8],
 ) -> Result<(Vec<u8>, zeroize::Zeroizing<Vec<u8>>), CryptoError> {
+    let (pk, sk) = generate_keypair_from_seed_secret(seed)?;
+    Ok((pk, zeroize::Zeroizing::new(sk.to_vec())))
+}
+
+/// [`generate_keypair_from_seed`] with the secret key generated in place in
+/// a [`SecretBytes`] (CRY-4): the seed copy, the key and the seeded RNG
+/// state are wiped, the stack the C key generators used is scrubbed.
+/// Byte-identical output.
+pub fn generate_keypair_from_seed_secret(seed: &[u8]) -> Result<(Vec<u8>, SecretBytes), CryptoError> {
     if seed.len() < 32 {
         return Err(CryptoError::InvalidKey(
             format!("seed too short: {} bytes (need 32+)", seed.len())
@@ -177,17 +214,13 @@ pub fn generate_keypair_from_seed_zeroizing(
     // for simplicity.
     let mut seed32 = zeroize::Zeroizing::new([0u8; 32]);
     seed32.copy_from_slice(&seed[..32]);
-
+    let mut pk = vec![0u8; HYBRID_PUBLIC_KEY_LEN];
+    let mut sk = SecretBytes::zeroed(HYBRID_SECRET_KEY_LEN);
     // Both keygens consume the unchanged stream within a non-escaping scope.
     // Cleanup also removes any accidentally forgotten nested legacy guards.
-    let ((mpk, mut msk), (fpk, fsk)) = pqcrypto_internals::with_seeded_rng_scope(&seed32, || {
-        (mldsa65::keypair(), falcon::keypair_zeroizing())
-    });
-    let mut pk = mpk.as_bytes().to_vec(); pk.extend_from_slice(&fpk);
-    let sk = hybrid_secret_body(msk.as_bytes(), &fsk);
-    wipe_mldsa_secret(&mut msk);
-    Ok((wrap_envelope(SUITE_MLDSA65_FALCON1024, &pk),
-        zeroize::Zeroizing::new(wrap_envelope(SUITE_MLDSA65_FALCON1024, &sk))))
+    pqcrypto_internals::with_seeded_rng_scope(&seed32, || hybrid_keypair_into(&mut pk, &mut sk));
+    gnb_secret::scrub_stack();
+    Ok((pk, sk))
 }
 
 // ── Signed-message domain (A4-M-4) ──────────────────────────────────────────
@@ -276,28 +309,31 @@ pub fn sign(secret_key_bytes: &[u8], message: &[u8]) -> Result<Vec<u8>, CryptoEr
                 return Err(CryptoError::InvalidKey("hybrid secret key too short".into()));
             }
             let (msk, fsk) = sk_body.split_at(MLDSA_SECRET_LEN);
-            let mut out = mldsa_sign_checked(msk, message)?;
-            out.extend_from_slice(&falcon::sign(fsk, message)?);
-            Ok(wrap_envelope(suite, &out))
+            let signed = mldsa_sign_checked(msk, message)
+                .and_then(|mut out| { out.extend_from_slice(&falcon::sign(fsk, message)?); Ok(out) });
+            gnb_secret::scrub_stack();
+            Ok(wrap_envelope(suite, &signed?))
         }
         SUITE_MLDSA65_ONLY => {
             if sk_body.len() != MLDSA_SECRET_LEN {
                 return Err(CryptoError::InvalidKey("ML-DSA-only secret key wrong length".into()));
             }
-            let out = mldsa_sign_checked(sk_body, message)?;
-            Ok(wrap_envelope(suite, &out))
+            let out = mldsa_sign_checked(sk_body, message);
+            gnb_secret::scrub_stack();
+            Ok(wrap_envelope(suite, &out?))
         }
         _ => Err(CryptoError::InvalidKey(format!("unknown/reserved suite {:#06x}", suite))),
     }
 }
 
-/// ML-DSA-65 detached signature with an output-length check and a
-/// best-effort wipe of the `Copy` secret-key value (CRY-4/CRY-5).
+/// ML-DSA-65 detached signature with an output-length check (CRY-5),
+/// signed straight from the borrowed secret bytes (CRY-4: no `Copy`
+/// `SecretKey` value is built).
 fn mldsa_sign_checked(secret: &[u8], message: &[u8]) -> Result<Vec<u8>, CryptoError> {
-    let mut sk = mldsa65::SecretKey::from_bytes(secret)
-        .map_err(|_| CryptoError::InvalidKey("bad ML-DSA secret key".into()))?;
-    let sig = mldsa65::detached_sign(message, &sk).as_bytes().to_vec();
-    wipe_mldsa_secret(&mut sk);
+    let sig = gnb_secret::pq::mldsa65_sign(secret, message).map_err(|e| match e {
+        gnb_secret::pq::PqError::BadLength { .. } => CryptoError::InvalidKey("bad ML-DSA secret key".into()),
+        e => CryptoError::SignFailed(e.to_string()),
+    })?;
     if sig.len() != MLDSA_SIG_LEN {
         return Err(CryptoError::SignFailed(format!(
             "ML-DSA-65 signer returned {} bytes, expected {}", sig.len(), MLDSA_SIG_LEN
@@ -372,7 +408,7 @@ fn parse_envelope_or_legacy(b: &[u8]) -> (u16, &[u8]) {
 /// length, both fixed. An ENVELOPED pubkey of the same suite is always
 /// exactly `SUITE_HEADER_LEN` bytes LONGER, so length alone disambiguates
 /// legacy-vs-enveloped with no ambiguity — see [`parse_pubkey_envelope_or_legacy`].
-fn legacy_hybrid_pubkey_len() -> usize {
+pub(crate) fn legacy_hybrid_pubkey_len() -> usize {
     MLDSA_PUBKEY_LEN.saturating_add(falcon::pubkey_len())
 }
 
@@ -792,16 +828,21 @@ pub fn sign_bound(secret_key_bytes: &[u8], digest: &[u8; 32]) -> Result<Vec<u8>,
                 return Err(CryptoError::InvalidKey("hybrid secret key too short".into()));
             }
             let (msk, fsk) = sk_body.split_at(MLDSA_SECRET_LEN);
-            let mut out = mldsa_sign_checked(msk, &bound_component_message(suite, COMPONENT_MLDSA65, digest))?;
-            out.extend_from_slice(&falcon::sign(fsk, &bound_component_message(suite, COMPONENT_FALCON1024, digest))?);
-            Ok(wrap_envelope(suite, &out))
+            let signed = mldsa_sign_checked(msk, &bound_component_message(suite, COMPONENT_MLDSA65, digest))
+                .and_then(|mut out| {
+                    out.extend_from_slice(&falcon::sign(fsk, &bound_component_message(suite, COMPONENT_FALCON1024, digest))?);
+                    Ok(out)
+                });
+            gnb_secret::scrub_stack();
+            Ok(wrap_envelope(suite, &signed?))
         }
         SUITE_MLDSA65_ONLY => {
             if sk_body.len() != MLDSA_SECRET_LEN {
                 return Err(CryptoError::InvalidKey("ML-DSA-only secret key wrong length".into()));
             }
-            let out = mldsa_sign_checked(sk_body, &bound_component_message(suite, COMPONENT_MLDSA65, digest))?;
-            Ok(wrap_envelope(suite, &out))
+            let out = mldsa_sign_checked(sk_body, &bound_component_message(suite, COMPONENT_MLDSA65, digest));
+            gnb_secret::scrub_stack();
+            Ok(wrap_envelope(suite, &out?))
         }
         _ => Err(CryptoError::InvalidKey(format!("unknown/reserved suite {:#06x}", suite))),
     }
@@ -896,22 +937,29 @@ fn zeroizing_diversified_seed(master_seed: &[u8], index: u32) -> zeroize::Zeroiz
 }
 
 /// Diversified keypair for `index` — independent, unlinkable, deterministic.
+/// Compatibility entry point (plain `Vec` secret the caller must wipe);
+/// prefer [`diversified_keypair_secret`].
 pub fn diversified_keypair(master_seed: &[u8], index: u32)
     -> Result<(Vec<u8>, Vec<u8>), CryptoError>
 {
+    let (pk, sk) = diversified_keypair_secret(master_seed, index)?;
+    Ok((pk, sk.to_vec()))
+}
+
+/// [`diversified_keypair`] with the secret key in a [`SecretBytes`] (CRY-4).
+pub fn diversified_keypair_secret(master_seed: &[u8], index: u32)
+    -> Result<(Vec<u8>, SecretBytes), CryptoError>
+{
     let seed = zeroizing_diversified_seed(master_seed, index);
-    generate_keypair_from_seed(&seed[..])
+    generate_keypair_from_seed_secret(&seed[..])
 }
 
 /// Diversified address string for `index`.
 pub fn diversified_address(master_seed: &[u8], index: u32, testnet: bool)
     -> Result<String, CryptoError>
 {
-    let (pk, secret) = diversified_keypair(master_seed, index)?;
-    let secret = zeroize::Zeroizing::new(secret);
-    let address = address_from_pubkey(&pk, testnet);
-    drop(secret);
-    Ok(address)
+    let (pk, _secret) = diversified_keypair_secret(master_seed, index)?;
+    Ok(address_from_pubkey(&pk, testnet))
 }
 
 /// Format a 20-byte pubkey hash into a gnb1q/gnb1t address with 4-byte checksum.
@@ -937,17 +985,23 @@ pub enum CryptoError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// CRY-4: the hybrid secret key is generated in place in a
+    /// `SecretBytes` (the old pre-envelope body copy, `hybrid_secret_body`,
+    /// and the `Copy` pqcrypto `SecretKey` values are gone), and the memory
+    /// a dropped key leaves behind is all zeros (read after the drop through
+    /// the test quarantine).
     #[test]
-    fn hybrid_keygen_secret_body_has_exact_zeroizing_ownership() {
-        use zeroize::Zeroize;
-
-        let _: fn(&[u8], &[u8]) -> zeroize::Zeroizing<Vec<u8>> = hybrid_secret_body;
-        let mut body = hybrid_secret_body(&[0x11, 0x22], &[0x33, 0x44, 0x55]);
-
-        assert!(std::mem::needs_drop::<zeroize::Zeroizing<Vec<u8>>>());
-        assert_eq!(&body[..], &[0x11, 0x22, 0x33, 0x44, 0x55]);
-        body.zeroize();
-        assert!(body.is_empty() || body.iter().all(|byte| *byte == 0));
+    fn hybrid_secret_key_lives_in_secret_memory_and_is_wiped_on_drop() {
+        let q = gnb_secret::test_support::Quarantine::start();
+        let (pk, sk) = generate_keypair_secret();
+        assert_eq!((pk.len(), sk.len()), (HYBRID_PUBLIC_KEY_LEN, HYBRID_SECRET_KEY_LEN));
+        assert!(verify(&pk, b"m", &sign(&sk, b"m").unwrap()));
+        let (spk, ssk) = generate_keypair_from_seed_secret(&[0x31; 32]).unwrap();
+        assert!(verify(&spk, b"m", &sign(&ssk, b"m").unwrap()));
+        drop((sk, ssk));
+        let released = q.released();
+        assert!(released.len() >= 2, "both secret keys were secret regions");
+        assert!(q.all_released_zeroed(), "a dropped hybrid secret key left bytes behind");
     }
     #[test] fn sign_verify_roundtrip() {
         let (pk, sk) = generate_keypair();
@@ -1165,8 +1219,8 @@ mod tests {
 // guarded by the tripwire test + KAT below and scripts/falcon-clean-guard.sh.
 pub mod falcon {
     use pqcrypto_falcon::falcon1024;
-    use pqcrypto_traits::sign::{PublicKey, SecretKey, DetachedSignature};
-    use super::CryptoError;
+    use pqcrypto_traits::sign::{PublicKey, DetachedSignature};
+    use super::{CryptoError, SecretBytes};
 
     /// Falcon-1024 public-key length (bytes).
     pub fn pubkey_len() -> usize { falcon1024::public_key_bytes() }
@@ -1179,27 +1233,28 @@ pub mod falcon {
         pqcrypto_falcon::falconpadded1024::signature_bytes()
     }
 
-    /// Best-effort wipe of the `Copy` upstream secret-key value (see
-    /// `super::wipe_mldsa_secret`).
-    fn wipe_secret(sk: &mut falcon1024::SecretKey) {
-        let zeros = vec![0u8; falcon1024::secret_key_bytes()];
-        if let Ok(zero) = falcon1024::SecretKey::from_bytes(&zeros) {
-            *sk = zero;
-        }
-        std::hint::black_box(&*sk);
-    }
-
+    /// Compatibility entry point: [`keypair_secret`] with the secret copied
+    /// into a plain `Vec` the caller must wipe.
     pub fn keypair() -> (Vec<u8>, Vec<u8>) {
-        let (pk, mut sk) = keypair_zeroizing();
-        (pk, std::mem::take(&mut *sk))
+        let (pk, sk) = keypair_secret();
+        (pk, sk.to_vec())
     }
 
-    /// [`keypair`] with the secret key under wiping ownership (CRY-4).
+    /// [`keypair`] with the secret key under wiping ownership (CRY-4,
+    /// compatibility).
     pub fn keypair_zeroizing() -> (Vec<u8>, zeroize::Zeroizing<Vec<u8>>) {
-        let (pk, mut sk) = falcon1024::keypair();
-        let secret = zeroize::Zeroizing::new(sk.as_bytes().to_vec());
-        wipe_secret(&mut sk);
-        (pk.as_bytes().to_vec(), secret)
+        let (pk, sk) = keypair_secret();
+        (pk, zeroize::Zeroizing::new(sk.to_vec()))
+    }
+
+    /// A Falcon-1024 key pair generated in place in a [`SecretBytes`]
+    /// (CRY-4: no `Copy` `SecretKey` value).
+    pub fn keypair_secret() -> (Vec<u8>, SecretBytes) {
+        let mut pk = vec![0u8; super::FALCON_PUBKEY_LEN];
+        let mut sk = SecretBytes::zeroed(super::FALCON_SECRET_LEN);
+        gnb_secret::pq::falcon1024_keypair(&mut pk, &mut sk).expect("Falcon-1024 key generation");
+        gnb_secret::scrub_stack();
+        (pk, sk)
     }
 
     /// Falcon-1024 detached signature (compact encoding).
@@ -1209,10 +1264,18 @@ pub mod falcon {
     /// be a well-formed compact encoding (header byte, nonce, exactly framed
     /// coefficients) before it is returned; anything else is an error.
     pub fn sign(secret_key_bytes: &[u8], message: &[u8]) -> Result<Vec<u8>, CryptoError> {
-        let mut sk = falcon1024::SecretKey::from_bytes(secret_key_bytes)
-            .map_err(|_| CryptoError::InvalidKey("bad falcon secret key".into()))?;
-        let sig = falcon1024::detached_sign(message, &sk).as_bytes().to_vec();
-        wipe_secret(&mut sk);
+        // CRY-4: signed straight from the borrowed bytes; no `Copy`
+        // `SecretKey` value. The C signer's return code is checked too.
+        let sig = match gnb_secret::pq::falcon1024_sign(secret_key_bytes, message) {
+            Ok(sig) => sig,
+            Err(gnb_secret::pq::PqError::BadLength { .. }) => {
+                return Err(CryptoError::InvalidKey("bad falcon secret key".into()));
+            }
+            Err(e) => {
+                return Err(CryptoError::SignFailed(format!(
+                    "Falcon-1024 signer failed ({e}; corrupted secret key?)")));
+            }
+        };
         if sig.len() > falcon1024::signature_bytes() || !is_compact_signature_encoding(&sig) {
             return Err(CryptoError::SignFailed(format!(
                 "Falcon-1024 signer failed (returned {} bytes; corrupted secret key?)",
@@ -1532,6 +1595,9 @@ mod kat {
     use super::*;
     use pqcrypto_falcon::falcon1024;
     use pqcrypto_mldsa::mldsa65;
+    // Test fixtures build legacy keys with the wrappers directly (CRY-4
+    // keeps their `Copy` `SecretKey` out of production code only).
+    use pqcrypto_traits::sign::SecretKey;
     // NOTE: the `pqcrypto_traits::sign::{DetachedSignature, PublicKey, SecretKey}`
     // trait imports were removed here: the suite-envelope refactor replaced the
     // kat module's direct trait-method slicing with `parse_envelope(..)` body

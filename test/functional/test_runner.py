@@ -52,6 +52,7 @@ ALL_TESTS = [
     "mining_getblocktemplate_submitblock.py",
     "rpc_gettxoutsetinfo.py",
     "rpc_auth.py",
+    "feature_assumevalid.py",
     "feature_test_build_guard.py",
 ]
 

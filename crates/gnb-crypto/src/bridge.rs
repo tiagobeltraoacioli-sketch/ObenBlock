@@ -57,9 +57,7 @@ impl Vault {
         let s = recovery.len();
         let release = SpendPolicy::new(k, signers, 0, 0).map_err(|e| format!("release branch: {e}"))?;
         let recover = SpendPolicy::new(r, recovery, 0, older).map_err(|e| format!("recovery branch: {e}"))?;
-        if release.pubkeys.iter().any(|p| recover.pubkeys.contains(p)) {
-            return Err("a key may not be both a signer and a recovery key".into());
-        }
+        check_branch_keys(&release, &recover)?;
         let tree = PolicyTree::new(vec![release, recover]).map_err(|e| format!("tree: {e}"))?;
         let script = tree.script_pubkey();
         let address = crate::address::PolicyAddress::from_script(&script, network)
@@ -83,19 +81,50 @@ impl Vault {
         if self.network == "mainnet" { Network::Mainnet } else { Network::Testnet }
     }
 
-    /// The policy tree, checked against the published script.
+    /// The policy tree, checked against the published script and against
+    /// the key rules [`Vault::create`] enforces (PF-4): no branch lists one
+    /// key twice (raw and enveloped encodings are one signer, `policy::
+    /// key_identity`), and no key is both a signer and a recovery key.
+    ///
+    /// Every participant loads a published vault through here (`gnb-cli
+    /// vaultlock`, `vaultchecklock`, `vaultrelease`, ...) before funding it
+    /// or acting on it, so a hand-made vault file whose release branch is,
+    /// say, 2-of-[A enveloped, A raw, B] is refused: signers would see three
+    /// keys that differ byte-wise while A alone fills two slots (on a chain
+    /// below the second hardening height), and from that height every
+    /// release-branch spend of it is invalid. `PolicyTree::decode` itself
+    /// keeps the byte-wise rule of consensus decoding.
     pub fn tree(&self) -> Result<PolicyTree, String> {
         let tree = PolicyTree::decode(&hex::decode(&self.tree).map_err(|_| "vault tree hex")?)
             .map_err(|e| format!("vault tree: {e}"))?;
         if hex::encode(tree.script_pubkey()) != self.script {
             return Err("vault tree does not match its published script".into());
         }
+        let [release, recover] = tree.branches.as_slice() else {
+            return Err(format!("vault tree has {} branches; a vault has exactly 2", tree.branches.len()));
+        };
+        check_branch_keys(release, recover).map_err(|e| format!("vault tree: {e}"))?;
         Ok(tree)
     }
 
     pub fn script(&self) -> Result<Vec<u8>, String> {
         hex::decode(&self.script).map_err(|_| "vault script hex".into())
     }
+}
+
+/// The key rules of a vault's two branches (PF-4): each branch lists every
+/// signer once by identity (`SpendPolicy::check_key_identities`: a raw and
+/// an enveloped encoding of one key are the same signer), and no key of the
+/// release branch is a recovery key, compared by identity, not bytes.
+fn check_branch_keys(release: &SpendPolicy, recover: &SpendPolicy) -> Result<(), String> {
+    use crate::core::policy::key_identity;
+    release.check_key_identities().map_err(|e| format!("release branch: {e}"))?;
+    recover.check_key_identities().map_err(|e| format!("recovery branch: {e}"))?;
+    let recovery_ids: Vec<_> = recover.pubkeys.iter().map(|p| key_identity(p)).collect();
+    if release.pubkeys.iter().any(|p| recovery_ids.contains(&key_identity(p))) {
+        return Err("a key may not be both a signer and a recovery key".into());
+    }
+    Ok(())
 }
 
 /// A lock found in a transaction.
@@ -233,6 +262,62 @@ mod tests {
         assert!(Vault::create(Network::Testnet, 2, k.clone(), 1, vec![k[0].clone()], 10).is_err(), "shared key");
         assert!(Vault::create(Network::Testnet, 2, k.clone(), 1, vec![crypto::generate_keypair().0], 0).is_err(),
                 "recovery needs older");
+    }
+
+    /// A vault file with `tree` replaced by `branches` (script and address
+    /// recomputed, so only the key rules can refuse it): what a dishonest
+    /// operator publishes by hand, past `Vault::create`.
+    pub(super) fn crafted(v: &Vault, branches: Vec<SpendPolicy>) -> Vault {
+        let tree = PolicyTree { branches };
+        let script = tree.script_pubkey();
+        Vault {
+            tree: hex::encode(tree.encode()),
+            script: hex::encode(&script),
+            address: crate::address::PolicyAddress::from_script(&script, v.network()).unwrap().to_string(),
+            ..v.clone()
+        }
+    }
+
+    /// PF-4 (review finding): `Vault::tree`, which every participant runs on
+    /// a published vault file before funding it (`gnb-cli load_vault`),
+    /// refuses a release branch that lists one key twice (raw and
+    /// enveloped: three byte-distinct keys, but A alone fills two of the
+    /// 2-of-3 slots) and a key that is both a signer and a recovery key in
+    /// two encodings, like `Vault::create`. Before the fix it checked only
+    /// that the tree hashes to the published script.
+    #[test]
+    fn a_published_vault_with_one_key_twice_is_refused() {
+        let (v, signers, cold) = vault();
+        let a = signers[0].0.clone();
+        let a_raw = a[crypto::SUITE_HEADER_LEN..].to_vec();
+        let decoded = |p: SpendPolicy| SpendPolicy::decode(&p.encode()).expect("consensus decoding accepts it");
+        let recovery = decoded(SpendPolicy { threshold: 1, pubkeys: cold.iter().map(|k| k.0.clone()).collect(),
+            after: 0, older: 1_000 });
+        let twin_release = decoded(SpendPolicy { threshold: 2, pubkeys: vec![a.clone(), a_raw.clone(),
+            signers[1].0.clone()], after: 0, older: 0 });
+        let bad = crafted(&v, vec![twin_release, recovery.clone()]);
+        assert_ne!(bad.script, v.script);
+        let e = bad.tree().unwrap_err();
+        assert!(e.contains("release branch") && e.contains("DuplicateKey"), "{e}");
+
+        // A signer that is also a recovery key, in its other encoding.
+        let release = decoded(SpendPolicy { threshold: 2, pubkeys: signers.iter().map(|k| k.0.clone()).collect(),
+            after: 0, older: 0 });
+        let mut shared = recovery.clone();
+        shared.pubkeys.push(a_raw);
+        let shared = decoded(shared);
+        let e = crafted(&v, vec![release.clone(), shared]).tree().unwrap_err();
+        assert!(e.contains("both a signer and a recovery key"), "{e}");
+
+        // A crafted vault with only honest keys (the same tree as `v`) loads.
+        let honest = crafted(&v, vec![release, recovery]);
+        assert_eq!(honest.script, v.script);
+        assert!(honest.tree().is_ok());
+        // So does `v` itself, and a vault of three branches is refused.
+        assert!(v.tree().is_ok());
+        let t = v.tree().unwrap();
+        let three = crafted(&v, vec![t.branches[0].clone(), t.branches[1].clone(), t.branches[1].clone()]);
+        assert!(three.tree().is_err_and(|e| e.contains("exactly 2")));
     }
 
     #[test]

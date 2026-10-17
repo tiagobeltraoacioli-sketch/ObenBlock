@@ -120,6 +120,20 @@ class Choose(unittest.TestCase):
         text = mcw.report(readings, cand, value, 2_880, warnings)
         self.assertIn("pub const MIN_CHAIN_WORK: u128 = 5_200_000;", text)
         self.assertIn("--minimumchainwork 4f5880", text)
+        # The assumed-valid block is the same candidate block (P5-G).
+        self.assertEqual(cand["height"], 9_000 - 1 - 2_880)
+        self.assertIn(f'Some(AssumedValidBlock::from_hex("{cand["hash"]}", {cand["height"]}));', text)
+        self.assertIn(f"--assumevalid {cand['hash']}", text)
+        # So is the release finality checkpoint (P5-A2, weak subjectivity).
+        self.assertIn(f'Some(ReleaseCheckpoint::from_hex("{cand["hash"]}", {cand["height"]}));', text)
+
+    def test_assume_valid_line_refuses_a_malformed_id(self):
+        good = {"hash": h(0xABCDEF), "height": 5}
+        self.assertIn(h(0xABCDEF), mcw.assume_valid_line(good))
+        for bad in [{"hash": h(0xABCDEF).upper(), "height": 5}, {"hash": h(5)[:-2], "height": 5},
+                    {"hash": h(5), "height": 0}, {"hash": None, "height": 5}]:
+            with self.assertRaises(mcw.ReadingError):
+                mcw.assume_valid_line(bad)
 
 
 class Transport(unittest.TestCase):
