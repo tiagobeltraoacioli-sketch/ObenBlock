@@ -3,7 +3,7 @@ name = "gnb"
 version = "0.1.2"
 edition = "2021"
 authors = ["GnB developers"]
-description = "GnB (Gödel and Bell): post-quantum proof-of-work BlockDAG node — GnB-SMH sequential memory-hard PoW, hybrid Falcon-1024 + ML-DSA-65 signatures, GhostDAG"
+description = "ObenBlock (OBB) full node: post-quantum proof-of-work BlockDAG — GhostDAG, PoWit witness finality, hybrid Falcon-1024 + ML-DSA-65 signatures. Relaunch in progress: this version still mines GnB-SMH and uses the GnB identifiers until SHA-256d lands (docs/DESIGN-obenblock.md)"
 license = "AGPL-3.0-or-later"
 publish = false
 

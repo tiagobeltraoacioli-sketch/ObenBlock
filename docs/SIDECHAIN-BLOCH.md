@@ -1,6 +1,9 @@
 # GnB ↔ Bloch sidechain
 
-How GNB moves to the Bloch L2 (as wGnB) and back. Two models:
+How GNB moves to the Bloch L2 (as wGnB) and back. This is the bridge of the
+GnB chain as the code runs today; the ObenBlock relaunch
+([DESIGN-obenblock.md](DESIGN-obenblock.md)) does not cover it yet. Two
+models:
 
 - **v1, set-once signers:** no new consensus rule on Bloch, and on GnB only
   the policy tree. Build first.

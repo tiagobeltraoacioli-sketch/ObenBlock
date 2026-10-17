@@ -1,10 +1,10 @@
-# GnB PQ-PSBT version 1
+# ObenBlock PQ-PSBT version 1
 
-PQ-PSBT carries a GnB unsigned transaction and public policy-signing metadata
-between creator, updater, signer, combiner, finalizer and extractor roles. It
-contains no private keys. This is a new GnB wallet format, **not Bitcoin PSBT
-wire compatibility**, and does not change consensus, activation heights,
-transaction IDs or signature messages.
+PQ-PSBT carries an unsigned ObenBlock transaction and public policy-signing
+metadata between creator, updater, signer, combiner, finalizer and extractor
+roles. It contains no private keys. This is a wallet format of ObenBlock,
+introduced in GnB, **not Bitcoin PSBT wire compatibility**, and does not
+change consensus, activation heights, transaction IDs or signature messages.
 
 For CLI, RPC and WASM examples, see [PQ-PSBT usage](PQ-PSBT-USAGE.md).
 

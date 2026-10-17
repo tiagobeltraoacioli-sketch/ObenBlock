@@ -1,5 +1,9 @@
 # GnB mainnet readiness (proposal, not applied)
 
+This proposal concerns the GnB chain. ObenBlock relaunches the code base with
+a clean genesis ([DESIGN-obenblock.md](DESIGN-obenblock.md)) and has no
+mainnet yet.
+
 Status on 14 Oct 2026 (read-only, from the running node):
 
 | | |

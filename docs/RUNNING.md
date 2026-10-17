@@ -1,4 +1,10 @@
-# Running a GnB node
+# Running a node
+
+This guide covers the node as the code runs today: the `gnb` binaries on the
+GnB network. The ObenBlock relaunch renames the binaries (`obenblock`,
+`obenblock-cli`, `obenblock-wallet`), moves the default ports (18110, 18210)
+and starts from a new genesis ([DESIGN-obenblock.md](DESIGN-obenblock.md));
+none of that is implemented yet.
 
 ## Hardening activation: upgrade before mainnet height 17,500
 

@@ -51,7 +51,7 @@ Validation on Rust/Cargo 1.94.1, native x86_64 macOS:
 
 ## Wallet Miri annotation
 
-[Base CI run 38893867410](https://github.com/gnb-smh/gnb-smh/actions/runs/38893867410)
+[Base CI run 38893867410](https://github.com/gnb-smh/ObenBlock/actions/runs/38893867410)
 failed the i686 Miri wallet test
 `bridgelock_signs_the_version_of_the_target_height` on unsupported foreign
 function `PQCLEAN_MLDSA65_CLEAN_crypto_sign_keypair`. The local copy is

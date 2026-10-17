@@ -22,3 +22,4 @@ pub mod wallet;
 pub mod hd_wallet;
 pub mod util;
 pub mod bridge;   // Bloch bridge v1, GnB side: vault, lock and release shapes
+pub mod bloch_anchor; // Bloch finalized checkpoints anchored in GnB-SMH transactions

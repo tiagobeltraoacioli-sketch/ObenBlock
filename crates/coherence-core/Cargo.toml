@@ -2,7 +2,7 @@
 name = "coherence-core"
 version = "0.1.0"
 edition = "2021"
-description = "Bloch-SIS Coherence shielded-pool primitives (notes, SHAKE-256 commitments/nullifiers/Merkle, spend statement). Lean + portable: shared by the node, the SP1 guest prover, and the mobile wallet — single source of truth."
+description = "ObenBlock Coherence shielded-pool primitives, inherited from Bloch-SIS (notes, SHAKE-256 commitments/nullifiers/Merkle, spend statement). Lean + portable: shared by the node, the SP1 guest prover, and the mobile wallet — single source of truth."
 license = "AGPL-3.0-or-later"
 
 [dependencies]

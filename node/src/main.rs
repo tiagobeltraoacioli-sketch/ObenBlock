@@ -66,7 +66,7 @@ use tokio::sync::{mpsc, broadcast};
 
 #[derive(Parser)]
 #[command(name = "gnb")]
-#[command(about = "GnB (Gödel and Bell) — GnB-SMH memory-hard PoW · Falcon‖ML-DSA · GhostDAG")]
+#[command(about = "ObenBlock node (relaunch in progress; this build: GnB-SMH memory-hard PoW) · Falcon‖ML-DSA · GhostDAG")]
 #[command(version)]
 struct Cli {
     #[arg(long)]                                         mine: bool,
@@ -621,9 +621,9 @@ async fn main() {
 
     println!();
     println!("  ╔══════════════════════════════════════════════════╗");
-    println!("  ║               ◆  G n B  ◆                        ║");
+    println!("  ║             ◆  O b e n B l o c k  ◆              ║");
     println!("  ║  GnB-SMH memory-hard PoW · Falcon‖ML-DSA · DAG   ║");
-    println!("  ║   Fair launch. Post-quantum. 10M GNB hard cap.   ║");
+    println!("  ║  Post-quantum. ObenBlock relaunch in progress.   ║");
     println!("  ╚══════════════════════════════════════════════════╝");
     println!();
 

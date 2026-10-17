@@ -1,10 +1,13 @@
-# GnB address v2
+# ObenBlock address v2
 
-This document specifies an opt-in representation of existing GnB payment
+This document specifies an opt-in representation of existing ObenBlock payment
 destinations. It changes no output script, transaction byte, signature message,
 key derivation, or consensus rule. A recipient must explicitly choose v2 output
 until the application supports it. Existing legacy address formats remain
-accepted with their existing bytes and checksums.
+accepted with their existing bytes and checksums. The strings below use the
+`gnb` prefixes the code implements today; ObenBlock's address prefixes are
+specified in [DESIGN-obenblock.md](DESIGN-obenblock.md) §2 and not implemented
+yet.
 
 The checksum and alphabet are the generic Bech32m format from
 [BIP350](https://github.com/bitcoin/bips/blob/master/bip-0350.mediawiki#bech32m),

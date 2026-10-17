@@ -60,7 +60,7 @@ fn label(k: &str, v: &str) {
 
 #[derive(Parser)]
 #[command(name = "gnb-wallet")]
-#[command(about = "Bloch Protocol Wallet — hybrid ML-DSA-65 + Falcon-1024 signatures")]
+#[command(about = "ObenBlock wallet — hybrid ML-DSA-65 + Falcon-1024 signatures")]
 #[command(version)]
 #[command(disable_help_flag = false)]
 struct Cli {

@@ -1,6 +1,6 @@
 # Public descriptors and pool files
 
-GnB static descriptors record existing public-key or policy output identities.
+ObenBlock static descriptors record existing public-key or policy output identities.
 They contain no private keys and do not derive new keys. Restoring a pool
 restores the listed public identities only, not spending keys, transaction
 history, balances, or a persistent node wallet index. Keep the encrypted

@@ -2,7 +2,7 @@
 name = "gnb-secret"
 version = "0.1.0"
 edition = "2021"
-description = "GnB secret memory (audit CRY-4): non-Copy, non-Clone byte buffers for key material that are locked in RAM where the platform allows (mlock, excluded from core dumps) and wiped before release, plus ML-DSA-65 / Falcon-1024 key generation and signing directly on those buffers (no Copy pqcrypto SecretKey values)"
+description = "ObenBlock secret memory (audit CRY-4): non-Copy, non-Clone byte buffers for key material that are locked in RAM where the platform allows (mlock, excluded from core dumps) and wiped before release, plus ML-DSA-65 / Falcon-1024 key generation and signing directly on those buffers (no Copy pqcrypto SecretKey values)"
 license = "AGPL-3.0-or-later"
 publish = false
 

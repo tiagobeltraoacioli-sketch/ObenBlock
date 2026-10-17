@@ -2,7 +2,7 @@
 name = "gnb-wallet-wasm"
 version = "0.1.0"
 edition = "2021"
-description = "GnB browser wallet core: keystores, coin selection and hybrid ML-DSA-65 + Falcon-1024 signing for WebAssembly (wasm32-wasip1)"
+description = "ObenBlock browser wallet core: keystores, coin selection and hybrid ML-DSA-65 + Falcon-1024 signing for WebAssembly (wasm32-wasip1)"
 license = "AGPL-3.0-or-later"
 publish = false
 

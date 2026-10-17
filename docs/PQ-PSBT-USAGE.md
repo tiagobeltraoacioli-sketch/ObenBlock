@@ -1,6 +1,6 @@
 # PQ-PSBT usage
 
-GnB PQ-PSBT is a custom format for one policy or one selected tree branch.
+ObenBlock's PQ-PSBT is a custom format for one policy or one selected tree branch.
 Coverage/review remains partial; see the [frontend brief](security/round-3/pqpsbt-frontends.md)
 and [browser brief](security/round-3/pqpsbt-browser.md). These developer
 interfaces add no PQ-PSBT wallet UI, QR exchange or HWI integration.

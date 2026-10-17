@@ -1,4 +1,8 @@
-# GnB peer-to-peer security
+# ObenBlock peer-to-peer security
+
+The protocol ids, topics and ports below are GnB's, as the code runs today.
+ObenBlock's (`/obenblock/pq/1.0.0`, ports 18110 and 18210) are specified in
+[DESIGN-obenblock.md](DESIGN-obenblock.md) §2 and not implemented yet.
 
 ## Transport: `/gnb/pq/2.0.0`
 

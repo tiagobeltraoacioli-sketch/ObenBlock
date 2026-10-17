@@ -1,9 +1,11 @@
 [workspace]
 resolver = "2"
-# GnB — Gödel and Bell. A proof-of-work hard fork of the Bloch codebase:
-# the Bloch BlockDAG node (GhostDAG, hybrid ML-DSA-65 ‖ Falcon-1024
-# transactions) with its proof of work replaced by GnB-SMH, a sequential
-# memory-hard SHAKE-256 function, and a fresh genesis.
+# ObenBlock: a post-quantum proof-of-work BlockDAG, relaunched from the GnB
+# code base with SHA-256d proof of work, PoWit finality and a clean genesis
+# (docs/DESIGN-obenblock.md; in progress). The code still runs GnB, a hard
+# fork of the Bloch codebase: the Bloch BlockDAG node (GhostDAG, hybrid
+# ML-DSA-65 ‖ Falcon-1024 transactions) with its proof of work replaced by
+# GnB-SMH, a sequential memory-hard SHAKE-256 function, and a fresh genesis.
 members = [
     "crates/gnb-smh",         # the proof of work: GnB-SMH v1 + difficulty (ASERT)
     "crates/gnb-crypto",      # consensus types, transactions, wallet, signatures

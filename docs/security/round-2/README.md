@@ -1,7 +1,7 @@
 # Security hardening — round 2
 
 Base: `f607e077f035733509aa9a6c549ee36b26f61870`, the owner's merge of
-[PR #10](https://github.com/gnb-smh/gnb-smh/pull/10) at
+[PR #10](https://github.com/gnb-smh/ObenBlock/pull/10) at
 2026-10-16 13:53:26 UTC. Integration branch:
 `codex/security-round-2-20261016`, codegen-units **41**.
 

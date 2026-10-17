@@ -1,0 +1,54 @@
+# Anchors the Bloch finalized checkpoint in a GnB-SMH transaction, one run per
+# timer tick (bloch-anchor.timer; docs/BLOCH-ANCHOR.md).
+#   /opt/gnb/bin/gnb-cli, /opt/gnb/bin/bloch-anchor.py
+#   /etc/gnb/bloch-anchor.env       BLOCH_RPC (comma-separated, >= 2 sources),
+#                                   BLOCH_MIN_AGREE, BLOCH_ANCHOR_EVERY_EPOCHS
+#   /etc/gnb/bloch-anchor/wallet.json      anchoring keystore (owner gnb-anchor, 0600)
+#   /etc/gnb/bloch-anchor/wallet-password  its password (root, 0600; passed as a credential)
+#   /var/lib/gnb-anchor/state.json  last anchored checkpoint (StateDirectory)
+# The local node's RPC (127.0.0.1:17210, gnb-cli's default) is used for the
+# wallet's UTXOs and the broadcast.
+[Unit]
+Description=Anchor the Bloch finalized checkpoint in GnB-SMH
+After=network-online.target gnb-node.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=gnb-anchor
+Group=gnb-anchor
+EnvironmentFile=/etc/gnb/bloch-anchor.env
+LoadCredential=wallet-password:/etc/gnb/bloch-anchor/wallet-password
+Environment=GNB_WALLET_PASSWORD_FILE=%d/wallet-password
+StateDirectory=gnb-anchor
+ExecStart=/usr/bin/python3 -I /opt/gnb/bin/bloch-anchor.py --bloch-rpc ${BLOCH_RPC} --min-agree ${BLOCH_MIN_AGREE} --every-epochs ${BLOCH_ANCHOR_EVERY_EPOCHS} --wallet /etc/gnb/bloch-anchor/wallet.json --state /var/lib/gnb-anchor/state.json --gnb-cli /opt/gnb/bin/gnb-cli
+# Exit 2 (Bloch sources down or disagreeing) is retried on the next tick.
+SuccessExitStatus=2
+TimeoutStartSec=15min
+MemoryMax=1G
+UMask=0077
+
+# ── Sandboxing (as gnb-node.service; deploy/test_deploy_files.py) ───────────
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

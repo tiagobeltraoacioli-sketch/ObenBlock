@@ -1,7 +1,14 @@
-# GNB monetary policy
+# ObenBlock monetary policy
 
 Consensus rules, defined in `crates/gnb-crypto/src/core/tokenomics.rs` and
-`crates/gnb-crypto/src/core/carryover.rs`.
+`crates/gnb-crypto/src/core/carryover.rs`. They are GnB's (ticker GNB), as
+the code implements them today. The ObenBlock relaunch (ticker OBB) keeps the
+same cap and allocations. Its genesis carries no balance from the GnB chain
+and pays the Bloch carryover exactly as GnB's genesis does: the same
+snapshot, conversion and keys. It adds a slow start, in which the subsidy
+ramps up over the first 5,760 blocks
+([DESIGN-obenblock.md](DESIGN-obenblock.md) §3, §4.2). That is not
+implemented yet.
 
 ## Hard cap: 12,500,000 GNB
 

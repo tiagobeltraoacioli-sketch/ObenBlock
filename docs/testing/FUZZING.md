@@ -1,6 +1,6 @@
 # Fuzzing
 
-GnB-SMH fuzzes its untrusted-input parsers, its consensus encodings and its
+ObenBlock fuzzes its untrusted-input parsers, its consensus encodings and its
 block-acceptance pipeline with [cargo-fuzz] (libFuzzer, coverage-guided)
 under AddressSanitizer. The crate is `node/fuzz`: its own workspace (excluded
 from the root one, so nightly-only sanitizer flags never reach the consensus

@@ -1,4 +1,9 @@
-# GnB consensus
+# ObenBlock consensus
+
+This document specifies the rules the code implements today, which are still
+GnB's: the GnB-SMH proof of work, the `gnb` chain ids and the GnB genesis.
+The ObenBlock relaunch replaces those parts as specified in
+[DESIGN-obenblock.md](DESIGN-obenblock.md); that is not implemented yet.
 
 ## Block header and proof of work
 

@@ -1,4 +1,4 @@
-# GnB ledger v1: stateless validation without a committee
+# ObenBlock ledger v1: stateless validation without a committee
 
 Status: draft with a tested reference implementation. Not audited.
 Normative definition: [`reference/gnb_ledger.py`](../reference/gnb_ledger.py).

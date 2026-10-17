@@ -27,6 +27,7 @@ UNITS = {
     "node": os.path.join(HERE, "gnb-node.service"),
     "explorer-api": os.path.join(HERE, "explorer-api", "gnb-explorer-api.service"),
     "cloudflared": os.path.join(HERE, "explorer-api", "cloudflared-gnb-explorer.service"),
+    "bloch-anchor": os.path.join(HERE, "bloch-anchor", "bloch-anchor.service"),
 }
 SCRIPTS = [
     os.path.join(HERE, "gnb-launch"),
@@ -119,6 +120,8 @@ class UnitHardening(unittest.TestCase):
                             "the explorer API must not run as the node's user (audit OPS-3)")
         self.assertNotEqual(users["cloudflared"], users["node"])
         self.assertNotEqual(users["cloudflared"], users["explorer-api"])
+        self.assertNotIn(users["bloch-anchor"], (users["node"], users["explorer-api"]),
+                         "the anchoring wallet must not be readable by the node or the API")
 
     def test_the_explorer_api_writes_nothing_and_reaches_loopback_only(self):
         svc = self.service("explorer-api")

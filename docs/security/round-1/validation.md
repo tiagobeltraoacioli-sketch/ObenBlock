@@ -39,7 +39,7 @@ made from that environment failure.
   the failure in the single test with explicit setup before changing the
   expectation to the shared test boundary.
 - **R1-TEST-2 — Miri tries to execute an unsupported C FFI call (open).**
-  The base [CI run](https://github.com/gnb-smh/gnb-smh/actions/runs/38893867410)
+  The base [CI run](https://github.com/gnb-smh/ObenBlock/actions/runs/38893867410)
   failed in the i686 wallet Miri test
   `bridgelock_signs_the_version_of_the_target_height`, calling
   `PQCLEAN_MLDSA65_CLEAN_crypto_sign_keypair`. Miri's diagnostic explicitly

@@ -14,7 +14,7 @@
 // (crates/gnb-crypto). Re-export its modules under the original paths so every
 // `crate::core::…` / `crate::crypto::…` reference in the node keeps resolving
 // unchanged, and so external embedders keep importing `gnb::{core,crypto,…}`.
-pub use gnb_crypto::{types, crypto, core, address, wallet, hd_wallet, util, bridge};
+pub use gnb_crypto::{types, crypto, core, address, wallet, hd_wallet, util, bridge, bloch_anchor};
 
 #[cfg(feature = "node")]
 pub mod analytics;   // Sprint B      // Sprint A — new unified Address type

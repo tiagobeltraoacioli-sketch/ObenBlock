@@ -6,7 +6,7 @@
   1,714 test executions passed (eight ignored); separate crypto 448 passed
   (four ignored); references, site/Worker/wallet, explorer and release tools
   passed. Local macOS functional run: 13 passed, one failed, zero skipped.
-- [Push CI 38908791122](https://github.com/gnb-smh/gnb-smh/actions/runs/38908791122)
+- [Push CI 38908791122](https://github.com/gnb-smh/ObenBlock/actions/runs/38908791122)
   for `ce7d60b084cb9436b6b278b6569ecd3258ec6ad3` concluded **failure** in
   `workspace-test`. The failure is
   `block_accepted_from_gossip_and_served_from_storage_is_accepted_by_a_fresh_node`
@@ -15,20 +15,20 @@
   run; these successes do not override the failing overall result.
 - The owner merged PR #10 while final PR checks were still running. The
   merge's success is not a testing result. No mainnet activation was added.
-- [Merge CI 38911370624](https://github.com/gnb-smh/gnb-smh/actions/runs/38911370624)
+- [Merge CI 38911370624](https://github.com/gnb-smh/ObenBlock/actions/runs/38911370624)
   for `f607e077f035733509aa9a6c549ee36b26f61870` subsequently completed
   successfully (observed 2026-10-16 14:11 UTC). All executed jobs passed;
   `fuzz` and `i686-node` were skipped by event filters. The preceding PR
   run's fuzz job was still running at that observation. This does not erase
   the separate push-CI or local macOS functional failures.
-- The [merge functional job](https://github.com/gnb-smh/gnb-smh/actions/runs/38911370624/job/117007762302)
+- The [merge functional job](https://github.com/gnb-smh/ObenBlock/actions/runs/38911370624/job/117007762302)
   log was also inspected, rather than relying only on its green status:
   all 14 named scenarios were `Passed`, none `Skipped`; the summary reports
   249 seconds. `mining_full_template.py` was the longest scenario at 146
   seconds; `feature_partition_heal.py` passed in 25.2 seconds for the entire
   scenario. This is Linux baseline evidence, not a measurement of
   the fixed shared deadline or closure of the macOS finding.
-- [PR CI 38909984512](https://github.com/gnb-smh/gnb-smh/actions/runs/38909984512)
+- [PR CI 38909984512](https://github.com/gnb-smh/ObenBlock/actions/runs/38909984512)
   for `ce7d60b084cb9436b6b278b6569ecd3258ec6ad3` subsequently completed
   **successfully**, including `fuzz / fuzz` (observed 2026-10-16 14:25 UTC).
   The event-filtered `i686-node` job remained skipped. This later success
@@ -118,7 +118,7 @@ still unknown, and the lost coverage is recorded in the independent scorecard.
 
 ### Merge and remote CI
 
-[PR #11](https://github.com/gnb-smh/gnb-smh/pull/11) was opened as a draft at
+[PR #11](https://github.com/gnb-smh/ObenBlock/pull/11) was opened as a draft at
 head `88d0e9309ed2e85a7fc7f75ad4317e82e3205448`. The owner merged it at
 2026-10-16 14:52:06 UTC as `f06b7f8dc05af107fd16f2cebdd89d62a360662a`, before
 the local functional result and final remote CI were complete. At the
@@ -128,12 +128,12 @@ were event-filtered skips. No green-at-merge claim is supported. This final
 local evidence is carried forward in the following round's documentation.
 
 Subsequent read-only observation on 2026-10-16 confirmed successful merge
-runs [38919256180](https://github.com/gnb-smh/gnb-smh/actions/runs/38919256180)
-and [38919616610](https://github.com/gnb-smh/gnb-smh/actions/runs/38919616610),
+runs [38919256180](https://github.com/gnb-smh/ObenBlock/actions/runs/38919256180)
+and [38919616610](https://github.com/gnb-smh/ObenBlock/actions/runs/38919616610),
 both at `f06b7f8dc05af107fd16f2cebdd89d62a360662a`. In the latter, `fuzz`
 and `i686-node` were skipped by event filters; all executed jobs passed.
 The actual Linux functional step in
-[job 117035844906](https://github.com/gnb-smh/gnb-smh/actions/runs/38919616610/job/117035844906)
+[job 117035844906](https://github.com/gnb-smh/ObenBlock/actions/runs/38919616610/job/117035844906)
 reports **14 passed, zero skipped, zero failed; 14/14 completed in 240 seconds**.
 The partition scenario passed in 22.4 seconds and full-template in 133.2
 seconds. This is the live functional step, not its preceding unit tests'
@@ -145,7 +145,7 @@ UTC. Its fuzz job was still running when inspected. These later results do
 not imply green CI at merge, and the Linux passes do not close either local
 macOS finding or establish the cause of the full-template timeout.
 
-The subsequent query of [PR run 38919107108](https://github.com/gnb-smh/gnb-smh/actions/runs/38919107108)
+The subsequent query of [PR run 38919107108](https://github.com/gnb-smh/ObenBlock/actions/runs/38919107108)
 returned `status: completed`, `conclusion: success`, with no pending jobs.
 This closes the remote CI gate for the published PR head `88d0e93`, after
 the owner had already merged it; it does not change the local failure record.

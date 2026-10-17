@@ -1,6 +1,6 @@
 # Static public descriptors and public pools
 
-This format describes existing GnB output scripts. It is a partial delivery of
+This format describes existing ObenBlock output scripts. It is a partial delivery of
 technology item 4.2: static public descriptors and restoration of public script
 identities. It does not derive child keys, import private keys, restore signing
 capability, obtain balances/history, create a persistent wallet index, or add a

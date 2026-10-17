@@ -2,7 +2,7 @@
 name = "gnb-smh"
 version = "0.1.0"
 edition = "2021"
-description = "GnB-SMH v1 (Gödel and Bell Sequential Memory-Hard): post-quantum proof-of-work over SHAKE-256, reference implementation"
+description = "GnB-SMH v1 (Gödel and Bell Sequential Memory-Hard): post-quantum proof-of-work over SHAKE-256, reference implementation, with compact targets and ASERT. GnB's proof of work, which the ObenBlock relaunch replaces with SHA-256d (in progress)"
 license = "MIT OR Apache-2.0"
 publish = false
 

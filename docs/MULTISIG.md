@@ -1,7 +1,7 @@
 # Multisig and timelocks
 
-GnB has no script language. A script interpreter is the largest consensus
-attack surface Bitcoin has, so GnB instead defines exactly two output types
+ObenBlock has no script language. A script interpreter is the largest consensus
+attack surface Bitcoin has, so ObenBlock instead defines exactly two output types
 (`crates/gnb-crypto/src/core/policy.rs`):
 
 | Output script | Address | Spent by |

@@ -356,6 +356,18 @@ fn main() {
             return;
         }
 
+        // ── Bloch finalized-checkpoint anchors (docs/BLOCH-ANCHOR.md) ──
+        "blochanchor" => {
+            require_params(params, 4, BLOCH_ANCHOR_USAGE);
+            do_bloch_anchor(params, &rpc_target, stated_network);
+            return;
+        }
+        "blochcheckanchor" => {
+            require_params(params, 1, "blochcheckanchor <txid> [--anchorer gnb1...] [--min-conf N] [--finalized]");
+            do_bloch_check_anchor(params, &rpc_target);
+            return;
+        }
+
         // ── Diagnostic: key format (no secret leaked — lengths/suite only) ─────
         "keyinfo" => {
             require_params(params, 1, "keyinfo <wallet.json>");
@@ -1023,7 +1035,12 @@ const POLICY_SPEND_USAGE: &str =
 /// authenticates none) opens only for a stated network, checked against its
 /// address; a keyfile v1 must record that network.
 fn load_keypair(path: &str, network: Option<gnb::address::Network>) -> gnb::wallet::Keypair {
-    let password = read_password("Wallet password: ");
+    open_keypair(path, network, read_password("Wallet password: "))
+}
+
+/// `load_keypair` with the password already read (unattended commands).
+fn open_keypair(path: &str, network: Option<gnb::address::Network>, password: zeroize::Zeroizing<String>)
+    -> gnb::wallet::Keypair {
     let p = std::path::Path::new(path);
     match open_keystore(p, &password, network) {
         Ok(kp) => kp,
@@ -1603,6 +1620,123 @@ fn do_vault_check_lock(params: &[&str], target: &RpcTarget) {
     }
 }
 
+const BLOCH_ANCHOR_USAGE: &str = "blochanchor <wallet.json> <epoch> <finalized_height> <root hex> [--fee GNB (default: minimum)] [--dry-run] [--testnet]";
+
+/// Wallet password for unattended commands: the file named by
+/// GNB_WALLET_PASSWORD_FILE (trailing newline dropped), else
+/// GNB_WALLET_PASSWORD, else a prompt.
+fn unattended_wallet_password() -> zeroize::Zeroizing<String> {
+    if let Ok(path) = std::env::var("GNB_WALLET_PASSWORD_FILE") {
+        let text = zeroize::Zeroizing::new(std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| die(&format!("GNB_WALLET_PASSWORD_FILE {path}: {e}"))));
+        return zeroize::Zeroizing::new(text.trim_end_matches(['\r', '\n']).to_string());
+    }
+    match std::env::var("GNB_WALLET_PASSWORD") {
+        Ok(p) => zeroize::Zeroizing::new(p),
+        Err(_) => read_password("Wallet password: "),
+    }
+}
+
+/// Anchor one Bloch finalized checkpoint: a payment from the wallet to
+/// itself carrying the root and epoch markers (`gnb::bloch_anchor`). The
+/// caller (scripts/bloch-anchor.py) reads and cross-checks the checkpoint.
+fn do_bloch_anchor(params: &[&str], target: &RpcTarget, stated: Option<gnb::address::Network>) {
+    let epoch: u64 = params[1].parse().unwrap_or_else(|_| die("epoch must be an integer"));
+    let height: u64 = params[2].parse().unwrap_or_else(|_| die("finalized_height must be an integer"));
+    let root: [u8; 32] = hex::decode(params[3].trim_start_matches("0x")).ok().and_then(|v| v.try_into().ok())
+        .unwrap_or_else(|| die("root must be 32-byte hex"));
+    let cp = gnb::bloch_anchor::Checkpoint { epoch, height, root };
+    let outputs = gnb::bloch_anchor::anchor_outputs(&cp).unwrap_or_else(|e| die(&e));
+    // Default: the consensus minimum for the built size (the loop below).
+    let fee = match flag_value(params, "--fee") {
+        Some(f) => gnb::wallet::parse_bloch_satoshis(f).unwrap_or_else(|m| die(m)),
+        None => 0,
+    };
+    let keypair = open_keypair(params[0], Some(policy_network(stated)), unattended_wallet_password());
+    let utxos = rpc_call(target, "getutxos", &serde_json::json!([keypair.address, 50]))
+        .unwrap_or_else(|e| die(&format!("RPC: {}", e)));
+    let next_height = next_block_height(target);
+    let available: Vec<(Vec<u8>, u32, gnb::core::TxOutput)> =
+        gnb::wallet::send::spendable_utxo_rows(&utxos, next_height)
+            .unwrap_or_else(|m| die(&m)).0
+            .into_iter().map(|u| (u.txid.to_vec(), u.index, u.output)).collect();
+    let mut fee = fee;
+    let mut tx = None;
+    for _ in 0..16 {
+        let built = gnb::wallet::TxBuilder::build_outputs(&keypair, &available, outputs.clone(), fee, next_height)
+            .unwrap_or_else(|e| die(&e));
+        let min = gnb::core::tokenomics::min_tx_fee_sat(built.to_wire_bytes(true).len());
+        if fee >= min { tx = Some(built); break; }
+        fee = fee.max(min);
+    }
+    let tx = tx.unwrap_or_else(|| die("could not settle the fee"));
+    // Self-check: the transaction parses back as this checkpoint.
+    if gnb::bloch_anchor::parse_anchor(&tx.outputs).as_ref() != Ok(&cp) {
+        die("built transaction does not parse back as the anchor");
+    }
+    let raw = hex::encode(tx.to_wire_bytes(true));
+    let txid = hex::encode(tx.txid());
+    if params.contains(&"--dry-run") {
+        println!("{}", serde_json::json!({ "dry_run": true, "anchor_txid": txid, "fee": fee.to_string(), "hex": raw }));
+        return;
+    }
+    let res = rpc_call(target, "sendrawtransaction", &serde_json::json!([raw]))
+        .unwrap_or_else(|e| die(&format!("broadcast: {}", e)));
+    if let Some(e) = res.get("error").and_then(|e| e.as_str()) { die(&format!("broadcast rejected: {}", e)); }
+    println!("{}", serde_json::json!({
+        "anchor_txid": txid, "epoch": epoch, "finalized_height": height,
+        "root": hex::encode(root), "anchorer": keypair.address, "fee": fee.to_string(),
+    }));
+}
+
+/// Read an anchor back from the node and say whether it is deep enough.
+/// With `--anchorer`, the anchor counts only if that address signed it.
+fn do_bloch_check_anchor(params: &[&str], target: &RpcTarget) {
+    let txid = params[0];
+    let min_conf: u64 = flag_value(params, "--min-conf").and_then(|v| v.parse().ok()).unwrap_or(6);
+    let want_final = params.contains(&"--finalized");
+    let anchorer = flag_value(params, "--anchorer").map(|a| gnb::address::Address::parse(a)
+        .unwrap_or_else(|_| die("invalid --anchorer address")));
+    let verdict = (|| -> Result<serde_json::Value, String> {
+        let raw = rpc_call(target, "getrawtransaction", &serde_json::json!([txid]))?;
+        if let Some(e) = raw.get("error").and_then(|e| e.as_str()) { return Err(e.to_string()); }
+        let bytes = hex::decode(raw["hex"].as_str().ok_or("no hex")?).map_err(|e| e.to_string())?;
+        let tx = gnb::core::Transaction::from_wire_bytes(&bytes)?;
+        if hex::encode(tx.txid()) != txid {
+            return Err("node returned a transaction with another txid".into());
+        }
+        let cp = gnb::bloch_anchor::parse_anchor(&tx.outputs)?;
+        let signers = gnb::bloch_anchor::anchor_signers(&tx);
+        let in_mempool = raw["in_mempool"].as_bool().unwrap_or(false);
+        let (height, conf, block_hash) = if in_mempool {
+            (0, 0, String::new())
+        } else {
+            let (_, h, c, b) = fetch_tx(target, txid)?;
+            (h, c, b)
+        };
+        let signed_ok = anchorer.as_ref().is_none_or(|a| signers.contains(a.hash()));
+        let deep = !in_mempool && if want_final {
+            let p = rpc_call(target, "getpowitinfo", &serde_json::Value::Null)?;
+            let fh = p["finalized"]["block_height"].as_u64().ok_or("PoWit finality not available")?;
+            height <= fh
+        } else {
+            conf >= min_conf
+        };
+        let ok = deep && signed_ok;
+        let reason = if !signed_ok { "not signed by the anchorer" } else if !deep { "not deep enough yet" } else { "" };
+        Ok(serde_json::json!({
+            "ok": ok, "reason": reason, "anchor_txid": txid,
+            "epoch": cp.epoch, "finalized_height": cp.height, "root": hex::encode(cp.root),
+            "signer_hashes": signers.iter().map(hex::encode).collect::<Vec<_>>(),
+            "in_mempool": in_mempool, "block_hash": block_hash, "block_height": height, "confirmations": conf,
+        }))
+    })();
+    match verdict {
+        Ok(v) => println!("{}", v),
+        Err(e) => println!("{}", serde_json::json!({ "ok": false, "reason": e, "anchor_txid": txid })),
+    }
+}
+
 fn burn_id_arg(s: &str) -> [u8; 32] {
     hex::decode(s.trim_start_matches("0x")).ok().and_then(|v| v.try_into().ok())
         .unwrap_or_else(|| die("burn id must be 32-byte hex"))
@@ -1759,7 +1893,7 @@ fn is_keystore_v2_or_v3(path: &std::path::Path) -> bool {
 
 fn print_usage() {
     println!(r#"
-  gnb-cli — Bloch-SIS Protocol RPC client
+  gnb-cli — ObenBlock RPC client
 
   NETWORK
     gnb-cli info                          Network info
@@ -1844,6 +1978,14 @@ fn print_usage() {
                                            Offline public identities only; no key or balance restore
     gnb-cli policysign <document.json> <wallet.json> [--max-fee GNB] [--yes]
                                            Verify the configured node before key access
+
+  BLOCH CHECKPOINT ANCHORS (docs/BLOCH-ANCHOR.md)
+    gnb-cli blochanchor <wallet.json> <epoch> <finalized_height> <root hex> [--fee GNB] [--dry-run]
+                                           Self-payment carrying a Bloch finalized
+                                           checkpoint; password from
+                                           GNB_WALLET_PASSWORD_FILE / _PASSWORD
+    gnb-cli blochcheckanchor <txid> [--anchorer gnb1...] [--min-conf N] [--finalized]
+                                           Decode an anchor and check its depth
 
   OPTIONS
     --rpc-host <host>                      RPC host (default: 127.0.0.1)
