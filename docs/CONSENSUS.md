@@ -767,7 +767,9 @@ disqualifications, minimum chain work, anchor and operator settings)
 compute the same pin whatever the arrival order, and a node that never
 applied the blocks carrying a finalization still learns it: after a
 partition heals, every node holding both sides pins the same checkpoint and
-converges on one chain. With a conflict, each node keeps the finality it
+converges on one chain (the heavier side stores the finalized side's blocks
+even below its anti-DoS work window, as they claim a newer finality: "Anti-DoS
+work rule" below, item 4). With a conflict, each node keeps the finality it
 reached first: the weak-subjectivity assumption of every finality protocol,
 which the release anchor and the minimum chain work make hold for a node
 that syncs while eclipsed. (The first fix of finding 2 pinned the latest
