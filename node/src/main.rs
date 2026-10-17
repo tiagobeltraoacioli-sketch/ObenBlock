@@ -2794,10 +2794,21 @@ fn make_chain_admin_cb(
     body_requests: Arc<tokio::sync::Notify>,
 ) -> Arc<rpc::ChainAdminFn> {
     Arc::new(move |op: rpc::ChainAdminOp, hash: [u8; 32]| -> Result<serde_json::Value, String> {
-        let res = match op {
-            rpc::ChainAdminOp::Invalidate => accept::invalidate_block(
+        // PoWit audit findings 2 and 3: the finality settings.
+        let finality_op = match op {
+            rpc::ChainAdminOp::Invalidate | rpc::ChainAdminOp::Reconsider => None,
+            rpc::ChainAdminOp::IgnoreFinalized => Some(powit::FinalityOp::Ignore(hash)),
+            rpc::ChainAdminOp::ReconsiderFinalized => Some(powit::FinalityOp::Reconsider(hash)),
+            rpc::ChainAdminOp::SetFinalityCheckpoint => Some(powit::FinalityOp::SetAnchor(hash)),
+            rpc::ChainAdminOp::DisableFinalityCheckpoint => Some(powit::FinalityOp::DisableAnchor),
+            rpc::ChainAdminOp::DefaultFinalityCheckpoint => Some(powit::FinalityOp::DefaultAnchor),
+        };
+        let res = match (op, finality_op) {
+            (_, Some(f)) => accept::override_finality(
+                f, &dag, &store, &mempool, &node_state, Some(&tip_tx), &shielded),
+            (rpc::ChainAdminOp::Invalidate, None) => accept::invalidate_block(
                 hash, &dag, &store, &mempool, &node_state, Some(&tip_tx), &shielded),
-            rpc::ChainAdminOp::Reconsider => accept::reconsider_block(
+            (_, None) => accept::reconsider_block(
                 hash, &dag, &store, &mempool, &node_state, Some(&tip_tx), &shielded),
         };
         let r = match res {
@@ -2814,14 +2825,18 @@ fn make_chain_admin_cb(
             }
             Err(e) => return Err(e.to_string()),
         };
-        Ok(serde_json::json!({
+        let mut out = serde_json::json!({
             "block":       hex::encode(hash),
             "affected":    r.affected,
             "rolled_back": r.rolled_back,
             "connected":   r.connected,
             "tip":         hex::encode(r.tip),
             "tip_height":  r.tip_height,
-        }))
+        });
+        if finality_op.is_some() {
+            out["finality"] = powit::finality_info_json(&dag.read(), 8);
+        }
+        Ok(out)
     })
 }
 

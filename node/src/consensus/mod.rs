@@ -75,6 +75,7 @@ pub const MERGE_DEPTH: u64 = 360;
 
 pub mod reachability;
 use reachability::ReachabilityStore;
+pub mod finality;
 
 thread_local! {
     static COMPUTE_BLOCK_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -969,11 +970,16 @@ pub struct GhostDAG {
     /// returned by `selected_tip()` or offered as template parents. Persisted
     /// by the acceptance pipeline (`Storage::load_invalid_blocks`).
     invalid: HashSet<BlockHash>,
-    /// PoWit finality (`powit`): the latest checkpoint the applied chain's
-    /// witness set finalized, as (hash, DAG height). A block whose
-    /// selected-parent chain does not pass through it is never selected or
-    /// offered as a template parent: finalized history is never rolled back.
+    /// PoWit finality pin (`finality`, node-local fork choice): the block,
+    /// as (hash, DAG height), every selectable block's selected-parent chain
+    /// passes through. A block whose selected-parent chain does not pass
+    /// through it is never selected or offered as a template parent:
+    /// finalized history is never rolled back. Computed from every stored
+    /// block's PoWit state ([`GhostDAG::compute_finality_pin`]).
     finalized: Option<(BlockHash, u64)>,
+    /// Every finalized checkpoint the PoWit states of stored blocks carry,
+    /// and the operator's finality settings (`finality`).
+    finality: finality::FinalityIndex,
     /// Whether the persisted invalid set has been loaded into `invalid`
     /// (set by `load_invalid`). The acceptance pipeline loads it lazily on
     /// first use if start-up did not.
@@ -1044,6 +1050,7 @@ impl GhostDAG {
             merge_skip: HashMap::new(),
             invalid: HashSet::new(),
             finalized: None,
+            finality: finality::FinalityIndex::default(),
             invalid_loaded: false,
             invalid_roots: HashSet::new(),
             invalid_all_edges_roots: HashSet::new(),
@@ -1974,6 +1981,7 @@ impl GhostDAG {
         self.invalid_all_edges.remove(hash);
         self.body_pending.remove(hash);
         self.body_requested.remove(hash);
+        self.forget_finality_source(hash);
         if self.reach_hint == Some(*hash) {
             self.reach_hint = None;
         }
@@ -3385,7 +3393,9 @@ impl GhostDAG {
     // ── PoWit finality ──────────────────────────────────────────────────────
 
     /// Record the PoWit-finalized checkpoint (hash, DAG height). Only ever
-    /// moves forward in height; see [`GhostDAG::finalized`].
+    /// moves forward in height; see [`GhostDAG::finalized`]. The node sets
+    /// the pin with [`GhostDAG::set_finality_pin`] (`finality`), which may
+    /// move it back; this stays for tests and tools that pin directly.
     pub fn set_finalized(&mut self, hash: BlockHash, height: u64) {
         if self.finalized.is_none_or(|(_, h)| height > h) {
             self.finalized = Some((hash, height));

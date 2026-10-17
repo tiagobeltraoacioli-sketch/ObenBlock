@@ -136,7 +136,8 @@ pub struct NodeState {
 pub type SubmitBlockFn = dyn Fn(crate::core::Block) -> Result<String, String> + Send + Sync;
 
 /// Operator chain overrides (audit DAG-6), Bitcoin Core's `invalidateblock`
-/// and `reconsiderblock`.
+/// and `reconsiderblock`, and the PoWit finality settings (PoWit audit
+/// findings 2 and 3, `powit::FinalityOp`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChainAdminOp {
     /// Disqualify a block and its selected-chain descendants, persistently.
@@ -144,6 +145,17 @@ pub enum ChainAdminOp {
     /// Remove such disqualifications (the block, its selected-chain ancestors
     /// and descendants) and let the node re-evaluate them.
     Reconsider,
+    /// `ignorefinalized`: never pin a finalized checkpoint at or above the
+    /// block on its chain.
+    IgnoreFinalized,
+    /// `reconsiderfinalized`: undo `ignorefinalized` for the block.
+    ReconsiderFinalized,
+    /// `setfinalitycheckpoint <hash>`: the operator's weak-subjectivity anchor.
+    SetFinalityCheckpoint,
+    /// `setfinalitycheckpoint none` (the hash is ignored).
+    DisableFinalityCheckpoint,
+    /// `setfinalitycheckpoint default`: back to the release checkpoint.
+    DefaultFinalityCheckpoint,
 }
 
 /// Hook that performs a [`ChainAdminOp`] on a block through the acceptance
@@ -326,6 +338,7 @@ const KNOWN_RPC_METHODS: &[&str] = &[
     "getblocktimepercentiles", "gettxstatus", "getaddressinfo", "estimatefeeadvanced",
     "getmempoolstats", "validateaddressverbose", "gettxsbyblock", "getaddressbalance_at_height",
     "getattestation", "invalidateblock", "reconsiderblock", "gettxoutsetinfo",
+    "getfinalityinfo", "ignorefinalized", "reconsiderfinalized", "setfinalitycheckpoint",
 ];
 
 /// Longest method-name prefix written to a log line (NET-13).
@@ -1242,12 +1255,27 @@ async fn handle_rpc(
     }
 }
 
-/// `invalidateblock` / `reconsiderblock`: params `[block_hash_hex]`.
+/// `invalidateblock` / `reconsiderblock` / `ignorefinalized` /
+/// `reconsiderfinalized` / `setfinalitycheckpoint`: params `[block_hash_hex]`
+/// (`ignorefinalized` without one: the current finality pin;
+/// `setfinalitycheckpoint` also takes `none` or `default`).
 fn chain_admin_call(op: ChainAdminOp, params: Option<&Value>, state: &AppState) -> Value {
     let hex_str = params.and_then(|p| p.get(0)).and_then(|v| v.as_str()).unwrap_or("");
-    let hash: [u8; 32] = match hex::decode(hex_str).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()) {
-        Some(h) => h,
-        None => return json!({ "error": "expected one parameter: a 64-hex-character block hash" }),
+    let (op, hex_str) = match (op, hex_str) {
+        (ChainAdminOp::SetFinalityCheckpoint, "none") => (ChainAdminOp::DisableFinalityCheckpoint, None),
+        (ChainAdminOp::SetFinalityCheckpoint, "default") => (ChainAdminOp::DefaultFinalityCheckpoint, None),
+        (ChainAdminOp::IgnoreFinalized, "") => match state.dag.read().finalized() {
+            Some((h, _)) => (op, Some(hex::encode(h))),
+            None => return json!({ "error": "this node has no finality pin; name a block hash" }),
+        },
+        (op, s) => (op, Some(s.to_string())),
+    };
+    let hash: [u8; 32] = match hex_str {
+        None => [0u8; 32],
+        Some(s) => match hex::decode(&s).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()) {
+            Some(h) => h,
+            None => return json!({ "error": "expected one parameter: a 64-hex-character block hash" }),
+        },
     };
     match &state.chain_admin {
         None => json!({ "error": "invalidateblock/reconsiderblock not wired on this node" }),
@@ -2050,6 +2078,17 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         // reconsiderblock). Admin methods: never anonymous (auth::ADMIN_METHODS).
         "invalidateblock" => chain_admin_call(ChainAdminOp::Invalidate, params, state),
         "reconsiderblock" => chain_admin_call(ChainAdminOp::Reconsider, params, state),
+        // PoWit audit findings 2 and 3: the finality pin's escape hatch.
+        // Admin methods (auth::ADMIN_METHODS); docs/RUNNING.md.
+        "ignorefinalized" => chain_admin_call(ChainAdminOp::IgnoreFinalized, params, state),
+        "reconsiderfinalized" => chain_admin_call(ChainAdminOp::ReconsiderFinalized, params, state),
+        "setfinalitycheckpoint" => chain_admin_call(ChainAdminOp::SetFinalityCheckpoint, params, state),
+        // The finality pin, where it comes from, the anchor, the finalized
+        // checkpoints it counts and any conflict (read; bounded output).
+        "getfinalityinfo" => {
+            let dag = state.dag.read();
+            crate::powit::finality_info_json(&dag, 32)
+        }
 
         // submitpowititem [kind, hex]: kind 1 = witness share, 2 = attestation,
         // 3 = equivocation proof. Validated like a gossiped item, then relayed.
@@ -3517,6 +3556,53 @@ mod audit_2026_10_rpc_tests {
             (ChainAdminOp::Invalidate, [7u8; 32]),
             (ChainAdminOp::Reconsider, [8u8; 32]),
         ]);
+    }
+
+    /// PoWit audit findings 2 and 3: the finality settings reach the
+    /// chain-admin hook with the right operation (`ignorefinalized` without a
+    /// hash takes the current pin; `setfinalitycheckpoint` takes `none` and
+    /// `default`), are admin methods, and `getfinalityinfo` reports the pin.
+    #[tokio::test]
+    async fn finality_admin_methods_reach_the_hook() {
+        let (_tmp, mut state) = state_with_chain(3);
+        type Calls = parking_lot::Mutex<Vec<(ChainAdminOp, [u8; 32])>>;
+        let calls: Arc<Calls> = Arc::default();
+        let seen = calls.clone();
+        state.chain_admin = Some(Arc::new(move |op, h| {
+            seen.lock().push((op, h));
+            Ok(json!({ "ok": true }))
+        }));
+        let r = dispatch("ignorefinalized", Some(&json!([])), &state).await;
+        assert!(r["error"].as_str().unwrap().contains("no finality pin"), "{r}");
+        let pinned = state.dag.read().selected_tip().unwrap();
+        state.dag.write().set_finalized(pinned, 2);
+        let info = dispatch("getfinalityinfo", None, &state).await;
+        assert_eq!(info["pin"]["hash"], json!(hex::encode(pinned)), "{info}");
+        for (method, params) in [
+            ("ignorefinalized", json!([])),
+            ("ignorefinalized", json!([hex::encode([5u8; 32])])),
+            ("reconsiderfinalized", json!([hex::encode([5u8; 32])])),
+            ("setfinalitycheckpoint", json!([hex::encode([6u8; 32])])),
+            ("setfinalitycheckpoint", json!(["none"])),
+            ("setfinalitycheckpoint", json!(["default"])),
+        ] {
+            let r = dispatch(method, Some(&params), &state).await;
+            assert_eq!(r["ok"], json!(true), "{method} {params}: {r}");
+        }
+        let r = dispatch("setfinalitycheckpoint", Some(&json!(["zz"])), &state).await;
+        assert!(r["error"].as_str().unwrap().contains("block hash"), "{r}");
+        assert_eq!(*calls.lock(), vec![
+            (ChainAdminOp::IgnoreFinalized, pinned),
+            (ChainAdminOp::IgnoreFinalized, [5u8; 32]),
+            (ChainAdminOp::ReconsiderFinalized, [5u8; 32]),
+            (ChainAdminOp::SetFinalityCheckpoint, [6u8; 32]),
+            (ChainAdminOp::DisableFinalityCheckpoint, [0u8; 32]),
+            (ChainAdminOp::DefaultFinalityCheckpoint, [0u8; 32]),
+        ]);
+        for m in ["ignorefinalized", "reconsiderfinalized", "setfinalitycheckpoint"] {
+            assert!(auth::ADMIN_METHODS.contains(&m) && auth::WRITE_METHODS.contains(&m), "{m}");
+        }
+        assert!(!auth::WRITE_METHODS.contains(&"getfinalityinfo"));
     }
 
     /// WAL-1: `getrawtransaction` returns bytes that hash to the txid.

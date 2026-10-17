@@ -101,11 +101,16 @@ pub const WRITE_METHODS: &[&str] = &[
     "submitpowititem",
     "invalidateblock",
     "reconsiderblock",
+    "ignorefinalized",
+    "reconsiderfinalized",
+    "setfinalitycheckpoint",
 ];
 
 /// Operator chain-override methods (audit DAG-6): `invalidateblock` /
 /// `reconsiderblock` make this node leave or rejoin a chain regardless of its
-/// work, so they are write-class (Host/Origin gate, never a wildcard origin,
+/// work, and the PoWit finality settings (`ignorefinalized`,
+/// `reconsiderfinalized`, `setfinalitycheckpoint`; PoWit audit findings 2
+/// and 3) change which finalized checkpoint pins it, so they are write-class (Host/Origin gate, never a wildcard origin,
 /// write rate bucket — see [`WRITE_METHODS`]) AND they are never served to an
 /// anonymous caller: they need either a fully trusted caller (loopback with
 /// `--rpc-trust-loopback`, or a trusted private range) or the configured API
@@ -115,6 +120,9 @@ pub const WRITE_METHODS: &[&str] = &[
 pub const ADMIN_METHODS: &[&str] = &[
     "invalidateblock",
     "reconsiderblock",
+    "ignorefinalized",
+    "reconsiderfinalized",
+    "setfinalitycheckpoint",
 ];
 
 /// Type alias for a direct (non-keyed) in-memory rate limiter.

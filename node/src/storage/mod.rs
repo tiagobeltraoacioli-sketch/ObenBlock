@@ -1925,6 +1925,27 @@ impl Storage {
         self.db.get_cf(&cf, key.as_bytes()).map_err(|e| StorageError::ReadFailed(e.to_string()))
     }
 
+    /// Delete one CF_META key (absent: nothing to do).
+    pub fn delete_meta(&self, key: &str) -> Result<(), StorageError> {
+        let cf = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        self.db.delete_cf(&cf, key.as_bytes()).map_err(|e| StorageError::WriteFailed(e.to_string()))
+    }
+
+    /// Every CF_META (key, value) whose key starts with `prefix`, in key
+    /// order (the PoWit finality index, `powit::load_finality_index`).
+    pub fn scan_meta_prefix(&self, prefix: &str) -> Result<KeyValueRows, StorageError> {
+        let cf = self.db.cf_handle(CF_META).ok_or(StorageError::CfNotFound(CF_META.into()))?;
+        let mut out = Vec::new();
+        for item in self.db.iterator_cf(&cf, IteratorMode::From(prefix.as_bytes(), rocksdb::Direction::Forward)) {
+            let (k, v) = item.map_err(|e| StorageError::ReadFailed(e.to_string()))?;
+            if !k.starts_with(prefix.as_bytes()) {
+                break;
+            }
+            out.push((k.to_vec(), v.to_vec()));
+        }
+        Ok(out)
+    }
+
     /// CF_META key of the network a data dir belongs to (u32 LE chain id).
     pub const CHAIN_ID_META: &'static str = "chain_id";
 

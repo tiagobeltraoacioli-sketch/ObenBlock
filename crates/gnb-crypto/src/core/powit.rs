@@ -9,6 +9,12 @@
 //! - **Witness set** `W(e)`: the `max_witnesses` heaviest keys over epochs
 //!   `e-1-window ..= e-2` (lagged two epochs, so forks shallower than an
 //!   epoch agree on it). Banned keys are excluded; inactive keys decay.
+//!   From the second hardening upgrade (`activation::hardening2_*`, PoWit
+//!   audit finding 3) the window counts finalized history only: it ends at
+//!   the last epoch entirely below the finalized checkpoint
+//!   ([`PowitState::finalized_window_epoch`]), so every chain that shares a
+//!   finalized checkpoint derives the same witness set until it finalizes
+//!   another one, and a fork cannot build its own.
 //! - **Attestations**: a member signs a link `source -> target` between two
 //!   checkpoints with its forward-secure KES key (`core::kes`, hybrid
 //!   ML-DSA-65 ‖ Falcon-1024 leaves), using the leaf of the target's epoch. Included in
@@ -30,6 +36,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 
+use super::activation;
 use super::witness_share::WitnessShare;
 use super::kes::{self, KesPublic, KesSignature, KesSigner};
 use super::{read_varint, write_varint, ChainId};
@@ -460,11 +467,101 @@ impl PowitState {
         v
     }
 
+    /// Epochs entirely below the finalized checkpoint's slot: every block of
+    /// epochs `0..n` on this chain is the finalized block or one of its
+    /// selected-chain ancestors (a slot names the highest selected-chain
+    /// block strictly below it), i.e. part of LOG_fin.
+    pub fn finalized_epochs(&self, p: &PowitParams) -> u64 {
+        self.finalized.height.saturating_sub(self.activation) / p.epoch_len
+    }
+
+    /// Second hardening upgrade (PoWit audit finding 3;
+    /// docs/DESIGN-pow-powit.md §7.4, "W_e is computed only from LOG_fin"):
+    /// the epoch whose window [`witness_set`](Self::witness_set) reads for a
+    /// target in `epoch`.
+    ///
+    /// With `nf` = [`finalized_epochs`](Self::finalized_epochs):
+    ///
+    /// - `nf == 0`, nothing beyond the activation checkpoint is final: the
+    ///   chain bootstraps from its own shares, `epoch` (the first rule). The
+    ///   first finalization always lies in epoch 2 or later (the witness set
+    ///   is empty before), so `nf` jumps from 0 to at least 2.
+    /// - otherwise `min(epoch, nf + 1)`: the window ends at
+    ///   `min(epoch - 2, nf - 1)`, the last epoch entirely in LOG_fin. While
+    ///   finality keeps up (the finalized slot lies in `epoch - 1` or later)
+    ///   that is `epoch` itself, the first rule's set; when finality lags,
+    ///   the set freezes at the last finalized window (the spec's
+    ///   "W_e = W_{e-1}") until a new checkpoint is finalized.
+    ///
+    /// Two chains whose states finalized the same checkpoint (same slot and
+    /// block) therefore read the same share history, below that block, for
+    /// every target until one of them finalizes another checkpoint.
+    pub fn finalized_window_epoch(&self, p: &PowitParams, epoch: u64) -> u64 {
+        match self.finalized_epochs(p) {
+            0 => epoch,
+            nf => epoch.min(nf + 1),
+        }
+    }
+
+    /// The witness set a block uses for a target in `epoch`: under the
+    /// first rule (`from_finalized == false`) `witness_set(epoch)`; from the
+    /// second hardening upgrade `witness_set(finalized_window_epoch(epoch))`.
+    /// A frozen window with no share work left in it (possible only across
+    /// the upgrade, for a chain whose finality had stalled long enough for
+    /// the first rule to prune that window, or one whose shares all fell in
+    /// the epoch the frozen window drops) gives way to `epoch`'s own window,
+    /// so finality can always start again; a frozen window is never empty
+    /// on a chain that finalized with its members (bans aside).
+    pub fn witness_set_at(&self, p: &PowitParams, epoch: u64, from_finalized: bool) -> Vec<(KeyId, u128)> {
+        let anchored = if from_finalized { self.finalized_window_epoch(p, epoch) } else { epoch };
+        if anchored == epoch {
+            return self.witness_set(p, epoch);
+        }
+        let w = self.witness_set(p, anchored);
+        if w.is_empty() { self.witness_set(p, epoch) } else { w }
+    }
+
+    /// [`witness_set_at`](Self::witness_set_at) for a block at header height
+    /// `block_height` under the process-wide second hardening height
+    /// (`activation::hardening2_activation_height`): what every producer
+    /// (pool admission, the witness duty, templates through `apply`, RPC)
+    /// reads for the block it builds or admits for.
+    pub fn witness_set_for_block(&self, p: &PowitParams, epoch: u64, block_height: u64) -> Vec<(KeyId, u128)> {
+        self.witness_set_at(p, epoch, activation::hardening2_active_at(block_height))
+    }
+
+    /// The epochs of the frozen window from the second hardening upgrade
+    /// (`(nf - window) ..= nf - 1`), which must outlive the first rule's
+    /// pruning while finality lags; `None` while nothing is final.
+    fn finalized_window(&self, p: &PowitParams) -> Option<(u64, u64)> {
+        match self.finalized_epochs(p) {
+            0 => None,
+            nf => Some((nf.saturating_sub(p.window_epochs), nf - 1)),
+        }
+    }
+
     /// Apply one block (height > activation) on top of its selected parent's
-    /// state. Any rule violation makes the block invalid.
+    /// state. Any rule violation makes the block invalid. The second
+    /// hardening upgrade applies from the process-wide height
+    /// (`activation::hardening2_activation_height`); see [`Self::apply_at`].
     pub fn apply(&self, p: &PowitParams, chain: ChainId, b: &BlockInput<'_>, view: &dyn ChainView)
         -> Result<PowitState, String>
     {
+        self.apply_at(p, chain, b, view, activation::hardening2_activation_height())
+    }
+
+    /// [`apply`](Self::apply) with the second hardening activation height
+    /// `h2` explicit. From `h2` (compared with the block's header height
+    /// `b.height`, as the upgrade's block rules) every witness set the block
+    /// reads (attester weights, justification totals, inactivity-decay
+    /// membership) comes from finalized history
+    /// ([`witness_set_at`](Self::witness_set_at)), and the epochs of the
+    /// frozen window are kept. Below `h2` this is the first rule, bit for
+    /// bit.
+    pub fn apply_at(&self, p: &PowitParams, chain: ChainId, b: &BlockInput<'_>, view: &dyn ChainView, h2: u64)
+        -> Result<PowitState, String>
+    {
+        let from_finalized = activation::is_active_at(b.height, h2);
         let act = self.activation;
         if b.height < act {
             return Err("powit: block below activation".into());
@@ -483,7 +580,8 @@ impl PowitState {
             for e in s.epoch..epoch {
                 let stalled = b.height.saturating_sub(s.finalized_at) >= p.leak_after_epochs * p.epoch_len;
                 if stalled {
-                    let members: Vec<KeyId> = s.witness_set(p, e).into_iter().map(|(k, _)| k).collect();
+                    let members: Vec<KeyId> =
+                        s.witness_set_at(p, e, from_finalized).into_iter().map(|(k, _)| k).collect();
                     for k in members {
                         if !s.active_this_epoch.contains(&k) {
                             *s.decay.entry(k).or_insert(0) += 1;
@@ -494,7 +592,16 @@ impl PowitState {
             }
             s.epoch = epoch;
             let keep_from = epoch.saturating_sub(p.window_epochs + 2);
-            s.epoch_work = s.epoch_work.split_off(&keep_from);
+            let mut kept = s.epoch_work.split_off(&keep_from);
+            if let Some((lo, hi)) = from_finalized.then(|| s.finalized_window(p)).flatten() {
+                // Hardening 2: the frozen window, older than the first
+                // rule's horizon while finality lags. Nothing else below it
+                // is ever read again: a newly finalized checkpoint lies at
+                // most `vote_ttl + checkpoint_interval` (under two epochs)
+                // below the block, so its window starts within the horizon.
+                kept.extend(std::mem::take(&mut s.epoch_work).into_iter().filter(|(e, _)| (lo..=hi).contains(e)));
+            }
+            s.epoch_work = kept;
             s.banned.retain(|_, until| *until > epoch);
             let link_floor = b.height.saturating_sub((p.window_epochs + 2) * p.epoch_len);
             for v in s.links.values_mut() {
@@ -545,7 +652,7 @@ impl PowitState {
             if s.is_banned(&k, epoch) {
                 return Err("powit: attestation by a barred key".into());
             }
-            let weight = s.witness_set(p, te).into_iter().find(|(m, _)| *m == k).map(|(_, w)| w)
+            let weight = s.witness_set_at(p, te, from_finalized).into_iter().find(|(m, _)| *m == k).map(|(_, w)| w)
                 .ok_or("powit: attester is not in the witness set")?;
             if !seen_in_block.insert((k, t)) || s.votes.get(&t).is_some_and(|v| v.contains_key(&k)) {
                 return Err("powit: duplicate attestation".into());
@@ -572,7 +679,8 @@ impl PowitState {
         // ── Justification and finality ───────────────────────────────────
         let mut newly: Option<Checkpoint> = None;
         for (t, votes) in &s.votes {
-            let total: u128 = s.witness_set(p, p.epoch(act, t.height)).iter().map(|(_, w)| *w).sum();
+            let total: u128 =
+                s.witness_set_at(p, p.epoch(act, t.height), from_finalized).iter().map(|(_, w)| *w).sum();
             if total == 0 {
                 continue;
             }
@@ -608,3 +716,5 @@ fn decayed(w: u128, steps: u32) -> u128 {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod finalized_history_tests;
