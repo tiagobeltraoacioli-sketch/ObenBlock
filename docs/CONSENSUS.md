@@ -1136,7 +1136,10 @@ bound of B's blue work:
    most its pin + one interval — marks itself, when buffered as an orphan,
    and the missing parents the node then requests; each marked block it
    requested in turn marks its own. A marked block (the claiming orphan, or
-   an ancestor of it the node requested) is admitted below `T`, after
+   an ancestor of it the node requested) that extends the pinned
+   checkpoint's chain (its selected parent is the pin or descends from it:
+   a chain that forks below the pin cannot advance it) is admitted below
+   `T`, after
    every cheap check and its proof of work, and charged, once, to the peer
    that delivered it (at most 1,440 admissions, refilled at one a minute)
    and to the node (at most 2,880, refilled at one per 30 s; about two

@@ -1786,6 +1786,20 @@ pub fn finality_claim_floor(dag: &GhostDAG) -> u64 {
     base.saturating_add(core::powit::params().checkpoint_interval)
 }
 
+/// Whether a block on `parents` extends the pinned checkpoint's chain (its
+/// selected parent is the pin or descends from it), so that a finality its
+/// chain carries could advance the pin (`consensus::finality`); with no pin,
+/// every block does. O(1) (reachability). A finality-backed admission
+/// requires it: a chain that forks below the pin cannot move it, whatever
+/// it claims.
+pub fn extends_pin(dag: &GhostDAG, parents: &[BlockHash]) -> bool {
+    match (dag.finalized(), dag.preview_selected_parent(parents)) {
+        (None, _) => true,
+        (Some((pin, _)), Some(sp)) => dag.is_chain_ancestor_or_self(&pin, &sp),
+        (Some(_), None) => false,
+    }
+}
+
 /// Review HIGH 2: the blocks a finality claim backs, and the budgets of
 /// their admission below the work threshold (section comment above).
 pub struct FinalityPulls {
@@ -2377,8 +2391,9 @@ fn work_rule(
         let chain_above = orphans.announced_work_capped(hash, threshold - lb);
         if lb.saturating_add(chain_above) >= threshold {
             (chain_above, 0) // ChainBacked: the merge bound is not needed
-        } else if finality.backs(hash) {
-            // Review HIGH 2: a requested ancestor of a finality claim.
+        } else if finality.backs(hash) && extends_pin(dag, &block.header.parents) {
+            // Review HIGH 2: a requested ancestor of a finality claim, on a
+            // chain whose finality could advance the pin.
             if charge && !finality.charge(peer, now) {
                 return Err(DropReason::FinalityBudgetExhausted);
             }
@@ -3047,6 +3062,32 @@ fn plain_penalty(gossip: GossipVerdict) -> BlockPenalty {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review HIGH 2: a finality-backed admission needs a block that extends
+    /// the pinned checkpoint's chain (selected parent through the pin).
+    #[test]
+    fn a_block_extends_the_pin_only_through_its_selected_parent() {
+        let h = |tag: u8, n: u8| -> BlockHash { let mut x = [0u8; 32]; x[0] = tag; x[1] = n; x };
+        let mut d = GhostDAG::with_default_k();
+        d.add_genesis(h(0, 0), 0);
+        let mut p = h(0, 0);
+        for i in 1..=6 {
+            d.add_block(h(1, i), vec![p], u64::from(i), 10).unwrap();
+            p = h(1, i);
+        }
+        let mut p = h(1, 2);
+        for i in 3..=5 {
+            d.add_block(h(2, i), vec![p], u64::from(i), 10).unwrap();
+            p = h(2, i);
+        }
+        assert!(extends_pin(&d, &[h(2, 5)]), "no pin: every block");
+        d.set_finalized(h(1, 4), 4);
+        assert!(extends_pin(&d, &[h(1, 4)]) && extends_pin(&d, &[h(1, 6)]));
+        assert!(!extends_pin(&d, &[h(2, 5)]), "a chain that forks below the pin");
+        assert!(!extends_pin(&d, &[h(1, 3)]), "a block below the pin on its chain");
+        // A merge whose selected parent (the heavier a6) is on the pin's chain.
+        assert!(extends_pin(&d, &[h(2, 5), h(1, 6)]));
+    }
 
     fn blk(parents: Vec<[u8; 32]>, tag: u64) -> core::Block {
         core::Block {
