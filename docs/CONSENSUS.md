@@ -1563,7 +1563,15 @@ finalized. The fallback to `e`'s own window lets finality restart on a chain
 whose frozen window holds no member at all (possible only across the
 upgrade, or when every member of it is barred). At an epoch boundary the
 state keeps the epochs of the frozen window (`nf - window ..= nf - 1`) besides
-the `window + 2` most recent ones. Inactivity decay, attester weights,
+the `window + 2` most recent ones; nothing older is read again because a
+vote is includable for at most one epoch and a newly finalized checkpoint
+lies less than two epochs below the block that finalizes it (`vote_ttl <=
+epoch_len` and `vote_ttl + checkpoint_interval < 2 * epoch_len`, asserted at
+compile time for both networks, `powit::params_keep_the_frozen_window`). The
+"has no member" test stops at the first unbarred key with work in the
+window (a key's decayed weight is positive exactly when its work is), so a
+membership lookup never aggregates the frozen window; the node's pool checks
+an attestation's target slot before any such lookup. Inactivity decay, attester weights,
 justification totals and equivocation evidence all read these sets
 (`witness_set_in`, `member_weight_h2`, `total_weight_h2`,
 `may_be_proven_h2`).
