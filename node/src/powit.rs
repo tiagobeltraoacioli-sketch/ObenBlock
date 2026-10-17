@@ -651,7 +651,7 @@ impl PowitPool {
 
     /// Admit an attestation by a member of its target's witness set, for an
     /// open checkpoint slot (`TipWitnesses::open_target`), linking from the
-    /// tip's justified checkpoint. Membership and the target are checked
+    /// tip's justified checkpoint. The target, then membership, are checked
     /// before the signature. A conflict with a link the same witness was seen
     /// signing becomes an equivocation proof.
     pub fn admit_attestation(&self, att: Attestation, dag: &GhostDAG, store: &Storage) -> Result<Hash, String> {
@@ -669,11 +669,14 @@ impl PowitPool {
         if t.height <= att.source.height || t.height < view.activation {
             return Err("invalid attestation signature".into());
         }
-        let key = att.key_id();
-        let weight = view.weight_for(&p, &t, &key).ok_or("attester is not in the witness set")?;
+        // Review MEDIUM 5: the attacker-chosen target first (O(1)), then the
+        // attester's weight (from the second hardening activation it reads the
+        // frozen finalized window), then the signature.
         if !view.open_target(&p, &t) {
             return Err("attestation target is not an open checkpoint slot".into());
         }
+        let key = att.key_id();
+        let weight = view.weight_for(&p, &t, &key).ok_or("attester is not in the witness set")?;
         // The message of the target's height (v2 from the second hardening
         // activation: it commits the witness key).
         if !att.verify_signature_at(chain, &p, act, view.hardening2) {

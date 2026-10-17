@@ -291,3 +291,62 @@ fn a_stall_freezes_the_witness_set_and_resumed_finality_refreshes_it() {
         }
     }
 }
+
+/// Review MEDIUM 5: the emptiness test of the frozen window stops at the
+/// first member, and answers exactly what aggregating the whole window did
+/// (so `h2_window_epoch`, a consensus function, is unchanged): over windows
+/// with keys of zero work, barred keys, decayed keys and empty epochs.
+#[test]
+fn the_early_exit_window_test_agrees_with_the_full_aggregation() {
+    let k = |i: u8| -> KeyId { [i; 20] };
+    let mut st = PowitState::genesis(ACT, [1; 32]);
+    let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    let mut checked = 0;
+    for _ in 0..400 {
+        st.epoch_work.clear();
+        st.banned.clear();
+        st.decay.clear();
+        for e in 0..12u64 {
+            if next() % 3 == 0 {
+                continue; // an empty epoch
+            }
+            for _ in 0..(next() % 4) {
+                let key = k((next() % 6) as u8);
+                let w = match next() % 4 { 0 => 0, 1 => 1, _ => u128::from(next() % 5_000) };
+                st.epoch_work.entry(e).or_default().insert(key, w);
+            }
+        }
+        for i in 0..6u8 {
+            match next() % 5 {
+                0 => { st.banned.insert(k(i), next() % 14); }
+                1 => { st.decay.insert(k(i), (next() % 70) as u32); }
+                _ => {}
+            }
+        }
+        for window_epoch in 0..14u64 {
+            for bar_epoch in [window_epoch, window_epoch + 3, 0] {
+                let full = !st.window_weights_at(&P, window_epoch, bar_epoch).is_empty();
+                assert_eq!(st.window_has_weight(&P, window_epoch, bar_epoch), full,
+                    "window {window_epoch}, bars at {bar_epoch}: {:?} {:?}", st.epoch_work, st.banned);
+                checked += 1;
+            }
+        }
+    }
+    assert!(checked > 10_000);
+}
+
+/// Review LOW 10: the relation the frozen-window retention relies on holds
+/// for both networks (also a compile-time assertion) and is not vacuous.
+#[test]
+fn the_parameters_keep_the_frozen_window() {
+    assert!(params_keep_the_frozen_window(&MAINNET_PARAMS));
+    assert!(params_keep_the_frozen_window(&TESTNET_PARAMS));
+    assert!(!params_keep_the_frozen_window(&PowitParams { vote_ttl: 21, ..TESTNET_PARAMS }));
+    assert!(!params_keep_the_frozen_window(&PowitParams { checkpoint_interval: 20, ..TESTNET_PARAMS }));
+}

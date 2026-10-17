@@ -125,6 +125,21 @@ pub const TESTNET_PARAMS: PowitParams = PowitParams {
     ban_epochs: 3,
 };
 
+/// The parameter relation the frozen-window retention of the second
+/// hardening activation relies on (review LOW 10; `PowitState::apply_at`,
+/// "Nothing else below it is ever read again"): a vote is includable for at
+/// most one epoch (`vote_ttl <= epoch_len`, which also keeps every open
+/// vote's target epoch within [`PowitState::evidence_epochs`]), and a newly
+/// finalized checkpoint lies less than two epochs below the block that
+/// finalizes it (`vote_ttl + checkpoint_interval < 2 * epoch_len`), so its
+/// window starts within the first rule's `window_epochs + 2` horizon.
+pub const fn params_keep_the_frozen_window(p: &PowitParams) -> bool {
+    p.vote_ttl <= p.epoch_len && p.vote_ttl + p.checkpoint_interval < 2 * p.epoch_len
+}
+
+const _: () = assert!(params_keep_the_frozen_window(&MAINNET_PARAMS));
+const _: () = assert!(params_keep_the_frozen_window(&TESTNET_PARAMS));
+
 pub fn params_for(chain: ChainId) -> PowitParams {
     match chain {
         ChainId::Mainnet => MAINNET_PARAMS,
@@ -673,13 +688,31 @@ impl PowitState {
     /// all fell in the epoch the frozen window drops) gives way to `epoch`'s
     /// own window, so finality can always start again; a frozen window is
     /// never empty on a chain that finalized with its members (bans aside).
+    ///
+    /// Cost (review MEDIUM 5): the emptiness test stops at the first unbarred
+    /// key with work ([`window_has_weight`](Self::window_has_weight)); it
+    /// used to aggregate the whole window on every membership lookup.
     pub fn h2_window_epoch(&self, p: &PowitParams, epoch: u64) -> u64 {
         let anchored = self.finalized_window_epoch(p, epoch);
-        if anchored != epoch && self.window_weights_at(p, anchored, epoch).is_empty() {
+        if anchored != epoch && !self.window_has_weight(p, anchored, epoch) {
             epoch
         } else {
             anchored
         }
+    }
+
+    /// `!self.window_weights_at(p, window_epoch, bar_epoch).is_empty()`,
+    /// stopping at the first member: some key not barred at `bar_epoch` has
+    /// positive work in the window (its decayed sum is then positive too:
+    /// [`decayed`] keeps every positive weight positive).
+    fn window_has_weight(&self, p: &PowitParams, window_epoch: u64, bar_epoch: u64) -> bool {
+        if window_epoch < 2 {
+            return false;
+        }
+        let hi = window_epoch - 2;
+        let lo = (window_epoch - 1).saturating_sub(p.window_epochs);
+        self.epoch_work.range(lo..=hi)
+            .any(|(_, m)| m.iter().any(|(k, w)| *w > 0 && !self.is_banned(k, bar_epoch)))
     }
 
     /// The witness set a block uses for a target in `epoch`: the first rule

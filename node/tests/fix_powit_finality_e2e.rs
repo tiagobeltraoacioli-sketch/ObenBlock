@@ -454,3 +454,27 @@ fn producers_follow_the_witness_set_rule_of_the_next_block() {
         }
     }
 }
+
+/// Review MEDIUM 5: the pool computed the attester's weight for an
+/// attacker-chosen target before checking that the target is an open
+/// checkpoint slot (and before the signature). From the second hardening
+/// activation that weight reads the frozen finalized window, whose
+/// emptiness test aggregated the whole window, for any target epoch beyond
+/// the finalized one. The target is now checked first: a link to a slot the
+/// next block cannot include is refused before any witness-set work, by
+/// member and non-member alike.
+#[test]
+fn the_pool_checks_the_target_slot_before_the_witness_set() {
+    setup();
+    let (m, k) = (Key::new(35), Key::new(36));
+    let s = stalled(m.id(), k.id());
+    let _g = activation::scoped_override_v2(0);
+    let source = Checkpoint { height: 43, hash: s.hashes[42] };
+    // Slot 148 (epoch 7): a checkpoint slot far above the tip (111).
+    let far = Checkpoint { height: 148, hash: [7; 32] };
+    for key in [&k, &m] {
+        let pool = PowitPool::new();
+        let err = pool.admit_attestation(key.attest(source, far), &s.dag, &s.store).expect_err("not open");
+        assert_eq!(err, "attestation target is not an open checkpoint slot");
+    }
+}
