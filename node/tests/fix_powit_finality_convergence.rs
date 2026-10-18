@@ -759,3 +759,51 @@ fn an_interrupted_rebuild_resumes_on_the_persisted_pin_during_a_conflict() {
     restart(&mut n);
     assert_eq!((pin_of(&n), applied_tip(&n)), (Some(h[30].block_hash()), Some(tip(&h))));
 }
+
+/// Review round 3, LOW 4: the pin held while an anchor is unknown is the
+/// node's previous pin whatever its origin. A node pinned at a known anchor
+/// (here an operator's; a release checkpoint alike) used to drop to no pin,
+/// and follow the most work, when an unknown anchor replaced it.
+#[test]
+fn an_unknown_anchor_holds_a_previous_anchor_pin_too() {
+    setup();
+    let genesis = mk_genesis(unix_now() - 100_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let x = b.chain(gh, 20, "x");
+    let y = b.chain(gh, 12, "y");
+    let mut n = node_with(&genesis, &[]);
+    deliver(&n, &x);
+    deliver(&n, &y);
+    finality_op(&n, FinalityOp::SetAnchor(y[5].block_hash()));
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(y[5].block_hash()), Some(tip(&y))));
+    finality_op(&n, FinalityOp::SetAnchorAt([0xEE; 32], 3));
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(y[5].block_hash()), Some(tip(&y))),
+        "the previous (anchor) pin is held, not the most work");
+    assert_eq!(gnb::powit::finality_info_json(&n.dag.read(), 8)["origin"], serde_json::json!("held"));
+    restart(&mut n);
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(y[5].block_hash()), Some(tip(&y))));
+}
+
+/// Review round 3, LOW 4: the height an unknown anchor names is unchecked
+/// until the block arrives, so a typo above the tip silenced the overdue
+/// alert. The node also alerts once the anchor has stayed unknown for a
+/// while (30 minutes; zero here) out of initial block download.
+#[test]
+fn an_unknown_anchor_alerts_in_time_whatever_height_it_names() {
+    setup();
+    gnb::powit::set_unknown_anchor_alert_after(Some(std::time::Duration::ZERO));
+    let genesis = mk_genesis(unix_now() - 100_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let x = b.chain(gh, 20, "x");
+    let n = node_with(&genesis, &[]);
+    finalize(&n, &b, &x, 3, 10);
+    deliver(&n, &x);
+    finality_op(&n, FinalityOp::SetAnchorAt([0xEE; 32], 1_000_000));
+    let info = gnb::powit::finality_info_json(&n.dag.read(), 8);
+    gnb::powit::set_unknown_anchor_alert_after(None);
+    assert_eq!((info["anchor_status"].as_str(), info["origin"].as_str(), info["anchor_overdue"].as_bool()),
+        (Some("unknown"), Some("held"), Some(true)), "{info}");
+    assert_eq!(pin_of(&n), Some(x[3].block_hash()));
+}

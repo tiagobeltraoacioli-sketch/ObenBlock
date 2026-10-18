@@ -56,8 +56,10 @@
 //!
 //! Cost: the pin is recomputed after every accepted block and at each step
 //! of a chain move, and almost every block after a finalization is a source
-//! of it, so one computation examines O(1) sources per candidate (the first
-//! that qualifies; review round 2, M1), walks each disqualified block at
+//! of it, so one computation examines O(1) sources per candidate (sources
+//! are kept heaviest first, and the first that qualifies decides; review
+//! round 2, M1; a candidate below the minimum chain work costs O(1), round
+//! 3, M-B), walks each disqualified block at
 //! most once (shared walks), reads every source only of conflicting
 //! candidates resolved by work, and asks O(1) reachability queries per
 //! candidate (no selected-chain walk).
@@ -68,9 +70,11 @@
 //! anchor never count.
 //!
 //! While a configured anchor is unknown (review round 2, M3) nothing above
-//! its height counts; the node holds the checkpoint it pinned last
-//! ([`PinOrigin::Held`]), keeps it persisted, and alerts once its applied
-//! tip is above the anchor's height ([`PinOutcome::anchor_overdue`]).
+//! its height counts; the node holds the block it pinned last, a finalized
+//! checkpoint or a previous anchor ([`PinOrigin::Held`], round 3, LOW 4),
+//! keeps it persisted, and alerts once its applied tip is above the
+//! anchor's height ([`PinOutcome::anchor_overdue`]; the node adds a
+//! time-based alert, `powit::UNKNOWN_ANCHOR_ALERT_AFTER`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -81,7 +85,11 @@ use super::{BlockHash, GhostDAG};
 struct Candidate {
     /// Its PoWit slot (`Checkpoint::height`).
     slot: u64,
-    sources: Vec<BlockHash>,
+    /// (blue work, source), heaviest first (ties by hash): a block's blue
+    /// work never changes, so the first entry is the heaviest source and a
+    /// candidate whose heaviest source is below the minimum chain work is
+    /// skipped in O(1) (review round 3, M-B).
+    sources: Vec<(u128, BlockHash)>,
 }
 
 /// A weak-subjectivity anchor: a block the node trusts as final (release
@@ -117,8 +125,9 @@ pub struct PinPolicy<'a> {
     /// The node's applied tip (the block its UTXO set sits on): the counted
     /// candidates on its selected chain are the node's own finality.
     pub applied: Option<BlockHash>,
-    /// The finalized checkpoint the node pinned last ([`FinalityIndex`],
-    /// persisted by the node): its own finality while it still counts.
+    /// The block the node pinned last ([`FinalityIndex`], persisted by the
+    /// node): its own finality while it is a counted finalized checkpoint,
+    /// and the pin held while a configured anchor is unknown.
     pub sticky: Option<BlockHash>,
 }
 
@@ -212,7 +221,9 @@ pub struct PinOutcome {
     /// Supported candidates the operator set aside.
     pub ignored: usize,
     /// The configured anchor is unknown while the applied tip is above its
-    /// height (review round 2, M3: the alert).
+    /// height (review round 2, M3: the alert; the node also raises it when
+    /// the anchor stays unknown for `powit::UNKNOWN_ANCHOR_ALERT_AFTER` out of
+    /// initial block download, whatever height it names: round 3, LOW 4).
     pub anchor_overdue: bool,
 }
 
@@ -225,9 +236,13 @@ pub struct FinalityIndex {
     /// Operator settings (loaded from storage at start-up, changed by RPC).
     pub(crate) anchor_setting: AnchorSetting,
     pub(crate) ignored: HashSet<BlockHash>,
-    /// The finalized checkpoint pinned last ([`PinPolicy::sticky`]): set by
-    /// [`GhostDAG::set_finality_pin`], persisted and reloaded by the node.
+    /// The block pinned last, a finalized checkpoint or the anchor
+    /// ([`PinPolicy::sticky`]): set by [`GhostDAG::set_finality_pin`],
+    /// persisted and reloaded by the node.
     pub(crate) sticky: Option<BlockHash>,
+    /// Since when (the node's clock, out of initial block download) the
+    /// configured anchor has been unknown (review round 3, LOW 4).
+    pub(crate) anchor_unknown_since: Option<std::time::Instant>,
     /// The last outcome applied ([`GhostDAG::set_finality_pin`]), for RPC and
     /// for logging changes once.
     pub(crate) last: PinOutcome,
@@ -285,10 +300,12 @@ impl GhostDAG {
         if !self.store.has(&source) || !self.store.has(&checkpoint) || self.finality.by_source.contains_key(&source) {
             return false;
         }
+        let work = self.store.get(&source).map(|d| d.blue_work).unwrap_or(0);
         self.finality.by_source.insert(source, checkpoint);
         let c = self.finality.by_checkpoint.entry(checkpoint).or_default();
         c.slot = slot;
-        c.sources.push(source);
+        let at = c.sources.partition_point(|(w, h)| (*w, *h) > (work, source));
+        c.sources.insert(at, (work, source));
         true
     }
 
@@ -296,7 +313,7 @@ impl GhostDAG {
     pub(super) fn forget_finality_source(&mut self, source: &BlockHash) {
         let Some(cp) = self.finality.by_source.remove(source) else { return };
         if let Some(c) = self.finality.by_checkpoint.get_mut(&cp) {
-            c.sources.retain(|s| s != source);
+            c.sources.retain(|(_, s)| s != source);
             if c.sources.is_empty() {
                 self.finality.by_checkpoint.remove(&cp);
             }
@@ -369,9 +386,17 @@ impl GhostDAG {
             // reason its id commits to; one waiting for a body or a verdict
             // (in-memory marks) keeps its finality. Round 2, M1: the first
             // qualifying source decides (almost every block after a
-            // finalization is a source of it).
+            // finalization is a source of it). Round 3, M-B: heaviest first,
+            // so a candidate below the minimum chain work (initial sync with a
+            // real minimum) costs O(1).
+            if cand.sources.first().is_none_or(|(w, _)| *w < policy.min_chain_work) {
+                continue;
+            }
             let mut supported = false;
-            for s in &cand.sources {
+            for (w, s) in &cand.sources {
+                if *w < policy.min_chain_work {
+                    break;
+                }
                 if self.source_qualifies(s, policy.min_chain_work, &mut memo, &mut visits) {
                     supported = true;
                     break;
@@ -518,17 +543,20 @@ impl GhostDAG {
         !self.invalid_persistently_memo(s, memo, visits) && self.store.get(s).is_some_and(|d| d.blue_work >= min_work)
     }
 
-    /// The blue work of the heaviest qualifying source of checkpoint `cp`.
+    /// The blue work of the heaviest qualifying source of checkpoint `cp`
+    /// (the first that qualifies: sources are kept heaviest first).
     fn best_source_work(&self, cp: &BlockHash, min_work: u128, memo: &mut HashMap<BlockHash, bool>, visits: &mut u64)
         -> u128
     {
-        let mut best = 0u128;
-        for s in self.finality.by_checkpoint.get(cp).map(|c| c.sources.as_slice()).unwrap_or(&[]) {
+        for (w, s) in self.finality.by_checkpoint.get(cp).map(|c| c.sources.as_slice()).unwrap_or(&[]) {
+            if *w < min_work {
+                break;
+            }
             if self.source_qualifies(s, min_work, memo, visits) {
-                best = best.max(self.store.get(s).map(|d| d.blue_work).unwrap_or(0));
+                return *w;
             }
         }
-        best
+        0
     }
 
     /// [`GhostDAG::is_invalid_persistently`] with its selected-chain walks
@@ -572,7 +600,10 @@ impl GhostDAG {
         self.finality.sticky = match (outcome.anchor, outcome.origin) {
             // Never cleared nor replaced while the anchor is unknown (M3).
             (AnchorStatus::Unknown, _) => self.finality.sticky,
-            (_, PinOrigin::Finalized) => outcome.pin.map(|(h, _)| h),
+            // The block pinned last, whatever its origin (round 3, LOW 4): an
+            // anchor pin is held as well. Only a counted finalized checkpoint
+            // is ever the node's own finality.
+            (_, PinOrigin::Finalized | PinOrigin::Anchor) => outcome.pin.map(|(h, _)| h),
             _ => None,
         };
         self.finality.last = outcome;
@@ -832,6 +863,12 @@ mod tests {
         let (v, o) = visits(&d, &on(h(1, (candidates - 100) * per), None, &none));
         assert_eq!(o.pin.map(|x| x.1), Some((candidates - 101) * per));
         assert!(v <= 2 * candidates + 3 * 100 * per, "{v} visits with 100 candidates disqualified");
+        // Review round 3, M-B: below the minimum chain work (initial sync with
+        // a real minimum) no source qualifies: a candidate is skipped in O(1).
+        let heavy = PinPolicy { min_chain_work: u128::MAX, ..on(h(1, n), None, &none) };
+        let (v, o) = visits(&d, &heavy);
+        assert_eq!(o.pin, None);
+        assert!(v <= candidates, "{v} source visits below the minimum chain work for {candidates} candidates");
     }
 
     #[test]
