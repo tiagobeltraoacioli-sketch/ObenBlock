@@ -153,6 +153,11 @@ kinds `exit`, `equivocate`, `stop_mining`), `offline` (`key: [from, to)`) and
 `totals`), and for PoCI `handoffs[]` (`at_slot`, `from_epoch`, `to_epoch`,
 `config_id`, `total`, `entries`), `bans` (`key: [start, end)`) and `pruned`
 (`key: start epoch`, absence pruning of DESIGN-obenblock-poci.md §4.1, added
-with package B2; scenarios `fade-10pct-daily` and `vanish-40pct`). A node-level
+with package B2; scenarios `fade-10pct-daily` and `vanish-40pct`; revised by
+decisions D3/D4 of 2026-10-18: a handoff to `C_x` reads history up to
+`opening(x)` only and prunes only when the keys present in the window hold a
+strict quorum of `C_e`, so the first handoff after a long partition or stall
+keeps the side that returns, e.g. `p50-long` hands off to `C_32` with all ten
+keys instead of pruning side B). A node-level
 partition test can replay a scenario's witnesses and events and compare these
 outcomes (slots are checkpoint indices: height = slot x 60).
