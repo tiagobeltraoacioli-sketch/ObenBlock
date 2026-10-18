@@ -953,6 +953,13 @@ impl Keypair {
         }
     }
 
+    /// The address shown on `family`'s chain. `address` keeps the GnB form,
+    /// which is also what keystores store (v3 binds that string), so a file
+    /// opens on either chain; ObenBlock shows it as `obb1…`.
+    pub fn address_in(&self, family: crate::address::AddressFamily) -> String {
+        crate::address::normalize_legacy_address_in(&self.address, family)
+    }
+
     pub fn sign(&self, msg: &[u8]) -> Result<Vec<u8>, String> {
         // Legacy v2 keystores stored the RAW private key (no 4-byte suite envelope),
         // while newer keys and crypto::sign use the enveloped form. If this key is
@@ -2883,6 +2890,39 @@ mod bloch_keystore_compat_tests {
         let bad_path = dir.join("bad.json");
         std::fs::write(&bad_path, json.replace(&kp.address, &format!("bloch1q{other}"))).unwrap();
         assert!(Keypair::load_encrypted_on(&bad_path, "correct horse battery 9!", Network::Mainnet).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// DESIGN-obenblock.md §2: GnB keystores (v2 with a bloch1q or gnb1q
+    /// address, v3 with its AAD-bound gnb1q address) open unchanged; the
+    /// stored string is checked as it is, then shown as obb1q on ObenBlock.
+    #[test]
+    fn gnb_keystores_open_unchanged_and_show_as_obb() {
+        use crate::address::{AddressFamily, OBB_MAINNET_PREFIX};
+        // Own directory: the other tests here remove `tempfile_dir()`.
+        let dir = std::env::temp_dir().join(format!("gnb-obb-ks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pw = "correct horse battery 9!";
+        let kp = generate_keypair(false);
+        let body = kp.address.strip_prefix(crate::core::MAINNET_PREFIX).unwrap();
+        let obb = format!("{OBB_MAINNET_PREFIX}{body}");
+
+        let v3 = kp.to_encrypted_json_version(pw, KEYSTORE_VERSION_V3).unwrap();
+        let v2 = kp.to_encrypted_json_version(pw, LEGACY_KEYSTORE_VERSION_V2).unwrap();
+        let bloch = v2.replace(&kp.address, &format!("bloch1q{body}"));
+        for (name, json) in [("v3.json", &v3), ("v2.json", &v2), ("bloch.json", &bloch)] {
+            let path = dir.join(name);
+            std::fs::write(&path, json).unwrap();
+            let loaded = Keypair::load_encrypted_on(&path, pw, Network::Mainnet).unwrap();
+            assert_eq!(loaded.address, kp.address, "{name}");
+            assert_eq!(loaded.address_in(AddressFamily::Gnb), kp.address);
+            assert_eq!(loaded.address_in(AddressFamily::ObenBlock), obb);
+        }
+        // The v3 AAD binds the stored string: rewriting it to the obb1q form
+        // (same key, same hash) is not the authenticated file.
+        let path = dir.join("v3-obb.json");
+        std::fs::write(&path, v3.replace(&kp.address, &obb)).unwrap();
+        assert!(Keypair::load_encrypted_on(&path, pw, Network::Mainnet).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

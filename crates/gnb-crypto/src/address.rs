@@ -4,7 +4,8 @@
 //! with a single ergonomic type. Works in all three forms:
 //!
 //!   - On-chain: 20-byte hash (`&[u8; 20]`)
-//!   - User-facing: "gnb1q..." / "gnb1t..." string with checksum
+//!   - User-facing: "gnb1q..." / "gnb1t..." string with checksum (ObenBlock:
+//!     "obb1q..." / "obb1t...", see [`AddressFamily`])
 //!   - Raw bytes: 24-byte payload (20 hash + 4 checksum)
 //!
 //! All validation, parsing, and display logic lives here. Other modules
@@ -24,7 +25,8 @@ pub const LEGACY_BLOCH_MAINNET_PREFIX: &str = "bloch1q";
 pub const LEGACY_BLOCH_TESTNET_PREFIX: &str = "bloch1t";
 
 /// Map a Bloch address string to its GnB form (same hash and checksum);
-/// anything else is returned unchanged.
+/// anything else is returned unchanged. This is the GnB rule; see
+/// [`normalize_legacy_address_in`] for ObenBlock.
 pub fn normalize_legacy_address(s: &str) -> String {
     if let Some(rest) = s.strip_prefix(LEGACY_BLOCH_MAINNET_PREFIX) {
         format!("{MAINNET_PREFIX}{rest}")
@@ -33,6 +35,123 @@ pub fn normalize_legacy_address(s: &str) -> String {
     } else {
         s.to_string()
     }
+}
+
+/// Map any address string `family` accepts to that family's form, keeping
+/// the format (legacy hex stays legacy hex, Bech32m v2 stays v2).
+///
+/// * GnB: exactly [`normalize_legacy_address`] (`bloch1q`/`bloch1t` to
+///   `gnb1q`/`gnb1t`; nothing else changes).
+/// * ObenBlock: a valid `bloch1q`/`bloch1t`, `gnb1q`/`gnb1t`, `gnb1m`/`gnb1n`
+///   or GnB v2 string, or an ObenBlock one, is shown as the `obb1…` (or
+///   `obb1z…`/`tobb1z…`) address of the same output script
+///   (DESIGN-obenblock.md §2). A legacy policy string gets a new checksum,
+///   because that checksum covers the prefix. A string that does not parse
+///   is returned unchanged, so the caller's parser reports the error.
+pub fn normalize_legacy_address_in(s: &str, family: AddressFamily) -> String {
+    if family == AddressFamily::Gnb {
+        return normalize_legacy_address(s);
+    }
+    let Ok((network, script)) = destination_script_in(s, family) else {
+        return s.to_string();
+    };
+    let v2 = bech32m::is_v2_candidate(s, family);
+    if let Ok(hash) = <[u8; 20]>::try_from(script.as_slice()) {
+        let a = Address::from_hash(hash, network);
+        return if v2 { a.to_bech32m_in(family) } else { a.to_string_in(family) };
+    }
+    match PolicyAddress::from_script(&script, network) {
+        Some(p) if v2 => p.to_bech32m_in(family),
+        Some(p) => p.to_string_in(family),
+        // destination_script_in returns only 20- or 33-byte policy scripts.
+        None => s.to_string(),
+    }
+}
+
+// ── Address families (GnB, ObenBlock) ─────────────────────────────────────────
+
+/// Prefix of an ObenBlock mainnet single-key address.
+pub const OBB_MAINNET_PREFIX: &str = "obb1q";
+/// Prefix of an ObenBlock regtest single-key address.
+pub const OBB_REGTEST_PREFIX: &str = "obb1t";
+/// Prefix of an ObenBlock mainnet policy address.
+pub const OBB_POLICY_MAINNET_PREFIX: &str = "obb1m";
+/// Prefix of an ObenBlock regtest policy address.
+pub const OBB_POLICY_REGTEST_PREFIX: &str = "obb1n";
+
+/// Which chain's address strings are written and read. Scripts, hashes and
+/// [`Network`] are the same for both: the family only picks the prefixes,
+/// the Bech32m HRPs and the aliases a parser accepts.
+///
+/// * `Gnb`: `gnb1q`/`gnb1t`, `gnb1m`/`gnb1n`, v2 `gnb`/`tgnb`; Bloch's
+///   `bloch1q`/`bloch1t` accepted. Every API without a family argument is
+///   this family, unchanged.
+/// * `ObenBlock`: `obb1q`/`obb1t`, `obb1m`/`obb1n`, v2 `obb`/`tobb`. Its
+///   regtest uses the `Testnet` slot of [`Network`]. Every GnB form (and the
+///   Bloch aliases) is also accepted as the same script (DESIGN-obenblock.md
+///   §2); a GnB testnet string therefore names an ObenBlock regtest script,
+///   and callers must still require the expected network.
+///
+/// Integration point: the node/wallet chain selector (O6a) picks the family
+/// together with the network and passes it to the `*_in` functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AddressFamily {
+    Gnb,
+    ObenBlock,
+}
+
+impl AddressFamily {
+    /// Prefix of a legacy single-key address.
+    pub const fn key_prefix(self, network: Network) -> &'static str {
+        match (self, network) {
+            (AddressFamily::Gnb, Network::Mainnet) => MAINNET_PREFIX,
+            (AddressFamily::Gnb, Network::Testnet) => TESTNET_PREFIX,
+            (AddressFamily::ObenBlock, Network::Mainnet) => OBB_MAINNET_PREFIX,
+            (AddressFamily::ObenBlock, Network::Testnet) => OBB_REGTEST_PREFIX,
+        }
+    }
+
+    /// Prefix of a legacy policy address.
+    pub const fn policy_prefix(self, network: Network) -> &'static str {
+        match (self, network) {
+            (AddressFamily::Gnb, Network::Mainnet) => POLICY_MAINNET_PREFIX,
+            (AddressFamily::Gnb, Network::Testnet) => POLICY_TESTNET_PREFIX,
+            (AddressFamily::ObenBlock, Network::Mainnet) => OBB_POLICY_MAINNET_PREFIX,
+            (AddressFamily::ObenBlock, Network::Testnet) => OBB_POLICY_REGTEST_PREFIX,
+        }
+    }
+
+    /// The families whose strings this family's parsers accept, own first.
+    /// GnB accepts only its own, so its diagnostics are unchanged.
+    pub(crate) const fn accepted(self) -> &'static [AddressFamily] {
+        match self {
+            AddressFamily::Gnb => &[AddressFamily::Gnb],
+            AddressFamily::ObenBlock => &[AddressFamily::ObenBlock, AddressFamily::Gnb],
+        }
+    }
+}
+
+const NETWORKS: [Network; 2] = [Network::Mainnet, Network::Testnet];
+
+/// Rewrite an accepted alias prefix of a legacy single-key string to the
+/// family's own prefix. The legacy checksum covers only the hash, so the
+/// rest of the string is kept as it is. For GnB this is
+/// [`normalize_legacy_address`].
+fn alias_key_prefix(s: &str, family: AddressFamily) -> String {
+    for network in NETWORKS {
+        let bloch = match network {
+            Network::Mainnet => LEGACY_BLOCH_MAINNET_PREFIX,
+            Network::Testnet => LEGACY_BLOCH_TESTNET_PREFIX,
+        };
+        let aliases = std::iter::once(bloch)
+            .chain(family.accepted().iter().filter(|&&f| f != family).map(|f| f.key_prefix(network)));
+        for alias in aliases {
+            if let Some(rest) = s.strip_prefix(alias) {
+                return format!("{}{rest}", family.key_prefix(network));
+            }
+        }
+    }
+    s.to_string()
 }
 
 // ── Policy addresses (multisig / timelocks, core::policy) ─────────────────────
@@ -45,7 +164,8 @@ pub const POLICY_TESTNET_PREFIX: &str = "gnb1n";
 /// Address of a spend policy: `prefix ‖ hex(hash32 ‖ checksum4)`, where the
 /// checksum is `SHA3-256(SHA3-256(prefix ‖ hash))[..4]` — it covers the
 /// network prefix, so a mainnet policy address cannot be mistyped into a
-/// valid testnet one.
+/// valid testnet one. It also covers the family: `gnb1m…` and `obb1m…` of the
+/// same policy have different checksums.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PolicyAddress {
     hash: [u8; 32],
@@ -74,7 +194,21 @@ impl PolicyAddress {
     /// Opt-in GnB v2 address. The Bech32m checksum binds the network and kind.
     /// `Display` retains the legacy representation for stored identities.
     pub fn to_bech32m(&self) -> String {
-        bech32m::encode_address(self.network, 1, &self.hash)
+        self.to_bech32m_in(AddressFamily::Gnb)
+    }
+
+    /// [`Self::to_bech32m`] with `family`'s HRP.
+    pub fn to_bech32m_in(&self, family: AddressFamily) -> String {
+        bech32m::encode_address(family, self.network, 1, &self.hash)
+    }
+
+    /// Legacy string with `family`'s prefix (and the checksum over it).
+    /// `Display` is the GnB form.
+    pub fn to_string_in(&self, family: AddressFamily) -> String {
+        let prefix = family.policy_prefix(self.network);
+        let mut payload = self.hash.to_vec();
+        payload.extend_from_slice(&Self::checksum(prefix, &self.hash));
+        format!("{prefix}{}", hex::encode(payload))
     }
 
     /// The 33-byte output script (`0x02 ‖ hash`).
@@ -84,24 +218,24 @@ impl PolicyAddress {
         s
     }
 
-    fn prefix(network: Network) -> &'static str {
-        match network {
-            Network::Mainnet => POLICY_MAINNET_PREFIX,
-            Network::Testnet => POLICY_TESTNET_PREFIX,
-        }
-    }
-
-    fn checksum(network: Network, hash: &[u8; 32]) -> [u8; 4] {
+    fn checksum(prefix: &str, hash: &[u8; 32]) -> [u8; 4] {
         let mut h = Sha3_256::new();
-        h.update(Self::prefix(network).as_bytes());
+        h.update(prefix.as_bytes());
         h.update(hash);
         let outer = Sha3_256::digest(h.finalize());
         [outer[0], outer[1], outer[2], outer[3]]
     }
 
+    /// Parse a GnB policy address (legacy or v2).
     pub fn parse(s: &str) -> Result<Self, AddressError> {
-        if bech32m::is_v2_candidate(s) {
-            let (network, kind, hash) = bech32m::decode_address(s)?;
+        Self::parse_in(s, AddressFamily::Gnb)
+    }
+
+    /// Parse a policy address of any family `family` accepts. A legacy
+    /// string's checksum is checked against the prefix it carries.
+    pub fn parse_in(s: &str, family: AddressFamily) -> Result<Self, AddressError> {
+        if bech32m::is_v2_candidate(s, family) {
+            let (network, kind, hash) = bech32m::decode_address(s, family)?;
             if kind != 1 {
                 return Err(AddressError::BadEncoding);
             }
@@ -109,20 +243,19 @@ impl PolicyAddress {
             policy_hash.copy_from_slice(&hash);
             return Ok(Self { hash: policy_hash, network });
         }
-        let (network, payload) = if let Some(rest) = s.strip_prefix(POLICY_MAINNET_PREFIX) {
-            (Network::Mainnet, rest)
-        } else if let Some(rest) = s.strip_prefix(POLICY_TESTNET_PREFIX) {
-            (Network::Testnet, rest)
-        } else {
-            return Err(AddressError::BadPrefix);
-        };
+        let (network, prefix, payload) = family
+            .accepted()
+            .iter()
+            .flat_map(|&f| NETWORKS.map(|n| (n, f.policy_prefix(n))))
+            .find_map(|(n, prefix)| s.strip_prefix(prefix).map(|rest| (n, prefix, rest)))
+            .ok_or(AddressError::BadPrefix)?;
         if payload.len() != 72 {
             return Err(AddressError::BadLength { got: payload.len(), expected: 72 });
         }
         let bytes = hex::decode(payload).map_err(|_| AddressError::BadHex)?;
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&bytes[..32]);
-        if bytes[32..36] != Self::checksum(network, &hash) {
+        if bytes[32..36] != Self::checksum(prefix, &hash) {
             return Err(AddressError::BadChecksum);
         }
         Ok(Self { hash, network })
@@ -131,9 +264,7 @@ impl PolicyAddress {
 
 impl std::fmt::Display for PolicyAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut payload = self.hash.to_vec();
-        payload.extend_from_slice(&Self::checksum(self.network, &self.hash));
-        write!(f, "{}{}", Self::prefix(self.network), hex::encode(payload))
+        f.write_str(&self.to_string_in(AddressFamily::Gnb))
     }
 }
 
@@ -142,8 +273,14 @@ impl std::fmt::Display for PolicyAddress {
 /// network and output script. Equivalent representations produce identical
 /// scripts; callers must still require the expected network.
 pub fn destination_script(s: &str) -> Result<(Network, Vec<u8>), AddressError> {
-    if bech32m::is_v2_candidate(s) {
-        let (network, kind, hash) = bech32m::decode_address(s)?;
+    destination_script_in(s, AddressFamily::Gnb)
+}
+
+/// [`destination_script`] for every form `family` accepts: on ObenBlock,
+/// `obb1q`/`obb1t`/`obb1m`/`obb1n`/`obb1z`/`tobb1z` and all GnB forms.
+pub fn destination_script_in(s: &str, family: AddressFamily) -> Result<(Network, Vec<u8>), AddressError> {
+    if bech32m::is_v2_candidate(s, family) {
+        let (network, kind, hash) = bech32m::decode_address(s, family)?;
         let mut script = Vec::with_capacity(hash.len() + usize::from(kind == 1));
         if kind == 1 {
             script.push(crate::core::policy::POLICY_TAG);
@@ -151,11 +288,15 @@ pub fn destination_script(s: &str) -> Result<(Network, Vec<u8>), AddressError> {
         script.extend_from_slice(&hash);
         return Ok((network, script));
     }
-    if s.starts_with(POLICY_MAINNET_PREFIX) || s.starts_with(POLICY_TESTNET_PREFIX) {
-        let a = PolicyAddress::parse(s)?;
+    let policy = family
+        .accepted()
+        .iter()
+        .any(|&f| NETWORKS.iter().any(|&n| s.starts_with(f.policy_prefix(n))));
+    if policy {
+        let a = PolicyAddress::parse_in(s, family)?;
         return Ok((a.network(), a.script_pubkey()));
     }
-    let a = Address::parse(s)?;
+    let a = Address::parse_in(s, family)?;
     Ok((a.network(), a.hash().to_vec()))
 }
 
@@ -193,7 +334,22 @@ impl Address {
     /// Opt-in GnB v2 address. The Bech32m checksum binds the network and kind.
     /// `Display` and serde retain the legacy representation and stored fields.
     pub fn to_bech32m(&self) -> String {
-        bech32m::encode_address(self.network, 0, &self.hash)
+        self.to_bech32m_in(AddressFamily::Gnb)
+    }
+
+    /// [`Self::to_bech32m`] with `family`'s HRP.
+    pub fn to_bech32m_in(&self, family: AddressFamily) -> String {
+        bech32m::encode_address(family, self.network, 0, &self.hash)
+    }
+
+    /// Legacy string with `family`'s prefix. The checksum covers only the
+    /// hash, so the forms differ only in the prefix. `Display` is the GnB form.
+    pub fn to_string_in(&self, family: AddressFamily) -> String {
+        let inner = Sha3_256::digest(self.hash);
+        let outer = Sha3_256::digest(inner);
+        let mut payload = self.hash.to_vec();
+        payload.extend_from_slice(&outer[..4]);
+        format!("{}{}", family.key_prefix(self.network), hex::encode(&payload))
     }
 
     /// Borrow the 20-byte pubkey hash component of the address.
@@ -215,8 +371,15 @@ impl Address {
     /// Also accepts GnB v2 Bech32m single-key addresses, whose checksum binds
     /// the network. Validates the selected format, length and checksum.
     pub fn parse(s: &str) -> Result<Self, AddressError> {
-        if bech32m::is_v2_candidate(s) {
-            let (network, kind, hash) = bech32m::decode_address(s)?;
+        Self::parse_in(s, AddressFamily::Gnb)
+    }
+
+    /// [`Self::parse`] for every single-key form `family` accepts. On
+    /// ObenBlock: `obb1q`/`obb1t`, `obb1z`/`tobb1z`, and the GnB and Bloch
+    /// forms of the same hash.
+    pub fn parse_in(s: &str, family: AddressFamily) -> Result<Self, AddressError> {
+        if bech32m::is_v2_candidate(s, family) {
+            let (network, kind, hash) = bech32m::decode_address(s, family)?;
             if kind != 0 {
                 return Err(AddressError::BadEncoding);
             }
@@ -224,11 +387,11 @@ impl Address {
             key_hash.copy_from_slice(&hash);
             return Ok(Self { hash: key_hash, network });
         }
-        let normalized = normalize_legacy_address(s);
+        let normalized = alias_key_prefix(s, family);
         let s = normalized.as_str();
-        let (network, payload) = if let Some(rest) = s.strip_prefix(MAINNET_PREFIX) {
+        let (network, payload) = if let Some(rest) = s.strip_prefix(family.key_prefix(Network::Mainnet)) {
             (Network::Mainnet, rest)
-        } else if let Some(rest) = s.strip_prefix(TESTNET_PREFIX) {
+        } else if let Some(rest) = s.strip_prefix(family.key_prefix(Network::Testnet)) {
             (Network::Testnet, rest)
         } else {
             return Err(AddressError::BadPrefix);
@@ -275,7 +438,12 @@ impl Address {
     /// prefix into the checksum is provided by the opt-in [`Self::to_bech32m`]
     /// format. The network comparison is required for both formats.
     pub fn parse_for_network(s: &str, network: Network) -> Result<Self, AddressError> {
-        let address = Self::parse(s)?;
+        Self::parse_for_network_in(s, network, AddressFamily::Gnb)
+    }
+
+    /// [`Self::parse_for_network`] for every form `family` accepts.
+    pub fn parse_for_network_in(s: &str, network: Network, family: AddressFamily) -> Result<Self, AddressError> {
+        let address = Self::parse_in(s, family)?;
         if address.network != network {
             return Err(AddressError::WrongNetwork { expected: network, got: address.network });
         }
@@ -314,12 +482,7 @@ impl Address {
 /// `Display`.
 impl std::fmt::Display for Address {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = Sha3_256::digest(&self.hash);
-        let outer = Sha3_256::digest(&inner);
-        let checksum = &outer[..4];
-        let mut payload = self.hash.to_vec();
-        payload.extend_from_slice(checksum);
-        write!(f, "{}{}", self.network.prefix(), hex::encode(&payload))
+        f.write_str(&self.to_string_in(AddressFamily::Gnb))
     }
 }
 

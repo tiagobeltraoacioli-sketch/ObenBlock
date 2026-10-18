@@ -8,18 +8,40 @@
 //! is a GnB *address format* version, not a Bitcoin witness/consensus version.
 //! This checksum is not authentication and these are not Bitcoin addresses.
 
-use super::{AddressError, Network};
+use super::{AddressError, AddressFamily, Network};
 
 const CHARSET: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 const GENERATORS: [u32; 5] = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
 const BECH32M: u32 = 0x2bc830a3;
 const FORMAT_VERSION: u8 = 2;
 
+/// HRP of a v2 address of `family` on `network`. ObenBlock's regtest uses
+/// the testnet slot of [`Network`], so its HRP is `tobb` (like `tgnb`).
+pub(super) fn hrp(family: AddressFamily, network: Network) -> &'static str {
+    match (family, network) {
+        (AddressFamily::Gnb, Network::Mainnet) => "gnb",
+        (AddressFamily::Gnb, Network::Testnet) => "tgnb",
+        (AddressFamily::ObenBlock, Network::Mainnet) => "obb",
+        (AddressFamily::ObenBlock, Network::Testnet) => "tobb",
+    }
+}
+
 /// Version 2 begins with `z`, disjoint from all exact legacy prefixes. This
 /// leaves legacy acceptance and diagnostics unchanged, including hex casing.
-pub(super) fn is_v2_candidate(s: &str) -> bool {
-    s.get(..5).is_some_and(|p| p.eq_ignore_ascii_case("gnb1z"))
-        || s.get(..6).is_some_and(|p| p.eq_ignore_ascii_case("tgnb1z"))
+/// Only the HRPs `family` accepts are candidates, so a GnB parser keeps its
+/// exact pre-ObenBlock diagnostics for `obb1z…` strings.
+pub(super) fn is_v2_candidate(s: &str, family: AddressFamily) -> bool {
+    // Bytes, not `str` slices: an untrusted string may split a UTF-8
+    // character anywhere, and only an ASCII match is a candidate.
+    let bytes = s.as_bytes();
+    family.accepted().iter().any(|&f| {
+        [Network::Mainnet, Network::Testnet].into_iter().any(|n| {
+            let hrp = hrp(f, n).as_bytes();
+            bytes.len() >= hrp.len() + 2
+                && bytes[..hrp.len()].eq_ignore_ascii_case(hrp)
+                && bytes[hrp.len()..hrp.len() + 2].eq_ignore_ascii_case(b"1z")
+        })
+    })
 }
 
 fn polymod(values: impl IntoIterator<Item = u8>) -> u32 {
@@ -115,25 +137,25 @@ fn convert_bits(data: &[u8], from: u8, to: u8, pad: bool) -> Option<Vec<u8>> {
     Some(result)
 }
 
-pub(super) fn encode_address(network: Network, kind: u8, hash: &[u8]) -> String {
+pub(super) fn encode_address(family: AddressFamily, network: Network, kind: u8, hash: &[u8]) -> String {
     debug_assert!((kind == 0 && hash.len() == 20) || (kind == 1 && hash.len() == 32));
-    let hrp = match network {
-        Network::Mainnet => "gnb",
-        Network::Testnet => "tgnb",
-    };
+    let hrp = hrp(family, network);
     let mut words = vec![FORMAT_VERSION, kind];
     // Every byte fits in eight bits; failure is impossible for this conversion.
     words.extend(convert_bits(hash, 8, 5, true).expect("8-bit bytes"));
     encode(hrp, &words)
 }
 
-pub(super) fn decode_address(s: &str) -> Result<(Network, u8, Vec<u8>), AddressError> {
-    let (hrp, words) = decode(s)?;
-    let network = match hrp.as_str() {
-        "gnb" => Network::Mainnet,
-        "tgnb" => Network::Testnet,
-        _ => return Err(AddressError::BadPrefix),
-    };
+/// Decode a v2 address whose HRP `family` accepts (see [`is_v2_candidate`]).
+pub(super) fn decode_address(s: &str, family: AddressFamily) -> Result<(Network, u8, Vec<u8>), AddressError> {
+    let (decoded_hrp, words) = decode(s)?;
+    let network = family
+        .accepted()
+        .iter()
+        .flat_map(|&f| [Network::Mainnet, Network::Testnet].map(|n| (hrp(f, n), n)))
+        .find(|(candidate, _)| *candidate == decoded_hrp)
+        .map(|(_, n)| n)
+        .ok_or(AddressError::BadPrefix)?;
     if words.len() < 2 || words[0] != FORMAT_VERSION {
         return Err(AddressError::BadEncoding);
     }
@@ -166,7 +188,7 @@ mod tests {
         ] {
             let (hrp, words) = decode(valid).unwrap_or_else(|e| panic!("{valid}: {e}"));
             assert_eq!(encode(&hrp, &words), valid.to_ascii_lowercase());
-            assert!(decode_address(valid).is_err());
+            assert!(decode_address(valid, AddressFamily::Gnb).is_err());
         }
         for invalid in [
             "\u{20}1xj0phk", "\u{7f}1g6xzxy", "\u{80}1vctc34",
@@ -189,14 +211,14 @@ mod tests {
     #[test]
     fn application_format_rejects_unknown_hrp_version_kind_and_lengths() {
         let valid = words(0, 20);
-        assert!(decode_address(&encode("other", &valid)).is_err());
+        assert!(decode_address(&encode("other", &valid), AddressFamily::Gnb).is_err());
         for version in [0, 1, 3, 31] {
             let mut bad = valid.clone();
             bad[0] = version;
-            assert!(decode_address(&encode("gnb", &bad)).is_err());
+            assert!(decode_address(&encode("gnb", &bad), AddressFamily::Gnb).is_err());
         }
         for kind in [2, 3, 31] {
-            assert!(decode_address(&encode("gnb", &words(kind, 20))).is_err());
+            assert!(decode_address(&encode("gnb", &words(kind, 20)), AddressFamily::Gnb).is_err());
         }
         for (kind, wrong_len) in [
             (0, 0),
@@ -208,10 +230,10 @@ mod tests {
             (1, 31),
             (1, 33),
         ] {
-            assert!(decode_address(&encode("gnb", &words(kind, wrong_len))).is_err());
+            assert!(decode_address(&encode("gnb", &words(kind, wrong_len)), AddressFamily::Gnb).is_err());
         }
         for too_short in [vec![], vec![2]] {
-            assert!(decode_address(&encode("gnb", &too_short)).is_err());
+            assert!(decode_address(&encode("gnb", &too_short), AddressFamily::Gnb).is_err());
         }
     }
 
@@ -220,48 +242,76 @@ mod tests {
         let mut nonzero = words(1, 32);
         *nonzero.last_mut().unwrap() |= 1;
         assert_eq!(
-            decode_address(&encode("gnb", &nonzero)),
+            decode_address(&encode("gnb", &nonzero), AddressFamily::Gnb),
             Err(AddressError::BadEncoding)
         );
         let mut excessive = words(0, 20);
         excessive.push(0); // A whole extra data word is not permitted padding.
         assert_eq!(
-            decode_address(&encode("gnb", &excessive)),
+            decode_address(&encode("gnb", &excessive), AddressFamily::Gnb),
             Err(AddressError::BadEncoding)
         );
         assert_eq!(
-            decode_address(&encode("gnb", &words(0, 20))).unwrap().2,
+            decode_address(&encode("gnb", &words(0, 20)), AddressFamily::Gnb).unwrap().2,
             vec![0; 20]
         );
         assert_eq!(
-            decode_address(&encode("gnb", &words(1, 32))).unwrap().2,
+            decode_address(&encode("gnb", &words(1, 32)), AddressFamily::Gnb).unwrap().2,
             vec![0; 32]
         );
     }
 
     #[test]
     fn bound_case_and_network_are_enforced_before_acceptance() {
-        let valid = encode_address(Network::Mainnet, 0, &[42; 20]);
-        assert!(decode_address(&valid.to_ascii_uppercase()).is_ok());
+        let valid = encode_address(AddressFamily::Gnb, Network::Mainnet, 0, &[42; 20]);
+        assert!(decode_address(&valid.to_ascii_uppercase(), AddressFamily::Gnb).is_ok());
         assert_eq!(
-            decode_address(&valid.replacen("gnb", "Gnb", 1)),
+            decode_address(&valid.replacen("gnb", "Gnb", 1), AddressFamily::Gnb),
             Err(AddressError::BadEncoding)
         );
         assert_eq!(
-            decode_address(&valid.replacen("gnb", "tgnb", 1)),
+            decode_address(&valid.replacen("gnb", "tgnb", 1), AddressFamily::Gnb),
             Err(AddressError::BadChecksum)
         );
         assert_eq!(
-            decode_address(&format!("gnb1z{}", "q".repeat(86))),
+            decode_address(&format!("gnb1z{}", "q".repeat(86)), AddressFamily::Gnb),
             Err(AddressError::BadEncoding)
         );
         assert_eq!(
-            decode_address(&format!("{valid}é")),
+            decode_address(&format!("{valid}é"), AddressFamily::Gnb),
             Err(AddressError::BadEncoding)
         );
         assert_eq!(
-            decode_address(&format!("{valid}\n")),
+            decode_address(&format!("{valid}\n"), AddressFamily::Gnb),
             Err(AddressError::BadEncoding)
         );
+    }
+
+    #[test]
+    fn obenblock_hrps_and_gnb_aliases() {
+        for network in [Network::Mainnet, Network::Testnet] {
+            for (kind, len) in [(0u8, 20usize), (1, 32)] {
+                let obb = encode_address(AddressFamily::ObenBlock, network, kind, &vec![7; len]);
+                let gnb = encode_address(AddressFamily::Gnb, network, kind, &vec![7; len]);
+                assert!(obb.starts_with(if network == Network::Mainnet { "obb1z" } else { "tobb1z" }));
+                assert!(is_v2_candidate(&obb, AddressFamily::ObenBlock));
+                // GnB does not know the obb HRPs: not a candidate, so its
+                // legacy diagnostics stay what they were.
+                assert!(!is_v2_candidate(&obb, AddressFamily::Gnb));
+                assert_eq!(decode_address(&obb, AddressFamily::Gnb), Err(AddressError::BadPrefix));
+                for s in [&obb, &gnb] {
+                    assert_eq!(decode_address(s, AddressFamily::ObenBlock).unwrap(), (network, kind, vec![7; len]));
+                }
+                assert!(is_v2_candidate(&gnb.to_ascii_uppercase(), AddressFamily::ObenBlock));
+            }
+        }
+    }
+
+    #[test]
+    fn candidate_check_never_slices_inside_a_character() {
+        for s in ["ob\u{e9}1zqqqqqq", "obb\u{e9}zqqqq", "\u{e9}", "tob\u{1F600}", "gn\u{e9}1z", ""] {
+            assert!(!is_v2_candidate(s, AddressFamily::ObenBlock), "{s:?}");
+            assert!(!is_v2_candidate(s, AddressFamily::Gnb), "{s:?}");
+        }
     }
 }
