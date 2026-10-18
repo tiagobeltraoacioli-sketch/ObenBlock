@@ -32,6 +32,7 @@ use gnb_crypto::core::{self, activation, Block};
 type Hash = [u8; 32];
 
 mod store;
+pub mod certificate;
 
 /// The second hardening activation height the PoWit rules switch at
 /// (`core::powit::Regime`; process-wide, the node's chain schedule):
@@ -1683,29 +1684,58 @@ pub fn info_json(dag: &GhostDAG, store: &Storage) -> serde_json::Value {
         "signers": crate::powit_signer::statuses(),
         // PoCI (ObenBlock, DESIGN-obenblock-poci.md): the configuration in
         // force (`null` on GnB and during the launch bootstrap).
-        "poci": poci_info_json(st.as_ref()),
+        "poci": poci_info_json(dag, store, st.as_ref()),
     })
 }
 
-/// The PoCI part of `getpowitinfo`: the configuration in force (epoch, id,
-/// exact total, entries, quorum threshold) and the bans.
-fn poci_info_json(st: Option<&PowitState>) -> serde_json::Value {
+/// The PoCI part of `getfinalityinfo` (ObenBlock; `null` on GnB): the
+/// configuration in force at the selected tip, as in `getpowitinfo`, with
+/// the latest finalized checkpoint and the summary of its kept certificate
+/// (`getfinalitycertificate` serves the certificate itself).
+pub fn poci_finality_json(dag: &GhostDAG, store: &Storage) -> serde_json::Value {
+    if PociParams::for_chain(core::node_chain_id()).is_none() {
+        return serde_json::Value::Null;
+    }
+    let tip = dag.selected_tip();
+    let tip_h = tip.and_then(|t| dag.get_block_data(&t)).map(|d| d.height).unwrap_or(0);
+    let st = selected_chain_since(dag, tip, tip_h.saturating_sub(16)).into_iter().find_map(|(h, _)| load_state(store, &h));
+    poci_info_json(dag, store, st.as_ref())
+}
+
+/// The PoCI part of `getpowitinfo` and `getfinalityinfo`: the configuration
+/// in force (epoch, id, exact total, entries), its absent weight per epoch,
+/// the bans, and the latest finalized checkpoint with its kept certificate.
+fn poci_info_json(dag: &GhostDAG, store: &Storage, st: Option<&PowitState>) -> serde_json::Value {
     let Some(pp) = PociParams::for_chain(core::node_chain_id()) else { return serde_json::Value::Null };
-    let Some(ps) = st.and_then(|s| s.poci.as_ref()) else {
+    let Some((s, ps)) = st.and_then(|s| s.poci.as_ref().map(|p| (s, p))) else {
         return serde_json::json!({ "active": false, "bootstrap_epochs": pp.bootstrap_epochs });
     };
     let c = ps.config();
     // The weight of C_e with no vote included in a block of each recent
     // epoch (not final: blocks above the finalized checkpoint count), so
     // operators see it grow long before it reaches a third.
-    let now = st.map(|s| s.epoch).unwrap_or(0);
+    let now = s.epoch;
     let absent: Vec<serde_json::Value> = (now.saturating_sub(poci::POCI_PRUNE_AFTER_EPOCHS)..=now)
         .filter(|e| *e >= c.epoch())
         .map(|e| {
             let w = ps.absent_weight(e);
-            serde_json::json!({ "epoch": e, "weight": w.to_string(),
+            let keys = c.entries().iter().filter(|(k, _)| !ps.seen.get(k).is_some_and(|m| m.contains_key(&e))).count();
+            serde_json::json!({ "epoch": e, "weight": w.to_string(), "keys": keys,
                                 "over_a_third": w.checked_mul(3).is_none_or(|x| x > c.total()) })
         }).collect();
+    let f = s.finalized;
+    let certificate = if certificate::final_by_definition(&pp, &f) {
+        serde_json::json!({ "available": false, "reason": "final by definition (launch checkpoint)" })
+    } else {
+        match certificate::load(store, &f.hash) {
+            Some(k) => {
+                let mut j = certificate::certificate_json(dag, &k, false);
+                j["available"] = true.into();
+                j
+            }
+            None => serde_json::json!({ "available": false, "reason": "not kept yet (getfinalitycertificate rebuilds it)" }),
+        }
+    };
     let bans: Vec<serde_json::Value> = ps.bans.iter().flat_map(|(k, bl)| bl.iter().map(move |b| serde_json::json!({
         "key": hex::encode(k), "config_id": hex::encode(b.config_id), "included_at": b.included_at,
         "start": b.start, "end": b.end(pp.ban_epochs),
@@ -1726,7 +1756,9 @@ fn poci_info_json(st: Option<&PowitState>) -> serde_json::Value {
         "absent_weight": absent,
         "pruned": ps.pruned.iter().map(|(k, p)| serde_json::json!({
             "key": hex::encode(k), "since_epoch": p.start, "rejoin_included_at": ps.rejoins.get(k) })).collect::<Vec<_>>(),
-        "growth_cap": growth_cap_json(st.and_then(|s| s.cap.as_ref())),
+        "growth_cap": growth_cap_json(s.cap.as_ref()),
+        "finalized": { "slot": f.height, "hash": hex::encode(f.hash) },
+        "finalized_certificate": certificate,
     })
 }
 

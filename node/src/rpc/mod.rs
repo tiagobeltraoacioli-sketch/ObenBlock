@@ -323,6 +323,9 @@ const HEAVY_READ_METHODS: &[&str] = &[
     // ObenBlock anchors (docs/OBB-ANCHOR.md): up to `MAX_STATE_READS` PoWit
     // state decodes per call.
     "getfinalityanchors",
+    // PoCI (ObenBlock): a certificate not kept yet is rebuilt from up to
+    // `vote_ttl + 1` bodies and verified (one signature per vote) once.
+    "getfinalitycertificate",
     // L-8 (audit): `getblocktemplate` is bounded the same way (cache +
     // single flight) but through its OWN gate (`AppState::template_gate`,
     // `gated_dispatch`): sharing this one's single scan permit answered a
@@ -346,7 +349,7 @@ const KNOWN_RPC_METHODS: &[&str] = &[
     "getmempoolstats", "validateaddressverbose", "gettxsbyblock", "getaddressbalance_at_height",
     "getattestation", "invalidateblock", "reconsiderblock", "gettxoutsetinfo",
     "getfinalityinfo", "ignorefinalized", "reconsiderfinalized", "setfinalitycheckpoint",
-    "getfinalityanchors", "getblochanchor",
+    "getfinalityanchors", "getblochanchor", "getfinalitycertificate",
 ];
 
 /// Longest method-name prefix written to a log line (NET-13).
@@ -2159,7 +2162,23 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         // checkpoints it counts and any conflict (read; bounded output).
         "getfinalityinfo" => {
             let dag = state.dag.read();
-            crate::powit::finality_info_json(&dag, 32)
+            let mut out = crate::powit::finality_info_json(&dag, 32);
+            // PoCI (ObenBlock): the configuration in force and the latest
+            // finalized checkpoint's certificate (GnB's answer is unchanged).
+            let poci = crate::powit::poci_finality_json(&dag, &state.store);
+            if !poci.is_null() {
+                out["poci"] = poci;
+            }
+            out
+        }
+
+        // getfinalitycertificate [slot | checkpoint hash]: the PoCI finality
+        // certificate (Proof of Integrity, docs/DESIGN-obenblock-poci.md §6)
+        // of a finalized checkpoint, with its registry proof; without a
+        // parameter, the latest finalized checkpoint's.
+        "getfinalitycertificate" => {
+            let dag = state.dag.read();
+            crate::powit::certificate::rpc_json(&dag, &state.store, params.and_then(|p| p.get(0)))
         }
 
         // submitpowititem [kind, hex]: kind 1 = witness share, 2 = attestation,

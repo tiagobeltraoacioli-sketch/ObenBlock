@@ -488,3 +488,61 @@ tests.
   (`powit/cap/<block>`). `getpowitinfo` reports, under `poci.growth_cap`,
   the last step's `W`, `G`, `sum(x)`, admitted, admitted to new keys and
   dropped.
+
+## 15. Implementation (package B4: certificates, RPC, partition tests)
+
+- Certificates on the node (`node/src/powit/certificate.rs`). The block `B`
+  whose state first carries a finalized checkpoint `F` is the one that
+  certifies it: under the configuration `C` in force at `B`'s selected
+  parent (whose justified checkpoint is `F`), the certificate holds every
+  included vote `F -> t` (`t = F + checkpoint_interval`, `B`'s justified
+  checkpoint) by a key of `C`, from the blocks of `B`'s selected chain at
+  heights `t ..= B` (the only blocks that may include such a vote; the
+  duplicate rule keeps one per key). `C` cannot change in between: only a
+  finalization changes it, and that moves the justified checkpoint away
+  from `F` first. On acceptance of `B` the node builds it, verifies it once
+  against `C` (every signature) and keeps it (`powit/pocicert/<F hash>`,
+  with the block that finalized `F` and the configuration it handed off
+  to); a checkpoint without a kept row is rebuilt from the selected chain on
+  request (at most `vote_ttl + 1` bodies) and kept then. The genesis slot
+  and the launch checkpoint of §9 are final by definition and have none.
+- RPC `getfinalitycertificate [slot | checkpoint hash]` (default: the latest
+  finalized checkpoint of the selected tip; `gnb-cli finalitycertificate`)
+  returns the certificate's wire bytes, the registry proof for its voters,
+  the configuration (epoch, `config_id`, exact total as a decimal string,
+  entry count), the signed weight, the block that finalized it and the
+  configuration it handed off to. It is in the single-flight read group of
+  the RPC server (a rebuild verifies signatures).
+- `getpowitinfo.poci` and `getfinalityinfo.poci`: the configuration in
+  force, the absent weight of §4.1 (`absent_weight`, §13; per epoch the
+  weight and number of its keys), the bans, and the latest finalized
+  checkpoint with its kept certificate's summary.
+- Ledger storage fix (found while testing partitions; B2 found and fixed
+  the same bug, and the merge keeps B2's rows, §13): a block's PoCI record
+  names a history node whose id commits to the whole sequence of
+  configurations (`powit/pocihist/<node id>`). Two forks that reach the
+  same configuration through different handoffs (one skips an epoch) used
+  to read back the same history, so evidence naming a past configuration
+  could be judged against the other fork's history (a consensus split
+  between nodes that saw the forks in a different order).
+  `node/tests/poci_state_store.rs` covers it.
+- Partition tests, node level (`node/tests/poci_partition.rs`, ObenBlock
+  regtest, real acceptance pipeline, SHA-256d shares, KES keys, v3 votes):
+  50/50 over 2 epochs, 60/40 and 70/30 over 6, exactly 2/3 (6 of 9) over 4,
+  and 50/50, 60/40, 70/30 over the window + 8 epochs (120). Each checks
+  that only a side with more than 2/3 of the configuration at the split
+  finalizes, that a side without it keeps that configuration, its total and
+  its finalized checkpoint at every block, that after the heal both nodes
+  select the same chain (the finalizing side is given less work, so the
+  finality pin is what decides) with no conflict alert, that finality
+  resumes under the configuration of the split when nothing was finalized
+  meanwhile, and that both nodes serve the same certificate, which verifies
+  against its `config_id` with the registry proof (and a forged weight
+  changes the id). `exit_and_ban_during_a_stall` covers §10's exit, ban and
+  stall row: 40 % offline for 6 epochs, an exit and an evidence included
+  during the stall, the same configuration and total on both nodes at every
+  block, one handoff at the end (the exited and the banned key out,
+  `ban_start` = that epoch, 100 epochs), and the certificate kept before
+  the stall still verifies. Expiry during a stall is not shown at node
+  level: the regtest window is 112 epochs (part of `params_digest`); the
+  reference simulation covers it.

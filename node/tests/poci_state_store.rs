@@ -92,6 +92,10 @@ fn absence_pruning_ledger_round_trips_through_the_store() {
     assert_eq!(a.config().weight(&[4; 20]), Some(400), "back after the rejoin is final");
 }
 
+/// Two branches reach the same configuration through different handoffs:
+/// each block reads back its own chain's history, whatever was stored first
+/// (evidence naming a past configuration is valid only where it was in
+/// force). Found by both B2 and B4.
 #[test]
 fn branches_with_the_same_configuration_keep_their_own_history() {
     let dir = tempfile::tempdir().unwrap();
@@ -118,4 +122,6 @@ fn branches_with_the_same_configuration_keep_their_own_history() {
     assert_eq!(lb, b);
     assert_eq!(la.history().map(|c| c.epoch()).collect::<Vec<_>>(), vec![6, 5, 4]);
     assert_eq!(lb.history().map(|c| c.epoch()).collect::<Vec<_>>(), vec![6, 4]);
+    let c5 = a.history().nth(1).unwrap().id();
+    assert!(la.find_config(&c5).is_some() && lb.find_config(&c5).is_none());
 }

@@ -744,6 +744,22 @@ answer to its own request; it is checked like a new block (height implied by
 its parents, difficulty, timestamp, proof of work, the witness commitment
 rules) before it is stored.
 
+### PoCI finality certificates (ObenBlock)
+
+On ObenBlock every finalized checkpoint after the launch has a finality
+certificate (docs/DESIGN-obenblock-poci.md §6): the votes of more than two
+thirds of the configuration in force, which the node keeps when it accepts
+the block that finalized it. `gnb-cli finalitycertificate [slot | hash]`
+(RPC `getfinalitycertificate`) returns it with the registry proof of its
+voters; without an argument, the latest finalized checkpoint's. Anyone who
+trusts the `config_id` (from their own node, or reached through earlier
+certificates) checks it without the configuration's entries. `getpowitinfo`
+and `getfinalityinfo` show, under `poci`, the configuration in force (epoch,
+`config_id`, exact `total`), the bans, the latest finalized checkpoint with
+its certificate, and `absent`: per recent epoch, the weight and number of
+the configuration's keys with no vote included on the chain. Watch it: if
+it nears a third of `total`, finality is about to halt.
+
 ### PoWit finality: the pin, conflicts and the operator
 
 From the PoWit activation the node never leaves a finalized checkpoint it
@@ -907,7 +923,8 @@ in the configuration for less than 4 epochs is not pruned. Pruning is not a
 punishment: the key keeps its share rewards and may come back.
 
 - `getpowitinfo` → `poci.absent_weight` lists, per recent epoch, the weight
-  of the configuration in force with no vote included in a block of that
+  (`weight`) and the number of keys (`keys`) of the configuration in force
+  with no vote included in a block of that
   epoch, and `over_a_third` when it exceeds a third (finality then halts
   until that weight returns). `poci.pruned` lists the pruned keys, the epoch
   their pruning started, and where a pending rejoin was included.

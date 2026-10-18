@@ -2365,6 +2365,9 @@ pub fn accept_block_tracking(
         // finality; one that conflicts with it only raises the conflict
         // alert (review HIGH 1, `consensus::finality`).
         crate::powit::note_block_finality(dag, store, &block_hash, powit_state.as_ref());
+        // PoCI (ObenBlock): keep the finality certificate of a checkpoint
+        // this block finalized (docs/DESIGN-obenblock-poci.md §6).
+        crate::powit::certificate::keep(dag, store, &block_hash, powit_state.as_ref());
         crate::powit::refresh_finality_pin(dag, store);
     }
     // Informational only (RPC / tip notifications).
