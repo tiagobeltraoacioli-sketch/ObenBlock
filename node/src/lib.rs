@@ -14,7 +14,7 @@
 // (crates/gnb-crypto). Re-export its modules under the original paths so every
 // `crate::core::…` / `crate::crypto::…` reference in the node keeps resolving
 // unchanged, and so external embedders keep importing `gnb::{core,crypto,…}`.
-pub use gnb_crypto::{types, crypto, core, address, wallet, hd_wallet, util, bridge, bloch_anchor};
+pub use gnb_crypto::{types, crypto, core, address, wallet, hd_wallet, util, bridge, bloch_anchor, obb_anchor};
 
 #[cfg(feature = "node")]
 pub mod analytics;   // Sprint B      // Sprint A — new unified Address type
@@ -66,6 +66,10 @@ pub mod assumevalid;
 // (audit MEM-2, DAG-2).
 #[cfg(feature = "node")]
 pub mod template;
+// ObenBlock finalized checkpoints anchored in Bloch: records, the Bloch
+// reader and the weak-subjectivity pin (docs/OBB-ANCHOR.md).
+#[cfg(feature = "node")]
+pub mod anchoring;
 
 // The libp2p crate the node is built with, for code that drives the node's
 // protocol implementations through libp2p traits and must name the SAME crate

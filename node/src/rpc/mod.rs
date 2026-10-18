@@ -320,6 +320,9 @@ const HEAVY_READ_METHODS: &[&str] = &[
     // VAL-11: the UTXO-set supply audit scans the whole UTXO set and every
     // undo record (cancellable, like Core's gettxoutsetinfo).
     "gettxoutsetinfo",
+    // ObenBlock anchors (docs/OBB-ANCHOR.md): up to `MAX_STATE_READS` PoWit
+    // state decodes per call.
+    "getfinalityanchors",
     // L-8 (audit): `getblocktemplate` is bounded the same way (cache +
     // single flight) but through its OWN gate (`AppState::template_gate`,
     // `gated_dispatch`): sharing this one's single scan permit answered a
@@ -343,6 +346,7 @@ const KNOWN_RPC_METHODS: &[&str] = &[
     "getmempoolstats", "validateaddressverbose", "gettxsbyblock", "getaddressbalance_at_height",
     "getattestation", "invalidateblock", "reconsiderblock", "gettxoutsetinfo",
     "getfinalityinfo", "ignorefinalized", "reconsiderfinalized", "setfinalitycheckpoint",
+    "getfinalityanchors", "getblochanchor",
 ];
 
 /// Longest method-name prefix written to a log line (NET-13).
@@ -2201,6 +2205,20 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             let dag = state.dag.read();
             crate::powit::info_json(&dag, &state.store)
         }
+
+        // getfinalityanchors [from_epoch, count]: the Bloch anchor records of
+        // this node's finalized chain, one per epoch (docs/OBB-ANCHOR.md).
+        "getfinalityanchors" => {
+            let from = params.and_then(|p| p.get(0)).and_then(Value::as_u64).unwrap_or(0);
+            let count = params.and_then(|p| p.get(1)).and_then(Value::as_u64).unwrap_or(8)
+                .min(crate::anchoring::MAX_ANCHORS_PER_CALL as u64) as usize;
+            let dag = state.dag.read();
+            crate::anchoring::anchors_json(&dag, &state.store, from, count)
+        }
+
+        // The Bloch weak-subjectivity anchor (`--bloch-rpc`) and what the
+        // node made of it.
+        "getblochanchor" => crate::anchoring::status_json(),
 
         "getdaginfo" => {
             let dag = state.dag.read();

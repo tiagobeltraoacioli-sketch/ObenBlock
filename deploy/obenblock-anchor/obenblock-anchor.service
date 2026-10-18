@@ -1,0 +1,52 @@
+# Publishes ObenBlock's finalized checkpoints (one record per epoch) to the
+# Bloch anchor registry, one run per timer tick (obenblock-anchor.timer;
+# docs/OBB-ANCHOR.md).
+#   /opt/obenblock/bin/obenblock-anchor.py
+#   /etc/obenblock/anchor.env          OBB_NODE_RPC (comma-separated), OBB_MIN_AGREE,
+#                                      OBB_ANCHOR_PUBLISHER, OBB_ANCHOR_FROM_EPOCH
+#   /var/lib/obenblock-anchor/state.json  published records (StateDirectory)
+# Until the Bloch registry exists the publisher is a spool
+# (jsonl:/var/lib/obenblock-anchor/spool.jsonl) that an operator submits.
+[Unit]
+Description=Publish ObenBlock finalized checkpoints to the Bloch anchor registry
+After=network-online.target gnb-node.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=obb-anchor
+Group=obb-anchor
+EnvironmentFile=/etc/obenblock/anchor.env
+StateDirectory=obenblock-anchor
+ExecStart=/usr/bin/python3 -I /opt/obenblock/bin/obenblock-anchor.py --node-rpc ${OBB_NODE_RPC} --min-agree ${OBB_MIN_AGREE} --publisher ${OBB_ANCHOR_PUBLISHER} --from-epoch ${OBB_ANCHOR_FROM_EPOCH} --state /var/lib/obenblock-anchor/state.json
+# Exit 2 (ObenBlock nodes down) is retried on the next tick; 3 (an alarm)
+# and 5 (publisher not available) fail the unit.
+SuccessExitStatus=2
+TimeoutStartSec=15min
+MemoryMax=256M
+UMask=0077
+
+# ── Sandboxing (as gnb-node.service; deploy/test_deploy_files.py) ───────────
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

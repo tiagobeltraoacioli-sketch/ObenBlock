@@ -3978,6 +3978,45 @@ pub fn invalidate_block(
     res
 }
 
+/// Pin fork choice to `hash` as a finalized checkpoint from outside the
+/// node's own PoWit finality (a weak-subjectivity checkpoint: the newest
+/// Bloch anchor, `anchoring`), then move the applied chain to the best block
+/// whose selected chain passes through it, committed in chunks like
+/// [`invalidate_block`]. `GhostDAG::set_finalized` only moves the pin
+/// forward, so a checkpoint at or below the current pin changes nothing.
+/// The caller checks that `hash` does not contradict the node's own
+/// finality (`anchoring::decide`). The pin lives in memory; the caller
+/// restores it at start-up.
+#[allow(clippy::too_many_arguments)]
+pub fn set_finality_checkpoint(
+    hash: BlockHash,
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &Arc<storage::Storage>,
+    mempool: &Arc<mempool::Mempool>,
+    node_state: &Arc<RwLock<rpc::NodeState>>,
+    tip_tx: Option<&broadcast::Sender<tip::TipChanged>>,
+    shielded: &Arc<RwLock<ShieldedPool>>,
+) -> Result<ChainOverride, OverrideError> {
+    let _guard = store.acceptance_lock();
+    ensure_invalid_set_loaded(dag, store);
+    let height = dag.read().get_block_data(&hash).map(|d| d.height)
+        .ok_or_else(|| format!("block {} not found", hex::encode(hash)))?;
+    if dag.read().is_invalid(&hash) {
+        return Err(format!("block {} is disqualified", hex::encode(hash)).into());
+    }
+    // Re-checked under the acceptance lock: own finality may have advanced
+    // since the caller decided. A pin above it must descend from it.
+    if let Some((fh, fheight)) = dag.read().finalized() {
+        if fheight < height && !dag.read().is_on_selected_chain_of(&fh, &hash) {
+            return Err(format!("block {} does not descend from the finalized checkpoint {}",
+                               hex::encode(hash), hex::encode(fh)).into());
+        }
+    }
+    dag.write().set_finalized(hash, height);
+    apply_operator_override(dag, store, mempool, node_state, tip_tx, shielded, Vec::new(),
+                            MarkClears::default(), 0)
+}
+
 /// Operator `reconsiderblock` (Bitcoin Core's `ReconsiderBlock`): consider
 /// every persisted disqualification whose root is `hash`, a selected-chain
 /// ancestor of `hash` or a block whose selected chain passes through `hash`,

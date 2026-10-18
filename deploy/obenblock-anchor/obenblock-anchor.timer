@@ -1,0 +1,13 @@
+# A run publishes the epochs finalized since the last one (one epoch is 6 h).
+# A wall-clock schedule, as bloch-anchor.timer: OnBootSec/OnUnitInactiveSec
+# leave nothing scheduled when the timer is enabled long after boot.
+[Unit]
+Description=Publish ObenBlock finalized checkpoints to the Bloch anchor registry (periodic)
+
+[Timer]
+OnCalendar=*:0/10
+RandomizedDelaySec=60
+Persistent=true
+
+[Install]
+WantedBy=timers.target

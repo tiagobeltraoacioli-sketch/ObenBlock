@@ -275,6 +275,11 @@ mutual anchoring. **Both directions are used** (owner, 2026-10-17).
   finality), removing the trusted Bloch RPC.
 - **Bloch side**: the anchor registry needs the Bloch code base. The record
   format above is the interface. *Pending access to the Bloch repository.*
+- **Implemented (phase 1, ObenBlock side)**: the record encoding with a
+  Python reference and vectors, `getfinalityanchors`, the reference
+  `obenblock-anchor` daemon with pluggable publishers, and `--bloch-rpc` with
+  the JSON-RPC interface the registry must serve:
+  [OBB-ANCHOR.md](OBB-ANCHOR.md).
 
 ## 9. Packages
 

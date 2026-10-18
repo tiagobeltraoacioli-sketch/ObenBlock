@@ -28,6 +28,7 @@ UNITS = {
     "explorer-api": os.path.join(HERE, "explorer-api", "gnb-explorer-api.service"),
     "cloudflared": os.path.join(HERE, "explorer-api", "cloudflared-gnb-explorer.service"),
     "bloch-anchor": os.path.join(HERE, "bloch-anchor", "bloch-anchor.service"),
+    "obenblock-anchor": os.path.join(HERE, "obenblock-anchor", "obenblock-anchor.service"),
 }
 SCRIPTS = [
     os.path.join(HERE, "gnb-launch"),
@@ -122,6 +123,7 @@ class UnitHardening(unittest.TestCase):
         self.assertNotEqual(users["cloudflared"], users["explorer-api"])
         self.assertNotIn(users["bloch-anchor"], (users["node"], users["explorer-api"]),
                          "the anchoring wallet must not be readable by the node or the API")
+        self.assertNotIn(users["obenblock-anchor"], (users["node"], users["explorer-api"], users["bloch-anchor"]))
 
     def test_the_explorer_api_writes_nothing_and_reaches_loopback_only(self):
         svc = self.service("explorer-api")
