@@ -6,7 +6,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { checkOriginTls, mayMatchHost, pageTargetMayMatchHost } from "../../worker/check-ssl-mode.mjs";
 
-const HOST = "api.gnb-smh.com";
+const HOST = "api.obenblock.xyz";
 
 /** A fake Cloudflare API: zone mode, Configuration Rules, Page Rules. */
 function cloudflare({ mode = "strict", rules = null, pages = [], status = {} } = {}) {
@@ -66,8 +66,8 @@ test("a Page Rule lowering SSL for the API host fails the check", async () => {
   const page = (target, value) => ({ targets: [{ target: "url", constraint: { operator: "matches", value: target } }],
                                      actions: [{ id: "ssl", value }], status: "active" });
   assert.equal((await check(cloudflare({ pages: [page(`${HOST}/*`, "full")] }))).ok, false);
-  assert.equal((await check(cloudflare({ pages: [page("*.gnb-smh.com/*", "flexible")] }))).ok, false);
-  assert.equal((await check(cloudflare({ pages: [page("www.gnb-smh.com/*", "full")] }))).ok, true);
+  assert.equal((await check(cloudflare({ pages: [page("*.obenblock.xyz/*", "flexible")] }))).ok, false);
+  assert.equal((await check(cloudflare({ pages: [page("www.obenblock.xyz/*", "full")] }))).ok, true);
   assert.equal((await check(cloudflare({ pages: [page(`${HOST}/*`, "strict")] }))).ok, true);
 });
 
@@ -84,11 +84,11 @@ test("host matching helpers", () => {
   assert.equal(mayMatchHost('http.request.full_uri eq "https://www.x.org/"', HOST), false);
   assert.equal(mayMatchHost("ip.src eq 1.2.3.4", HOST), true);
   assert.equal(mayMatchHost('http.host ne "www.x.org"', HOST), true);
-  assert.equal(mayMatchHost('ends_with(http.host, ".gnb-smh.com")', HOST), true);
+  assert.equal(mayMatchHost('ends_with(http.host, ".obenblock.xyz")', HOST), true);
   assert.equal(mayMatchHost('http.host eq "www.x.org" and ip.src eq 1.2.3.4', HOST), false);
   assert.equal(pageTargetMayMatchHost(`https://${HOST}/v1/*`, HOST), true);
-  assert.equal(pageTargetMayMatchHost("*gnb-smh.com/*", HOST), true);
-  assert.equal(pageTargetMayMatchHost("gnb-smh.com/*", HOST), false);
+  assert.equal(pageTargetMayMatchHost("*obenblock.xyz/*", HOST), true);
+  assert.equal(pageTargetMayMatchHost("obenblock.xyz/*", HOST), false);
 });
 
 test("the explorer README and the Worker README require Full (strict)", () => {

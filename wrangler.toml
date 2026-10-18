@@ -1,23 +1,40 @@
-# gnb-smh.com: static site (./site) plus the read-only explorer API proxy
+# obenblock.xyz: static site (./site) plus the read-only explorer API proxy
 # (worker/index.js, /api/*). Deploy from the repository root: wrangler deploy
-# The origin shared secret is a Worker secret: wrangler secret put GNB_API_KEY
+# (worker/README.md, "Deploying obenblock.xyz"; nothing in this repository
+# deploys it).
 #
-# WAL-2: the explorer origins are configuration, not code. Set them as a
-# secret or dashboard variable (comma-separated, https:// only; plain http://
-# entries are ignored and the API answers 503 until one https origin is set):
-#   wrangler secret put GNB_ORIGINS
-#   e.g. https://explorer-origin-1.example.net,https://explorer-origin-2.example.net
-# Each origin terminates TLS itself or is a Cloudflare Tunnel hostname; see
-# deploy/explorer-api/README.md.
-name = "gnb-smh"
+# Secrets (never in this file):
+#   wrangler secret put OBB_API_KEY    the shared secret sent to the origins as
+#                                      X-GnB-Key: the content of
+#                                      /etc/obenblock/explorer-api.key on every
+#                                      origin host (at least 32 characters)
+#   wrangler secret put OBB_ORIGINS    the explorer origins, comma-separated,
+#                                      https:// only (WAL-2: plain http://
+#                                      entries are ignored and the API answers
+#                                      503 until one https origin is set). The
+#                                      launch hosts, by their sslip.io names
+#                                      (a Worker cannot fetch a bare IP):
+#     https://136-244-93-186.sslip.io:2087,https://209-250-236-240.sslip.io:2087,https://152-236-5-112.sslip.io:2087
+# The GnB names GNB_API_KEY / GNB_ORIGINS are still read when the OBB_* ones
+# are unset. Each origin terminates TLS itself (deploy/explorer-api/README.md,
+# "ObenBlock mainnet") or is a Cloudflare Tunnel host name.
+name = "obenblock"
 main = "worker/index.js"
 compatibility_date = "2026-09-01"
-# Keep the *.workers.dev address alive alongside the custom domains.
+# Keep the *.workers.dev address alive alongside the custom domains (a
+# preview of the site before the obenblock.xyz records are in place).
 workers_dev = true
+# The obenblock.xyz zone is in the owner's Cloudflare account; the custom
+# domains create their DNS records and certificates on the first deploy.
 routes = [
-  { pattern = "gnb-smh.com", custom_domain = true },
-  { pattern = "www.gnb-smh.com", custom_domain = true },
+  { pattern = "obenblock.xyz", custom_domain = true },
+  { pattern = "www.obenblock.xyz", custom_domain = true },
 ]
+
+[vars]
+# Pages requested on www.obenblock.xyz are redirected here (301); /api/* is
+# served on both names.
+CANONICAL_HOST = "obenblock.xyz"
 
 [assets]
 directory = "./site"

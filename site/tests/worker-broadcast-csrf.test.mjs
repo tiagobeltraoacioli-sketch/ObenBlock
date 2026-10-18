@@ -1,5 +1,5 @@
 // Re-audit B2-R2-2: any web page could make its visitors' browsers broadcast
-// through gnb-smh.com. A cross-origin `fetch(url, {method: "POST", mode:
+// through obenblock.xyz. A cross-origin `fetch(url, {method: "POST", mode:
 // "no-cors", body})`, `navigator.sendBeacon` or a text/plain form is a CORS
 // "simple request": the browser sends it without a preflight, so the
 // per-client broadcast limit counted each visitor and never the attacker,
@@ -18,8 +18,8 @@ import worker from "../../worker/index.js";
 
 const ctx = { waitUntil: (p) => p };
 const assets = { fetch: async () => new Response("<!doctype html>") };
-const env = { ASSETS: assets, GNB_ORIGINS: "https://origin.example.net", GNB_API_KEY: "k" };
-const URL_ = "https://gnb-smh.com/api/sendrawtransaction";
+const env = { ASSETS: assets, OBB_ORIGINS: "https://origin.example.net", OBB_API_KEY: "k" };
+const URL_ = "https://obenblock.xyz/api/sendrawtransaction";
 const BODY = JSON.stringify({ hex: "ab".repeat(100) });
 
 /** Install a fake origin; returns the list of forwarded requests. */
@@ -72,7 +72,7 @@ test("application/json from another site or origin is refused too", async () => 
     { "content-type": "application/json", origin: "https://evil.example" },
     { "content-type": "application/json", "sec-fetch-site": "cross-site" },
     // a sibling subdomain is the same site but another origin
-    { "content-type": "application/json", origin: "https://other.gnb-smh.com", "sec-fetch-site": "same-site" },
+    { "content-type": "application/json", origin: "https://other.obenblock.xyz", "sec-fetch-site": "same-site" },
     // sandboxed frames and data: URLs send the opaque origin "null"
     { "content-type": "application/json", origin: "null" },
   ]) {
@@ -98,9 +98,9 @@ test("the preflight of a cross-origin JSON broadcast fails: 405 without CORS hea
 
 test("the site's own wallet and non-browser clients still broadcast; the answer carries no CORS header", async () => {
   for (const headers of [
-    // site/wallet/app.js and site/shared/gnb.js: same-origin fetch with JSON
-    { "content-type": "application/json", origin: "https://gnb-smh.com", "sec-fetch-site": "same-origin", "sec-fetch-mode": "cors" },
-    { "content-type": "application/json; charset=utf-8", origin: "https://gnb-smh.com" },
+    // site/wallet/app.js: a same-origin fetch with a JSON body
+    { "content-type": "application/json", origin: "https://obenblock.xyz", "sec-fetch-site": "same-origin", "sec-fetch-mode": "cors" },
+    { "content-type": "application/json; charset=utf-8", origin: "https://obenblock.xyz" },
     // curl / scripts / CLI wallets send neither Origin nor Sec-Fetch-Site
     { "content-type": "application/json" },
     // typed into the address bar / bookmarklet: Sec-Fetch-Site none
@@ -119,10 +119,10 @@ test("the site's own wallet and non-browser clients still broadcast; the answer 
   // The same-origin check follows the host the request was made to (the
   // workers.dev address and www serve the same Worker).
   const seen = fakeOrigin();
-  const www = new Request("https://www.gnb-smh.com/api/sendrawtransaction", {
+  const www = new Request("https://www.obenblock.xyz/api/sendrawtransaction", {
     method: "POST", body: BODY,
     headers: { "content-length": String(BODY.length), "content-type": "application/json",
-               origin: "https://www.gnb-smh.com", "sec-fetch-site": "same-origin" },
+               origin: "https://www.obenblock.xyz", "sec-fetch-site": "same-origin" },
   });
   assert.equal((await worker.fetch(www, env, ctx)).status, 200);
   assert.equal(seen.length, 1);
