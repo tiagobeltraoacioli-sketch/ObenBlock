@@ -1,0 +1,59 @@
+# Keeps the Cloudflare-only table of firewall-cloudflare.sh loaded (direct-TLS
+# layout; pre-launch review). `nft -f` alone does not survive a reboot, and on
+# Debian/Ubuntu `systemctl restart nftables` (its /etc/nftables.conf starts
+# with `flush ruleset`) deletes every table, this one included, leaving the
+# API port open to the whole Internet while the service keeps working.
+#
+# This unit applies ONLY the table `inet gnb_explorer` (the script replaces
+# that table atomically and touches no other; idempotent):
+#   * at boot, before the network comes up and before the explorer API;
+#   * again after every restart or reload of nftables.service (PartOf= /
+#     ReloadPropagatedFrom=, ordered After= it);
+#   * every 5 minutes (obenblock-explorer-firewall-reapply.timer), which
+#     closes the window left by any other tool that flushes the ruleset.
+# The API's direct-TLS drop-in Requires= this unit and checks the table in
+# ExecStartPre, so the API never listens on 0.0.0.0 without it.
+#
+# Install (as root, README.md "ObenBlock mainnet"):
+#   install -m 0755 firewall-cloudflare.sh /opt/obenblock/bin/
+#   install -m 0644 cloudflare-ips-v4.txt /etc/obenblock/
+#   install -m 0644 obenblock-explorer-firewall.service obenblock-explorer-firewall-reapply.service \
+#           obenblock-explorer-firewall-reapply.timer /etc/systemd/system/
+#   systemctl enable --now obenblock-explorer-firewall obenblock-explorer-firewall-reapply.timer
+[Unit]
+Description=ObenBlock explorer API firewall (nftables table inet gnb_explorer)
+DefaultDependencies=no
+After=nftables.service local-fs.target
+Before=network-pre.target obenblock-explorer-api.service shutdown.target
+Wants=network-pre.target
+Conflicts=shutdown.target
+PartOf=nftables.service
+ReloadPropagatedFrom=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh /opt/obenblock/bin/firewall-cloudflare.sh 2087 /etc/obenblock/cloudflare-ips-v4.txt
+ExecReload=/bin/sh /opt/obenblock/bin/firewall-cloudflare.sh 2087 /etc/obenblock/cloudflare-ips-v4.txt
+# No ExecStop: stopping this unit (or nftables.service) never opens the port.
+# nft needs CAP_NET_ADMIN and netlink, nothing else.
+CapabilityBoundingSet=CAP_NET_ADMIN
+RestrictAddressFamilies=AF_NETLINK AF_UNIX
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target nftables.service

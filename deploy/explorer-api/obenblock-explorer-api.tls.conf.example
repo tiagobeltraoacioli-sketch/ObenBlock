@@ -2,20 +2,29 @@
 #   /etc/systemd/system/obenblock-explorer-api.service.d/tls.conf
 #
 # The API serves HTTPS on 0.0.0.0:2087 (a port Cloudflare Workers may fetch)
-# with a publicly trusted certificate for this host's sslip.io name, e.g.
-# 136-244-93-186.sslip.io for 136.244.93.186 (a Worker cannot fetch a bare IP
-# address). Let's Encrypt keeps its files root-only, so a renewal deploy hook
+# with a publicly trusted certificate for this host's name in the owner's
+# zone (node1/node2/node3.obenblock.xyz, DNS-only records; README.md), and,
+# during the move, its sslip.io name as a second SAN (a Worker cannot fetch a
+# bare IP address). Let's Encrypt keeps its files root-only, so a renewal deploy hook
 # copies them for the API user (README.md, "ObenBlock mainnet"):
 #   install -m 0640 -o root -g obenblock-api fullchain.pem /etc/obenblock/explorer-api.crt
 #   install -m 0640 -o root -g obenblock-api privkey.pem   /etc/obenblock/explorer-api.tls.key
-# Then restrict the port to Cloudflare's edge:
-#   sudo sh firewall-cloudflare.sh 2087 cloudflare-ips-v4.txt
+# The port is restricted to Cloudflare's edge by obenblock-explorer-firewall.service
+# (persistent; pre-launch review): this drop-in requires it, and refuses to
+# start the API unless its nftables table is loaded.
+[Unit]
+Requires=obenblock-explorer-firewall.service
+After=obenblock-explorer-firewall.service
+
 [Service]
+# "+": run as root (nft needs CAP_NET_ADMIN), only this check.
+ExecStartPre=+/usr/sbin/nft list table inet gnb_explorer
 Environment=OBB_API_BIND=0.0.0.0
 Environment=OBB_API_PORT=2087
 Environment=OBB_API_TLS_CERT=/etc/obenblock/explorer-api.crt
 Environment=OBB_API_TLS_KEY=/etc/obenblock/explorer-api.tls.key
-# Peers are no longer loopback only: the nftables rule of
-# firewall-cloudflare.sh admits Cloudflare's ranges on 2087.
+# Peers are no longer loopback only: the nftables table of
+# obenblock-explorer-firewall.service admits Cloudflare's ranges on 2087, and
+# every request must carry the Worker's HMAC (gnb_explorer_api.py).
 IPAddressDeny=
 IPAddressAllow=

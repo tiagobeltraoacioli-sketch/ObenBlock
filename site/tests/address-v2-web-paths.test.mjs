@@ -5,6 +5,7 @@ import { readFileSync } from "node:fs";
 import vm from "node:vm";
 import * as safe from "../assets/safe.js";
 import worker from "../../worker/index.js";
+import { installOrigins, envFor, N1 } from "./fake-origin.mjs";
 import { loadCore, walletNetwork } from "../wallet/core.js";
 
 // ObenBlock (docs/DESIGN-obenblock.md §2): the node's validateaddress answers
@@ -154,15 +155,13 @@ for (const path of ["../wallet/app.js"]) {
 
 test("Worker forwards valid-shaped v2 aliases unchanged and retains legacy routing", async () => {
   const originalFetch = globalThis.fetch, originalCaches = globalThis.caches;
-  const calls = [];
-  globalThis.caches = { default: { match: async () => undefined, put: async () => {} } };
-  globalThis.fetch = async (url) => { calls.push(String(url)); return new Response('{"result":{}}'); };
+  const { seen } = installOrigins({ [N1]: { handler: () => ({ status: 200, body: '{"result":{}}' }) } });
   try {
-    const env = { OBB_ORIGINS: "https://origin.example.net", OBB_API_KEY: "fixture" }, ctx = { waitUntil() {} };
+    const env = envFor({ OBB_ORIGINS: N1 }), ctx = { waitUntil() {} };
     for (const a of [LEGACY, OBB, ...CASES.filter(([a]) => /^t?(?:gnb|obb)1z/.test(a)).flatMap(([a]) => [a, a.toUpperCase()])]) {
       const result = await worker.fetch(new Request(`https://example.net/api/carryover/${a}`), env, ctx);
       assert.equal(result.status, 200, a);
-      assert.equal(calls.at(-1), `https://origin.example.net/v1/carryover/${a}?p=%5B%5D`);
+      assert.equal(seen.at(-1).url, `${N1}/v1/carryover/${a}?p=%5B%5D`);
     }
     for (const a of ["G" + V2.slice(1), V2 + "%22", V2 + "%2Fextra"]) {
       assert.equal((await worker.fetch(new Request(`https://example.net/api/carryover/${a}`), env, ctx)).status, 404);

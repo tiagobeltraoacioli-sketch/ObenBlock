@@ -15,21 +15,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import worker from "../../worker/index.js";
+import { installOrigins, envFor, N1 } from "./fake-origin.mjs";
 
 const ctx = { waitUntil: (p) => p };
-const assets = { fetch: async () => new Response("<!doctype html>") };
-const env = { ASSETS: assets, OBB_ORIGINS: "https://origin.example.net", OBB_API_KEY: "k" };
+const env = envFor({ OBB_ORIGINS: N1 });
 const URL_ = "https://obenblock.xyz/api/sendrawtransaction";
 const BODY = JSON.stringify({ hex: "ab".repeat(100) });
 
 /** Install a fake origin; returns the list of forwarded requests. */
 function fakeOrigin() {
-  const seen = [];
-  globalThis.fetch = async (url, init) => {
-    seen.push({ url: String(url), init });
-    return new Response('{"result":{"txid":"00"}}', { status: 200 });
-  };
-  return seen;
+  return installOrigins({ [N1]: { handler: () => ({ status: 200, body: '{"result":{"txid":"00"}}' }) } }).seen;
 }
 
 function post(headers, body = BODY) {
@@ -111,7 +106,7 @@ test("the site's own wallet and non-browser clients still broadcast; the answer 
     assert.equal(r.status, 200, JSON.stringify(headers));
     assert.equal(r.headers.get("access-control-allow-origin"), null, "broadcast answer without CORS");
     assert.equal(seen.length, 1);
-    assert.equal(seen[0].url, "https://origin.example.net/v1/sendrawtransaction");
+    assert.equal(seen[0].url, `${N1}/v1/sendrawtransaction`);
     assert.equal(seen[0].init.headers["content-type"], "application/json");
     assert.equal(seen[0].init.headers["x-gnb-client-ip"], "198.51.100.4");
     assert.equal(seen[0].init.body, BODY);

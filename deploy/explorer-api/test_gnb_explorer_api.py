@@ -3,6 +3,7 @@
     python3 -m unittest deploy/explorer-api/test_gnb_explorer_api.py
 """
 
+import hashlib
 import http.client
 import importlib.util
 import json
@@ -23,6 +24,19 @@ spec.loader.exec_module(api)
 KEY = "k" * 40
 
 
+def signed(method, target, headers=None, body=b"", key=KEY, ts=None, nonce=None):
+    """`headers` plus the Worker's HMAC authentication of the request
+    (worker/index.js originHeaders; deploy/explorer-api request_mac)."""
+    h = {k.lower(): v for k, v in (headers or {}).items()}
+    h["x-obb-body-sha256"] = hashlib.sha256(body).hexdigest()
+    ts = str(int(time.time()) if ts is None else ts)
+    nonce = nonce or os.urandom(16).hex()
+    values = [h.get(name, "") for name in api.SIGNED_HEADERS]
+    h.update({"x-obb-ts": ts, "x-obb-nonce": nonce,
+              "x-obb-auth": api.request_mac(key.encode(), method, target, ts, nonce, values)})
+    return h
+
+
 class ApiServer:
     def __init__(self, max_connections=4, timeout=1.0, deadline=2.0):
         api.API_KEY = KEY.encode()
@@ -40,7 +54,7 @@ class ApiServer:
 
     def get(self, path, headers=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
-        conn.request("GET", path, headers={"x-gnb-key": KEY, **(headers or {})})
+        conn.request("GET", path, headers=signed("GET", path, headers))
         r = conn.getresponse()
         body = r.read()
         conn.close()
@@ -49,16 +63,23 @@ class ApiServer:
     def post(self, path, body, headers=None):
         conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
         conn.request("POST", path, body=body.encode(),
-                     headers={"x-gnb-key": KEY, "content-type": "application/json", **(headers or {})})
+                     headers=signed("POST", path, {"content-type": "application/json", **(headers or {})}, body.encode()))
         r = conn.getresponse()
         data = r.read()
         conn.close()
         return r.status, json.loads(data) if data else None
 
 
+GENESIS = "ab" * 32
+REAL_NODE_IDENTITY = api.node_identity
+
+
 class ExplorerApiTests(unittest.TestCase):
     def setUp(self):
         api._cache.clear()
+        # The chain identity stamped on every answer comes from cached node
+        # reads of its own; it is tested in OriginAuthTests.
+        api.node_identity = lambda: ("0x4f420001", GENESIS, "")
         api.GET_LIMIT = api.RateLimiter(1000)
         api.POST_LIMIT = api.RateLimiter(1000)
         if hasattr(api, "ByteBudget"):
@@ -312,6 +333,9 @@ class ExplorerApiTests(unittest.TestCase):
                     for i in range(1, 4)]
         self.assertEqual(statuses, [200, 200, 429])
         budget = api.ByteBudget(600)
+        # A round clock: (monotonic() + 1) - monotonic() is not exactly 1.0
+        # in floating point, which made the refill check below flaky.
+        budget.last = 1000.0
         self.assertTrue(budget.take(600, now=budget.last))
         self.assertFalse(budget.take(1, now=budget.last))
         self.assertTrue(budget.take(10, now=budget.last + 1), "refills at per_min / 60 per second")
@@ -370,6 +394,152 @@ class ExplorerApiTests(unittest.TestCase):
                 api.load_api_key(fh.name)
         finally:
             os.unlink(fh.name)
+
+
+# Shared with site/tests/worker-origin-auth.test.mjs: both sides of the
+# Worker-to-origin protocol must compute the same MACs.
+VECTOR_KEY = b"test-key-0123456789-0123456789-0123"
+VECTOR_NONCE = "00112233445566778899aabbccddeeff"
+VECTOR_REQUEST_MAC = "c3cbbce26b2117702761531fc0d45e65e1d0d8371eba9bb0208bebf1b30c6a00"
+VECTOR_RESPONSE_MAC = "2e475ec4f7ef9feb79822310ea02f37c24579c653c4063ea6f6e9323d75025a1"
+
+
+class OriginAuthTests(unittest.TestCase):
+    """Pre-launch review: the Worker authenticated itself with one static
+    header, and nothing authenticated the origin's answers. Requests are now
+    HMAC-signed per request (method, target, timestamp, nonce, forwarded
+    headers, body hash) and answers are signed back with the node's chain
+    identity."""
+
+    def setUp(self):
+        api._cache.clear()
+        api.NONCES = api.NonceCache()
+        api.GET_LIMIT = api.RateLimiter(1000)
+        api.POST_LIMIT = api.RateLimiter(1000)
+        api.POST_BYTES = api.ByteBudget(10**9)
+        api.CROSS_SITE_LIMIT = api.RateLimiter(10**6, max_clients=100)
+        api.node_identity = lambda: ("0x4f420001", GENESIS, "100:" + "cd" * 32)
+        self.mode = api.AUTH_MODE
+        self.server = ApiServer()
+
+    def tearDown(self):
+        api.AUTH_MODE = self.mode
+        self.server.close()
+
+    def raw(self, method, path, headers, body=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.server.port, timeout=5)
+        conn.request(method, path, body=body, headers=headers)
+        r = conn.getresponse()
+        data = r.read()
+        conn.close()
+        return r.status, {k.lower(): v for k, v in r.getheaders()}, data
+
+    def test_vectors_match_the_worker(self):
+        empty = hashlib.sha256(b"").hexdigest()
+        self.assertEqual(api.request_mac(VECTOR_KEY, "GET", "/v1/getbalance?p=%5B%22obb1q%22%5D", "1760000000",
+                                         VECTOR_NONCE, ["198.51.100.4", "", "", "", empty]), VECTOR_REQUEST_MAC)
+        self.assertEqual(api.response_mac(VECTOR_KEY, VECTOR_NONCE, 200, "0x4f420001", "ab" * 32, "100:" + "cd" * 32,
+                                          b'{"result":1}'), VECTOR_RESPONSE_MAC)
+
+    def test_a_signed_request_gets_a_signed_answer_with_the_chain_identity(self):
+        path = "/v1/getblockcount"
+        h = signed("GET", path, {"x-gnb-client-ip": "198.51.100.4"})
+        status, headers, body = self.raw("GET", path, h)
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["x-obb-chain-id"], "0x4f420001")
+        self.assertEqual(headers["x-obb-genesis"], GENESIS)
+        self.assertEqual(headers["x-obb-finalized"], "100:" + "cd" * 32)
+        self.assertEqual(headers["x-obb-resp-auth"],
+                         api.response_mac(KEY.encode(), h["x-obb-nonce"], 200, "0x4f420001", GENESIS,
+                                          "100:" + "cd" * 32, body))
+
+    def test_the_static_header_alone_is_refused_on_obenblock(self):
+        self.assertEqual(api.AUTH_MODE, "hmac", "ObenBlock's default")
+        status, headers, _ = self.raw("GET", "/v1/getblockcount", {"x-gnb-key": KEY})
+        self.assertEqual(status, 403)
+        self.assertNotIn("x-obb-resp-auth", headers, "a refusal is not signed")
+        api.AUTH_MODE = "hmac+static"
+        self.assertEqual(self.raw("GET", "/v1/getblockcount", {"x-gnb-key": KEY})[0], 200)
+        self.assertEqual(self.raw("GET", "/v1/getblockcount", {"x-gnb-key": "wrong"})[0], 403)
+
+    def test_bad_stale_replayed_and_tampered_requests_are_refused(self):
+        path = "/v1/getblockcount"
+        now = int(time.time())
+        cases = {
+            "wrong key": signed("GET", path, key="x" * 40),
+            "stale": signed("GET", path, ts=now - api.AUTH_SKEW - 5),
+            "from the future": signed("GET", path, ts=now + api.AUTH_SKEW + 5),
+            "signed for another path": signed("GET", "/v1/getdaginfo"),
+            "signed as POST": signed("POST", path),
+        }
+        tampered = signed("GET", path, {"x-gnb-client-ip": "198.51.100.4"})
+        tampered["x-gnb-client-ip"] = "198.51.100.5"
+        cases["forwarded header changed"] = tampered
+        crossed = signed("GET", path)
+        crossed["x-gnb-cross-site"] = "1"
+        cases["cross-site mark added"] = crossed
+        bad_nonce = signed("GET", path)
+        bad_nonce["x-obb-nonce"] = "zz"
+        cases["malformed nonce"] = bad_nonce
+        for name, headers in cases.items():
+            with self.subTest(case=name):
+                status, _, body = self.raw("GET", path, headers)
+                self.assertEqual(status, 403, body)
+        once = signed("GET", path)
+        self.assertEqual(self.raw("GET", path, once)[0], 200)
+        status, _, body = self.raw("GET", path, once)
+        self.assertEqual(status, 403)
+        self.assertIn(b"replayed", body)
+
+    def test_a_broadcast_body_is_bound_to_its_signature(self):
+        api.rpc = lambda method, params: {"result": {"txid": "00"}}
+        path = "/v1/sendrawtransaction"
+        body = json.dumps({"hex": "ab" * 10}).encode()
+        other = json.dumps({"hex": "cd" * 10}).encode()
+        h = signed("POST", path, {"content-type": "application/json"}, body)
+        self.assertEqual(self.raw("POST", path, h, other)[0], 403, "another body under the same signature")
+        h = signed("POST", path, {"content-type": "application/json"}, body)
+        self.assertEqual(self.raw("POST", path, h, body)[0], 200)
+
+    def test_cross_site_reads_are_pooled_per_page_origin(self):
+        api.CROSS_SITE_LIMIT = api.RateLimiter(2, max_clients=100)
+        path = "/v1/getblockcount"
+
+        def read(i, origin=None):
+            h = {"x-gnb-client-ip": f"198.51.100.{i}", "x-gnb-cross-site": "1"}
+            if origin:
+                h["x-obb-page-origin"] = origin
+            return self.server.get(path, h)[0]
+
+        self.assertEqual([read(i, "https://evil.example") for i in range(1, 4)], [200, 200, 429])
+        self.assertEqual([read(i, "https://dashboard.example") for i in range(4, 6)], [200, 200],
+                         "another page's pool is untouched")
+        self.assertEqual([read(i) for i in range(6, 9)], [200, 200, 429], "no Origin: one shared pool")
+        self.assertEqual(read(9, "not an origin\u00ff"[:13]), 429, "a malformed origin falls in the shared pool")
+
+    def test_worker_probes_are_not_charged_to_a_client_budget(self):
+        api.GET_LIMIT = api.RateLimiter(2)
+        path = "/v1/getdaginfo"
+        probe = {"x-obb-probe": "1"}
+        self.assertEqual([self.server.get(path, probe)[0] for _ in range(4)], [200] * 4)
+        self.assertEqual([self.server.get(path)[0] for _ in range(3)], [200, 200, 429])
+        self.assertEqual(self.server.get("/v1/getblockcount", probe)[0], 429, "only the health methods")
+        api.AUTH_MODE = "hmac+static"
+        self.assertEqual(self.raw("GET", path, {"x-gnb-key": KEY, "x-obb-probe": "1"})[0], 429,
+                         "an unsigned probe mark is ignored")
+
+    def test_node_identity_reads_the_chain_id_genesis_and_checkpoint(self):
+        def node(method, params):
+            return {
+                "getnetworkinfo": {"result": {"chain_id": "0x4F420001"}},
+                "getblockhash": {"result": GENESIS},
+                "getpowitinfo": {"result": {"finalized": {"block_height": 77, "hash": "ef" * 32}}},
+            }[method]
+        api.rpc = node
+        self.assertEqual(REAL_NODE_IDENTITY(), ("0x4f420001", GENESIS, "77:" + "ef" * 32))
+        api._cache.clear()
+        api.rpc = lambda method, params: (_ for _ in ()).throw(OSError("down"))
+        self.assertEqual(REAL_NODE_IDENTITY(), ("", "", ""), "a node that cannot tell yields no identity")
 
 
 if __name__ == "__main__":

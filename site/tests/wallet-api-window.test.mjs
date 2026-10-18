@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { spendableWindow, getutxosFetcher, UTXO_WINDOW, UTXO_WIDE_WINDOW } from "../wallet/core.js";
+import { originFetch } from "../../worker/index.js";
 
 const API_PY = fileURLToPath(new URL("../../deploy/explorer-api/gnb_explorer_api.py", import.meta.url));
 const KEY = "k".repeat(40);
@@ -45,9 +46,11 @@ async function startApi(rows) {
   });
   // The page's api(): result on success, an exception on any error document.
   const api = async (method, params) => {
-    const r = await fetch(`http://127.0.0.1:${port}/v1/${method}?p=${encodeURIComponent(JSON.stringify(params))}`,
-      { headers: { "x-gnb-key": KEY } });
-    const doc = await r.json();
+    // Signed the way the Worker signs (worker/index.js originFetch), whose
+    // check of the signed answer runs too.
+    const r = await originFetch({ OBB_API_KEY: KEY }, `http://127.0.0.1:${port}`, "GET",
+      `/v1/${method}?p=${encodeURIComponent(JSON.stringify(params))}`);
+    const doc = JSON.parse(r.body);
     if (doc.error) throw new Error(String(doc.error));
     return doc.result;
   };
@@ -93,7 +96,7 @@ test("a failing wide request keeps the narrow window instead of failing the refr
   const w = await spendableWindow(fetchRows, next, UTXO_WINDOW, UTXO_WIDE_WINDOW);
   assert.deepEqual(asked, [UTXO_WINDOW, UTXO_WIDE_WINDOW]);
   assert.equal(w.widenFailed, true);
-  assert.equal(w.spendable.length, 40, "the mature coins of the narrow window stay spendable");
+  assert.equal(w.spendable.length, UTXO_WINDOW - 10, "the mature coins of the narrow window stay spendable");
   assert.equal(w.immature.length, 10);
   assert.equal(w.truncated, true);
 });
