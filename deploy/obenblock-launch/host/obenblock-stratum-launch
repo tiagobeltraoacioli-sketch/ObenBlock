@@ -1,0 +1,36 @@
+#!/bin/sh
+# Launcher of obenblock-stratum.service: the Stratum V1 endpoint for the
+# rented ASICs (port 3333), run from the active release.
+#
+# /etc/obenblock/stratum.env:
+#   OBB_STRATUM_EXEC  program inside /opt/obenblock/current/ (no slashes)
+#   OBB_STRATUM_ARGS  its arguments, whitespace separated; each word may hold
+#                     only [A-Za-z0-9./:_=,@+-], so nothing can be injected
+# The proxy reads its configuration from the other OBB_STRATUM_* variables of
+# the same file (systemd passes them in the environment). A value that still
+# carries LAUNCH-PLACEHOLDER makes this launcher refuse.
+set -euf
+die() { echo "obenblock-stratum-launch: $*" >&2; exit 64; }
+
+base=${OBB_RELEASE_DIR:-/opt/obenblock/current}
+exe=${OBB_STRATUM_EXEC:-}
+case $exe in
+  ''|*/*|*[!A-Za-z0-9._-]*) die "OBB_STRATUM_EXEC must be a program name inside $base" ;;
+esac
+[ -x "$base/$exe" ] || die "$base/$exe is missing: this release has no stratum proxy"
+if env | grep -q '^OBB_STRATUM_[A-Z_]*=.*LAUNCH-PLACEHOLDER'; then
+  die "/etc/obenblock/stratum.env still has a LAUNCH-PLACEHOLDER value"
+fi
+
+set --
+old_ifs=$IFS
+IFS=$(printf ' \t\nx'); IFS=${IFS%x}
+for a in ${OBB_STRATUM_ARGS:-}; do
+  case $a in
+    *[!A-Za-z0-9./:_=,@+-]*) die "OBB_STRATUM_ARGS word '$a' has characters outside [A-Za-z0-9./:_=,@+-]" ;;
+  esac
+  set -- "$@" "$a"
+done
+IFS=$old_ifs
+
+exec "$base/$exe" "$@"

@@ -1,0 +1,52 @@
+# ObenBlock mainnet launch kit: configuration.
+#
+# Copy to kit.conf next to obb-launch.sh and fill the values marked
+# LAUNCH-PLACEHOLDER. The file is sourced by bash: plain KEY=value lines,
+# values in double quotes, no spaces around '='.
+
+# The owner's ObenBlock payout address (obb1q... or obb1z...). Every CPU
+# miner and the stratum proxy's fallback payout go to it.
+OWNER_ADDRESS="LAUNCH-PLACEHOLDER-obb1-address"
+
+# Launch time of the genesis in Unix seconds (also the ASERT anchor time).
+# Empty: the genesis step uses the moment it runs (date -u +%s).
+LAUNCH_TS=""
+
+# The three mainnet hosts. KEY_HOSTS log in with SSH_KEY; PW_HOSTS log in
+# with the password on the 'senha:' line of PW_FILE (expect, ssh -tt; no key
+# is ever installed on them).
+HOSTS="136.244.93.186 209.250.236.240 152.236.5.112"
+KEY_HOSTS="136.244.93.186 209.250.236.240"
+PW_HOSTS="152.236.5.112"
+SSH_USER="ubuntu"
+SSH_KEY="$HOME/.ssh/edgevana_fleet_g4"
+PW_FILE="$HOME/Desktop/gnb-servidor-teste-152.txt"
+
+# Where the genesis is mined and the release binaries are built (a KEY_HOST).
+BUILD_HOST="136.244.93.186"
+BUILD_DIR="obenblock-launch"
+BUILD_JOBS="28"
+
+# The source checkout the genesis is written into and the binaries are built
+# from: a git worktree of the launch branch on this Mac. Empty: the checkout
+# that contains this kit (deploy/obenblock-launch/../..).
+SRC_DIR=""
+
+# Stratum V1 endpoint for the rented ASICs (on STRATUM_HOST only).
+STRATUM_HOST="136.244.93.186"
+STRATUM_PORT="3333"
+
+# CPU miner threads per host: "auto" = logical CPUs minus one.
+MINE_THREADS="auto"
+
+# Explorer API (read by the obenblock.xyz Worker through https origins).
+#   EXPLORER_TLS="letsencrypt": the API listens on 0.0.0.0:EXPLORER_PORT with
+#     a Let's Encrypt certificate for <ip-with-dashes>.sslip.io, and the port
+#     is open to Cloudflare's IPv4 ranges only (step explorer-tls).
+#   EXPLORER_TLS="none": loopback only on 127.0.0.1:2086 (no public origin).
+EXPLORER_TLS="letsencrypt"
+EXPLORER_PORT="2087"
+
+# DNS seed the nodes dial besides the fixed peers: "none" until the
+# seed.obenblock.xyz A records exist, then "default".
+DNS_SEED="none"

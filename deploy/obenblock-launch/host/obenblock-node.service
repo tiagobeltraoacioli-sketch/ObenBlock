@@ -1,0 +1,59 @@
+# systemd unit of an ObenBlock mainnet node with its CPU miner
+# (deploy/obenblock-launch/LAUNCH-RUNBOOK.md).
+#   /opt/obenblock/current/       the active release (symlink into releases/)
+#   /var/lib/obenblock            data dir (user obenblock, mode 0750)
+#   /etc/obenblock/obenblock.env  OBB_MINER_ADDRESS, OBB_MINE_THREADS, OBB_PEERS,
+#                                 OBB_CARRYOVER, OBB_RPC_KEY_FILE, OBB_DNS_SEED
+# P2P 18110 (public), RPC 18210 (127.0.0.1 only). GnB's gnb-node and the
+# Bloch units on the same host are separate and untouched.
+[Unit]
+Description=ObenBlock node (SHA-256d, PoWit) with CPU miner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=obenblock
+Group=obenblock
+EnvironmentFile=/etc/obenblock/obenblock.env
+ExecStart=/opt/obenblock/current/obenblock-launch
+Restart=always
+RestartPreventExitStatus=64
+RestartSec=5
+TimeoutStopSec=120
+LimitNOFILE=65536
+# Secret keys are kept in mlock()ed pages (audit CRY-4).
+LimitMEMLOCK=16M
+# SHA-256d mining needs no scratchpad; the node itself stays far below this.
+MemoryMax=24G
+Nice=10
+UMask=0077
+
+# ── Sandboxing (audit OPS-3, as deploy/gnb-node.service) ────────────────────
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/obenblock
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+CapabilityBoundingSet=
+AmbientCapabilities=
+# AF_NETLINK: libp2p-tcp watches interfaces through rtnetlink (if-watch).
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
