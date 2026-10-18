@@ -1,4 +1,4 @@
-// Safe HTML building for gnb-smh.com (audit finding WAL-3).
+// Safe HTML building for obenblock.xyz (audit finding WAL-3).
 //
 // Every page that renders API data builds its markup with the `html` tagged
 // template: each interpolated value is HTML-escaped unless it is itself the
@@ -37,15 +37,25 @@ export const isHex64 = (v) => typeof v === "string" && /^[0-9a-f]{64}$/.test(v);
 // Syntax only: BIP350 alphabet, version/kind lengths, and BIP173 uniform case.
 // Checksum/network validity belongs to the node RPC or wallet WASM codec.
 // https://github.com/bitcoin/bips/blob/master/bip-0350.mediawiki
+// ObenBlock addresses (obb1q/obb1t key hash, obb1m/obb1n policy, v2 obb/tobb)
+// and their GnB aliases (gnb1…, v2 gnb/tgnb), which name the same script
+// (docs/DESIGN-obenblock.md §2). Bloch's bloch1q/bloch1t strings are accepted
+// only where a page converts them first (watchAddress, the explorer search).
 export const isLegacyAddress = (v) => typeof v === "string" && v === v.trim()
-  && /^(gnb1[qt][0-9a-f]{48}|gnb1[mn][0-9a-f]{72})$/.test(v);
+  && /^((?:obb|gnb)1[qt][0-9a-f]{48}|(?:obb|gnb)1[mn][0-9a-f]{72})$/.test(v);
 export const isAddress = (v) => isLegacyAddress(v) || (typeof v === "string" && v === v.trim()
   && (v === v.toLowerCase() || v === v.toUpperCase())
-  && /^(t?gnb1zq[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{38}|t?gnb1zp[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{58})$/.test(v.toLowerCase()));
+  && /^(t?(?:obb|gnb)1zq[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{38}|t?(?:obb|gnb)1zp[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{58})$/.test(v.toLowerCase()));
+/** An ObenBlock (obb1…) legacy address: the form the node and the core show. */
+export const isObbAddress = (v) => isLegacyAddress(v) && v.startsWith("obb1");
+/** A policy (multisig / timelock) address, legacy form, either family. */
+export const isPolicyAddress = (v) => isLegacyAddress(v) && /^(?:obb|gnb)1[mn]/.test(v);
 
 /** Resolve an alias before prefix classification or legacy identity lookups. */
+/** An obb1 legacy string is returned as is; every alias (gnb1, v2) is
+ *  resolved by the node's validateaddress, which answers the obb1 form. */
 export async function canonicalAddress(value, api) {
-  if (isLegacyAddress(value)) return value;
+  if (isObbAddress(value)) return value;
   if (!isAddress(value)) throw new Error("invalid address");
   const result = await api("validateaddress", [value]);
   if (result?.isvalid !== true || !isLegacyAddress(result.canonical_address)) throw new Error("invalid address for this network");

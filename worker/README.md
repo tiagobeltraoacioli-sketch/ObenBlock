@@ -1,17 +1,50 @@
-# gnb-smh.com Worker
+# obenblock.xyz Worker
 
 `worker/index.js` serves the static site (`site/`) and proxies the read-only
 explorer API: `/api/<method>?p=<JSON params>` goes to `/v1/<method>` on one of
 the explorer origins (`deploy/explorer-api`), `/api/sendrawtransaction`
 forwards a broadcast. Deploy from the repository root with `wrangler deploy`
-(`wrangler.toml`).
+(`wrangler.toml`: Worker `obenblock`, custom domains `obenblock.xyz` and
+`www.obenblock.xyz`).
 
 ## Configuration
 
 | Name | Kind | Meaning |
 | --- | --- | --- |
-| `GNB_ORIGINS` | secret or variable | Explorer origins, comma- or space-separated. `https://` only, no credentials, path or query (audit WAL-2); anything else is ignored, and the API answers 503 until one valid origin is set. |
-| `GNB_API_KEY` | secret | Shared secret sent to the origin as `X-GnB-Key`; the explorer API refuses requests without it. |
+| `OBB_ORIGINS` (or `GNB_ORIGINS`) | secret or variable | Explorer origins, comma- or space-separated. `https://` only, no credentials, path or query (audit WAL-2); anything else is ignored, and the API answers 503 until one valid origin is set. Workers cannot fetch a bare IP address, so an origin is a host name (launch: `https://<ip-with-dashes>.sslip.io:2087`). |
+| `OBB_API_KEY` (or `GNB_API_KEY`) | secret | Shared secret sent to the origin as `X-GnB-Key`; the explorer API refuses requests without it. |
+| `CANONICAL_HOST` | variable (`wrangler.toml`) | `obenblock.xyz`: page requests on `www.obenblock.xyz` get a 301 to it. `/api/*` is served on both names. |
+
+The retired GnB pages `/wallet/` and `/explorer/` (its sidechain wallet and
+older explorer) answer 301 to `/wallet` and `/explorer`; the fragment of an
+old link (`#/tx/<id>`, `#watch/<address>`) is kept by the browser.
+
+## Deploying obenblock.xyz
+
+Nothing in the repository deploys; the owner runs, from the repository root
+of the release checkout, after the explorer API origins answer
+(`deploy/explorer-api/README.md`, "ObenBlock mainnet"):
+
+    wrangler login
+    wrangler secret put OBB_API_KEY
+    wrangler secret put OBB_ORIGINS
+    wrangler deploy
+
+`OBB_API_KEY` is the content of `/etc/obenblock/explorer-api.key` (the same
+on every origin host). `OBB_ORIGINS`, for the three launch hosts:
+
+    https://136-244-93-186.sslip.io:2087,https://209-250-236-240.sslip.io:2087,https://152-236-5-112.sslip.io:2087
+
+The origins are tried in that order on each request (the next one when one
+fails or answers 5xx), so list the host closest to the Worker's users, or
+the least loaded one, first. The sslip.io names are outside the
+obenblock.xyz zone, so the zone's SSL mode does not apply to them: the
+Worker's TLS connection to them is checked against the public CA (the
+origins use Let's Encrypt certificates for exactly those names). Confirm it
+once at launch: with a self-signed certificate on one origin, that origin
+must be skipped (the API keeps answering from the others). Then check
+`https://obenblock.xyz/api/getnetworkinfo` (`chain_id` `0x4f420001`) and
+`https://obenblock.xyz/wallet`.
 
 The Worker forwards the visitor's address (`CF-Connecting-IP`) in
 `X-GnB-Client-IP`, so the explorer API rate-limits per client (WAL-4). It
@@ -69,7 +102,7 @@ name lowers it; a setting it cannot read is a failure, never a pass.
 `site/tests/worker-ssl-mode.test.mjs` tests it against a fake API.
 
 A Cloudflare Tunnel origin (`deploy/explorer-api/README.md`, layout A, the
-recommended one) is authenticated by the tunnel itself, but keep the zone
+recommended one for a host name inside the zone) is authenticated by the tunnel itself, but keep the zone
 strict anyway: it costs nothing and covers a later direct-TLS origin.
 Authenticated Origin Pulls (mTLS from Cloudflare to the origin) additionally
 lets only Cloudflare connect to a direct-TLS origin; it does not authenticate

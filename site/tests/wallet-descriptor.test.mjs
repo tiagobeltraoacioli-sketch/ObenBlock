@@ -17,10 +17,10 @@ async function coreInstance() {
   finally { globalThis.fetch = original; }
 }
 
-test("descriptor public frontend retains existing normalization control", async () => {
+test("descriptor public frontend normalizes to the ObenBlock form", async () => {
   const core = await coreInstance();
   const address = "gnb1q0000000000000000000000000000000000000000335d2ee7";
-  assert.equal(core.normalize(address), address);
+  assert.equal(core.normalize(address), address.replace("gnb1q", "obb1q"));
 });
 
 for (const network of ["mainnet", "testnet"]) {
@@ -35,7 +35,10 @@ for (const network of ["mainnet", "testnet"]) {
       assert.equal(info.requires_policy_tree_activation, kind === "tree");
       assert.deepEqual(core.descriptor({ action: "inspect", network, descriptor: info.descriptor }), info);
       assert.throws(() => core.descriptor({ action: "inspect", network: network === "mainnet" ? "testnet" : "mainnet", descriptor: info.descriptor }), /network/i);
-      assert.match(info.bech32m, network === "mainnet" ? /^gnb1z/ : /^tgnb1z/);
+      // The ObenBlock core shows the obb forms (the descriptor text keeps
+      // its gnbd1 format: it names keys, not a chain).
+      assert.match(info.bech32m, network === "mainnet" ? /^obb1z/ : /^tobb1z/);
+      assert.match(info.address, network === "mainnet" ? /^obb1[qm]/ : /^obb1[tn]/);
       if (kind === "pkh") {
         assert.equal(info.script_pubkey, createHash("sha3-256").update(Buffer.from(key, "hex")).digest("hex").slice(0, 40));
         assert.equal(core.normalize(info.bech32m), info.address);

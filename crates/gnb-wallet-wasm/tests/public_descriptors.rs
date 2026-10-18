@@ -11,12 +11,13 @@ fn key(byte: u8) -> String {
 
 #[test]
 fn legacy_normalize_control_without_a_session() {
+    // ObenBlock core: a GnB string is accepted and shown as obb1q….
     let address =
         gnb_crypto::address::Address::from_hash([0; 20], gnb_crypto::address::Network::Mainnet)
             .to_string();
     assert_eq!(
         handle(&json!({"op":"normalize", "address":address})).unwrap(),
-        json!({"address":address})
+        json!({"address": format!("obb1q{}", &address[5..]), "network": "mainnet"})
     );
 }
 
@@ -42,9 +43,11 @@ fn public_descriptor_creation_preserves_existing_script_without_a_session() {
         };
         let address =
             gnb_crypto::address::Address::from_pubkey(&hex::decode(public_key).unwrap(), net);
-        assert_eq!(result["address"], address.to_string());
+        // The ObenBlock core shows the obb forms of the same script.
+        let family = gnb_crypto::address::AddressFamily::ObenBlock;
+        assert_eq!(result["address"], address.to_string_in(family));
         assert_eq!(result["script_pubkey"], hex::encode(address.hash()));
-        assert_eq!(result["bech32m"], address.to_bech32m());
+        assert_eq!(result["bech32m"], address.to_bech32m_in(family));
         assert_eq!(result["requires_policy_tree_activation"], false);
     }
 }
@@ -98,7 +101,7 @@ fn raw_public_envelopes_cannot_redirect_or_mutate_a_live_session() {
         opened["address"].as_str().unwrap()
     );
     let legacy: Value = serde_json::from_slice(&call_bytes(raw.as_bytes())).unwrap();
-    assert_eq!(legacy, json!({"ok":{"address":opened["address"]}}));
+    assert_eq!(legacy, json!({"ok":{"address":opened["address"], "network":"mainnet"}}));
     assert_eq!(handle(&json!({"op":"address"})).unwrap(), before);
     handle(&json!({"op":"wipe"})).unwrap();
 }

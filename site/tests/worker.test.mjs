@@ -17,20 +17,20 @@ test("only https origins are accepted", () => {
 
 test("every static path gets CSP, HSTS and anti-framing headers", async () => {
   for (const path of ["/", "/explorer", "/brand.html", "/assets/site.js"]) {
-    const r = await worker.fetch(new Request(`https://gnb-smh.com${path}`), { ASSETS: assets }, ctx);
+    const r = await worker.fetch(new Request(`https://obenblock.xyz${path}`), { ASSETS: assets }, ctx);
     assert.equal(r.headers.get("content-security-policy"), SITE_CSP, path);
     assert.match(r.headers.get("strict-transport-security"), /max-age=\d{7,}/);
     assert.equal(r.headers.get("x-frame-options"), "DENY");
     assert.ok(!SITE_CSP.includes("unsafe-eval") && /script-src 'self'(;|$)/.test(SITE_CSP));
   }
-  const w = withSecurityHeaders(new URL("https://gnb-smh.com/wallet/gnb_wallet.wasm"), new Response("x"));
+  const w = withSecurityHeaders(new URL("https://obenblock.xyz/wallet/gnb_wallet.wasm"), new Response("x"));
   assert.equal(w.headers.get("content-security-policy"), WALLET_CSP);
   assert.equal(w.headers.get("content-type"), "application/wasm");
 });
 
 test("the API refuses to run without an https origin", async () => {
-  for (const GNB_ORIGINS of [undefined, "http://139-84-201-52.sslip.io:2086"]) {
-    const r = await worker.fetch(new Request("https://gnb-smh.com/api/getblockcount"), { ASSETS: assets, GNB_ORIGINS }, ctx);
+  for (const OBB_ORIGINS of [undefined, "http://139-84-201-52.sslip.io:2086"]) {
+    const r = await worker.fetch(new Request("https://obenblock.xyz/api/getblockcount"), { ASSETS: assets, OBB_ORIGINS }, ctx);
     assert.equal(r.status, 503);
     assert.ok(r.headers.get("strict-transport-security"));
   }
@@ -44,8 +44,8 @@ test("origin cache headers are ignored; fixed TTL; client IP forwarded", async (
     seen.push({ url: String(url), headers: init.headers });
     return new Response('{"result":1}', { status: 200, headers: { "cache-control": "public, max-age=31536000" } });
   };
-  const req = new Request("https://gnb-smh.com/api/getbalance?p=%5B%5D", { headers: { "cf-connecting-ip": "198.51.100.4" } });
-  const r = await worker.fetch(req, { ASSETS: assets, GNB_ORIGINS: "https://origin.example.net", GNB_API_KEY: "k" }, ctx);
+  const req = new Request("https://obenblock.xyz/api/getbalance?p=%5B%5D", { headers: { "cf-connecting-ip": "198.51.100.4" } });
+  const r = await worker.fetch(req, { ASSETS: assets, OBB_ORIGINS: "https://origin.example.net", OBB_API_KEY: "k" }, ctx);
   assert.equal(r.status, 200);
   assert.equal(r.headers.get("cache-control"), `public, max-age=${ttlFor("getbalance")}`);
   assert.ok(ttlFor("getbalance") <= 5 && ttlFor("unknownmethod") <= 5);
@@ -56,7 +56,7 @@ test("origin cache headers are ignored; fixed TTL; client IP forwarded", async (
 
   // Errors are never cached.
   globalThis.fetch = async () => new Response('{"error":"x"}', { status: 404, headers: { "cache-control": "max-age=999" } });
-  const e = await worker.fetch(new Request("https://gnb-smh.com/api/getbalance"), { ASSETS: assets, GNB_ORIGINS: "https://o.example.net" }, ctx);
+  const e = await worker.fetch(new Request("https://obenblock.xyz/api/getbalance"), { ASSETS: assets, OBB_ORIGINS: "https://o.example.net" }, ctx);
   assert.equal(e.headers.get("cache-control"), "no-store");
   assert.equal(stored.length, 1);
 });

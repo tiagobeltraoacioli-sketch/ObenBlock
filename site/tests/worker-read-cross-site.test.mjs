@@ -1,7 +1,7 @@
 // Re-audit B2-R2-2, read variant: "the same trick, aimed at the uncached GET
 // address endpoints, multiplies the heavy-read cost too". A script on any
 // page (or an ad) can make each visitor's browser send
-// fetch("https://gnb-smh.com/api/getutxos?p=...") with a fresh `p` every time
+// fetch("https://obenblock.xyz/api/getutxos?p=...") with a fresh `p` every time
 // (an edge-cache miss), and every such read was charged to that visitor's
 // own per-client budget in the explorer API (240 a minute), so the page got
 // a fresh budget per visitor and never one of its own.
@@ -21,7 +21,7 @@ import worker, { isCrossSite } from "../../worker/index.js";
 
 const ctx = { waitUntil: (p) => p };
 const assets = { fetch: async () => new Response("<!doctype html>") };
-const env = { ASSETS: assets, GNB_ORIGINS: "https://origin.example.net", GNB_API_KEY: "k" };
+const env = { ASSETS: assets, OBB_ORIGINS: "https://origin.example.net", OBB_API_KEY: "k" };
 const ADDRESS = "gnb1q0000000000000000000000000000000000000000335d2ee7";
 
 /** A fake origin and an always-missing edge cache; returns forwarded requests. */
@@ -37,7 +37,7 @@ function fakeOrigin() {
 
 function read(n, headers) {
   const p = encodeURIComponent(JSON.stringify([ADDRESS, n]));
-  return new Request(`https://gnb-smh.com/api/getutxos?p=${p}`, { headers: { "cf-connecting-ip": "198.51.100.7", ...headers } });
+  return new Request(`https://obenblock.xyz/api/getutxos?p=${p}`, { headers: { "cf-connecting-ip": "198.51.100.7", ...headers } });
 }
 
 test("a cross-site read of an uncached address endpoint is forwarded marked cross-site", async () => {
@@ -48,7 +48,7 @@ test("a cross-site read of an uncached address endpoint is forwarded marked cros
     // Sec-Fetch-Site still tells
     { "sec-fetch-site": "cross-site", "sec-fetch-mode": "no-cors" },
     // a sibling subdomain is the same site but another origin
-    { origin: "https://other.gnb-smh.com", "sec-fetch-site": "same-site" },
+    { origin: "https://other.obenblock.xyz", "sec-fetch-site": "same-site" },
     // an older browser without Sec-Fetch-*: the Origin of a CORS request
     { origin: "https://evil.example" },
     // sandboxed frames and data: URLs send the opaque origin "null"
@@ -72,7 +72,7 @@ test("a cross-site read of an uncached address endpoint is forwarded marked cros
 test("same-origin pages and non-browser clients are not marked", async () => {
   for (const headers of [
     // the site's explorer and wallet pages
-    { origin: "https://gnb-smh.com", "sec-fetch-site": "same-origin", "sec-fetch-mode": "cors" },
+    { origin: "https://obenblock.xyz", "sec-fetch-site": "same-origin", "sec-fetch-mode": "cors" },
     { "sec-fetch-site": "same-origin" },
     // typed into the address bar / a bookmark
     { "sec-fetch-site": "none" },
@@ -88,18 +88,18 @@ test("same-origin pages and non-browser clients are not marked", async () => {
   }
   // The same-origin check follows the host the request was made to.
   const seen = fakeOrigin();
-  const www = new Request(`https://www.gnb-smh.com/api/getblockcount?p=%5B%5D`, {
-    headers: { origin: "https://www.gnb-smh.com", "sec-fetch-site": "same-origin" },
+  const www = new Request(`https://www.obenblock.xyz/api/getblockcount?p=%5B%5D`, {
+    headers: { origin: "https://www.obenblock.xyz", "sec-fetch-site": "same-origin" },
   });
   assert.equal((await worker.fetch(www, env, ctx)).status, 200);
   assert.equal(seen[0].init.headers["x-gnb-cross-site"], undefined);
 });
 
 test("isCrossSite is the one predicate of the read and the broadcast routes", () => {
-  const url = new URL("https://gnb-smh.com/api/getutxos");
+  const url = new URL("https://obenblock.xyz/api/getutxos");
   const req = (headers) => new Request(url, { headers });
   assert.equal(isCrossSite(req({}), url), false);
-  assert.equal(isCrossSite(req({ "sec-fetch-site": "same-origin", origin: "https://gnb-smh.com" }), url), false);
+  assert.equal(isCrossSite(req({ "sec-fetch-site": "same-origin", origin: "https://obenblock.xyz" }), url), false);
   assert.equal(isCrossSite(req({ "sec-fetch-site": "none" }), url), false);
   assert.equal(isCrossSite(req({ "sec-fetch-site": "cross-site" }), url), true);
   assert.equal(isCrossSite(req({ "sec-fetch-site": "same-site" }), url), true);
