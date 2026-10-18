@@ -87,6 +87,28 @@ quorum(C, votes) <=> 3 × sum(weight of distinct keys of C voting the link) > 2 
   `e+k`, the next configuration is `C_{e+k}`, computed from the finalized
   history up to that checkpoint.
 
+### 4.1 Absence pruning by the old committee (owner, 2026-10-18)
+
+Dead weight is removed **by the current configuration, while it still has its
+quorum**, never by a local timeout:
+
+- A key of `C_e` whose votes were not included in any block of the finalized
+  history during the last `PRUNE_AFTER = 4` epochs (24 h) is left out of the
+  next configuration. The rule reads only finalized history, so every node
+  computes the same set, and it takes effect through the handoff, which more
+  than two thirds of `C_e` finalized: the old committee authorizes it.
+- A pruned key returns by publishing a **rejoin** message signed with its KES
+  key; once that message is in finalized history, the key's share work counts
+  again from the next handoff, as new weight under the growth cap
+  (DESIGN-obenblock.md §6.3).
+- `getpowitinfo` reports the absent weight of `C_e` per epoch, so operators
+  see it grow long before it reaches a third.
+- What it covers: weight that fades out (operators going offline over
+  hours or days). What it cannot cover: more than a third of `C_e` vanishing
+  at once. Then `C_e` has no quorum to authorize anything and finality halts
+  until the weight returns or the coordinated recovery of §7. No rule inside
+  one partition can safely decide that the old committee is gone.
+
 **The inactivity leak does not apply to finality weight on ObenBlock.**
 DESIGN-obenblock.md §5.2 is replaced by this section for finality; block
 production (§5.1 stall relief) is unchanged.
@@ -189,6 +211,8 @@ provisional.
 | partitions 50/50, 60/40, 70/30, also longer than the window | never two conflicting finalized checkpoints; only a side with more than 2/3 of the original `C` advances |
 | double and surround votes, evidence, 100-epoch ban | evidence verified; ban start/end exact; no ban for a timeout or a missing vote |
 | exit, ban and expiry during a stall | same `C` and denominators on every honest node; one handoff; old certificates keep verifying |
+| weight fading out (5 %, 20 %, 30 % offline over days) | pruned at handoffs, finality never halts; 40 % vanishing at once halts finality (expected) and no node prunes locally |
+| pruned key rejoins | rejoin message finalized, weight back from the next handoff through the growth cap |
 | crash before/after persisting, before/after signing | no sequence releases two conflicting votes; restart is idempotent |
 | restored old record, two signer instances | signing stops with an alert |
 | forged weight, duplicate key, key outside `C` | certificate verification refuses it |
