@@ -426,3 +426,8 @@ mod tests {
         assert!(!verify(b"gnb", 0, &Target::ZERO));
     }
 }
+
+/// SHA-256d over an 80-byte Bitcoin-ASIC-compatible header (ObenBlock,
+/// docs/DESIGN-obenblock.md §4). Not GnB's proof of work. (Declared at the
+/// end of the file so the line numbers above do not move.)
+pub mod sha256d;
