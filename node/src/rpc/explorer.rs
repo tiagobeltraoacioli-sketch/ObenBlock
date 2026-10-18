@@ -176,7 +176,7 @@ fn parse_hash(v: Option<&Value>) -> Option<[u8; 32]> {
 
 fn spk_address(spk: &[u8]) -> Option<String> {
     <[u8; 20]>::try_from(spk).ok()
-        .map(|h| crate::crypto::address_from_hash(&h, crate::core::node_chain_id().is_test_network()))
+        .map(|h| crate::address::display_hash(&h, crate::core::node_chain_id().network()))
 }
 
 /// Previous output of an input: from storage (UTXO set or the creating tx).
@@ -567,7 +567,7 @@ pub(super) fn get_address_history(params: Option<&Value>, state: &AppState) -> V
         "amount":    e.amount.to_string(),
     })).collect();
     json!({
-        "address": addr, "balance": balance.to_string(), "utxo_count": utxos,
+        "address": crate::address::display_address(addr), "balance": balance.to_string(), "utxo_count": utxos,
         "total": total, "offset": offset, "max_offset": MAX_HISTORY_OFFSET,
         "items": items, "next_cursor": page.next_cursor.map(hex::encode),
     })
@@ -593,7 +593,7 @@ pub(super) fn get_rich_list(params: Option<&Value>, state: &AppState) -> Value {
     let limit = (params.and_then(|p| p.get(0)).and_then(|v| v.as_u64()).unwrap_or(50) as usize).clamp(1, MAX_PAGE);
     let offset = params.and_then(|p| p.get(1)).and_then(|v| v.as_u64()).unwrap_or(0)
         .min(crate::analytics::MAX_RICHLIST_OFFSET as u64) as usize;
-    let testnet = crate::core::node_chain_id().is_test_network();
+    let network = crate::core::node_chain_id().network();
     match crate::analytics::rich_list_bounded(&state.store, offset, limit, &state.cancel) {
         Ok(page) => json!({
             "holders":      page.holders,
@@ -602,7 +602,7 @@ pub(super) fn get_rich_list(params: Option<&Value>, state: &AppState) -> Value {
             "max_offset":   crate::analytics::MAX_RICHLIST_OFFSET,
             "items":        page.items.iter().enumerate().map(|(i, (h, e))| json!({
                 "rank":    page.offset + i + 1,
-                "address": crate::crypto::address_from_hash(h, testnet),
+                "address": crate::address::display_hash(h, network),
                 "balance": e.balance.to_string(),
                 "utxos":   e.utxos,
                 "share":   if page.total_supply > 0 { e.balance as f64 / page.total_supply as f64 } else { 0.0 },

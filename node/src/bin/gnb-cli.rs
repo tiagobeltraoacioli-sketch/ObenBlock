@@ -1597,7 +1597,7 @@ fn do_vault_create(params: &[&str], stated: Option<gnb::address::Network>) {
     let v = gnb::bridge::Vault::create(network, k, signers, r, cold, older).unwrap_or_else(|e| die(&e));
     std::fs::write(out, serde_json::to_string_pretty(&v).unwrap()).unwrap_or_else(|e| die(&format!("write {}: {}", out, e)));
     println!("Vault written to {}", out);
-    println!("Address:  {}", v.address);
+    println!("Address:  {}", gnb::address::display_address(&v.address));
     println!("Release:  {}-of-{} signer keys, no timelock", v.release_threshold, v.signers);
     println!("Recovery: {}-of-{} cold keys, {} blocks after each deposit", v.recovery_threshold, v.recovery_keys, v.recovery_older);
     println!("Publish this file once; signers and users check the address against it.");
@@ -1752,7 +1752,7 @@ fn do_bloch_anchor(params: &[&str], target: &RpcTarget, stated: Option<gnb::addr
     if let Some(e) = res.get("error").and_then(|e| e.as_str()) { die(&format!("broadcast rejected: {}", e)); }
     println!("{}", serde_json::json!({
         "anchor_txid": txid, "epoch": epoch, "finalized_height": height,
-        "root": hex::encode(root), "anchorer": keypair.address, "fee": fee.to_string(),
+        "root": hex::encode(root), "anchorer": gnb::address::display_address(&keypair.address), "fee": fee.to_string(),
     }));
 }
 
@@ -1871,7 +1871,7 @@ fn do_vault_check_release(params: &[&str], target: &RpcTarget, stated: Option<gn
         let fee = gnb::bridge::check_release(&spend.tx.outputs, &inputs, &vault.script()?, &recipient, burn_amount, &burn)?;
         // Anti-replay: no output with this burn's marker may already exist.
         let marker = gnb::bridge::release_marker(&burn);
-        let marker_addr = gnb::crypto::address_from_hash(&marker, vault.network() == gnb::address::Network::Testnet);
+        let marker_addr = gnb::address::display_hash(&marker, vault.network());
         let seen = rpc_call(target, "getutxos", &serde_json::json!([marker_addr, 1]))?;
         if seen.get("utxos").and_then(|u| u.as_array()).is_some_and(|a| !a.is_empty()) {
             return Err("a release for this burn already exists on chain".into());
