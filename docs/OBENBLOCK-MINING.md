@@ -146,6 +146,12 @@ the second parameter is ignored, as before.
   with the body roots committed in the coinbase. That change is an open
   point for the owner (package O3b report); nothing in this package
   depends on it.
+- **Stratum V1 server**: `tools/obenblock-stratum` (a solo-pool job server
+  and `obenblock-cpu-miner`). It serves standard V1 jobs from one header job
+  per template and judges every share on this chain's root; miners that
+  negotiate its `obenblock-root` extension get the root rule in
+  `mining.notify`. Work from stock V1 firmware (Bitcoin's root) is counted
+  as such and never submitted; its README, section 1, has the details.
 - **Share difficulty**: pools set it as on Bitcoin; a share is a block when
   its id meets `target`.
 - **Witness shares** (PoWit, §6 of the design) are a separate header and a
