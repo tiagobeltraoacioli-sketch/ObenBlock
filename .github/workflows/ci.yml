@@ -84,6 +84,12 @@ jobs:
         run: |
           python3 reference/powit_reference_test.py -v
           python3 reference/powit_reference.py --check
+      # docs/research/obenblock-partition-sim.md (ObenBlock O11, PoCI): the
+      # partition simulator's required outcomes and its reproducible results.
+      - name: Partition simulator (current rules vs PoCI)
+        run: |
+          python3 -I reference/sim/partition_sim_test.py -v
+          python3 -I reference/sim/partition_sim.py --check
 
   rust:
     runs-on: ubuntu-latest
