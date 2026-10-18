@@ -15,8 +15,15 @@ kit_load_conf() {
   SSH_USER=${SSH_USER:-ubuntu}
   BUILD_DIR=${BUILD_DIR:-obenblock-launch}
   BUILD_JOBS=${BUILD_JOBS:-28}
-  STRATUM_PORT=${STRATUM_PORT:-3333}
-  MINE_THREADS=${MINE_THREADS:-auto}
+  STRATUM_V1_PORT=${STRATUM_V1_PORT:-3333}
+  STRATUM_V2_PORT=${STRATUM_V2_PORT:-3334}
+  MINER_THREADS=${MINER_THREADS:-${MINE_THREADS:-auto}}
+  MINER_LABEL_PREFIX=${MINER_LABEL_PREFIX:-cpu}
+  NODE_MINE=${NODE_MINE:-off}
+  WITNESS=${WITNESS:-on}
+  WITNESS_SHARE_THREADS=${WITNESS_SHARE_THREADS:-1}
+  STRATUM_PROXY=${STRATUM_PROXY:-off}
+  STRATUM_PROXY_PORT=${STRATUM_PROXY_PORT:-3335}
   EXPLORER_TLS=${EXPLORER_TLS:-letsencrypt}
   EXPLORER_PORT=${EXPLORER_PORT:-2087}
   DNS_SEED=${DNS_SEED:-none}
@@ -24,6 +31,23 @@ kit_load_conf() {
     SRC_DIR=$(cd "$KIT_DIR/../.." 2>/dev/null && pwd)
   fi
   STATE_DIR=${STATE_DIR:-$KIT_DIR/state}
+  # Never ship the kit's state (secrets, tarballs, logs) or kit.conf with a
+  # source copy: excluded from every rsync of SRC_DIR (build host and the
+  # rehearsal copy). A STATE_DIR elsewhere inside SRC_DIR is refused.
+  KIT_SRC_EXCLUDES=(--exclude /target --exclude /.git --exclude /deploy/obenblock-launch/state
+                    --exclude /deploy/obenblock-launch/kit.conf)
+  local sd src_abs
+  mkdir -p "$STATE_DIR"
+  sd=$(cd "$STATE_DIR" && pwd -P)
+  src_abs=$(cd "${SRC_DIR:-$KIT_DIR/../..}" 2>/dev/null && pwd -P || true)
+  if [ -n "$src_abs" ]; then
+    case $sd/ in
+      "$src_abs"/deploy/obenblock-launch/state/) ;;
+      "$src_abs"/*) kit_die "STATE_DIR=$STATE_DIR is inside SRC_DIR: it would be copied to the build host" ;;
+    esac
+  fi
+  SITE_OUT=${SITE_OUT:-$STATE_DIR/site-deploy}
+  RELEASE_URL=${RELEASE_URL:-}
   mkdir -p "$STATE_DIR/logs" "$STATE_DIR/secrets" "$STATE_DIR/dist"
   chmod 700 "$STATE_DIR/secrets"
 }
@@ -79,7 +103,7 @@ kit_get() {
 kit_sync_src() {
   kit_is_pw_host "$BUILD_HOST" && kit_die "BUILD_HOST must be a key host"
   kit_run "$BUILD_HOST" "mkdir -p ~/$BUILD_DIR/src"
-  rsync -az --delete --exclude /target --exclude /.git \
+  rsync -az --delete "${KIT_SRC_EXCLUDES[@]}" \
     -e "ssh ${KIT_SSH_OPTS[*]} -i $SSH_KEY" "$SRC_DIR/" "$SSH_USER@$BUILD_HOST:$BUILD_DIR/src/"
 }
 
@@ -99,6 +123,20 @@ kit_peers_for() {
 }
 
 kit_dashed() { printf '%s' "$1" | tr . -; }
+
+# The explorer API origin name of host $1: its entry in EXPLORER_NAMES
+# ("<ip>=<name> ..."; DNS-only A records in the owner's zone, preferred),
+# else <ip-with-dashes>.sslip.io (fallback).
+kit_explorer_name() {
+  local e
+  for e in ${EXPLORER_NAMES:-}; do
+    [ "${e%%=*}" = "$1" ] && { printf '%s' "${e#*=}"; return; }
+  done
+  printf '%s.sslip.io' "$(kit_dashed "$1")"
+}
+
+# The CPU miner's worker label on host $1 (cpu-136-244-93-186).
+kit_miner_label() { printf '%s-%s' "$MINER_LABEL_PREFIX" "$(kit_dashed "$1")"; }
 
 kit_check_address() {
   local addr=$1 network=${2:-mainnet}

@@ -2,60 +2,155 @@
 # Launcher of obenblock-node.service: turns /etc/obenblock/obenblock.env into
 # the node's arguments (the node binary is still named gnb in the source).
 #
-# Every value is validated before it becomes an argument: the payout address
-# is alphanumeric, the thread count decimal, every peer a multiaddr, and the
-# peer list is split on whitespace only with pathname expansion off, so no
-# value can smuggle options or file names into the command line (as
-# deploy/gnb-launch, audit OPS-3).
+# Every value is validated before it becomes an argument: addresses are
+# alphanumeric, numbers decimal, every peer a multiaddr, every path absolute
+# and free of shell or option characters, and the peer list is split on
+# whitespace only with pathname expansion off, so no value can smuggle
+# options or file names into the command line (as deploy/gnb-launch, audit
+# OPS-3).
 #
-# The OBB_BIN, OBB_DATA_DIR, OBB_P2P_PORT, OBB_RPC_PORT and OBB_LISTEN_IP
-# overrides exist for the regtest rehearsal (rehearse-regtest.sh); the
-# installed env file sets none of them.
+# /etc/obenblock/obenblock.env (install.sh writes it):
+#   OBB_NETWORK            mainnet | regtest
+#   OBB_CARRYOVER          the uncompressed Bloch G3 snapshot
+#   OBB_PAYOUT_ADDRESS     the owner's obb1 address: --stratum-payout (and
+#                          --miner-address, the label fallback of the stratum
+#                          servers and the payout of --mine when it is on)
+#   OBB_PEERS              "<multiaddr> ..." (the other launch hosts)
+#   OBB_RPC_KEY_FILE       the node API key (RPC on 127.0.0.1 only)
+#   OBB_DNS_SEED           none | default
+#   OBB_STRATUM            on | off   built-in Stratum V1 (docs/STRATUM.md)
+#   OBB_STRATUM_V1_PORT    3333
+#   OBB_STRATUM_V2         on | off   built-in Stratum V2 (Noise NX)
+#   OBB_STRATUM_V2_PORT    3334
+#   OBB_STRATUM_MAX_SESSIONS / OBB_STRATUM_MAX_PER_IP        V1 caps (1024 / 256)
+#   OBB_STRATUM_V2_MAX_SESSIONS / OBB_STRATUM_V2_MAX_PER_IP  V2 caps (1024 / 64)
+#   OBB_STRATUM_V2_KEY     authority key file (created by the node on first
+#                          start; default <data dir>/stratum-v2-authority.json)
+#   OBB_NODE_MINE          off | on   the node's own --mine (off: the CPU
+#                          miner unit mines through stratum instead)
+#   OBB_MINE_THREADS       auto | N   threads of --mine when it is on
+#   OBB_WITNESS            on | off   PoWit witness duty (PoCI finality)
+#   OBB_WITNESS_KEY        KES witness key file (gnb-cli witnesskeygen)
+#   OBB_WITNESS_PASSWORD_FILE  its password (first line), or credential:<name>
+#                          for a systemd LoadCredential (the installed layout)
+#   OBB_WITNESS_PAYOUT     share rewards address (default OBB_PAYOUT_ADDRESS)
+#   OBB_SHARE_THREADS      witness share threads (default 1)
+#   OBB_METRICS            on | off   Prometheus on 127.0.0.1 (18310 / 18311)
+#
+# The OBB_BIN, OBB_DATA_DIR, OBB_P2P_PORT, OBB_RPC_PORT, OBB_METRICS_PORT,
+# OBB_LISTEN_IP, OBB_STRATUM_IP and OBB_ALLOW_PRIVATE_PEERS overrides exist
+# for the regtest rehearsal (rehearse-regtest.sh); the installed env file
+# sets none of them.
 set -euf
 die() { echo "obenblock-launch: $*" >&2; exit 64; }
 
 num() { case $2 in ''|*[!0-9]*) die "$1 must be a decimal number, got '$2'" ;; esac; }
+onoff() { case $2 in on|off) ;; *) die "$1 must be on or off, got '$2'" ;; esac; }
+addr() { case $2 in ''|*[!A-Za-z0-9]*) die "$1 must be an alphanumeric address, got '$2'" ;; esac; }
+path() {
+  case $2 in /*) ;; *) die "$1 must be an absolute path, got '$2'" ;; esac
+  case $2 in *[!A-Za-z0-9./_-]*) die "$1 has characters outside [A-Za-z0-9./_-]: '$2'" ;; esac
+}
+ipv4() { case $2 in ''|*[!0-9.]*) die "$1 must be an IPv4 address, got '$2'" ;; esac; }
 
 OBB_BIN=${OBB_BIN:-/opt/obenblock/current/obenblock}
 OBB_DATA_DIR=${OBB_DATA_DIR:-/var/lib/obenblock}
 OBB_NETWORK=${OBB_NETWORK:-mainnet}
+path OBB_DATA_DIR "$OBB_DATA_DIR"
 [ -n "${OBB_CARRYOVER:-}" ] || die "OBB_CARRYOVER is not set"
 [ -r "$OBB_CARRYOVER" ] || die "carryover snapshot $OBB_CARRYOVER is not readable"
 
 case $OBB_NETWORK in
-  mainnet) p2p=18110; rpc=18210; set -- --chain obenblock ;;
-  regtest) p2p=18111; rpc=18211; set -- --chain obenblock --regtest ;;
+  mainnet) p2p=18110; rpc=18210; metrics=18310; set -- --chain obenblock ;;
+  regtest) p2p=18111; rpc=18211; metrics=18311; set -- --chain obenblock --regtest ;;
   *) die "OBB_NETWORK must be mainnet or regtest" ;;
 esac
-p2p=${OBB_P2P_PORT:-$p2p}; rpc=${OBB_RPC_PORT:-$rpc}
-num OBB_P2P_PORT "$p2p"; num OBB_RPC_PORT "$rpc"
+p2p=${OBB_P2P_PORT:-$p2p}; rpc=${OBB_RPC_PORT:-$rpc}; metrics=${OBB_METRICS_PORT:-$metrics}
+num OBB_P2P_PORT "$p2p"; num OBB_RPC_PORT "$rpc"; num OBB_METRICS_PORT "$metrics"
 listen_ip=${OBB_LISTEN_IP:-0.0.0.0}
-case $listen_ip in *[!0-9.]*|'') die "OBB_LISTEN_IP must be an IPv4 address" ;; esac
+ipv4 OBB_LISTEN_IP "$listen_ip"
 
 # Archive: every node keeps every body, so a fresh node can always sync.
+# The RPC stays on 127.0.0.1 (the node's default; --rpc-public is never set).
 set -- "$@" --data-dir "$OBB_DATA_DIR" --carryover-snapshot "$OBB_CARRYOVER" \
        --listen "/ip4/$listen_ip/tcp/$p2p" --rpc-port "$rpc" --archive
 
 if [ -n "${OBB_RPC_KEY_FILE:-}" ]; then
+  path OBB_RPC_KEY_FILE "$OBB_RPC_KEY_FILE"
   set -- "$@" --rpc-api-key-file "$OBB_RPC_KEY_FILE"
 fi
 
-case ${OBB_MINE_THREADS:-auto} in
-  auto) ;;
-  *) num OBB_MINE_THREADS "$OBB_MINE_THREADS" ;;
-esac
-if [ -n "${OBB_MINER_ADDRESS:-}" ]; then
-  case $OBB_MINER_ADDRESS in
-    *[!A-Za-z0-9]*) die "OBB_MINER_ADDRESS must be alphanumeric" ;;
-  esac
+payout=${OBB_PAYOUT_ADDRESS:-${OBB_MINER_ADDRESS:-}}
+[ -z "$payout" ] || addr OBB_PAYOUT_ADDRESS "$payout"
+
+# ── Built-in stratum servers (solo: a block pays the worker's address) ──
+stratum=${OBB_STRATUM:-off}; v2=${OBB_STRATUM_V2:-off}
+onoff OBB_STRATUM "$stratum"; onoff OBB_STRATUM_V2 "$v2"
+stratum_ip=${OBB_STRATUM_IP:-0.0.0.0}
+ipv4 OBB_STRATUM_IP "$stratum_ip"
+v1_port=${OBB_STRATUM_V1_PORT:-3333}; v2_port=${OBB_STRATUM_V2_PORT:-3334}
+num OBB_STRATUM_V1_PORT "$v1_port"; num OBB_STRATUM_V2_PORT "$v2_port"
+# Session caps: MiningRigRentals rigs arrive from a few MRR proxy addresses,
+# so the per-IP caps are high (V1 256, V2 64) and the totals 1024.
+v1_max=${OBB_STRATUM_MAX_SESSIONS:-1024}; v1_ip=${OBB_STRATUM_MAX_PER_IP:-256}
+v2_max=${OBB_STRATUM_V2_MAX_SESSIONS:-1024}; v2_ip=${OBB_STRATUM_V2_MAX_PER_IP:-64}
+num OBB_STRATUM_MAX_SESSIONS "$v1_max"; num OBB_STRATUM_MAX_PER_IP "$v1_ip"
+num OBB_STRATUM_V2_MAX_SESSIONS "$v2_max"; num OBB_STRATUM_V2_MAX_PER_IP "$v2_ip"
+if [ "$stratum" = on ]; then
+  set -- "$@" --stratum --stratum-addr "$stratum_ip:$v1_port" \
+         --stratum-max-sessions "$v1_max" --stratum-max-sessions-per-ip "$v1_ip"
+fi
+if [ "$v2" = on ]; then
+  v2_key=${OBB_STRATUM_V2_KEY:-$OBB_DATA_DIR/stratum-v2-authority.json}
+  path OBB_STRATUM_V2_KEY "$v2_key"
+  set -- "$@" --stratum-v2 --stratum-v2-addr "$stratum_ip:$v2_port" --stratum-v2-key "$v2_key" \
+         --stratum-v2-max-sessions "$v2_max" --stratum-v2-max-sessions-per-ip "$v2_ip"
+fi
+if [ "$stratum" = on ] || [ "$v2" = on ]; then
+  [ -n "$payout" ] || die "the stratum servers need OBB_PAYOUT_ADDRESS (the label fallback)"
+  set -- "$@" --stratum-payout "$payout"
+fi
+[ -z "$payout" ] || set -- "$@" --miner-address "$payout"
+
+# ── The node's own CPU miner (off by default: obenblock-cpu-miner.service) ──
+node_mine=${OBB_NODE_MINE:-off}
+onoff OBB_NODE_MINE "$node_mine"
+if [ "$node_mine" = on ]; then
+  [ -n "$payout" ] || die "OBB_NODE_MINE=on needs OBB_PAYOUT_ADDRESS"
   threads=${OBB_MINE_THREADS:-auto}
   if [ "$threads" = auto ]; then
     threads=$(( $(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN) - 1 ))
     [ "$threads" -ge 1 ] || threads=1
   fi
   num OBB_MINE_THREADS "$threads"
-  set -- "$@" --mine --miner-address "$OBB_MINER_ADDRESS" --mine-threads "$threads"
+  set -- "$@" --mine --mine-threads "$threads"
 fi
+
+# ── PoWit witness (finality weight is share work, PoCI from launch_height) ──
+witness=${OBB_WITNESS:-off}
+onoff OBB_WITNESS "$witness"
+if [ "$witness" = on ]; then
+  : "${OBB_WITNESS_KEY:?OBB_WITNESS=on needs OBB_WITNESS_KEY}"
+  : "${OBB_WITNESS_PASSWORD_FILE:?OBB_WITNESS=on needs OBB_WITNESS_PASSWORD_FILE}"
+  wpw=$OBB_WITNESS_PASSWORD_FILE
+  case $wpw in
+    credential:*)
+      [ -n "${CREDENTIALS_DIRECTORY:-}" ] || die "OBB_WITNESS_PASSWORD_FILE=$wpw needs systemd LoadCredential (CREDENTIALS_DIRECTORY unset)"
+      wpw=$CREDENTIALS_DIRECTORY/${wpw#credential:} ;;
+  esac
+  path OBB_WITNESS_KEY "$OBB_WITNESS_KEY"; path OBB_WITNESS_PASSWORD_FILE "$wpw"
+  [ -r "$OBB_WITNESS_KEY" ] || die "witness key $OBB_WITNESS_KEY is not readable"
+  wpay=${OBB_WITNESS_PAYOUT:-$payout}
+  addr OBB_WITNESS_PAYOUT "$wpay"
+  share_threads=${OBB_SHARE_THREADS:-1}
+  num OBB_SHARE_THREADS "$share_threads"
+  set -- "$@" --witness-key "$OBB_WITNESS_KEY" --witness-password-file "$wpw" \
+         --witness-payout "$wpay" --share-threads "$share_threads"
+fi
+
+metrics_on=${OBB_METRICS:-off}
+onoff OBB_METRICS "$metrics_on"
+[ "$metrics_on" = on ] && set -- "$@" --metrics --metrics-addr 127.0.0.1 --metrics-port "$metrics"
 
 case ${OBB_DNS_SEED:-none} in
   none) set -- "$@" --no-default-dns-seed ;;

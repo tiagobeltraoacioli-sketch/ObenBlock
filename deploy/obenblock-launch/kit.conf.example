@@ -4,9 +4,17 @@
 # LAUNCH-PLACEHOLDER. The file is sourced by bash: plain KEY=value lines,
 # values in double quotes, no spaces around '='.
 
-# The owner's ObenBlock payout address (obb1q... or obb1z...). Every CPU
-# miner and the stratum proxy's fallback payout go to it.
-OWNER_ADDRESS="LAUNCH-PLACEHOLDER-obb1-address"
+# The owner's ObenBlock payout address. It is the owner's GnB miner key
+#   gnb1q52273b58c1032291d562f582c413bbf05efabcdd0df82055   (GnB form)
+# in ObenBlock's notation (same 20-byte key hash, same output script; the
+# legacy single-key checksum does not cover the prefix, so only "gnb1q"
+# becomes "obb1q"). Computed with reference/obb_address.py normalize(...,
+# "obenblock") of the final code; the Bech32m v2 form of the same key is
+# obb1zq2gnnkkxpqv3fr4tz7kpvgyam7p0040xakucl78. It receives: every block the
+# hosts' CPU miners find (worker <OWNER_ADDRESS>.<label>), the stratum label
+# fallback (--stratum-payout), the witness share rewards (--witness-payout).
+OWNER_ADDRESS="obb1q52273b58c1032291d562f582c413bbf05efabcdd0df82055"
+OWNER_ADDRESS_GNB="gnb1q52273b58c1032291d562f582c413bbf05efabcdd0df82055"
 
 # Launch time of the genesis in Unix seconds (also the ASERT anchor time).
 # Empty: the genesis step uses the moment it runs (date -u +%s).
@@ -14,7 +22,8 @@ LAUNCH_TS=""
 
 # The three mainnet hosts. KEY_HOSTS log in with SSH_KEY; PW_HOSTS log in
 # with the password on the 'senha:' line of PW_FILE (expect, ssh -tt; no key
-# is ever installed on them).
+# is ever installed on them). Every host runs the same services; each
+# node's peers are the other two.
 HOSTS="136.244.93.186 209.250.236.240 152.236.5.112"
 KEY_HOSTS="136.244.93.186 209.250.236.240"
 PW_HOSTS="152.236.5.112"
@@ -28,25 +37,70 @@ BUILD_DIR="obenblock-launch"
 BUILD_JOBS="28"
 
 # The source checkout the genesis is written into and the binaries are built
-# from: a git worktree of the launch branch on this Mac. Empty: the checkout
-# that contains this kit (deploy/obenblock-launch/../..).
+# from: a git worktree of the launch branch on this Mac
+# (obenblock/mainnet-launch). Empty: the checkout that contains this kit
+# (deploy/obenblock-launch/../..).
 SRC_DIR=""
 
-# Stratum V1 endpoint for the rented ASICs (on STRATUM_HOST only).
-STRATUM_HOST="136.244.93.186"
-STRATUM_PORT="3333"
+# The node's built-in stratum servers, on every host (ufw open):
+#   V1 stratum+tcp://<host>:3333   stock Bitcoin ASIC firmware, MRR, NiceHash
+#   V2 stratum2+tcp://<host>:3334/<authority key>   (key created by the node on
+#      first start; the start step prints it and keeps it in state/)
+# Solo: a block pays the obb1 address in the worker name; a plain label
+# (rig1) pays OWNER_ADDRESS.
+STRATUM_V1_PORT="3333"
+STRATUM_V2_PORT="3334"
 
-# CPU miner threads per host: "auto" = logical CPUs minus one.
-MINE_THREADS="auto"
+# The CPU miner unit (obenblock-cpu-miner through the local V1 server):
+# "auto" = logical CPUs minus 2. MINER_LABEL_PREFIX + the host's dashed IP is
+# the worker label (cpu-136-244-93-186).
+MINER_THREADS="auto"
+MINER_LABEL_PREFIX="cpu"
+
+# The node's own --mine as well (off: the miner unit is ~8x faster per
+# thread, AVX-512/AVX2 kernels, and mines the same stratum path as the
+# ASICs; both on would only compete for the same cores).
+NODE_MINE="off"
+
+# PoWit witness duty on every host (PoCI finality: the configuration that
+# enters into force at launch_height 3,600 is the share work of witness keys
+# in the first 4 epochs; with no witness there is no finality). A KES key is
+# generated on each host at deploy and never leaves it.
+WITNESS="on"
+WITNESS_SHARE_THREADS="1"
+
+# Optional external job server tools/obenblock-stratum (vardiff, PPLNS
+# accounting, metrics) on its own port. The built-in servers are primary.
+STRATUM_PROXY="off"
+STRATUM_PROXY_PORT="3335"
 
 # Explorer API (read by the obenblock.xyz Worker through https origins).
 #   EXPLORER_TLS="letsencrypt": the API listens on 0.0.0.0:EXPLORER_PORT with
-#     a Let's Encrypt certificate for <ip-with-dashes>.sslip.io, and the port
-#     is open to Cloudflare's IPv4 ranges only (step explorer-tls).
+#     a Let's Encrypt certificate for the host's origin name, and the port is
+#     open to Cloudflare's IPv4 ranges only (step explorer-tls).
 #   EXPLORER_TLS="none": loopback only on 127.0.0.1:2086 (no public origin).
+# Origin names: EXPLORER_NAMES maps each host to a name in the owner's zone
+# (preferred; create the DNS-only A records first: ./obb-launch.sh dns
+# prints them). A host without an entry uses <ip-with-dashes>.sslip.io
+# (fallback, no DNS record needed). The Worker secret OBB_ORIGINS is the
+# list https://<name>:2087 (the site step writes it).
 EXPLORER_TLS="letsencrypt"
 EXPLORER_PORT="2087"
+EXPLORER_NAMES="136.244.93.186=node1.obenblock.xyz 209.250.236.240=node2.obenblock.xyz 152.236.5.112=node3.obenblock.xyz"
+EXPLORER_ZONE="obenblock.xyz"
+# Also put the host's sslip.io name on its certificate (the Worker's
+# OBB_FALLBACK_ORIGINS during the move to the in-zone names).
+EXPLORER_SSLIP_SAN="on"
+# Request authentication of the explorer API: "hmac+static" for the switch
+# (also the old static header), then "hmac" (./obb-launch.sh explorer-auth hmac).
+EXPLORER_AUTH="hmac+static"
 
 # DNS seed the nodes dial besides the fixed peers: "none" until the
 # seed.obenblock.xyz A records exist, then "default".
 DNS_SEED="none"
+
+# Site step: where the filled copy of the obenblock.xyz deploy tree goes
+# (state/site-deploy by default) and the public release download location
+# shown on the site (empty: the release id and tarball SHA-256 only).
+SITE_OUT=""
+RELEASE_URL=""
