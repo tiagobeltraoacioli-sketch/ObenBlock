@@ -16,9 +16,15 @@ fn main() {
         return;
     }
 
-    // Parse --rpc-url flag (default: 127.0.0.1:17210)
+    // Parse --rpc-url flag (default: 127.0.0.1 and the chain's RPC port:
+    // GnB 17210, ObenBlock 18210, ObenBlock regtest 18211)
     let mut rpc_host = "127.0.0.1".to_string();
-    let mut rpc_port = 17210u16;
+    let mut rpc_port: Option<u16> = None;
+    // DESIGN-obenblock §2: `--chain gnb|obenblock` selects the chain ids a
+    // key signs for and the default RPC port; `--regtest` is ObenBlock's
+    // test network as `--testnet` is GnB's.
+    let mut chain: Option<gnb::core::chain::Chain> = None;
+    let mut regtest = false;
     // WAL-7: `--rpc-url https://node.example` (certificate-verified), with
     // `--rpc-ca <PEM/DER file>` for a private CA or self-signed certificate.
     let mut rpc_url: Option<String> = None;
@@ -36,7 +42,19 @@ fn main() {
     while i < args.len() {
         match args[i].as_str() {
             "--rpc-host" => { i += 1; if i < args.len() { rpc_host = args[i].clone(); } }
-            "--rpc-port" => { i += 1; if i < args.len() { rpc_port = args[i].parse().unwrap_or(17210); } }
+            "--rpc-port" => {
+                i += 1;
+                if i < args.len() {
+                    rpc_port = Some(args[i].parse().unwrap_or_else(|_| die("--rpc-port must be a port number")));
+                }
+            }
+            "--chain" => {
+                i += 1;
+                if i < args.len() {
+                    chain = Some(gnb::core::chain::Chain::parse(&args[i]).unwrap_or_else(|e| die(&e)));
+                }
+            }
+            "--regtest" => { regtest = true; }
             "--rpc-url" => { i += 1; if i < args.len() { rpc_url = Some(args[i].clone()); } }
             "--rpc-ca" => { i += 1; if i < args.len() { rpc_ca = Some(args[i].clone()); } }
             "--allow-large-hd-wallet" => { allow_large_hd_wallet = true; }
@@ -46,9 +64,16 @@ fn main() {
         }
         i += 1;
     }
-    if testnet && mainnet {
-        die("--mainnet and --testnet are mutually exclusive");
+    if (testnet || regtest) && mainnet {
+        die("--mainnet and --testnet/--regtest are mutually exclusive");
     }
+    let net_params = gnb::core::chain::select_flags(chain, testnet, regtest).unwrap_or_else(|e| die(&e));
+    // Every signature this process makes uses the selected chain's ids.
+    gnb::core::chain::set_process_chain(net_params.chain).expect("process chain is set once");
+    // From here `testnet` means the chain's test network (GnB testnet or
+    // ObenBlock regtest): the address network both use.
+    let testnet = testnet || regtest;
+    let rpc_port = rpc_port.unwrap_or(net_params.rpc_port);
     let stated_network = match (testnet, mainnet) {
         (true, _) => Some(gnb::address::Network::Testnet),
         (false, true) => Some(gnb::address::Network::Mainnet),
@@ -186,7 +211,7 @@ fn main() {
         // this does not consult a vote record, and it evolves the key file.
         "powitattest" => {
             require_params(params, 6,
-                "powitattest <witness-key.json> <mainnet|testnet> <src_slot> <src_hash> <tgt_slot> <tgt_hash> [activation]");
+                "powitattest <witness-key.json> <mainnet|testnet|regtest> <src_slot> <src_hash> <tgt_slot> <tgt_hash> [activation]");
             // CRY-4: wiping storage, as for witnesskeygen.
             let pw = match std::env::var("GNB_WALLET_PASSWORD") {
                 Ok(p) => zeroize::Zeroizing::new(p),
@@ -195,7 +220,13 @@ fn main() {
             let path = std::path::Path::new(params[0]);
             let file = gnb::core::kes::KesKeyFile::load(path).unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
             let mut signer = file.open(&pw).unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
-            let chain = if params[1] == "testnet" { gnb::core::ChainId::Testnet } else { gnb::core::ChainId::Mainnet };
+            // The network of the selected chain (--chain); "testnet" and
+            // "regtest" both name its test network.
+            let chain = gnb::core::ChainId::for_network(match params[1] {
+                "mainnet" => gnb::address::Network::Mainnet,
+                "testnet" | "regtest" => gnb::address::Network::Testnet,
+                other => die(&format!("unknown network {other:?} (expected mainnet, testnet or regtest)")),
+            });
             let cp = |slot: &str, h: &str| -> gnb::core::powit::Checkpoint {
                 let mut hash = [0u8; 32];
                 let b = hex::decode(h).unwrap_or_default();
@@ -1990,7 +2021,12 @@ fn print_usage() {
 
   OPTIONS
     --rpc-host <host>                      RPC host (default: 127.0.0.1)
-    --rpc-port <port>                      RPC port (default: 17210)
+    --rpc-port <port>                      RPC port (default: the chain's; GnB
+                                           17210, ObenBlock 18210, regtest 18211)
+    --chain <gnb|obenblock>                Chain whose ids keys sign for and whose
+                                           RPC port is the default (default: gnb)
+    --regtest                              ObenBlock's test network (with
+                                           --chain obenblock); as --testnet for GnB
     --rpc-url <url>                        RPC endpoint URL instead of host/port:
                                            http://host:port or https://host[:port]
                                            (certificate and host name verified)

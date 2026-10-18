@@ -99,10 +99,20 @@ struct Cli {
     /// The file is verified against the consensus constants (SHA3-256, rows,
     /// totals) before anything is written; any mismatch refuses to start.
     #[arg(long)]                                         carryover_snapshot: Option<PathBuf>,
+    /// Chain to run: `gnb` (default) or `obenblock` (docs/DESIGN-obenblock.md
+    /// §2). Selects the chain id, the default ports, data dir, DNS seed and
+    /// P2P protocol ids.
+    #[arg(long, value_parser = core::chain::Chain::parse)] chain: Option<core::chain::Chain>,
+    /// GnB's public testnet (refused with `--chain obenblock`).
     #[arg(long)]                                         testnet: bool,
+    /// ObenBlock's local regtest (needs `--chain obenblock`).
+    #[arg(long)]                                         regtest: bool,
+    /// Do not dial the chain's built-in DNS seeds (ObenBlock mainnet:
+    /// seed.obenblock.xyz) when no --dns-seed is given.
+    #[arg(long)]                                         no_default_dns_seed: bool,
     /// PoW + PoWit activation height (GnB-SMH v3, witness shares, witness-set
-    /// finality). TESTNET ONLY: refused without --testnet. Mainnet activation
-    /// is a consensus constant (core::POWIT_HEIGHT_MAINNET).
+    /// finality). TEST NETWORKS ONLY: refused without --testnet / --regtest.
+    /// Mainnet activation is a consensus constant (core::POWIT_HEIGHT_MAINNET).
     #[arg(long)]                                         powit_height: Option<u64>,
     /// PoWit witness: a forward-secure KES key from `gnb-cli witnesskeygen`.
     /// The node mines witness shares credited to it and, once it is in the
@@ -116,13 +126,19 @@ struct Cli {
     /// Threads mining witness shares (GnB-SMH v3, 4 MiB each). Default 2 when
     /// a witness wallet is set.
     #[arg(long)]                                         share_threads: Option<usize>,
-    #[arg(long, default_value = "./gnb-data")]            data_dir: String,
+    /// Data directory. Default: the network's (`./gnb-data` for GnB,
+    /// `./obenblock-data`, `./obenblock-regtest-data`).
+    #[arg(long = "data-dir")]                            data_dir_arg: Option<String>,
+    #[arg(skip)]                                         data_dir: String,
     /// RPC bind address. SECURITY: defaults to 127.0.0.1 (local only).
     /// Use --rpc-public to bind 0.0.0.0, which exposes RPC to the internet.
     #[arg(long, default_value = "127.0.0.1")]            rpc_bind: String,
     /// Override rpc_bind to 0.0.0.0. DANGEROUS when unauthenticated.
     #[arg(long)]                                         rpc_public: bool,
-    #[arg(long, default_value = "17210")]                rpc_port: u16,
+    /// RPC port. Default: the network's (GnB 17210, ObenBlock 18210,
+    /// ObenBlock regtest 18211).
+    #[arg(long = "rpc-port")]                            rpc_port_arg: Option<u16>,
+    #[arg(skip)]                                         rpc_port: u16,
 
     // ── Sprint M: authentication ────────────────────────────────────
     /// Shared-secret API key required for authenticated endpoints.
@@ -183,13 +199,18 @@ struct Cli {
     #[arg(long)]                                         metrics: bool,
     /// Metrics bind address. Default 127.0.0.1 (localhost-only).
     #[arg(long, default_value = "127.0.0.1")]            metrics_addr: String,
-    /// Metrics port. Default 17310.
-    #[arg(long, default_value = "17310")]                metrics_port: u16,
+    /// Metrics port. Default: the network's (GnB 17310, ObenBlock 18310,
+    /// ObenBlock regtest 18311).
+    #[arg(long = "metrics-port")]                        metrics_port_arg: Option<u16>,
+    #[arg(skip)]                                         metrics_port: u16,
     /// Shortcut: binds metrics to 0.0.0.0 (publicly reachable).
     /// DANGER: reveals version, peer count, timing data. Use only if you
     /// accept that the node advertises its status publicly.
     #[arg(long)]                                         metrics_public: bool,
-    #[arg(long, default_value = "/ip4/0.0.0.0/tcp/17110")] listen: String,
+    /// P2P listen multiaddr. Default: `/ip4/0.0.0.0/tcp/<port>` with the
+    /// network's port (GnB 17110, ObenBlock 18110, ObenBlock regtest 18111).
+    #[arg(long = "listen")]                              listen_arg: Option<String>,
+    #[arg(skip)]                                         listen: String,
     #[arg(long)]                                         peer: Vec<String>,
     #[arg(long)]                                         miner_address: Option<String>,
     /// Sprint P: allow RFC1918 / loopback addresses via PEX. Dev/test only.
@@ -215,7 +236,7 @@ struct Cli {
     /// override). Bitcoin-style cold-start convenience — NON-privileged and
     /// opt-in: the shipped DEFAULT_SEEDS stays empty, so nobody's seed is
     /// required and you can point at (or run) any seed you trust. Repeatable.
-    #[arg(long)]                                         dns_seed: Vec<String>,
+    #[arg(long = "dns-seed")]                            dns_seed: Vec<String>,
     /// Minimum chain work (hexadecimal blue work, as Bitcoin Core's
     /// `-minimumchainwork`): while the selected tip carries less, the node is
     /// in initial block download — it stores no block it did not ask for
@@ -256,6 +277,76 @@ struct Cli {
 
 // Bloch-SIS founder address}
 
+impl Cli {
+    /// Select the network from `--chain` / `--testnet` / `--regtest` and fill
+    /// every network default the operator did not override (ports, listen
+    /// address, data dir, DNS seeds).
+    fn resolve_network(&mut self) -> Result<&'static core::chain::ChainParams, String> {
+        let p = core::chain::select_flags(self.chain, self.testnet, self.regtest)?;
+        self.data_dir = self.data_dir_arg.clone().unwrap_or_else(|| p.data_dir.to_string());
+        self.rpc_port = self.rpc_port_arg.unwrap_or(p.rpc_port);
+        self.metrics_port = self.metrics_port_arg.unwrap_or(p.metrics_port);
+        self.listen = self.listen_arg.clone().unwrap_or_else(|| format!("/ip4/0.0.0.0/tcp/{}", p.p2p_port));
+        if self.dns_seed.is_empty() && !self.no_default_dns_seed {
+            self.dns_seed = p.dns_seeds.iter().map(|s| s.to_string()).collect();
+        }
+        Ok(p)
+    }
+}
+
+#[cfg(test)]
+mod resolve_network_tests {
+    use super::*;
+
+    fn resolve(args: &[&str]) -> Result<(Cli, &'static core::chain::ChainParams), String> {
+        let mut cli = Cli::try_parse_from(std::iter::once("gnb").chain(args.iter().copied()))
+            .map_err(|e| e.to_string())?;
+        let p = cli.resolve_network()?;
+        Ok((cli, p))
+    }
+
+    /// GnB keeps every default it shipped.
+    #[test]
+    fn gnb_defaults_are_unchanged() {
+        for args in [&[][..], &["--chain", "gnb"][..]] {
+            let (cli, p) = resolve(args).unwrap();
+            assert_eq!(p.chain_id, core::ChainId::Mainnet);
+            assert_eq!((cli.rpc_port, cli.metrics_port), (17210, 17310));
+            assert_eq!(cli.listen, "/ip4/0.0.0.0/tcp/17110");
+            assert_eq!(cli.data_dir, "./gnb-data");
+            assert!(cli.dns_seed.is_empty());
+        }
+        let (cli, p) = resolve(&["--testnet"]).unwrap();
+        assert_eq!(p.chain_id, core::ChainId::Testnet);
+        assert_eq!((cli.rpc_port, cli.listen.as_str(), cli.data_dir.as_str()), (17210, "/ip4/0.0.0.0/tcp/17110", "./gnb-data"));
+    }
+
+    #[test]
+    fn obenblock_networks_have_their_own_defaults() {
+        let (cli, p) = resolve(&["--chain", "obenblock"]).unwrap();
+        assert_eq!(p.chain_id, core::ChainId::ObenBlockMainnet);
+        assert_eq!((cli.rpc_port, cli.metrics_port), (18210, 18310));
+        assert_eq!(cli.listen, "/ip4/0.0.0.0/tcp/18110");
+        assert_eq!(cli.dns_seed, vec!["seed.obenblock.xyz".to_string()]);
+        let (cli, _) = resolve(&["--chain", "obenblock", "--no-default-dns-seed"]).unwrap();
+        assert!(cli.dns_seed.is_empty());
+        let (cli, _) = resolve(&["--chain", "obenblock", "--dns-seed", "seed.example"]).unwrap();
+        assert_eq!(cli.dns_seed, vec!["seed.example".to_string()]);
+        let (cli, p) = resolve(&["--chain", "obenblock", "--regtest", "--rpc-port", "1", "--listen", "/ip4/127.0.0.1/tcp/2",
+                                 "--data-dir", "d"]).unwrap();
+        assert_eq!(p.chain_id, core::ChainId::ObenBlockRegtest);
+        assert_eq!((cli.rpc_port, cli.listen.as_str(), cli.data_dir.as_str()), (1, "/ip4/127.0.0.1/tcp/2", "d"));
+        assert!(cli.dns_seed.is_empty());
+    }
+
+    #[test]
+    fn contradictory_flags_are_refused() {
+        assert!(resolve(&["--chain", "obenblock", "--testnet"]).err().unwrap().contains("no public testnet"));
+        assert!(resolve(&["--regtest"]).err().unwrap().contains("no regtest"));
+        assert!(resolve(&["--chain", "bloch"]).is_err());
+    }
+}
+
 /// Parse a gnb1q/gnb1t address string
 /// into its 20-byte pubkey-hash script_pubkey.
 ///
@@ -277,10 +368,7 @@ struct Cli {
 /// `--testnet` before any caller runs): a testnet address on a mainnet node
 /// (or the reverse) is refused instead of silently paying the same hash.
 fn address_to_script_pubkey(addr: &str) -> Result<Vec<u8>, address::AddressError> {
-    let network = match core::node_chain_id() {
-        core::ChainId::Testnet => address::Network::Testnet,
-        core::ChainId::Mainnet => address::Network::Mainnet,
-    };
+    let network = core::node_chain_id().network();
     Ok(address::Address::parse_for_network(addr, network)?.hash().to_vec())
 }
 
@@ -438,9 +526,17 @@ async fn main() {
         env_logger::Env::default().default_filter_or("info")
     ).init();
 
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    let net_params = match cli.resolve_network() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("❌ {e}");
+            std::process::exit(2);
+        }
+    };
+    let test_network = net_params.chain_id.is_test_network();
 
-    if let Err(refusal) = test_pow_limit_guard(core::TEST_POW_LIMIT, cli.testnet, cfg!(debug_assertions)) {
+    if let Err(refusal) = test_pow_limit_guard(core::TEST_POW_LIMIT, test_network, cfg!(debug_assertions)) {
         eprintln!("❌ {refusal}");
         std::process::exit(2);
     }
@@ -454,12 +550,13 @@ async fn main() {
     // validator read core::node_chain_id() (design §4.3 invariant 6); without
     // this call a testnet node would default to the Mainnet sighash domain and
     // reject every correctly-signed testnet transaction.
-    core::set_node_chain_id(
-        if cli.testnet { core::ChainId::Testnet } else { core::ChainId::Mainnet }
-    ).expect("node chain-id must be settable exactly once at startup");
+    core::set_node_chain_id(net_params.chain_id)
+        .expect("node chain-id must be settable exactly once at startup");
+    info!("chain {} {} (chain id {:#010x})", net_params.chain.name(), net_params.network_name,
+          net_params.chain_id.to_u32());
     if let Some(h) = cli.powit_height {
-        if !cli.testnet {
-            eprintln!("--powit-height is testnet-only; mainnet activation is a consensus constant");
+        if !test_network {
+            eprintln!("--powit-height is for test networks only; mainnet activation is a consensus constant");
             std::process::exit(2);
         }
         core::set_powit_height_override(h).expect("PoWit height must be settable once at startup");
@@ -471,7 +568,7 @@ async fn main() {
     // POW-3 (Phase 4): the minimum chain work (Bitcoin Core's
     // nMinimumChainWork), once, before any block is handled.
     {
-        let net = if cli.testnet { core::ChainId::Testnet } else { core::ChainId::Mainnet };
+        let net = net_params.chain_id;
         let setting = match ingress::MinimumChainWorkSetting::resolve(cli.minimum_chain_work.as_deref(), net.into()) {
             Ok(s) => s,
             Err(e) => {
@@ -2606,7 +2703,7 @@ async fn main() {
     let metrics_state = std::sync::Arc::new(
         crate::metrics::MetricsState::new(
             env!("CARGO_PKG_VERSION"),
-            if cli.testnet { "testnet" } else { "mainnet" },
+            net_params.network_name,
         )
     );
     let metrics_config = crate::metrics::MetricsConfig {

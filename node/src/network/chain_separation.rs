@@ -16,6 +16,12 @@
 //! network's protocol version is disconnected ([`same_network`]). Mainnet
 //! keeps the identifiers it has always used (deployed nodes stay
 //! compatible); testnet gets its own.
+//!
+//! ObenBlock (docs/DESIGN-obenblock.md §2) has a different genesis, so its
+//! blocks never validate on GnB; it still gets its own identifiers on every
+//! layer, the post-quantum transport included (`/obenblock/pq/1.0.0`,
+//! [`ChainProtocols::transport`]): a GnB node and an ObenBlock node do not
+//! even complete a connection.
 
 use libp2p::StreamProtocol;
 
@@ -34,6 +40,9 @@ pub struct ChainProtocols {
     pub sync_topic: &'static str,
     /// request-response protocol of the directed sync (`sync_rr`).
     pub sync_protocol: StreamProtocol,
+    /// multistream-select id of the post-quantum transport upgrade
+    /// (`transport::upgrade::PqConfig`), `core::chain::ChainParams::transport_protocol`.
+    pub transport: &'static str,
 }
 
 /// Mainnet: the identifiers every released node uses.
@@ -43,6 +52,7 @@ pub const MAINNET: ChainProtocols = ChainProtocols {
     txs_topic: super::TOPIC_TXS,
     sync_topic: super::TOPIC_SYNC,
     sync_protocol: super::sync_rr::SYNC_PROTOCOL,
+    transport: crate::transport::upgrade::PQ_PROTOCOL_ID,
 };
 
 /// Testnet: every identifier names the network.
@@ -52,6 +62,27 @@ pub const TESTNET: ChainProtocols = ChainProtocols {
     txs_topic: "gnb-testnet/txs/1",
     sync_topic: "gnb-testnet/sync/1",
     sync_protocol: StreamProtocol::new("/gnb-testnet/sync/1"),
+    transport: crate::transport::upgrade::PQ_PROTOCOL_ID,
+};
+
+/// ObenBlock mainnet.
+pub const OBENBLOCK_MAINNET: ChainProtocols = ChainProtocols {
+    identify: "/obenblock/1.0.0",
+    blocks_topic: "obenblock/blocks/1",
+    txs_topic: "obenblock/txs/1",
+    sync_topic: "obenblock/sync/1",
+    sync_protocol: StreamProtocol::new("/obenblock/sync/1"),
+    transport: crate::core::chain::OBENBLOCK_MAINNET.transport_protocol,
+};
+
+/// ObenBlock regtest: every identifier names the network.
+pub const OBENBLOCK_REGTEST: ChainProtocols = ChainProtocols {
+    identify: "/obenblock-regtest/1.0.0",
+    blocks_topic: "obenblock-regtest/blocks/1",
+    txs_topic: "obenblock-regtest/txs/1",
+    sync_topic: "obenblock-regtest/sync/1",
+    sync_protocol: StreamProtocol::new("/obenblock-regtest/sync/1"),
+    transport: crate::core::chain::OBENBLOCK_REGTEST.transport_protocol,
 };
 
 /// The protocol identifiers of `chain`.
@@ -59,6 +90,8 @@ pub const fn chain_protocols(chain: ChainId) -> ChainProtocols {
     match chain {
         ChainId::Mainnet => MAINNET,
         ChainId::Testnet => TESTNET,
+        ChainId::ObenBlockMainnet => OBENBLOCK_MAINNET,
+        ChainId::ObenBlockRegtest => OBENBLOCK_REGTEST,
     }
 }
 
@@ -194,6 +227,28 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), 10, "every identifier is distinct");
+    }
+
+    /// No identifier of one of the four networks is used by another, and
+    /// ObenBlock's transport is a different protocol from GnB's.
+    #[test]
+    fn obenblock_shares_no_identifier_with_gnb() {
+        let protos = ChainId::ALL.map(chain_protocols);
+        let mut all: Vec<&str> = protos.iter().flat_map(fields).collect();
+        let n = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), n, "every identifier is distinct");
+        assert_eq!(OBENBLOCK_MAINNET.transport, "/obenblock/pq/1.0.0");
+        assert_eq!(MAINNET.transport, "/gnb/pq/2.0.0");
+        assert_eq!(TESTNET.transport, MAINNET.transport, "GnB keeps one transport id");
+        for id in ChainId::ALL {
+            assert_eq!(chain_protocols(id).transport, id.params().transport_protocol);
+        }
+        assert_ne!(OBENBLOCK_MAINNET.transport, OBENBLOCK_REGTEST.transport);
+        assert!(!same_network(&OBENBLOCK_MAINNET, MAINNET.identify));
+        assert!(!same_network(&MAINNET, OBENBLOCK_MAINNET.identify));
+        assert!(!same_network(&OBENBLOCK_MAINNET, OBENBLOCK_REGTEST.identify));
     }
 
     #[test]

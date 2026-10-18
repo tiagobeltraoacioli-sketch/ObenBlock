@@ -1353,10 +1353,11 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 // The chain this node runs (`--testnet`), as set once at
                 // start-up. Was the literal "mainnet" on every node
                 // (test/functional/feature_test_build_guard.py).
-                "network":         match crate::core::node_chain_id() {
-                    crate::core::ChainId::Testnet => "testnet",
-                    crate::core::ChainId::Mainnet => "mainnet",
-                },
+                "network":         crate::core::chain::node_params().network_name,
+                // DESIGN-obenblock §2: "gnb" or "obenblock", and the chain id
+                // folded into every signature.
+                "chain":           crate::core::chain::node_params().chain.name(),
+                "chain_id":        format!("{:#010x}", crate::core::node_chain_id().to_u32()),
                 "version":         s.version,
                 // The hardening activation height this binary enforces on its
                 // chain (builds before 0.1.1 do not report the field), so an
@@ -2698,9 +2699,11 @@ fn inspect_rpc_descriptor(params: Option<&Value>) -> Result<Value, String> {
     let args = params.and_then(Value::as_array).filter(|args| args.len() == 1)
         .ok_or("expected exactly one checksummed descriptor in an array")?;
     let descriptor = args[0].as_str().ok_or("descriptor must be a string")?;
-    let network = match crate::core::node_chain_id() {
-        crate::core::ChainId::Mainnet => "mainnet",
-        crate::core::ChainId::Testnet => "testnet",
+    // The descriptor codec names address networks ("testnet" = the test
+    // network of either chain).
+    let network = match crate::core::node_chain_id().network() {
+        crate::address::Network::Mainnet => "mainnet",
+        crate::address::Network::Testnet => "testnet",
     };
     gnb_crypto::wallet::descriptor::public_request(&json!({
         "action": "inspect", "network": network, "descriptor": descriptor,
@@ -2708,10 +2711,7 @@ fn inspect_rpc_descriptor(params: Option<&Value>) -> Result<Value, String> {
 }
 
 fn rpc_address_network() -> crate::address::Network {
-    match crate::core::node_chain_id() {
-        crate::core::ChainId::Mainnet => crate::address::Network::Mainnet,
-        crate::core::ChainId::Testnet => crate::address::Network::Testnet,
-    }
+    crate::core::node_chain_id().network()
 }
 
 /// Local RPC policy, not a transaction or block rule. All address entry
@@ -3846,7 +3846,7 @@ mod audit_2026_10_rpc_tests {
         const N: u32 = 3_000;
         let (_tmp, state) = state_with_chain(5);
         let addr = [0x5Au8; 20];
-        let testnet = crate::core::node_chain_id() == crate::core::ChainId::Testnet;
+        let testnet = crate::core::node_chain_id().is_test_network();
         let addr_s = crate::crypto::address_from_hash(&addr, testnet);
         // History: N rows over 30 heights (one 100-output transaction each).
         for h in 0..N / 100 {
@@ -4474,7 +4474,7 @@ mod audit_2026_10_rpc_tests {
         state.store.put_block(&block).unwrap();
         state.store.put_tx_index(&txid, &bh, 31).unwrap();
         state.dag.write().add_block(bh, vec![[30u8; 32]], 1_000 + 31 * 60, 1).unwrap();
-        let addr = crate::crypto::address_from_hash(&[0x11; 20], crate::core::node_chain_id() == crate::core::ChainId::Testnet);
+        let addr = crate::crypto::address_from_hash(&[0x11; 20], crate::core::node_chain_id().is_test_network());
         let under_lock = std::rc::Rc::new(std::cell::Cell::new(0u32));
         let reads = std::rc::Rc::new(std::cell::Cell::new(0u32));
         let (dag, u, r) = (state.dag.clone(), under_lock.clone(), reads.clone());

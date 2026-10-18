@@ -14,6 +14,12 @@
 //! | mainnet | [`MAINNET_HARDENING_ACTIVATION_HEIGHT`] = 17,500 (about 2026-10-17 04:17 UTC on the ASERT schedule; see the constant) |
 //! | testnet | [`TESTNET_HARDENING_ACTIVATION_HEIGHT`] = 0 (active from genesis) |
 //! | regtest | [`REGTEST_HARDENING_ACTIVATION_HEIGHT`] = 0 (active from genesis) |
+//! | ObenBlock mainnet | [`OBENBLOCK_HARDENING_ACTIVATION_HEIGHT`] = 0 (active from genesis) |
+//!
+//! "mainnet" and "testnet" are GnB's networks. ObenBlock
+//! (docs/DESIGN-obenblock.md §3) applies every rule of both upgrades from its
+//! genesis block on both its networks; its regtest uses the regtest schedule.
+//! None of the legacy regimes is reachable on ObenBlock.
 //!
 //! A second upgrade ("hardening 2", the Phase-5 audit fixes) has its own
 //! schedule with the same API suffixed `2` / `_v2`
@@ -171,18 +177,24 @@ pub const TESTNET_HARDENING_ACTIVATION_HEIGHT: u64 = 0;
 /// Regtest activates the hardening rules from genesis.
 pub const REGTEST_HARDENING_ACTIVATION_HEIGHT: u64 = 0;
 
+/// ObenBlock mainnet activates the hardening rules from genesis
+/// (docs/DESIGN-obenblock.md §3).
+pub const OBENBLOCK_HARDENING_ACTIVATION_HEIGHT: u64 = 0;
+
 /// An activation height that is never reached: old rules forever. Use it in
 /// tests that prove the pre-activation behaviour is unchanged.
 pub const NEVER: u64 = u64::MAX;
 
-/// The networks an activation schedule is defined for. `ChainId` has no
-/// regtest discriminant yet; a future regtest chain id maps to
+/// The networks an activation schedule (and the node-local release values
+/// keyed by it: minimum chain work, assumed-valid block) is defined for.
+/// `Mainnet` and `Testnet` are GnB's; ObenBlock's regtest chain id maps to
 /// [`ActivationNetwork::Regtest`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ActivationNetwork {
     Mainnet,
     Testnet,
     Regtest,
+    ObenBlockMainnet,
 }
 
 impl From<ChainId> for ActivationNetwork {
@@ -190,6 +202,8 @@ impl From<ChainId> for ActivationNetwork {
         match id {
             ChainId::Mainnet => ActivationNetwork::Mainnet,
             ChainId::Testnet => ActivationNetwork::Testnet,
+            ChainId::ObenBlockMainnet => ActivationNetwork::ObenBlockMainnet,
+            ChainId::ObenBlockRegtest => ActivationNetwork::Regtest,
         }
     }
 }
@@ -200,6 +214,7 @@ pub const fn hardening_activation_height_for_network(net: ActivationNetwork) -> 
         ActivationNetwork::Mainnet => MAINNET_HARDENING_ACTIVATION_HEIGHT,
         ActivationNetwork::Testnet => TESTNET_HARDENING_ACTIVATION_HEIGHT,
         ActivationNetwork::Regtest => REGTEST_HARDENING_ACTIVATION_HEIGHT,
+        ActivationNetwork::ObenBlockMainnet => OBENBLOCK_HARDENING_ACTIVATION_HEIGHT,
     }
 }
 
@@ -208,6 +223,8 @@ pub const fn hardening_activation_height_for_chain(id: ChainId) -> u64 {
     match id {
         ChainId::Mainnet => MAINNET_HARDENING_ACTIVATION_HEIGHT,
         ChainId::Testnet => TESTNET_HARDENING_ACTIVATION_HEIGHT,
+        ChainId::ObenBlockMainnet => OBENBLOCK_HARDENING_ACTIVATION_HEIGHT,
+        ChainId::ObenBlockRegtest => REGTEST_HARDENING_ACTIVATION_HEIGHT,
     }
 }
 
@@ -227,16 +244,14 @@ thread_local! {
 /// Order of precedence:
 /// 1. a [`scoped_override`] active on the calling thread (tests only);
 /// 2. the node's chain id, if `set_node_chain_id` was called;
-/// 3. otherwise the mainnet height, matching `node_chain_id()`'s default (see
-///    the module documentation for why).
+/// 3. otherwise the height of `node_chain_id()`'s default: the GnB mainnet
+///    height (see the module documentation for why), or ObenBlock
+///    mainnet's in a process that selected ObenBlock.
 pub fn hardening_activation_height() -> u64 {
     if let Some(h) = THREAD_OVERRIDE.with(|c| c.get()) {
         return h;
     }
-    match super::NODE_CHAIN_ID.get() {
-        Some(id) => hardening_activation_height_for_chain(*id),
-        None => MAINNET_HARDENING_ACTIVATION_HEIGHT,
-    }
+    hardening_activation_height_for_chain(super::node_chain_id())
 }
 
 /// Activation height for code that knows the chain it signs for but is not a
@@ -305,12 +320,17 @@ pub const TESTNET_HARDENING2_ACTIVATION_HEIGHT: u64 = 0;
 /// Regtest activates the second hardening rules from genesis.
 pub const REGTEST_HARDENING2_ACTIVATION_HEIGHT: u64 = 0;
 
+/// ObenBlock mainnet activates the second hardening rules from genesis
+/// (docs/DESIGN-obenblock.md §3).
+pub const OBENBLOCK_HARDENING2_ACTIVATION_HEIGHT: u64 = 0;
+
 /// Second hardening activation height for a network.
 pub const fn hardening2_activation_height_for_network(net: ActivationNetwork) -> u64 {
     match net {
         ActivationNetwork::Mainnet => MAINNET_HARDENING2_ACTIVATION_HEIGHT,
         ActivationNetwork::Testnet => TESTNET_HARDENING2_ACTIVATION_HEIGHT,
         ActivationNetwork::Regtest => REGTEST_HARDENING2_ACTIVATION_HEIGHT,
+        ActivationNetwork::ObenBlockMainnet => OBENBLOCK_HARDENING2_ACTIVATION_HEIGHT,
     }
 }
 
@@ -319,6 +339,8 @@ pub const fn hardening2_activation_height_for_chain(id: ChainId) -> u64 {
     match id {
         ChainId::Mainnet => MAINNET_HARDENING2_ACTIVATION_HEIGHT,
         ChainId::Testnet => TESTNET_HARDENING2_ACTIVATION_HEIGHT,
+        ChainId::ObenBlockMainnet => OBENBLOCK_HARDENING2_ACTIVATION_HEIGHT,
+        ChainId::ObenBlockRegtest => REGTEST_HARDENING2_ACTIVATION_HEIGHT,
     }
 }
 
@@ -328,15 +350,13 @@ thread_local! {
 
 /// The process-wide second hardening activation height. Same precedence as
 /// [`hardening_activation_height`]: a [`scoped_override_v2`] on the calling
-/// thread, then the node's chain id, then the mainnet height.
+/// thread, then the node's chain id, then the height of `node_chain_id()`'s
+/// default.
 pub fn hardening2_activation_height() -> u64 {
     if let Some(h) = THREAD_OVERRIDE_V2.with(|c| c.get()) {
         return h;
     }
-    match super::NODE_CHAIN_ID.get() {
-        Some(id) => hardening2_activation_height_for_chain(*id),
-        None => MAINNET_HARDENING2_ACTIVATION_HEIGHT,
-    }
+    hardening2_activation_height_for_chain(super::node_chain_id())
 }
 
 /// Second hardening activation height for a signer of chain `id` (see
@@ -391,7 +411,7 @@ mod tests {
             let via_chain = match net {
                 ActivationNetwork::Mainnet => Some(ChainId::Mainnet),
                 ActivationNetwork::Testnet => Some(ChainId::Testnet),
-                ActivationNetwork::Regtest => None,
+                ActivationNetwork::Regtest | ActivationNetwork::ObenBlockMainnet => None,
             };
             if let Some(id) = via_chain {
                 assert_eq!(ActivationNetwork::from(id), net);
@@ -513,5 +533,28 @@ mod tests {
 
     fn chain_id_unset() -> bool {
         super::super::NODE_CHAIN_ID.get().is_none()
+    }
+
+    /// docs/DESIGN-obenblock.md §3: both upgrades apply from genesis on
+    /// both ObenBlock networks; GnB's schedules are unchanged.
+    #[test]
+    fn obenblock_applies_every_rule_from_genesis() {
+        for id in [ChainId::ObenBlockMainnet, ChainId::ObenBlockRegtest] {
+            assert_eq!(hardening_activation_height_for_chain(id), 0);
+            assert_eq!(hardening2_activation_height_for_chain(id), 0);
+            assert_eq!(hardening_activation_height_for_network(id.into()), 0);
+            assert_eq!(hardening2_activation_height_for_network(id.into()), 0);
+            assert_eq!(hardening_activation_height_for_signer(id), 0);
+            assert_eq!(hardening2_activation_height_for_signer(id), 0);
+        }
+        assert_eq!(ActivationNetwork::from(ChainId::ObenBlockMainnet), ActivationNetwork::ObenBlockMainnet);
+        assert_eq!(ActivationNetwork::from(ChainId::ObenBlockRegtest), ActivationNetwork::Regtest);
+        assert_eq!(hardening_activation_height_for_chain(ChainId::Mainnet), MAINNET_HARDENING_ACTIVATION_HEIGHT);
+        assert_eq!(hardening2_activation_height_for_chain(ChainId::Mainnet), MAINNET_HARDENING2_ACTIVATION_HEIGHT);
+        // A process that selected no chain keeps GnB mainnet's schedule.
+        if chain_id_unset() {
+            assert_eq!(hardening_activation_height(), MAINNET_HARDENING_ACTIVATION_HEIGHT);
+            assert_eq!(hardening2_activation_height(), MAINNET_HARDENING2_ACTIVATION_HEIGHT);
+        }
     }
 }

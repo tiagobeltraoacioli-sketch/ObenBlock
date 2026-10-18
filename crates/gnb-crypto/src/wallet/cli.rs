@@ -74,10 +74,34 @@ struct Cli {
     /// to unlock, and migrate to v3, a v2 keystore; CRY-7).
     #[arg(long, global = true)]
     mainnet: bool,
+    /// Chain whose ids the keys sign for: `gnb` (default) or `obenblock`
+    /// (docs/DESIGN-obenblock.md §2). Also selects the default RPC port.
+    #[arg(long, global = true, value_parser = crate::core::chain::Chain::parse)]
+    chain: Option<crate::core::chain::Chain>,
+    /// ObenBlock's test network (with `--chain obenblock`), as `--testnet`
+    /// is GnB's.
+    #[arg(long, global = true, conflicts_with = "mainnet")]
+    regtest: bool,
     /// Node RPC endpoint: http://host:port, or https://host[:port] (TLS,
     /// certificate verified; GNB_RPC_CA=<PEM/DER file> for a private CA).
-    #[arg(long, global = true, default_value = "http://127.0.0.1:17210")]
+    /// Default: http://127.0.0.1 with the chain's RPC port (GnB 17210,
+    /// ObenBlock 18210, ObenBlock regtest 18211).
+    #[arg(long = "rpc", global = true)]
+    rpc_arg: Option<String>,
+    #[arg(skip)]
     rpc: String,
+}
+
+impl Cli {
+    /// Select the chain from `--chain` / `--testnet` / `--regtest`, fill the
+    /// default RPC endpoint, and fold `--regtest` into `testnet` (the address
+    /// network of either chain's test network).
+    fn resolve_network(&mut self) -> Result<&'static crate::core::chain::ChainParams, String> {
+        let p = crate::core::chain::select_flags(self.chain, self.testnet, self.regtest)?;
+        self.rpc = self.rpc_arg.clone().unwrap_or_else(|| format!("http://127.0.0.1:{}", p.rpc_port));
+        self.testnet |= self.regtest;
+        Ok(p)
+    }
 }
 
 #[derive(Subcommand)]
@@ -177,7 +201,11 @@ enum Cmd {
 }
 
 pub fn main() {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    let net_params = cli.resolve_network().unwrap_or_else(|e| err(&e));
+    // Every signature this process makes uses the selected chain's ids
+    // (`ChainId::for_network`).
+    crate::core::chain::set_process_chain(net_params.chain).expect("process chain is set once");
     banner();
 
     match cli.cmd {
@@ -1145,5 +1173,24 @@ mod audit_2026_10_cli_tests {
         let cli = Cli::try_parse_from(["gnb-wallet", "verify-message", "00", "m", "00", "--legacy-v1"]).unwrap();
         assert!(matches!(cli.cmd, Cmd::VerifyMessage { legacy_v1: true, canonical: false, .. }));
         assert!(Cli::try_parse_from(["gnb-wallet", "verify-message", "00", "m", "00", "--legacy-v1", "--canonical"]).is_err());
+    }
+
+    /// DESIGN-obenblock §2: `--chain` selects the RPC default; GnB keeps its.
+    #[test]
+    fn chain_flags_select_the_rpc_default() {
+        let mut cli = Cli::try_parse_from(["gnb-wallet", "balance", "a"]).unwrap();
+        assert_eq!(cli.resolve_network().unwrap().chain_id, crate::core::ChainId::Mainnet);
+        assert_eq!(cli.rpc, "http://127.0.0.1:17210");
+        let mut cli = Cli::try_parse_from(["gnb-wallet", "--chain", "obenblock", "balance", "a"]).unwrap();
+        assert_eq!(cli.resolve_network().unwrap().chain_id, crate::core::ChainId::ObenBlockMainnet);
+        assert_eq!(cli.rpc, "http://127.0.0.1:18210");
+        assert!(!cli.testnet);
+        let mut cli = Cli::try_parse_from(["gnb-wallet", "--chain", "obenblock", "--regtest", "--rpc",
+                                           "http://h:1", "balance", "a"]).unwrap();
+        assert_eq!(cli.resolve_network().unwrap().chain_id, crate::core::ChainId::ObenBlockRegtest);
+        assert_eq!(cli.rpc, "http://h:1");
+        assert!(cli.testnet, "regtest uses the test address network");
+        let mut cli = Cli::try_parse_from(["gnb-wallet", "--chain", "obenblock", "--testnet", "balance", "a"]).unwrap();
+        assert!(cli.resolve_network().is_err());
     }
 }

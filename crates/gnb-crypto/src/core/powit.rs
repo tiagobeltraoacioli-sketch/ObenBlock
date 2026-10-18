@@ -140,10 +140,13 @@ pub const fn params_keep_the_frozen_window(p: &PowitParams) -> bool {
 const _: () = assert!(params_keep_the_frozen_window(&MAINNET_PARAMS));
 const _: () = assert!(params_keep_the_frozen_window(&TESTNET_PARAMS));
 
+/// The PoWit parameters of `chain`. ObenBlock mainnet uses the mainnet
+/// clock and its regtest the testnet one; ObenBlock's own window and leak
+/// (docs/DESIGN-obenblock.md §5.2, §6.2) are set by those packages.
 pub fn params_for(chain: ChainId) -> PowitParams {
     match chain {
-        ChainId::Mainnet => MAINNET_PARAMS,
-        ChainId::Testnet => TESTNET_PARAMS,
+        ChainId::Mainnet | ChainId::ObenBlockMainnet => MAINNET_PARAMS,
+        ChainId::Testnet | ChainId::ObenBlockRegtest => TESTNET_PARAMS,
     }
 }
 

@@ -132,6 +132,22 @@ obtain from a future timestamp to about 6%.
 
 ## Networks (mainnet and testnet)
 
+> **ObenBlock networks** (docs/DESIGN-obenblock.md §2; in progress). The same
+> code base also selects ObenBlock (`--chain obenblock`): mainnet chain id
+> `0x4F420001`, regtest `0x4F420002` (`--regtest`; there is no ObenBlock
+> testnet). The chain id is folded into every digest exactly as below, so no
+> transaction, signed message or PoWit attestation of one of the four
+> networks verifies on another
+> (`core::chain_id_tests::every_signed_digest_is_separated_across_the_four_chain_ids`).
+> On the wire ObenBlock negotiates its own post-quantum transport,
+> `/obenblock/pq/1.0.0` (regtest `/obenblock-regtest/pq/1.0.0`; GnB keeps
+> `/gnb/pq/2.0.0`), and its own topics, sync protocol and identify version
+> (`obenblock/...`). Both ObenBlock networks apply both hardening
+> activations and PoWit from height 0. Network defaults
+> (`core::chain::ChainParams`): ObenBlock P2P 18110, RPC 18210, metrics
+> 18310, DNS seed `seed.obenblock.xyz`; regtest 18111 / 18211 / 18311, no
+> seed. The rest of this section describes GnB's two networks.
+
 Mainnet and testnet share the genesis block (`core::genesis_block()`, the
 same id `a63fd2c1…`), so they also share the ASERT anchor (the genesis time
 and target) and the genesis ledger (the carryover and the locked team and

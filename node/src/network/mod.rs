@@ -1485,19 +1485,21 @@ impl NetworkNode {
 
         let (pq_tcp, pins_tcp) = (self.pq_identity.clone(), self.pq_pins.clone());
         let (pq_ws, pins_ws) = (self.pq_identity.clone(), self.pq_pins.clone());
+        // DESIGN-obenblock §2: the transport id names the chain.
+        let transport_id = protos.transport;
         let mut swarm = SwarmBuilder::with_existing_identity(self.local_key.clone())
             .with_tokio()
             .with_tcp(
                 tcp::Config::default(),
                 move |keys: &identity::Keypair| -> Result<PqConfig, std::convert::Infallible> {
-                    Ok(PqConfig::new(keys, pq_tcp, pins_tcp))
+                    Ok(PqConfig::new(keys, pq_tcp, pins_tcp).with_protocol_id(transport_id))
                 },
                 yamux_config,
             )
             .map_err(|e| NetworkError::StartFailed(e.to_string()))?
             .with_websocket(
                 move |keys: &identity::Keypair| -> Result<PqConfig, std::convert::Infallible> {
-                    Ok(PqConfig::new(keys, pq_ws, pins_ws))
+                    Ok(PqConfig::new(keys, pq_ws, pins_ws).with_protocol_id(transport_id))
                 },
                 yamux_config,
             )
@@ -1680,7 +1682,7 @@ impl NetworkNode {
         // answers are third-party data and are screened like learned
         // addresses (Core's addrman refuses unroutable seed results).
         for host in self.config.dns_seeds.iter() {
-            let hp = if host.contains(':') { host.clone() } else { format!("{host}:17110") };
+            let hp = if host.contains(':') { host.clone() } else { format!("{host}:{}", self.chain.params().p2p_port) };
             match tokio::net::lookup_host(hp).await {
                 Ok(addrs) => {
                     for sa in addrs {
