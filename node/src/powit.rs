@@ -187,8 +187,15 @@ fn bincode_decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Option<T> {
 }
 
 fn load_poci(store: &Storage, hash: &Hash) -> Option<Option<PociState>> {
-    let Some(bytes) = store.get_meta(&poci_key(hash)).ok()? else { return Some(None) };
-    let rec: PociRecord = bincode_decode(&bytes)?;
+    // The per-epoch + diff layout (`store`), else a row of the layout before
+    // it (`powit/poci/<hash>`, the whole ledger per block; read only).
+    let rec = match store::load_poci_ledger(store, hash)? {
+        Some(r) => PociRecord { head: r.head, bans: r.bans, pruned: r.pruned, rejoins: r.rejoins, seen: r.seen },
+        None => {
+            let Some(bytes) = store.get_meta(&poci_key(hash)).ok()? else { return Some(None) };
+            bincode_decode::<PociRecord>(&bytes)?
+        }
+    };
     let cached = POCI_HISTORIES.lock().as_ref().and_then(|m| m.get(&rec.head).cloned());
     let st = match cached {
         Some(st) => st,
@@ -224,11 +231,13 @@ fn load_poci(store: &Storage, hash: &Hash) -> Option<Option<PociState>> {
     Some(Some(st))
 }
 
-/// Stage the PoCI rows of `state`: the block's record, and the history nodes
-/// not stored yet, newest first until one is (normally only the head's, the
-/// first block a configuration is in force at; the walk also covers a state
-/// whose earlier heads were never stored).
-fn stage_poci(store: &Storage, batch: &mut rocksdb::WriteBatch, hash: &Hash, state: &PowitState) -> Result<(), String> {
+/// Stage the PoCI rows of `state`: the block's ledger record (per-epoch
+/// segments plus a diff against `parent`'s record, `store::stage_poci_ledger`),
+/// and the history nodes not stored yet, newest first until one is (normally
+/// only the head's, the first block a configuration is in force at; the walk
+/// also covers a state whose earlier heads were never stored).
+fn stage_poci(store: &Storage, batch: &mut rocksdb::WriteBatch, hash: &Hash, parent: Option<&Hash>,
+              state: &PowitState) -> Result<(), String> {
     let Some(st) = &state.poci else { return Ok(()) };
     let ids = poci_node_ids(st);
     let head = *ids.last().expect("a history has a configuration in force");
@@ -244,11 +253,11 @@ fn stage_poci(store: &Storage, batch: &mut rocksdb::WriteBatch, hash: &Hash, sta
         store.stage_meta(batch, &nkey, &bytes).map_err(|e| format!("storage: powit poci: {e}"))?;
     }
     debug_assert!(st.pruned.values().all(|p| p.until.is_none()), "a stored ledger holds no handoff in progress");
-    let rec = PociRecord { head, bans: st.bans.clone(), pruned: st.pruned.iter().map(|(k, p)| (*k, p.start)).collect(),
-                           rejoins: st.rejoins.clone(), seen: st.seen.clone() };
-    let bytes = bincode::serde::encode_to_vec(&rec, bincode::config::standard())
-        .map_err(|e| format!("powit poci encode: {e}"))?;
-    store.stage_meta(batch, &poci_key(hash), &bytes).map_err(|e| format!("storage: powit poci: {e}"))
+    let rows = store::PociLedgerRows {
+        head, bans: st.bans.clone(), pruned: st.pruned.iter().map(|(k, p)| (*k, p.start)).collect(),
+        rejoins: st.rejoins.clone(), seen: st.seen.clone(),
+    };
+    store::stage_poci_ledger(store, batch, hash, parent, &rows)
 }
 
 /// `hash`'s stored PoWit state (`store`: per-epoch segments plus per-block
@@ -291,7 +300,7 @@ pub fn stage_state(store: &Storage, batch: &mut rocksdb::WriteBatch, hash: &Hash
     if let Some(x) = encode_exited(state)? {
         store.stage_meta(batch, &exited_key(hash), &x).map_err(|e| format!("storage: powit exits: {e}"))?;
     }
-    stage_poci(store, batch, hash, state)?;
+    stage_poci(store, batch, hash, parent, state)?;
     store::stage_cap(store, batch, hash, state)?;
     if let Some((key, row)) = finality_row(hash, state) {
         store.stage_meta(batch, &key, &row).map_err(|e| format!("storage: powit finality row: {e}"))?;

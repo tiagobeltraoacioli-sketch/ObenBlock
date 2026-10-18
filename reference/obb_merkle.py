@@ -27,8 +27,10 @@ bytes 48..80 on ObenBlock are
     witness_root    = gnb_merkle.witness_root (tagged tree over
                       [0^32, wtxid_1, ..., wtxid_n])
     shielded_root   = SHA3-256("gnb:block:shielded:v1" || SHA3-256(stx)...)
-    powit_root      = SHA3-256("GNB-POWIT-v1/body" || PoWit section wire,
-                      exits list included)
+    powit_root      = SHA3-256("GNB-POWIT-v1/body" || PoWit section wire
+                      in the block's body format: shares, attestations,
+                      the PoCI evidence list, the membership list (exits
+                      then rejoins); docs/CONSENSUS.md)
 
 `crates/gnb-crypto/src/core/pow_scheme.rs` must reproduce
 `obb_merkle_vectors.json` (`crates/gnb-crypto/tests/obb_merkle_vectors.rs`).

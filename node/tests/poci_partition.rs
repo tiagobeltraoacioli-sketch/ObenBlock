@@ -461,6 +461,7 @@ fn exit_and_ban_during_a_stall() {
     let (cert_before, cid_before) = served_certificate(&na, None);
     assert_eq!(cid_before, c0.id());
     let configs_before = st0.poci.as_ref().unwrap().history().count();
+    forged_poci_evidence_is_a_peer_fault(&na, &tip, &ws[3], &c0);
 
     let online: Vec<usize> = (0..6).collect();
     let mut miners: Vec<usize> = online.clone();
@@ -485,6 +486,9 @@ fn exit_and_ban_during_a_stall() {
             evidence_at = Some(h);
         }
         let b = build(&na, tip, &ws, &online, &miners, Votes::EverySlot, "s", extra);
+        if evidence_at == Some(h) {
+            stripped_poci_items_fail_the_body_commitment(&na, &b, &ws[2]);
+        }
         tip = accept(&na, &b).unwrap_or_else(|e| panic!("stall h={h}: {e}"));
         deliver(&nb, std::slice::from_ref(&b));
         for n in [&na, &nb] {
@@ -545,6 +549,73 @@ fn exit_and_ban_during_a_stall() {
     // Evidence against the banned key again is refused while the ban runs.
     let end = blocks.last().unwrap().block_hash();
     assert!(state(&na, &end).poci.as_ref().unwrap().may_ban(&PP, &ws[1].id, &c0.id()).is_err());
+}
+
+/// Review finding (MEDIUM): PoCI evidence against a real member whose
+/// signature is forged passes every cheap check and costs the node KES
+/// verifications; its refusal is a context-free fault (charge kept, the
+/// peer penalised: `ingress::powit_admit_error_fault`), while evidence
+/// against a key outside every configuration is refused before any
+/// signature and keeps its charge without a penalty.
+fn forged_poci_evidence_is_a_peer_fault(n: &Node, tip: &BlockHash, w: &Witness, c0: &Configuration) {
+    use gnb::ingress::{powit_admit_error_fault, powit_admit_error_keeps_charge, BlockFault};
+    let st = state(n, tip);
+    let slot = (height_of(n, tip) + 1) / IV * IV;
+    let va = w.vote_unguarded(&c0.id(), st.justified, Checkpoint { height: slot, hash: [0xF1; 32] });
+    let mut vb = w.vote_unguarded(&c0.id(), st.justified, Checkpoint { height: slot, hash: [0xF2; 32] });
+    vb.sig.sig[0] ^= 1;
+    let (_, kind, data) = powit::poci_evidence_item(&PociEvidence { config_id: c0.id(), a: va.clone(), b: vb });
+    let err = powit::admit_item(kind, &data, &n.dag.read(), &n.store).expect_err("a forged signature");
+    assert_eq!(err, poci::EvidenceReject::Signature.to_string());
+    assert_eq!(powit_admit_error_fault(kind, &err), Some(BlockFault::ContextFree), "{err}");
+    // Not a member of any configuration: refused before the signatures.
+    let mut stranger = va.clone();
+    stranger.witness.root = [0xEE; 32];
+    let mut stranger_b = stranger.clone();
+    stranger_b.target.hash = [0xF3; 32];
+    let (_, kind, data) = powit::poci_evidence_item(&PociEvidence { config_id: c0.id(), a: stranger, b: stranger_b });
+    let err = powit::admit_item(kind, &data, &n.dag.read(), &n.store).expect_err("not a member");
+    assert_eq!(err, powit::EVIDENCE_NOT_A_WITNESS);
+    assert_eq!(powit_admit_error_fault(kind, &err), None);
+    assert!(powit_admit_error_keeps_charge(kind, &err));
+}
+
+/// Decision D1 (review CRITICAL): the body commitment covers the whole PoWit
+/// section in the PoCI wire format. Copies of the evidence block `b` (same
+/// block id) whose PoCI evidence was deleted or swapped, or that carry a
+/// rejoin the miner did not include, are refused for the commitment before
+/// they are stored, and do not disqualify the id: the honest body is
+/// accepted afterwards (the caller does).
+fn stripped_poci_items_fail_the_body_commitment(n: &Node, b: &Block, other: &Witness) {
+    assert!(!b.powit.poci_evidence.is_empty());
+    let rejoin = {
+        let s = other.evolved(PP.epoch_of(b.height));
+        gnb::core::powit::WitnessRejoin::sign(PP.chain_id, &s).unwrap()
+    };
+    let mut copies: Vec<(&str, Block)> = Vec::new();
+    let mut c = b.clone();
+    c.powit.poci_evidence.clear();
+    copies.push(("evidence deleted", c));
+    let mut c = b.clone();
+    let e = &mut c.powit.poci_evidence[0];
+    std::mem::swap(&mut e.a, &mut e.b);
+    copies.push(("evidence votes swapped", c));
+    let mut c = b.clone();
+    c.powit.rejoins.push(rejoin.clone());
+    copies.push(("rejoin added", c));
+    let mut c = b.clone();
+    c.powit.poci_evidence.clear();
+    c.powit.rejoins.push(rejoin);
+    copies.push(("evidence swapped for a rejoin", c));
+    for (what, c) in copies {
+        assert_eq!(c.block_hash(), b.block_hash(), "{what}: same block id");
+        // The altered copy survives the wire (it is what a relay would send).
+        let c = Block::from_wire_bytes(&c.to_wire_bytes()).unwrap();
+        assert_ne!(core::block_rules::body_commitment_root(&c), core::block_rules::body_commitment_root(b), "{what}");
+        let err = accept(n, &c).expect_err(what);
+        assert!(err.contains("bad witness commitment"), "{what}: {err}");
+        assert!(n.dag.read().get_block_data(&b.block_hash()).is_none(), "{what}: not stored");
+    }
 }
 
 /// The certificate RPC refuses what is not a finalized checkpoint.
