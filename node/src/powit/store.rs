@@ -32,6 +32,16 @@
 //! node (a block's state is staged once, `accept::TriggerRecord`); nothing
 //! deletes them, so a diff never loses its parent.
 //!
+//! - **The growth cap** (ObenBlock, `PowitState::cap`, DESIGN-obenblock.md
+//!   §6.3): the admitted credit per key per window epoch is stored like the
+//!   frozen epochs, as content-addressed segments (`powit/epoch/<digest>`,
+//!   the same digest of `(epoch, map)`: a credit map is a key -> u128 map
+//!   too). A ledger changes only at a PoCI handoff, so it is stored once per
+//!   ledger (`powit/capl/<ledger id>`: its epoch, the segments of its
+//!   credits, its last report), and each block stores only the ledger's id
+//!   and the first-block bits it keeps (`powit/cap/<hash>`). GnB states
+//!   have no ledger and store none of these rows.
+//!
 //! Compatibility: data dirs written before this layout hold
 //! `powit/state/<hash>` (the whole state, bincode). They are read as before
 //! when a block has no record in this layout, and a child of such a block
@@ -46,7 +56,9 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 
 use crate::storage::Storage;
+use gnb_crypto::core::powit::growth_cap::{CapLedger, CapReport, CapState};
 use gnb_crypto::core::powit::{KeyId, PowitState};
+use primitive_types::U256;
 
 type Hash = [u8; 32];
 type EpochWork = BTreeMap<KeyId, u128>;
@@ -59,6 +71,10 @@ const CORE_PREFIX: &str = "powit/sc/";
 const WORK_PREFIX: &str = "powit/sw/";
 /// A frozen epoch's work map, by [`epoch_digest`].
 const EPOCH_PREFIX: &str = "powit/epoch/";
+/// A block's [`CapRecord`] (ObenBlock).
+const CAP_PREFIX: &str = "powit/cap/";
+/// A growth cap ledger's [`LedgerRow`], by [`CapLedger::id`].
+const CAP_LEDGER_PREFIX: &str = "powit/capl/";
 /// Domain tag of a segment digest.
 const EPOCH_TAG: &[u8] = b"GNB-POWIT-STORE-v1/epoch";
 /// First byte of a core or work row: the layout version.
@@ -167,7 +183,114 @@ fn core_of(s: &PowitState) -> PowitState {
         // Not in the serde encoding: node/src/powit.rs stores them in their own rows.
         exited: BTreeMap::new(),
         poci: None,
+        cap: None,
     }
+}
+
+// ── Growth cap rows (ObenBlock) ──────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct CapRecord {
+    ledger: Hash,
+    first_bits: Vec<(u64, u32)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ReportRow {
+    epoch: u64,
+    w: u128,
+    g: u128,
+    /// sum_x, admitted, admitted_new, dropped: 256-bit, little-endian.
+    wide: [[u8; 32]; 4],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct LedgerRow {
+    epoch: u64,
+    credits: Vec<FrozenRef>,
+    report: Option<ReportRow>,
+}
+
+/// Decoded ledgers by id (a handful are live at once: one per configuration
+/// in force on the branches the node follows).
+static LEDGER_CACHE: Mutex<Option<HashMap<Hash, CapLedger>>> = parking_lot::const_mutex(None);
+const LEDGER_CACHE_CAP: usize = 16;
+
+fn report_row(r: &CapReport) -> ReportRow {
+    ReportRow { epoch: r.epoch, w: r.w, g: r.g,
+                wide: [r.sum_x, r.admitted, r.admitted_new, r.dropped].map(|v| v.to_little_endian()) }
+}
+
+fn report_of(r: &ReportRow) -> CapReport {
+    let [sum_x, admitted, admitted_new, dropped] = r.wide.map(|b| U256::from_little_endian(&b));
+    CapReport { epoch: r.epoch, w: r.w, g: r.g, sum_x, admitted, admitted_new, dropped }
+}
+
+fn load_ledger(store: &Storage, id: &Hash) -> Option<CapLedger> {
+    if let Some(l) = LEDGER_CACHE.lock().as_ref().and_then(|m| m.get(id).cloned()) {
+        return Some(l);
+    }
+    let row: LedgerRow = unversioned(&store.get_meta(&key(CAP_LEDGER_PREFIX, id)).ok().flatten()?)?;
+    let mut credits = BTreeMap::new();
+    for f in &row.credits {
+        if credits.insert(f.epoch, load_epoch(store, f)?).is_some() {
+            return None;
+        }
+    }
+    let ledger = CapLedger::from_parts(row.epoch, credits, row.report.as_ref().map(report_of));
+    if ledger.id() != *id {
+        return None;
+    }
+    let mut g = LEDGER_CACHE.lock();
+    let m = g.get_or_insert_with(HashMap::new);
+    if m.len() >= LEDGER_CACHE_CAP {
+        m.clear();
+    }
+    m.insert(*id, ledger.clone());
+    Some(ledger)
+}
+
+/// `hash`'s growth cap state: `Some(None)` when it has none (GnB, or a
+/// state stored before the cap), `None` when a row it needs is missing or
+/// corrupt.
+pub fn load_cap(store: &Storage, hash: &Hash) -> Option<Option<CapState>> {
+    let Some(bytes) = store.get_meta(&key(CAP_PREFIX, hash)).ok()? else { return Some(None) };
+    let rec: CapRecord = unversioned(&bytes)?;
+    let ledger = load_ledger(store, &rec.ledger)?;
+    let first_bits: BTreeMap<u64, u32> = rec.first_bits.iter().copied().collect();
+    if first_bits.len() != rec.first_bits.len() {
+        return None;
+    }
+    Some(Some(CapState { ledger, first_bits }))
+}
+
+/// Stage `state`'s growth cap rows: the block's record, and the ledger with
+/// its credit segments unless already stored (by the block whose handoff
+/// built it).
+pub fn stage_cap(store: &Storage, batch: &mut rocksdb::WriteBatch, hash: &Hash, state: &PowitState)
+    -> Result<(), String>
+{
+    let Some(cap) = &state.cap else { return Ok(()) };
+    let err = |e: String| format!("storage: powit growth cap: {e}");
+    let id = cap.ledger.id();
+    let lkey = key(CAP_LEDGER_PREFIX, &id);
+    if store.get_meta(&lkey).map_err(|e| err(e.to_string()))?.is_none() {
+        let mut credits = Vec::with_capacity(cap.ledger.credits().len());
+        for (n, m) in cap.ledger.credits() {
+            let bytes = encode(&**m, "credit")?;
+            let digest = epoch_digest(*n, &bytes);
+            let k = key(EPOCH_PREFIX, &digest);
+            if store.get_meta(&k).map_err(|e| err(e.to_string()))?.is_none() {
+                store.stage_meta(batch, &k, &bytes).map_err(|e| err(e.to_string()))?;
+            }
+            let (keys, sum) = fingerprint(m);
+            credits.push(FrozenRef { epoch: *n, digest, keys, sum });
+        }
+        let row = LedgerRow { epoch: cap.ledger.epoch(), credits, report: cap.ledger.report().map(report_row) };
+        store.stage_meta(batch, &lkey, &versioned(&row, "growth cap ledger")?).map_err(|e| err(e.to_string()))?;
+    }
+    let rec = CapRecord { ledger: id, first_bits: cap.first_bits.iter().map(|(e, b)| (*e, *b)).collect() };
+    store.stage_meta(batch, &key(CAP_PREFIX, hash), &versioned(&rec, "growth cap")?).map_err(|e| err(e.to_string()))
 }
 
 // ── Segment cache ────────────────────────────────────────────────────────────

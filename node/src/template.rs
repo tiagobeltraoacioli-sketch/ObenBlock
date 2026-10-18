@@ -470,7 +470,7 @@ pub fn build_block_template_with(
     // PoWit section (from powit_height), valid in this template's context.
     let powit_body = {
         let d = dag.read();
-        crate::powit::template_body(crate::powit::pool(), &d, store, parents[0], height)
+        crate::powit::template_body_with_bits(crate::powit::pool(), &d, store, parents[0], height, bits)
     };
     let powit_bytes = {
         let mut v = Vec::new();

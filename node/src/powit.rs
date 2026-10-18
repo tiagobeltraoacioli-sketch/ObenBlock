@@ -259,6 +259,7 @@ pub fn load_state(store: &Storage, hash: &Hash) -> Option<PowitState> {
         st.exited = bincode::serde::decode_from_slice(&x, bincode::config::standard()).ok()?.0;
     }
     st.poci = load_poci(store, hash)?;
+    st.cap = store::load_cap(store, hash)?;
     Some(st)
 }
 
@@ -290,6 +291,7 @@ pub fn stage_state(store: &Storage, batch: &mut rocksdb::WriteBatch, hash: &Hash
         store.stage_meta(batch, &exited_key(hash), &x).map_err(|e| format!("storage: powit exits: {e}"))?;
     }
     stage_poci(store, batch, hash, state)?;
+    store::stage_cap(store, batch, hash, state)?;
     if let Some((key, row)) = finality_row(hash, state) {
         store.stage_meta(batch, &key, &row).map_err(|e| format!("storage: powit finality row: {e}"))?;
     }
@@ -409,7 +411,7 @@ pub fn block_state(block: &Block, block_hash: &Hash, dag: &GhostDAG, store: &Sto
     let view = DagChainView { dag, start: sp };
     // PoCI on ObenBlock (with the block's PoCI evidence), PoWit on GnB.
     base.apply_block(&powit::params(), core::node_chain_id(), hardening2_height(), liveness_height(), &input,
-                     powit::PociItems::of(&block.powit), &view)
+                     block.header.bits, powit::PociItems::of(&block.powit), &view)
         .map(Some)
 }
 
@@ -1174,7 +1176,20 @@ impl PowitPool {
 /// re-checked against the template's own context, so the section is valid.
 /// Equivocation proofs go by the key's witness weight on `tip` (heaviest
 /// first, then KeyId): a KeyId is free to grind, a weight is not.
+///
+/// The template's compact bits are not known here: [`template_body_with_bits`]
+/// takes them. They never change which items are valid (the ObenBlock growth
+/// cap records an epoch's first-block bits for a handoff at least two
+/// epochs later), so the bits of a GnB template do not matter.
+#[allow(dead_code)] // tests; the node binary compiles this module too
 pub fn template_body(pool: &PowitPool, dag: &GhostDAG, store: &Storage, tip: Hash, height: u64) -> PowitBody {
+    template_body_with_bits(pool, dag, store, tip, height, 0)
+}
+
+/// [`template_body`] for a template whose compact bits are `bits`.
+pub fn template_body_with_bits(pool: &PowitPool, dag: &GhostDAG, store: &Storage, tip: Hash, height: u64, bits: u32)
+    -> PowitBody
+{
     if !core::powit_active(height) {
         return PowitBody::default();
     }
@@ -1216,7 +1231,7 @@ pub fn template_body(pool: &PowitPool, dag: &GhostDAG, store: &Storage, tip: Has
     let try_apply = |b: &PowitBody, sw: &[(KeyId, u128)]| {
         let input = BlockInput { height, hash: [0; 32], share_work: sw, attestations: &b.attestations,
                                  evidence: &b.evidence, exits: &b.exits };
-        base.apply_block(&p, chain, h2, live, &input, powit::PociItems::of(b), &view).is_ok()
+        base.apply_block(&p, chain, h2, live, &input, bits, powit::PociItems::of(b), &view).is_ok()
     };
     for (ev, config_id) in evidence {
         if body.evidence.len() + body.poci_evidence.len() >= p.max_evidence_per_block {
@@ -1711,6 +1726,26 @@ fn poci_info_json(st: Option<&PowitState>) -> serde_json::Value {
         "absent_weight": absent,
         "pruned": ps.pruned.iter().map(|(k, p)| serde_json::json!({
             "key": hex::encode(k), "since_epoch": p.start, "rejoin_included_at": ps.rejoins.get(k) })).collect::<Vec<_>>(),
+        "growth_cap": growth_cap_json(st.and_then(|s| s.cap.as_ref())),
+    })
+}
+
+/// The growth cap of `getpowitinfo` (DESIGN-obenblock.md §6.3: the capture
+/// is visible the whole time): the ledger's epoch and, for the last cap
+/// step (the one that built the configuration in force), `W`, the budget
+/// `G`, `sum(x)`, what it admitted, what new keys got and what it dropped.
+/// Integers as decimal strings.
+fn growth_cap_json(cap: Option<&gnb_crypto::core::powit::growth_cap::CapState>) -> serde_json::Value {
+    let Some(c) = cap else { return serde_json::Value::Null };
+    let last = c.ledger.report().map(|r| serde_json::json!({
+        "epoch": r.epoch, "w": r.w.to_string(), "g": r.g.to_string(), "sum_x": r.sum_x.to_string(),
+        "admitted": r.admitted.to_string(), "admitted_new": r.admitted_new.to_string(),
+        "dropped": r.dropped.to_string(),
+    }));
+    serde_json::json!({
+        "ledger_epoch": c.ledger.epoch(),
+        "credited_epochs": c.ledger.credits().len(),
+        "last_step": last,
     })
 }
 
