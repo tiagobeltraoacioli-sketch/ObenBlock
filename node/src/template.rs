@@ -55,6 +55,13 @@
 //!   height of a block that merges a tip with a greater DAG height than its
 //!   selected parent exceeds the selected tip's DAG height + 1, DAG-8).
 //!
+//! * SHA-256d (ObenBlock, `core::pow_scheme`): the header parent list must
+//!   be sorted ascending (its `OBB-PARENTS-v1` commitment is part of the
+//!   80-byte header), so a template's `parents` are sorted once the PoWit
+//!   section has been chosen on the selected parent, and [`assemble_block`]
+//!   writes the scheme's block version ([`header_version`]). Under GnB-SMH
+//!   both are as before (selected parent first, version 1).
+//!
 //! The template is built under the store's acceptance lock, so the DAG and
 //! UTXO snapshot it reads are consistent with each other.
 
@@ -139,7 +146,8 @@ pub fn external_coinbase_max_extra(prefix_len: usize, hardened: bool, reserve: u
 /// A block template: everything needed to assemble a candidate block.
 #[derive(Clone, Debug)]
 pub struct BlockTemplate {
-    /// Parents, the selected parent first.
+    /// Parents, the selected parent first (GnB-SMH); sorted ascending under
+    /// the SHA-256d scheme, as its header requires.
     pub parents: Vec<BlockHash>,
     /// Header height: max parent DAG height + 1 (the `accept_block` rule).
     pub height: u64,
@@ -542,6 +550,13 @@ pub fn build_block_template_with(
     if evicted > 0 {
         mempool.retain_valid(|e| !evict.contains(&e.tx.txid()));
     }
+    // SHA-256d: the header commits to the parent list sorted ascending
+    // (`sha256d::check_parents`). The PoWit section above was chosen on the
+    // selected parent (`parents[0]`); nothing after this needs that order.
+    let mut parents = parents;
+    if core::pow_scheme::node_sha256d_params().is_some() {
+        parents.sort_unstable();
+    }
 
     Ok(BlockTemplate {
         parents,
@@ -680,7 +695,7 @@ pub fn assemble_block(template: &BlockTemplate, coinbase: Transaction, timestamp
         .collect();
     let mut block = Block {
         header: BlockHeader {
-            version: 1,
+            version: header_version(),
             parents: template.parents.clone(),
             merkle_root: MerkleRoot::ZERO,
             timestamp: timestamp.max(template.parent_timestamp),
@@ -713,6 +728,13 @@ pub fn assemble_block(template: &BlockTemplate, coinbase: Transaction, timestamp
     block.commit_witnesses();
     check_template_block_at(&block, template.total_fees, template.activation_height)?;
     Ok(block)
+}
+
+/// The header version of a block the node builds: the SHA-256d scheme's
+/// block version (`0x20000000` on ObenBlock; BIP 320 lets miners roll bits
+/// 13 to 28 on top of it), 1 under GnB-SMH.
+pub fn header_version() -> u32 {
+    core::pow_scheme::node_sha256d_params().map_or(1, |p| p.block_version)
 }
 
 /// The template self-check on an assembled (not yet mined) block: every

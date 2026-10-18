@@ -2213,6 +2213,11 @@ bytes at/after the activation (80-byte prefix) and 874 bytes before it (no
 prefix), both on the wire measure. A coinbase within both fields never
 pushes a block built from the template over `max_block_size`.
 
+Under the SHA-256d scheme (ObenBlock) the built-in miner searches the
+32-bit nonce of the 80-byte header, templates carry their parents sorted
+ascending and version `0x20000000`, and `getblocktemplate` adds a `sha256d`
+object (header fields, header jobs for pools); see docs/OBENBLOCK-MINING.md.
+
 ## Block rules at the hardening activation
 
 The 2026-10-14 audit found block-validity gaps that need a consensus change:
