@@ -9,8 +9,12 @@ obenblock.xyz explorer and web wallet.
 
 Only methods in ALLOWED are forwarded, with validated parameters, to the
 node's localhost JSON-RPC. Responses are cached briefly. Every request must
-carry the shared secret in X-GnB-Key (set by the Cloudflare Worker), so the
-origin is not an open public API. Standard library only.
+be signed by the Cloudflare Worker with the shared secret (an HMAC over the
+method, the request target, a timestamp and a nonce; stale timestamps and
+replayed nonces are refused), and every answer is signed back together with
+the node's chain id, genesis hash and finalized checkpoint, so the origin is
+not an open public API and the Worker can tell a genuine origin of the right
+chain from anything else. Standard library only.
 
 ObenBlock (OBB_CHAIN=obenblock, the default; docs/DESIGN-obenblock.md):
   * the node's RPC is on port 18210 (GnB: 17210);
@@ -27,7 +31,8 @@ ObenBlock (OBB_CHAIN=obenblock, the default; docs/DESIGN-obenblock.md):
   * PoWit finality: block, chain, transaction and address-history answers
     get `finality` ("finalized" at or below the finalized checkpoint the
     node's getpowitinfo reports, else "pending"; "off-chain" for a block
-    that is not merged), and getdaginfo gets `finalized_height`,
+    that is not merged, "merged-not-applied" for a blue/red block a chain
+    block merged: ObenBlock never applies a mergeset), and getdaginfo gets `finalized_height`,
     `finalized_hash` and `justified_height`; getnetworkinfo reports the chain
     from its chain id. getfinalityinfo is served as well.
 
@@ -75,6 +80,11 @@ Environment (each GNB_* name may also be given as OBB_*, which wins):
     GNB_API_BIND             bind address   (default 127.0.0.1)
     GNB_API_PORT             bind port      (default 2086)
     GNB_API_KEY_FILE         file holding the shared secret (required, mode 0600/0640)
+    GNB_API_AUTH             "hmac" (ObenBlock default: signed requests only) or
+                             "hmac+static" (GnB default: also the legacy
+                             X-GnB-Key header)
+    GNB_API_AUTH_SKEW        accepted clock difference to the Worker, seconds
+                             (default 60; keep the host on NTP)
     GNB_API_TLS_CERT         PEM certificate chain: serve HTTPS (optional)
     GNB_API_TLS_KEY          PEM private key for GNB_API_TLS_CERT
     GNB_API_TIMEOUT          per-read socket timeout, seconds (default 10)
@@ -85,7 +95,9 @@ Environment (each GNB_* name may also be given as OBB_*, which wins):
     GNB_API_POST_BYTES_PER_MIN  transaction bytes forwarded per minute, all
                              clients together (default 2000000)
     GNB_API_CROSS_SITE_PER_MIN  GET requests per minute that browser pages of
-                             other sites may cause, all together (default 240)
+                             one other site may cause, all visitors together
+                             (default 240)
+    GNB_API_CROSS_SITE_POOLS cross-site page origins tracked (default 10000)
     GNB_API_MAX_CLIENTS      clients tracked per limiter (default 50000)
     GNB_CARRYOVER            uncompressed Bloch Genesis-3 carryover TSV (optional)
 """
@@ -404,9 +416,12 @@ def chain_finality(height, finalized):
 
 
 def merged_finality(colour, height, merged_by, finalized):
-    """Finality of a block of `colour`: a chain block by its own height, a
-    merged (blue/red) one by the height of the chain block that merged it, a
-    block nothing merged yet is "off-chain"."""
+    """Finality of a block of `colour`: a chain block by its own height; a
+    merged (blue/red) one is "merged-not-applied" once a selected-chain block
+    merged it, never "finalized" (pre-launch review): ObenBlock never applies
+    a mergeset (docs/CONSENSUS.md), so neither the block's reward nor its
+    transactions take effect, however final the merging block is. A block
+    nothing merged yet is "off-chain"."""
     if finalized is None:
         return None
     if colour == "chain":
@@ -417,7 +432,7 @@ def merged_finality(colour, height, merged_by, finalized):
         except Exception:
             return None
         if isinstance(merger, dict) and merger.get("colour") == "chain":
-            return chain_finality(merger.get("height"), finalized)
+            return "merged-not-applied"
         return None
     return "off-chain"
 
@@ -500,6 +515,97 @@ def present(name, params, doc):
             if isinstance(p, dict):
                 p["difficulty"] = sha256d_difficulty(p.get("bits", p.get("bits_hex")))
     return {"result": res}
+
+
+# ── the node's chain identity (pre-launch review) ───────────────────────────
+
+CHAIN_ID = re.compile(r"^0x[0-9a-f]{8}$")
+
+
+def node_identity():
+    """(chain id, genesis hash, "height:hash" of the finalized checkpoint) of
+    the node behind this API, each "" when the node does not tell (down, or
+    no checkpoint yet). Stamped and signed on every authenticated answer."""
+    chain_id = genesis = ""
+    try:
+        info = _cached_rpc("getnetworkinfo", [], 30).get("result")
+        cid = str(info.get("chain_id", "")).lower() if isinstance(info, dict) else ""
+        chain_id = cid if CHAIN_ID.match(cid) else ""
+    except Exception:
+        pass
+    try:
+        g = _cached_rpc("getblockhash", [0], 300).get("result")
+        genesis = g if isinstance(g, str) and HEX64.match(g) else ""
+    except Exception:
+        pass
+    height, fin_hash, _ = finality_heights()
+    finalized = f"{height}:{fin_hash}" if height is not None and fin_hash else ""
+    return chain_id, genesis, finalized
+
+
+# ── Worker-to-origin authentication (pre-launch review) ─────────────────────
+#
+# Request:  X-OBB-Ts (unix seconds), X-OBB-Nonce (32 hex), X-OBB-Auth =
+#   HMAC-SHA256(key, "OBB-ORIGIN-v1\n" METHOD "\n" target "\n" ts "\n"
+#   nonce "\n" + the SIGNED_HEADERS values joined by "\n"), where target is
+#   the request target as sent (path and query) and X-OBB-Body-SHA256 is the
+#   SHA-256 of the body (of b"" for a GET).
+# Answer:   X-OBB-Chain-Id, X-OBB-Genesis, X-OBB-Finalized and X-OBB-Resp-Auth =
+#   HMAC-SHA256(key, "OBB-ORIGIN-RESP-v1\n" nonce "\n" status "\n" chain id
+#   "\n" genesis "\n" finalized "\n" SHA-256(body) hex).
+# worker/index.js implements the other side; both are tested against the
+# same vectors (test_obenblock_explorer_api.py, site/tests/worker-origin-auth).
+
+AUTH_MODE = env("API_AUTH", "hmac" if OBENBLOCK else "hmac+static").strip().lower()
+if AUTH_MODE not in ("hmac", "hmac+static"):
+    raise SystemExit(f"OBB_API_AUTH must be hmac or hmac+static, not {AUTH_MODE!r}")
+AUTH_SKEW = int(env("API_AUTH_SKEW", "60"))
+# X-OBB-Probe: 1 marks the Worker's own origin health checks (getdaginfo):
+# signed, so only the Worker can set it, and not charged to any client budget
+# (they would otherwise all count against one Cloudflare egress address).
+SIGNED_HEADERS = ("x-gnb-client-ip", "x-gnb-cross-site", "x-obb-page-origin", "x-obb-probe", "x-obb-body-sha256")
+PROBE_METHODS = ("getdaginfo", "health")
+MAC_HEX = re.compile(r"^[0-9a-f]{64}$")
+NONCE = re.compile(r"^[0-9a-f]{32}$")
+TS = re.compile(r"^[0-9]{1,12}$")
+
+
+def request_mac(key, method, target, ts, nonce, values):
+    msg = "\n".join(["OBB-ORIGIN-v1", method, target, str(ts), nonce, *values]).encode()
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()
+
+
+def response_mac(key, nonce, status, chain_id, genesis, finalized, body):
+    msg = "\n".join(["OBB-ORIGIN-RESP-v1", nonce, str(status), chain_id, genesis, finalized,
+                     hashlib.sha256(body).hexdigest()]).encode()
+    return hmac.new(key, msg, hashlib.sha256).hexdigest()
+
+
+class NonceCache:
+    """Nonces of authenticated requests still inside the timestamp window: a
+    captured request cannot be replayed. Bounded; the oldest entry goes first
+    (by then normally outside the window anyway)."""
+
+    def __init__(self, max_entries=200000):
+        self.max_entries = max_entries
+        self.seen = collections.OrderedDict()
+        self.lock = threading.Lock()
+
+    def replayed(self, nonce, ts, now=None):
+        now = time.time() if now is None else now
+        with self.lock:
+            while self.seen:
+                oldest, t = next(iter(self.seen.items()))
+                if t >= now - 2 * AUTH_SKEW and len(self.seen) < self.max_entries:
+                    break
+                self.seen.popitem(last=False)
+            if nonce in self.seen:
+                return True
+            self.seen[nonce] = ts
+            return False
+
+
+NONCES = NonceCache()
 
 
 # ── per-client rate limiting (WAL-4, B1-T10, B2-T4) ─────────────────────────
@@ -588,9 +694,16 @@ class ByteBudget:
 GET_LIMIT = RateLimiter(int(env("API_RATE_PER_MIN", "240")))
 POST_LIMIT = RateLimiter(int(env("API_POST_PER_MIN", "6")))
 POST_BYTES = ByteBudget(int(env("API_POST_BYTES_PER_MIN", "2000000")))
-# Re-audit B2-R2-2 (reads): one window shared by every cross-site read.
-CROSS_SITE_LIMIT = RateLimiter(int(env("API_CROSS_SITE_PER_MIN", "240")), max_clients=1)
+# Re-audit B2-R2-2 (reads): cross-site reads share one window per page
+# origin (X-OBB-Page-Origin, the Origin header the browser sent); reads with
+# no Origin (<img>, no-cors GETs) share the CROSS_SITE_KEY window. Keyed by
+# origin (pre-launch review), a client that forges cross-site headers drains
+# only the pool of the origin it names, not the one every third-party
+# explorer depends on; a real page still gets one pool, not one per visitor.
+CROSS_SITE_LIMIT = RateLimiter(int(env("API_CROSS_SITE_PER_MIN", "240")),
+                               max_clients=int(env("API_CROSS_SITE_POOLS", "10000")))
 CROSS_SITE_KEY = "cross-site"
+PAGE_ORIGIN = re.compile(r"^(?:null|https?://[a-z0-9.-]{1,253}(?::[0-9]{1,5})?)$")
 
 RATE_LIMITED = {"error": "rate limit exceeded; retry in a minute"}
 
@@ -721,13 +834,60 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("content-type", "application/json")
         self.send_header("cache-control", f"public, max-age={ttl}" if ttl and code == 200 else "no-store")
         self.send_header("content-length", str(len(data)))
+        nonce = getattr(self, "_nonce", None)
+        if nonce:
+            # The chain this answer comes from, signed with the answer
+            # (pre-launch review): the Worker pins the chain id and genesis
+            # hash on every answer it uses and compares finalized checkpoints
+            # across origins.
+            chain_id, genesis, finalized = node_identity()
+            self.send_header("x-obb-chain-id", chain_id)
+            self.send_header("x-obb-genesis", genesis)
+            self.send_header("x-obb-finalized", finalized)
+            self.send_header("x-obb-resp-auth", response_mac(API_KEY, nonce, code, chain_id, genesis, finalized, data))
         self.end_headers()
         self.wfile.write(data)
 
+    def auth_failure(self):
+        """None when the request is authenticated, else why not.
+
+        Pre-launch review: the Worker signs every request with an HMAC
+        (`request_mac`) over the method, the request target, a timestamp, a
+        fresh nonce and the forwarded headers; a timestamp more than
+        AUTH_SKEW seconds from this host's clock, or a nonce seen before, is
+        refused. The answer is then signed back over the same nonce
+        (`Handler.send`), so the Worker accepts only answers from a holder of
+        the key, whatever DNS or certificate an impostor obtained. The
+        static X-GnB-Key header is accepted only with OBB_API_AUTH=hmac+static
+        (the default of a GnB API, whose Worker predates the HMAC)."""
+        self._nonce = None
+        if not API_KEY:
+            return "no key configured"
+        h = self.headers
+        sig = h.get("x-obb-auth", "").strip().lower()
+        if sig:
+            ts, nonce = h.get("x-obb-ts", "").strip(), h.get("x-obb-nonce", "").strip().lower()
+            if not (MAC_HEX.match(sig) and NONCE.match(nonce) and TS.match(ts)):
+                return "malformed authentication"
+            if abs(time.time() - int(ts)) > AUTH_SKEW:
+                return "stale authentication timestamp"
+            want = request_mac(API_KEY, self.command, self.path, ts, nonce,
+                               [h.get(name, "") for name in SIGNED_HEADERS])
+            if not hmac.compare_digest(want, sig):
+                return "bad authentication"
+            # After the MAC: only the key holder can put entries in the cache.
+            if NONCES.replayed(nonce, int(ts)):
+                return "replayed request"
+            self._nonce = nonce
+            return None
+        if "static" in AUTH_MODE:
+            key = h.get("x-gnb-key", "").encode()
+            if key and hmac.compare_digest(hashlib.sha256(key).digest(), hashlib.sha256(API_KEY).digest()):
+                return None
+        return "forbidden"
+
     def authorized(self):
-        key = self.headers.get("x-gnb-key", "").encode()
-        return bool(API_KEY) and hmac.compare_digest(
-            hashlib.sha256(key).digest(), hashlib.sha256(API_KEY).digest())
+        return self.auth_failure() is None
 
     def client(self):
         """The original client's rate-limit key: the Worker's X-GnB-Client-IP
@@ -749,6 +909,16 @@ class Handler(BaseHTTPRequestHandler):
         Only called on authorized requests: no one else can set it."""
         return self.headers.get("x-gnb-cross-site", "").strip() == "1"
 
+    def probe(self, name):
+        """True for a health check of the Worker (signed X-OBB-Probe: 1)."""
+        return bool(self._nonce) and name in PROBE_METHODS and self.headers.get("x-obb-probe", "").strip() == "1"
+
+    def cross_site_pool(self):
+        """The shared budget a cross-site read is charged to: one per page
+        origin the Worker forwards (X-OBB-Page-Origin), else CROSS_SITE_KEY."""
+        origin = self.headers.get("x-obb-page-origin", "").strip().lower()
+        return "page " + origin if PAGE_ORIGIN.match(origin) else CROSS_SITE_KEY
+
     def over_read_limit(self):
         """Count this (already validated) read; True when over a limit: the
         client's own GET budget and, for a cross-site read, the one budget
@@ -757,11 +927,12 @@ class Handler(BaseHTTPRequestHandler):
         counted each visitor and never the page."""
         if self.over_limit(GET_LIMIT):
             return True
-        return self.cross_site() and not CROSS_SITE_LIMIT.allow(CROSS_SITE_KEY)
+        return self.cross_site() and not CROSS_SITE_LIMIT.allow(self.cross_site_pool())
 
     def do_GET(self):
-        if not self.authorized():
-            return self.send(403, {"error": "forbidden"})
+        failure = self.auth_failure()
+        if failure:
+            return self.send(403, {"error": failure})
         url = urllib.parse.urlsplit(self.path)
         parts = [p for p in url.path.split("/") if p]
         if len(parts) < 2 or parts[0] != "v1":
@@ -772,7 +943,7 @@ class Handler(BaseHTTPRequestHandler):
         # cannot occupy limiter slots.
         try:
             if name == "health" and len(parts) == 2:
-                if self.over_read_limit():
+                if not self.probe(name) and self.over_read_limit():
                     return self.send(429, RATE_LIMITED)
                 r = rpc("getblockcount", [])
                 return self.send(200, {"ok": "result" in r, "blocks": r.get("result")})
@@ -791,7 +962,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(params, list) or len(params) > len(checkers):
                 raise ValueError("params must be a JSON array")
             params = [check(v) for check, v in zip(checkers, params)]
-            if self.over_read_limit():
+            if not self.probe(name) and self.over_read_limit():
                 return self.send(429, RATE_LIMITED)
             ck = name + json.dumps(params)
             result = present(name, params, cached(ck, ttl, lambda: rpc(name, params)))
@@ -831,8 +1002,9 @@ def broadcast_refusal(headers):
 
 class PostHandler(Handler):
     def do_POST(self):
-        if not self.authorized():
-            return self.send(403, {"error": "forbidden"})
+        failure = self.auth_failure()
+        if failure:
+            return self.send(403, {"error": failure})
         if urllib.parse.urlsplit(self.path).path != "/v1/sendrawtransaction":
             return self.send(404, {"error": "not found"})
         refusal = broadcast_refusal(self.headers)
@@ -842,7 +1014,12 @@ class PostHandler(Handler):
             n = int(self.headers.get("content-length", "0"))
             if not 0 < n <= MAX_TX_HEX + 64:
                 raise ValueError("body size out of range")
-            doc = json.loads(self.rfile.read(n))
+            body = self.rfile.read(n)
+            # The body is bound to the request MAC through its hash.
+            if self._nonce and not hmac.compare_digest(
+                    hashlib.sha256(body).hexdigest(), self.headers.get("x-obb-body-sha256", "").strip().lower()):
+                return self.send(403, {"error": "body does not match its authentication"})
+            doc = json.loads(body)
             raw = doc.get("hex") if isinstance(doc, dict) else None
             if not isinstance(raw, str) or not raw or len(raw) > MAX_TX_HEX or len(raw) % 2 or not HEXTX.match(raw):
                 raise ValueError("hex-encoded transaction expected")

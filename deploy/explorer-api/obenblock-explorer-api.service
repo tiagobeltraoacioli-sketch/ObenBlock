@@ -3,11 +3,11 @@
 #
 # Default (WAL-2/WAL-4): loopback only on 127.0.0.1:2086, for a Cloudflare
 # Tunnel. The ObenBlock launch publishes it directly instead: TLS on
-# 0.0.0.0:2087 with a Let's Encrypt certificate for the host's
-# <ip-with-dashes>.sslip.io name (Workers cannot fetch a bare IP), and the
-# port open to Cloudflare's ranges only (firewall-cloudflare.sh 2087). That
-# layout is the drop-in obenblock-explorer-api.tls.conf.example. See
-# README.md ("ObenBlock mainnet").
+# 0.0.0.0:2087 with a Let's Encrypt certificate for the host's name in the
+# owner's zone (node1/node2/node3.obenblock.xyz, DNS-only), the port open to
+# Cloudflare's ranges only (obenblock-explorer-firewall.service), and every
+# request HMAC-signed by the Worker. That layout is the drop-in
+# obenblock-explorer-api.tls.conf.example. See README.md ("ObenBlock mainnet").
 #
 # Audit OPS-3: the API faces the internet (through the Worker), so it runs
 # as its OWN system user, not as the node's `obenblock` user: a compromise of

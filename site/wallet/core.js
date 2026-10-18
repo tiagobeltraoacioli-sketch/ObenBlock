@@ -174,13 +174,15 @@ export function splitByMaturity(rows, nextHeight) {
   return { spendable, immature };
 }
 
-// One payment spends at most UTXO_WINDOW outputs (each input carries an
-// ~8.5 kB post-quantum signature), so getutxos is asked for that many rows,
+// One payment spends at most UTXO_WINDOW outputs (each hybrid input carries
+// an ~8.6 kB post-quantum signature and key: 47 fit under the core's
+// MAX_STANDARD_TX_BYTES = 400 KiB, pinned by
+// crates/gnb-wallet-wasm/tests/utxo_window.rs), so getutxos is asked for that many rows,
 // and for UTXO_WIDE_WINDOW when immature coinbase outputs took part of a
 // cut-short list. B2-T3: the explorer API accepts limits up to exactly
 // UTXO_WIDE_WINDOW (deploy/explorer-api: GETUTXOS_MAX; its tests and
 // site/tests/wallet-api-window.test.mjs keep the two equal).
-export const UTXO_WINDOW = 50, UTXO_WIDE_WINDOW = 1000;
+export const UTXO_WINDOW = 47, UTXO_WIDE_WINDOW = 1000;
 
 /** The coins one payment may spend in the block at `nextHeight`: the first
  *  `window` spendable rows the node lists, and the immature coinbase outputs
@@ -215,4 +217,64 @@ export function getutxosFetcher(api, address) {
     const r = await api("getutxos", [address, limit]);
     return { rows: Array.isArray(r.utxos) ? r.utxos : [], truncated: r.truncated === true };
   };
+}
+
+// ── What the user typed (pre-launch review) ─────────────────────────────────
+/** The family of an address string as typed: "gnb" (gnb1…, v2 gnb1z/tgnb1z),
+ *  "bloch" (bloch1…) or "obb". The core accepts the GnB and Bloch forms as
+ *  the same script (the same key on ObenBlock) and shows its obb1 form; the
+ *  page must say so before OBB is sent to a string the user may have copied
+ *  from a GnB or Bloch wallet or exchange that never watches ObenBlock. */
+export function addressFamily(input) {
+  const s = String(input ?? "").trim().toLowerCase();
+  if (s.startsWith("bloch1")) return "bloch";
+  if (s.startsWith("gnb1") || s.startsWith("tgnb1")) return "gnb";
+  return "obb";
+}
+
+// ── One chain per wallet session (pre-launch review) ────────────────────────
+const CHAIN_HEX = /^0x[0-9a-f]{8}$/, GENESIS_HEX = /^[0-9a-f]{64}$/;
+export class ChainMismatchError extends Error {}
+
+/**
+ * The chain a wallet session is bound to. The Worker stamps every answer
+ * with the chain id, genesis hash and finalized checkpoint of the origin
+ * that produced it (X-OBB-Chain-Id, X-OBB-Genesis, X-OBB-Finalized). The
+ * first answer binds the session (it must be an ObenBlock chain id); every
+ * later answer must name the same chain id and genesis, and must not report
+ * a different finalized block at a height already seen. Any violation
+ * breaks the session for good: every later check throws, so nothing more
+ * is shown or signed until the page is reloaded.
+ */
+export class ChainSession {
+  constructor() { this.identity = null; this.broken = null; this.finalized = new Map(); }
+
+  /** Check the answer whose headers are `headers` (a Headers object). */
+  check(headers) {
+    if (this.broken) throw new ChainMismatchError(this.broken);
+    const get = (n) => String(headers?.get?.(n) ?? "").trim().toLowerCase();
+    const chain = get("x-obb-chain-id"), genesis = get("x-obb-genesis");
+    if (!CHAIN_HEX.test(chain) || !GENESIS_HEX.test(genesis)) {
+      throw new ChainMismatchError("The answer does not say which chain it comes from; it was not used.");
+    }
+    if (!this.identity) {
+      networkOfChainId(chain);
+      this.identity = { chain, genesis };
+    } else if (chain !== this.identity.chain || genesis !== this.identity.genesis) {
+      return this.fail(`An answer came from another chain (chain id ${chain}, genesis ${genesis.slice(0, 16)}…) than the one this session verified (${this.identity.chain}, ${this.identity.genesis.slice(0, 16)}…).`);
+    }
+    const m = /^(\d{1,15}):([0-9a-f]{64})$/.exec(get("x-obb-finalized"));
+    if (m) {
+      const height = Number(m[1]), seen = this.finalized.get(height);
+      if (seen && seen !== m[2]) return this.fail(`Two answers report different finalized blocks at height ${height}: the site's nodes disagree on the chain.`);
+      this.finalized.set(height, m[2]);
+      if (this.finalized.size > 256) this.finalized.delete(this.finalized.keys().next().value);
+    }
+    return this.identity;
+  }
+
+  fail(message) {
+    this.broken = `${message} Nothing more is shown or signed in this session; reload the page.`;
+    throw new ChainMismatchError(this.broken);
+  }
 }

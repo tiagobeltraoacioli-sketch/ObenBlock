@@ -18,7 +18,14 @@
 // offered to the core (core.js splitByMaturity). Received coins are final
 // once PoWit finalizes their block (getpowitinfo finalized), which the
 // activity list shows per movement.
-import { loadCore, spendableWindow, splitByMaturity, getutxosFetcher, networkOfChainId, walletNetwork, COINBASE_MATURITY, UTXO_WINDOW, UTXO_WIDE_WINDOW } from "/wallet/core.js";
+//
+// Pre-launch review: every API answer is bound to the chain this page
+// verified first (core.js ChainSession: the chain id, genesis hash and
+// finalized checkpoints the Worker stamps on each answer); an answer from
+// another chain stops the session with an alert instead of being shown or
+// signed against. A gnb1…/bloch1… destination is shown as typed next to the
+// obb1… key it maps to, and needs an explicit confirmation.
+import { loadCore, spendableWindow, splitByMaturity, getutxosFetcher, networkOfChainId, walletNetwork, addressFamily, ChainSession, ChainMismatchError, COINBASE_MATURITY, UTXO_WINDOW, UTXO_WIDE_WINDOW } from "/wallet/core.js";
 import { html, raw, isAddress, watchAddress, isHex64, num, sats } from "/assets/safe.js";
 
 // SHA-256 of /wallet/gnb_wallet.wasm. Written by scripts/build-wallet-wasm.sh
@@ -38,6 +45,8 @@ let idleTimer = null, pollTimer = null;
 // The site's node: its network (from the chain id it reports), tip and PoWit
 // finality. `error` is set when it is unreachable or not an ObenBlock node.
 let node = { network: null, error: null, tip: null, finalized: null };
+// The one chain every answer of this page must come from.
+const session = new ChainSession();
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 const show = (el, markup) => { el.innerHTML = String(markup); };
@@ -55,16 +64,34 @@ function parseGnb(s) {
   const [w, f = ""] = s.split(".");
   return BigInt(w) * SAT + BigInt(f.padEnd(8, "0"));
 }
+/** Bind the answer `r` to the session's chain (core.js ChainSession). A
+ *  Worker error without an origin behind it (502, 503) names no chain and is
+ *  only an error; every origin answer must name this session's chain. */
+function bindAnswer(r) {
+  if (!r.ok && !r.headers.get("x-obb-chain-id")) return;
+  try { session.check(r.headers); }
+  catch (e) { if (session.broken) chainAlert(session.broken); throw e; }
+}
+function chainAlert(message) {
+  clearInterval(pollTimer);
+  if (netBadge) { netBadge.textContent = "chain mismatch"; netBadge.dataset.state = "bad"; netBadge.title = message; }
+  let el = document.getElementById("chain-alert");
+  if (!el) { el = document.createElement("div"); el.id = "chain-alert"; el.className = "alert bad"; el.style.margin = "0 0 18px"; el.setAttribute("role", "alert"); app.before(el); }
+  el.textContent = message;
+}
 async function api(method, params = []) {
   const r = await fetch(`/api/${method}?p=${encodeURIComponent(JSON.stringify(params))}`, { cache: "no-store" });
   const doc = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+  bindAnswer(r);
   if (doc.error) throw new Error(String(doc.error));
   if (doc.result === null || typeof doc.result !== "object") throw new Error("unexpected response");
   return doc.result;
 }
 async function broadcast(hex) {
+  if (session.broken) throw new ChainMismatchError(session.broken);
   const r = await fetch("/api/sendrawtransaction", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ hex }) });
   const doc = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+  bindAnswer(r);
   if (doc.error) throw new Error(String(doc.error));
   return doc.result;
 }
@@ -88,6 +115,11 @@ async function refreshNode() {
   try {
     const info = await api("getnetworkinfo");
     node.network = networkOfChainId(info.chain_id);
+    // The node's own report must be the chain the answers are stamped with.
+    if (String(info.chain_id).toLowerCase() !== session.identity?.chain) {
+      try { session.fail(`The node reports chain id ${info.chain_id}, but its answers are stamped ${session.identity?.chain ?? "with no chain"}.`); }
+      catch (e) { chainAlert(session.broken); throw e; }
+    }
     node.error = null;
     try {
       const pw = await api("getpowitinfo");
@@ -104,6 +136,7 @@ async function refreshNode() {
 }
 function paintNetBadge() {
   if (!netBadge) return;
+  if (session.broken) return chainAlert(session.broken);
   const text = node.network
     ? `ObenBlock ${node.network}${node.finalized !== null ? ` · finalized #${node.finalized.toLocaleString("en-US")}` : ""}`
     : node.error ? "node unavailable" : "connecting…";
@@ -113,6 +146,8 @@ function paintNetBadge() {
 }
 /** The node runs `network`, or an error that says why the page will not sign. */
 function requireNodeNetwork(network) {
+  if (session.broken) throw new ChainMismatchError(session.broken);
+  if (!session.identity) throw new Error("The site's chain is not verified yet; try again.");
   if (!node.network) throw new Error(node.error ? `Cannot reach an ObenBlock node: ${node.error}` : "The node's network is not known yet; try again.");
   if (node.network !== network) throw new Error(`This wallet is on ObenBlock ${network}, but the site's node runs ${node.network}. Nothing was signed.`);
 }
@@ -319,7 +354,7 @@ function paintSlab() {
    <div class="row"><button class="chip" id="copy">Copy address</button><button class="chip" id="refresh">Refresh</button></div>
    <div class="facts"><div><b>${state.utxoCount ?? "—"}</b><span>Unspent outputs</span></div><div><b>${state.utxos.length ? fmt(state.utxoTotal, 4) : "—"}</b><span>Spendable now*</span></div>${state.immature.length ? html`<div><b>${fmt(state.immatureTotal, 4)}</b><span>Immature (mining rewards)</span></div>` : ""}</div>
    ${node.finalized !== null ? html`<p class="note">PoWit finalized through height ${count(node.finalized)}${node.tip !== null ? ` (tip ${count(node.tip)})` : ""}. Coins received at or below it are final.</p>` : ""}
-   <p class="note">* One payment can spend up to ${UTXO_WINDOW} outputs (each input carries an ~8.5 kB post-quantum signature).${state.immature.length ? ` Mining rewards (coinbase outputs) become spendable ${COINBASE_MATURITY} blocks after their block; ${state.immature.length} are not yet and are not counted.` : ""}${state.utxosTruncated ? " The node listed only part of this address's outputs; more may be spendable." : ""}</p><div id="slab-err"></div>`);
+   <p class="note">* One payment can spend up to ${UTXO_WINDOW} outputs (each input carries an ~8.6 kB post-quantum signature and key).${state.immature.length ? ` Mining rewards (coinbase outputs) become spendable ${COINBASE_MATURITY} blocks after their block; ${state.immature.length} are not yet and are not counted.` : ""}${state.utxosTruncated ? " The node listed only part of this address's outputs; more may be spendable." : ""}</p><div id="slab-err"></div>`);
   document.getElementById("copy").addEventListener("click", (e) => navigator.clipboard?.writeText(state.address).then(() => { e.target.textContent = "Copied"; setTimeout(() => (e.target.textContent = "Copy address"), 1200); }));
   document.getElementById("refresh").addEventListener("click", refresh);
 }
@@ -362,12 +397,13 @@ async function fetchPrevTxs(txids) {
 
 function paintSend(pane = document.getElementById("pane")) {
   show(pane, html`<h3>Send OBB</h3>
-   <label>To<input id="to" spellcheck="false" placeholder="obb1q… (gnb1q… and bloch1q… are the same address)"></label>
+   <label>To<input id="to" spellcheck="false" placeholder="obb1q…"></label>
    <div class="field-row"><label>Amount (OBB)<input id="amt" inputmode="decimal" placeholder="0.00"></label><button class="btn ghost" id="max">Max</button></div>
    <p class="note">The network fee is the consensus minimum for the transaction's real size (≈ 0.00002 OBB per kB, at least 0.0001 OBB). Fees above 0.02 OBB are refused.</p>
    <button class="btn" id="review">Review payment</button><div id="send-out"></div>`);
   document.getElementById("max").addEventListener("click", () => {
-    // Leave room for the fee of up to 50 inputs (~430 kB at 2,000 sat/kB).
+    // Leave room for the fee of up to UTXO_WINDOW (47) inputs (~403 kB at
+    // 2,000 sat/kB).
     // utxoTotal counts only the coins spendable in the next block.
     const reserve = 900000n, spendable = state.utxoTotal || 0n;
     document.getElementById("amt").value = spendable > reserve ? fmt(spendable - reserve) : "0";
@@ -375,8 +411,13 @@ function paintSend(pane = document.getElementById("pane")) {
   document.getElementById("review").addEventListener("click", async (ev) => {
     const btn = ev.currentTarget, out = document.getElementById("send-out"); out.innerHTML = "";
     try {
-      const dest = core.classify(document.getElementById("to").value);
+      const typed = document.getElementById("to").value.trim();
+      const dest = core.classify(typed);
       const to = dest.address;
+      // A GnB or Bloch string names the same key on ObenBlock: say so, show
+      // what was typed, and ask for an explicit confirmation below.
+      const family = addressFamily(typed);
+      const alias = family === "obb" ? null : family === "gnb" ? "GnB" : "Bloch";
       if (walletNetwork(dest.network) !== state.network) throw new Error(`That is an ObenBlock ${walletNetwork(dest.network)} address; this wallet is on ${state.network}.`);
       const amount = parseGnb(document.getElementById("amt").value);
       if (amount <= 0n) throw new Error("Enter an amount above zero.");
@@ -395,12 +436,12 @@ function paintSend(pane = document.getElementById("pane")) {
       const plan = core.plan(coins, to, amount.toString(), "0", next);
       const prevtxs = await fetchPrevTxs(plan.prev_txids || []);
       const tx = core.pay(coins, to, amount.toString(), "0", next, prevtxs);
-      state.pending = { ...tx, to };
+      state.pending = { ...tx, to, typed };
       unbusy(btn);
       const unverified = num(tx.unverified_inputs) || 0;
       const dust = sats(tx.dust_to_fee) ?? 0n;
       show(out, html`<div class="review">
-        <div><span>To</span><b>${to}</b></div>
+        <div><span>To</span><b>${to}${alias ? html`<br><small>typed as the ${alias} address ${typed}</small>` : ""}</b></div>
         <div><span>Amount</span><b>${fmt(tx.amount)} OBB</b></div>
         <div><span>Network fee (actual)</span><b>${fmt(tx.fee)} OBB${dust > 0n ? html` <small>incl. ${fmt(dust)} OBB change too small to return</small>` : ""}</b></div>
         <div><span>Inputs · size</span><b>${count(tx.inputs)} · ${(num(tx.size) / 1024).toFixed(1)} kB</b></div>
@@ -411,12 +452,17 @@ function paintSend(pane = document.getElementById("pane")) {
         <div><span>Total leaving this address</span><b>${fmt((sats(tx.amount) ?? 0n) + (sats(tx.fee) ?? 0n))} OBB</b></div></div>
         ${unverified ? html`<div class="alert bad" style="margin-top:12px">${unverified} input value(s) come only from the server (genesis carryover or pruned history) and could not be checked against their transaction. If the server lied, the difference would be paid as fee.
           <label class="check"><input type="checkbox" id="accept-unverified"> I accept the unverified input value(s) shown above.</label></div>` : ""}
-        <div class="row" style="margin-top:14px"><button class="btn" id="confirm" ${unverified ? raw("disabled") : ""}>Confirm and send</button><button class="btn ghost" id="cancel">Cancel</button></div>`);
+        ${alias ? html`<div class="alert bad" id="alias-notice" style="margin-top:12px"><b>You entered a ${alias} address.</b> <span class="mono">${typed}</span> is the ${alias} form of the key <span class="mono">${to}</span>. This payment sends OBB on ObenBlock to that key; nothing is sent on ${alias}. A ${alias} wallet or exchange that does not watch ObenBlock will never see or credit these coins. Send only if the recipient controls this key and uses ObenBlock.
+          <label class="check"><input type="checkbox" id="accept-alias"> I confirm: send OBB on ObenBlock to the key of this ${alias} address.</label></div>` : ""}
+        <div class="row" style="margin-top:14px"><button class="btn" id="confirm" ${unverified || alias ? raw("disabled") : ""}>Confirm and send</button><button class="btn ghost" id="cancel">Cancel</button></div>`);
       const confirmBtn = document.getElementById("confirm");
-      document.getElementById("accept-unverified")?.addEventListener("change", (e) => { confirmBtn.disabled = !e.target.checked; });
+      const confirmations = ["accept-unverified", "accept-alias"].map((id) => document.getElementById(id)).filter(Boolean);
+      confirmations.forEach((box) => box.addEventListener("change", () => { confirmBtn.disabled = !confirmations.every((b) => b.checked); }));
       document.getElementById("cancel").addEventListener("click", () => { state.pending = null; out.innerHTML = ""; });
       confirmBtn.addEventListener("click", async (e2) => {
-        const b2 = e2.currentTarget; busy(b2, "Broadcasting…");
+        const b2 = e2.currentTarget;
+        if (!confirmations.every((b) => b.checked)) return;
+        busy(b2, "Broadcasting…");
         try {
           requireNodeNetwork(state.network);
           await broadcast(state.pending.raw);
@@ -435,7 +481,7 @@ function paintReceive(pane = document.getElementById("pane")) {
   try { const q = window.qrcode(0, "M"); q.addData(state.address, "Byte"); q.make(); qr = raw(q.createSvgTag({ cellSize: 6, margin: 0, scalable: true })); } catch {}
   show(pane, html`<h3>Receive OBB</h3><div class="receive"><div class="qr" aria-label="QR code of the address">${qr}</div>
    <div style="display:grid;gap:12px"><p>Share this address. Anyone can send OBB to it; only the keystore can spend it.</p><div class="addr">${state.address}</div>
-   ${state.network === "mainnet" && state.address.startsWith("obb1q") ? html`<p class="note">The same key as the GnB address <span class="mono">gnb1q${state.address.slice(5)}</span> and the Bloch address <span class="mono">bloch1q${state.address.slice(5)}</span>: OBB from the Genesis-3 carryover is already here. Wallets that know only those forms can pay either one; the coins arrive here.</p>` : ""}
+   ${state.network === "mainnet" && state.address.startsWith("obb1q") ? html`<p class="note">This key also has a GnB form (<span class="mono">gnb1q${state.address.slice(5)}</span>) and a Bloch form (<span class="mono">bloch1q${state.address.slice(5)}</span>), each on its own chain: OBB from the Genesis-3 carryover is already here. Share the obb1q… address. A GnB or Bloch wallet paying those forms sends GnB or Bloch coins on its own chain, and nothing arrives here; only ObenBlock software sending OBB reaches this wallet.</p>` : ""}
    <p class="note">Coins sent to this address are final once PoWit finalizes their block; the Activity tab marks each movement.</p></div></div>`);
 }
 
@@ -443,9 +489,8 @@ async function paintActivity(pane = document.getElementById("pane")) {
   if (!pane || state.tab !== "activity") return;
   if (!pane.dataset.loaded) show(pane, html`<h3>Activity</h3><p class="muted"><span class="busy"></span>Loading…</p>`);
   try {
-    const [h, carry] = await Promise.all([api("getaddresshistory", [state.address, 25, 0]), fetch(`/api/carryover/${state.address}`).then((r) => r.json()).catch(() => null)]);
+    const [h, c] = await Promise.all([api("getaddresshistory", [state.address, 25, 0]), api(`carryover/${state.address}`).catch((e) => { if (session.broken) throw e; return null; })]);
     pane.dataset.loaded = "1";
-    const c = carry?.result;
     const items = Array.isArray(h.items) ? h.items : [];
     show(pane, html`<h3>Activity</h3>
      ${c?.in_carryover === true ? html`<div class="alert ok">Genesis carryover: ${fmt(c.amount)} OBB from the Bloch Genesis-3 snapshot (${count(c.utxos)} outputs).</div>` : ""}

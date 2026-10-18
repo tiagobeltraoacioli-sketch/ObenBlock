@@ -170,7 +170,8 @@ class Presentation(unittest.TestCase):
         self.assertEqual(b["finalized_height"], 100)
         self.assertEqual(b["transactions"][0]["outputs"][0]["address"], legacy("obb1q", H20))
         blue = self.view("getblockdag", [BLUE_HASH])
-        self.assertEqual(blue["finality"], "finalized", "merged by chain block 90 <= 100")
+        self.assertEqual(blue["finality"], "merged-not-applied",
+                         "a merged block is never 'finalized': ObenBlock never applies a mergeset")
         self.assertEqual(blue["difficulty"], 256.0)
         g = self.view("getblock", [CHAIN_HASH, False])
         self.assertEqual(g["pow"], "sha256d")
@@ -183,8 +184,8 @@ class Presentation(unittest.TestCase):
         h = self.view("getaddresshistory", [legacy("obb1q", H20), 25, 0])
         self.assertEqual([i["finality"] for i in h["items"]], ["finalized", "pending"])
         self.assertEqual(self.view("gettransactionfull", ["aa" * 32])["finality"], "finalized")
-        self.assertEqual(self.view("gettransactionfull", ["bb" * 32])["finality"], "finalized",
-                         "a merged block is final when its merging chain block is")
+        self.assertEqual(self.view("gettransactionfull", ["bb" * 32])["finality"], "merged-not-applied",
+                         "a transaction of a merged block was not applied, however final its merger")
         self.assertEqual(self.view("gettransactionfull", ["cc" * 32])["finality"], "off-chain")
         d = self.view("getdaginfo")
         self.assertEqual((d["finalized_height"], d["finalized_hash"], d["justified_height"]), (100, CHAIN_HASH, 112))

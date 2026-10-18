@@ -4,20 +4,17 @@
 # deploys it).
 #
 # Secrets (never in this file):
-#   wrangler secret put OBB_API_KEY    the shared secret sent to the origins as
-#                                      X-GnB-Key: the content of
-#                                      /etc/obenblock/explorer-api.key on every
-#                                      origin host (at least 32 characters)
-#   wrangler secret put OBB_ORIGINS    the explorer origins, comma-separated,
-#                                      https:// only (WAL-2: plain http://
-#                                      entries are ignored and the API answers
-#                                      503 until one https origin is set). The
-#                                      launch hosts, by their sslip.io names
-#                                      (a Worker cannot fetch a bare IP):
-#     https://136-244-93-186.sslip.io:2087,https://209-250-236-240.sslip.io:2087,https://152-236-5-112.sslip.io:2087
-# The GnB names GNB_API_KEY / GNB_ORIGINS are still read when the OBB_* ones
-# are unset. Each origin terminates TLS itself (deploy/explorer-api/README.md,
-# "ObenBlock mainnet") or is a Cloudflare Tunnel host name.
+#   wrangler secret put OBB_API_KEY    the shared secret the Worker signs every
+#                                      origin request with (HMAC-SHA256 per
+#                                      request; nothing static is sent) and
+#                                      checks every answer against: the content
+#                                      of /etc/obenblock/explorer-api.key on
+#                                      every origin host (at least 32 characters)
+# Origins and the expected chain are the [vars] below (not secret: the host
+# names are public DNS records). The GnB names GNB_API_KEY / GNB_ORIGINS are
+# no longer read. Each origin terminates TLS itself
+# (deploy/explorer-api/README.md, "ObenBlock mainnet") or is a Cloudflare
+# Tunnel host name inside the zone.
 name = "obenblock"
 main = "worker/index.js"
 compatibility_date = "2026-09-01"
@@ -35,6 +32,20 @@ routes = [
 # Pages requested on www.obenblock.xyz are redirected here (301); /api/* is
 # served on both names.
 CANONICAL_HOST = "obenblock.xyz"
+# Explorer origins: host names inside OBB_ORIGIN_ZONE only (others are
+# ignored), https only. DNS-only (grey cloud) A records the owner creates,
+# one per host (worker/README.md, "Origins").
+OBB_ORIGIN_ZONE = "obenblock.xyz"
+OBB_ORIGINS = "https://node1.obenblock.xyz:2087,https://node2.obenblock.xyz:2087,https://node3.obenblock.xyz:2087"
+# Used ONLY while no OBB_ORIGINS host is usable (the launch names; remove
+# once node1-3 answer). They sit in a third party's DNS: an impostor there
+# still cannot answer without OBB_API_KEY, but it can deny service.
+OBB_FALLBACK_ORIGINS = "https://136-244-93-186.sslip.io:2087,https://209-250-236-240.sslip.io:2087,https://152-236-5-112.sslip.io:2087"
+# The chain every origin answer must name (ObenBlock mainnet), and, once
+# known, its genesis block hash (getblockhash 0 on a trusted node). Until it
+# is set the Worker requires the origins to agree on one genesis.
+OBB_CHAIN_ID = "0x4f420001"
+OBB_GENESIS_HASH = ""
 
 [assets]
 directory = "./site"

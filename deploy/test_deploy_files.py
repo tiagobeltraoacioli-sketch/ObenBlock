@@ -145,8 +145,14 @@ class UnitHardening(unittest.TestCase):
 
     def test_the_obenblock_tls_drop_in_only_opens_the_tls_port(self):
         path = os.path.join(HERE, "explorer-api", "obenblock-explorer-api.tls.conf.example")
-        svc = parse_unit(path)["Service"]
-        self.assertEqual(set(svc), {"Environment", "IPAddressDeny", "IPAddressAllow"})
+        unit = parse_unit(path)
+        svc = unit["Service"]
+        self.assertEqual(set(svc), {"Environment", "IPAddressDeny", "IPAddressAllow", "ExecStartPre"})
+        # Pre-launch review: the API never listens on 0.0.0.0 without the
+        # Cloudflare-only table, which a persistent unit keeps loaded.
+        self.assertEqual(svc["ExecStartPre"], ["+/usr/sbin/nft list table inet gnb_explorer"])
+        self.assertEqual(unit["Unit"].get("Requires"), ["obenblock-explorer-firewall.service"])
+        self.assertEqual(unit["Unit"].get("After"), ["obenblock-explorer-firewall.service"])
         self.assertEqual(svc["IPAddressDeny"], [""])
         self.assertEqual(svc["IPAddressAllow"], [""])
         env = svc["Environment"]
@@ -187,6 +193,47 @@ class UnitHardening(unittest.TestCase):
         problems = [line for line in (p.stdout + p.stderr).splitlines()
                     if line.strip() and "is not executable: No such file or directory" not in line]
         self.assertEqual(problems, [], "\n".join(problems))
+
+
+class PersistentFirewall(unittest.TestCase):
+    """Pre-launch review: the nft table was loaded once and nothing re-applied
+    it, so a reboot or `systemctl restart nftables` (flush ruleset) left the
+    API port open to the Internet."""
+
+    def unit(self, name):
+        return parse_unit(os.path.join(HERE, "explorer-api", name))
+
+    def test_the_firewall_unit_loads_the_table_at_boot_and_after_nftables(self):
+        u = self.unit("obenblock-explorer-firewall.service")
+        unit, svc = u["Unit"], u["Service"]
+        cmd = "/bin/sh /opt/obenblock/bin/firewall-cloudflare.sh 2087 /etc/obenblock/cloudflare-ips-v4.txt"
+        self.assertEqual(svc["Type"], ["oneshot"])
+        self.assertEqual(svc["RemainAfterExit"], ["yes"])
+        self.assertEqual(svc["ExecStart"], [cmd])
+        self.assertEqual(svc["ExecReload"], [cmd])
+        self.assertNotIn("ExecStop", svc, "stopping the unit must never open the port")
+        self.assertEqual(svc["CapabilityBoundingSet"], ["CAP_NET_ADMIN"])
+        self.assertEqual(unit["PartOf"], ["nftables.service"])
+        self.assertEqual(unit["ReloadPropagatedFrom"], ["nftables.service"])
+        self.assertIn("nftables.service", " ".join(unit["After"]).split())
+        self.assertIn("obenblock-explorer-api.service", " ".join(unit["Before"]).split())
+        self.assertIn("network-pre.target", " ".join(unit["Before"]).split())
+        wanted = " ".join(u["Install"]["WantedBy"]).split()
+        self.assertIn("multi-user.target", wanted)
+        self.assertIn("nftables.service", wanted)
+        reapply = self.unit("obenblock-explorer-firewall-reapply.service")["Service"]
+        self.assertEqual(reapply["ExecStart"], [cmd])
+        timer = self.unit("obenblock-explorer-firewall-reapply.timer")
+        self.assertIn("OnUnitActiveSec", timer["Timer"])
+        self.assertEqual(timer["Install"]["WantedBy"], ["timers.target"])
+
+    def test_the_script_touches_only_its_own_table(self):
+        with open(os.path.join(HERE, "explorer-api", "firewall-cloudflare.sh"), encoding="utf-8") as fh:
+            script = fh.read()
+        rules = script[script.index("nft -f - <<EOF"):]
+        rules = rules[:rules.index("\nEOF")]
+        self.assertNotIn("flush ruleset", rules)
+        self.assertEqual(set(re.findall(r"table (\S+ \S+)", rules)), {"inet gnb_explorer"})
 
 
 class ShellScripts(unittest.TestCase):

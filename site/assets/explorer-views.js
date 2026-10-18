@@ -100,9 +100,12 @@ const FINALITY = {
   finalized: raw(`<span class="badge final"><i class="dot final"></i>Finalized by PoWit</span>`),
   pending: raw(`<span class="badge"><i class="dot pending"></i>Not final yet</span>`),
   "off-chain": raw(`<span class="badge"><i class="dot red"></i>Off the selected chain</span>`),
+  // A blue/red block a chain block merged: ObenBlock never applies a
+  // mergeset, so it is never "finalized" (deploy/explorer-api merged_finality).
+  "merged-not-applied": raw(`<span class="badge"><i class="dot red"></i>Merged, not applied</span>`),
 };
 export const finalityBadge = (f) => (Object.hasOwn(FINALITY, f) ? FINALITY[f] : "");
-const FINAL_SHORT = { finalized: "final", pending: "pending", "off-chain": "off-chain" };
+const FINAL_SHORT = { finalized: "final", pending: "pending", "off-chain": "off-chain", "merged-not-applied": "not applied" };
 export const finalityShort = (f) => (Object.hasOwn(FINAL_SHORT, f) ? FINAL_SHORT[f] : "—");
 const COLOURS = new Set(["chain", "blue", "red", "pending"]);
 const colourOf = (c) => (COLOURS.has(c) ? c : "pending");
@@ -281,7 +284,7 @@ export function blockPage(b, full = null) {
     <div>Timestamp</div><div>${utc(b.timestamp)} <span class="muted">(${ago(b.timestamp)})</span></div>
     <div>Height · blue score</div><div class="mono">${int(b.height)} · ${int(b.blue_score)}</div>
     <div>Confirmations</div><div class="mono">${int(b.confirmations)} <span class="muted">blue score</span></div>
-    <div>Finality</div><div>${b.finality === "finalized" ? "Finalized by PoWit: no reorganization can remove it." : b.finality === "pending" ? html`Above the finalized checkpoint (#${int(b.finalized_height)}).` : b.finality === "off-chain" ? "Not merged by the selected chain." : html`<span class="muted">not reported</span>`}</div>
+    <div>Finality</div><div>${b.finality === "finalized" ? "Finalized by PoWit: no reorganization can remove it." : b.finality === "pending" ? html`Above the finalized checkpoint (#${int(b.finalized_height)}).` : b.finality === "off-chain" ? "Not merged by the selected chain." : b.finality === "merged-not-applied" ? "Merged by the selected chain but not applied: its transactions and reward never take effect." : html`<span class="muted">not reported</span>`}</div>
     <div>Difficulty</div><div class="mono">${b.difficulty ? diff(b.difficulty) : "—"} <span class="muted">bits ${b.bits || ""}</span></div>
     ${hex64(b.pow_hash) ? html`<div>PoW hash</div><div class="hash" title="The block id in the byte order Bitcoin tools display">${hex64(b.pow_hash)}</div>` : ""}
     <div>Version · nonce</div><div class="mono">${b.version !== undefined && b.version !== null ? html`0x${numOr(b.version, (v) => (v >>> 0).toString(16).padStart(8, "0"))}` : "—"} · ${b.nonce ?? "—"}</div>

@@ -7,7 +7,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import * as V from "../assets/explorer-views.js";
-import worker, { originsOf, redirectFor, ttlFor } from "../../worker/index.js";
+import worker, { originsOf, parseOrigins, redirectFor, ttlFor } from "../../worker/index.js";
+import { installOrigins, envFor, N1 } from "./fake-origin.mjs";
 
 const EVIL = `"><img src=x onerror=alert(1)><script>alert(2)</script>" onmouseover="alert(3)`;
 const H = "ab".repeat(32);
@@ -102,21 +103,19 @@ test("the wallet page signs only for the network the site's ObenBlock node runs"
 const assets = { fetch: async (req) => new Response(`asset ${new URL(req.url).pathname}`) };
 const ctx = { waitUntil() {} };
 
-test("the Worker reads OBB_* first and falls back to GNB_*", async () => {
-  assert.deepEqual(originsOf({ OBB_ORIGINS: "https://a.example.net", GNB_ORIGINS: "https://b.example.net" }), ["https://a.example.net"]);
-  assert.deepEqual(originsOf({ GNB_ORIGINS: "https://b.example.net" }), ["https://b.example.net"]);
-  assert.deepEqual(originsOf({}), []);
+test("the Worker reads only the OBB_* names: in-zone origins first, the fallback list only when none is usable", async () => {
+  assert.deepEqual(originsOf({ OBB_ORIGINS: "https://node1.obenblock.xyz:2087,https://a.example.net", GNB_ORIGINS: "https://b.example.net" }),
+    { primary: ["https://node1.obenblock.xyz:2087"], fallback: [] }, "an origin outside the zone is not a primary origin");
+  assert.deepEqual(originsOf({ GNB_ORIGINS: "https://b.example.net" }), { primary: [], fallback: [] }, "the GnB names are no longer read");
+  assert.deepEqual(originsOf({ OBB_FALLBACK_ORIGINS: "https://1-2-3-4.sslip.io:2087" }), { primary: [], fallback: ["https://1-2-3-4.sslip.io:2087"] });
+  assert.deepEqual(originsOf({}), { primary: [], fallback: [] });
   const originalFetch = globalThis.fetch, originalCaches = globalThis.caches;
-  const seen = [];
-  globalThis.caches = { default: { match: async () => undefined, put: async () => {} } };
-  globalThis.fetch = async (url, init) => { seen.push([String(url), init.headers]); return new Response('{"result":{}}'); };
   try {
-    const env = { ASSETS: assets, OBB_ORIGINS: "https://o.example.net", OBB_API_KEY: "obb-key", GNB_API_KEY: "gnb-key" };
-    assert.equal((await worker.fetch(new Request("https://obenblock.xyz/api/getfinalityinfo"), env, ctx)).status, 200);
-    assert.equal(seen[0][0], "https://o.example.net/v1/getfinalityinfo?p=%5B%5D");
-    assert.equal(seen[0][1]["x-gnb-key"], "obb-key");
-    await worker.fetch(new Request("https://obenblock.xyz/api/getpowitinfo"), { ASSETS: assets, GNB_ORIGINS: "https://g.example.net", GNB_API_KEY: "gnb-key" }, ctx);
-    assert.equal(seen[1][1]["x-gnb-key"], "gnb-key");
+    const { seen } = installOrigins({ [N1]: {} });
+    assert.equal((await worker.fetch(new Request("https://obenblock.xyz/api/getfinalityinfo"), envFor({ OBB_ORIGINS: N1 }), ctx)).status, 200);
+    assert.equal(seen[0].url, `${N1}/v1/getfinalityinfo?p=%5B%5D`);
+    const gnbOnly = { ASSETS: assets, GNB_ORIGINS: "https://g.example.net", GNB_API_KEY: "g".repeat(40) };
+    assert.equal((await worker.fetch(new Request("https://obenblock.xyz/api/getpowitinfo"), gnbOnly, ctx)).status, 503);
   } finally { globalThis.fetch = originalFetch; globalThis.caches = originalCaches; }
   assert.ok(ttlFor("getfinalityinfo") <= 5 && ttlFor("getpowitinfo") <= 5);
 });
@@ -155,6 +154,16 @@ test("wrangler.toml names the obenblock Worker, its domains and no secret", () =
   assert.match(toml, /\{ pattern = "obenblock\.xyz", custom_domain = true \}/);
   assert.match(toml, /\{ pattern = "www\.obenblock\.xyz", custom_domain = true \}/);
   assert.match(toml, /^CANONICAL_HOST = "obenblock\.xyz"$/m);
-  assert.ok(!/^\s*(OBB|GNB)_(API_KEY|ORIGINS)\s*=/m.test(toml), "secrets are set with wrangler secret put, never in the file");
+  assert.ok(!/^\s*(OBB|GNB)_API_KEY\s*=/m.test(toml), "the key is set with wrangler secret put, never in the file");
+  assert.ok(!/^\s*GNB_ORIGINS\s*=/m.test(toml));
+  // Pre-launch review: the primary origins are names inside the owner's
+  // zone; the sslip.io names are only the fallback list.
+  const value = (name) => toml.match(new RegExp(`^${name} = "([^"]*)"$`, "m"))?.[1];
+  const primary = parseOrigins(value("OBB_ORIGINS"));
+  assert.deepEqual(primary.map((o) => new URL(o).hostname), ["node1.obenblock.xyz", "node2.obenblock.xyz", "node3.obenblock.xyz"]);
+  assert.deepEqual(originsOf({ OBB_ORIGINS: value("OBB_ORIGINS"), OBB_ORIGIN_ZONE: value("OBB_ORIGIN_ZONE") }).primary, primary);
+  assert.ok(parseOrigins(value("OBB_FALLBACK_ORIGINS")).every((o) => new URL(o).hostname.endsWith(".sslip.io")));
+  assert.equal(value("OBB_CHAIN_ID"), "0x4f420001");
+  assert.match(value("OBB_GENESIS_HASH"), /^(|[0-9a-f]{64})$/);
   assert.ok(!/gnb-smh\.com/.test(toml));
 });
