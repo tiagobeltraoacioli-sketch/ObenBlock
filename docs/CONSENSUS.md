@@ -2667,6 +2667,80 @@ the template keep agreeing on that height.
 `stored_blocks_failing_the_hardening_rules_are_disqualified_at_startup`
 covers the scenario.
 
+## Liveness (ObenBlock)
+
+`docs/DESIGN-obenblock.md` §5. Code: `crates/gnb-smh/src/stall_relief.rs`,
+`crates/gnb-crypto/src/core/liveness.rs`, `crates/gnb-crypto/src/core/powit.rs`.
+Executable reference: `reference/obb_liveness.py`, pinned by
+`reference/liveness_vectors.json` (`crates/gnb-crypto/tests/liveness_vectors.rs`).
+
+### Which height
+
+Each chain selects a liveness activation height `L`
+(`liveness::liveness_activation_height_for_chain`). The GnB networks never
+activate it: GnB's rules, encodings and vectors are unchanged. ObenBlock uses
+`L = 0`. Stall relief and witness exits apply to a block whose header height
+is at least `L`. The leak rule is a PoWit parameter of the chain
+(`PowitParams::leak`), not height-gated, because decay steps are stored as
+counts.
+
+### Stall relief
+
+For a block stamped `time` whose ASERT bits are `base_bits`, computed from
+`parent_time` (the latest timestamp over its parents, the ASERT input):
+
+```text
+late     = max(0, time - parent_time - 180)
+steps    = floor(late / 60)
+exponent = floor(steps * 60 * 65536 / 1800)
+shifts   = floor(exponent / 65536),  frac = exponent mod 65536
+factor   = 65536 + ((195766423245049*frac + 971821376*frac^2 + 5127*frac^3 + 2^47) >> 48)
+relaxed  = floor(target(base_bits) * factor * 2^(shifts - 16))
+bits     = base_bits                                         if steps = 0
+           bits(max(target(base_bits), min(pow_limit, relaxed)))   otherwise
+```
+
+`2^x` uses ASERT's 16.16 fixed point and cubic, so 30 steps are exactly one
+doubling. The relief never makes a block harder, and with no step the bits
+are `base_bits` bit for bit. The validator checks `bits` against this
+(`pow::expected_block_bits`). `getblocktemplate` returns `bits` for
+`cur_time`, `asert_bits`, and the `stall_relief` constants, so a pool can
+issue one job per 60-second step.
+
+### Inactivity leak
+
+The stalled test and the step accounting are unchanged. One step takes 1/16
+on GnB (`w -= w / 16`, at most 64 steps). On ObenBlock it takes half: after
+`n` steps a weight is `ceil(w / 2^min(n, 128))`.
+
+### Witness exit
+
+A witness signs with the KES leaf of epoch `epoch`:
+
+```text
+msg_exit = SHA3-256( u32le(17) || "OBB-POWIT-v1/exit" || u32le(chain_id)
+                     || u8(depth) || root[32] || u64le(epoch) )      // 66-byte preimage
+```
+
+From `L`, a block's PoWit section ends with `varint n || exits`. Each exit is
+encoded as `u8 depth || root[32] || u64le epoch || KES signature`, and the
+list is included in the section root. Below `L` the list is absent from the
+wire and from the root. A block of PoWit epoch `E` may carry at most 4 exits,
+checked after the equivocation proofs and before the shares. An exit is valid
+iff all of these hold:
+
+- `epoch <= E <= epoch + 1`;
+- its key has share work in the state's kept epochs;
+- the key has not exited already, in the state or earlier in the same block;
+- the signature verifies, which is checked last.
+
+It records `exited[k] = E + 1`. From `W(E + 1)` on, `k` is not a member.
+While the record lives, shares credited to `k` are invalid and an
+equivocation proof against `k` stays valid. The record goes at the first
+epoch boundary that leaves `k` without share work. Gossip and
+`submitpowititem` carry exits as item kind 4, and `gnb-cli powitexit` signs
+one.
+
 ## Shielded pool (inactive)
 
 No shielded transaction is valid today. The node compiles exactly one proof

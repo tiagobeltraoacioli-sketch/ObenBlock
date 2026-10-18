@@ -23,7 +23,7 @@ use parking_lot::Mutex;
 use crate::consensus::GhostDAG;
 use crate::storage::Storage;
 use gnb_crypto::core::powit::{self, Attestation, BlockInput, ChainView, Checkpoint, Equivocation,
-                              KeyId, PowitBody, PowitParams, PowitState, Regime};
+                              KeyId, PowitBody, PowitParams, PowitState, Regime, WitnessExit};
 use gnb_crypto::core::witness_share::{self, WitnessShare, SHARE_WINDOW};
 use gnb_crypto::core::{self, activation, Block};
 
@@ -36,6 +36,12 @@ type Hash = [u8; 32];
 /// that may include it.
 fn hardening2_height() -> u64 {
     activation::hardening2_activation_height()
+}
+
+/// The liveness activation height (witness exits; `core::liveness`),
+/// process-wide like [`hardening2_height`].
+fn liveness_height() -> u64 {
+    core::liveness::liveness_activation_height()
 }
 
 /// Longest selected-chain walk any lookup performs.
@@ -87,9 +93,29 @@ fn state_key(hash: &Hash) -> String {
     format!("powit/state/{}", hex::encode(hash))
 }
 
+/// The state's witness exits (`PowitState::exited`, liveness activation),
+/// stored beside it only when there are any: the serde encoding of a state
+/// leaves them out, so every GnB state is stored exactly as before.
+fn exited_key(hash: &Hash) -> String {
+    format!("powit/exited/{}", hex::encode(hash))
+}
+
 pub fn load_state(store: &Storage, hash: &Hash) -> Option<PowitState> {
     let bytes = store.get_meta(&state_key(hash)).ok().flatten()?;
-    bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).ok().map(|(s, _)| s)
+    let (mut st, _): (PowitState, _) =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).ok()?;
+    if let Some(x) = store.get_meta(&exited_key(hash)).ok()? {
+        st.exited = bincode::serde::decode_from_slice(&x, bincode::config::standard()).ok()?.0;
+    }
+    Some(st)
+}
+
+fn encode_exited(state: &PowitState) -> Result<Option<Vec<u8>>, String> {
+    if state.exited.is_empty() {
+        return Ok(None);
+    }
+    bincode::serde::encode_to_vec(&state.exited, bincode::config::standard())
+        .map(Some).map_err(|e| format!("powit exits encode: {e}"))
 }
 
 fn encode_state(state: &PowitState) -> Result<Vec<u8>, String> {
@@ -103,6 +129,9 @@ fn encode_state(state: &PowitState) -> Result<Vec<u8>, String> {
 #[allow(dead_code)] // tools and tests; the node binary compiles this module too
 pub fn save_state(store: &Storage, hash: &Hash, state: &PowitState) -> Result<(), String> {
     let bytes = encode_state(state)?;
+    if let Some(x) = encode_exited(state)? {
+        store.put_meta(&exited_key(hash), &x).map_err(|e| format!("storage: powit exits: {e}"))?;
+    }
     store.put_meta(&state_key(hash), &bytes).map_err(|e| format!("storage: powit state: {e}"))
 }
 
@@ -114,6 +143,9 @@ pub fn stage_state(store: &Storage, batch: &mut rocksdb::WriteBatch, hash: &Hash
     -> Result<(), String>
 {
     let bytes = encode_state(state)?;
+    if let Some(x) = encode_exited(state)? {
+        store.stage_meta(batch, &exited_key(hash), &x).map_err(|e| format!("storage: powit exits: {e}"))?;
+    }
     store.stage_meta(batch, &state_key(hash), &bytes).map_err(|e| format!("storage: powit state: {e}"))
 }
 
@@ -216,9 +248,11 @@ pub fn block_state(block: &Block, block_hash: &Hash, dag: &GhostDAG, store: &Sto
         share_work: &share_work,
         attestations: &block.powit.attestations,
         evidence: &block.powit.evidence,
+        exits: &block.powit.exits,
     };
     let view = DagChainView { dag, start: sp };
-    base.apply_at(&powit::params(), core::node_chain_id(), hardening2_height(), &input, &view).map(Some)
+    base.apply_full(&powit::params(), core::node_chain_id(), hardening2_height(), liveness_height(), &input, &view)
+        .map(Some)
 }
 
 // ── Pools ────────────────────────────────────────────────────────────────────
@@ -256,6 +290,8 @@ const ATTESTATIONS_PER_KEY: usize = 2;
 /// from gossip; the oldest go first.
 const SEEN_LINKS_PER_KEY: usize = 16;
 const SEEN_LINKS_CAP: usize = 2_048;
+/// Witness exits held, one per key (liveness activation).
+const EXIT_CAP: usize = 256;
 
 /// `admit_evidence`'s refusal of a proof against a key outside the recent
 /// witness sets: this node's view, never a misbehaviour (`ingress` charges
@@ -344,6 +380,26 @@ impl TipWitnesses {
 
     fn is_banned(&self, key: &KeyId) -> bool {
         self.state.is_banned(key, self.epoch)
+    }
+
+    /// What the next block checks of an exit before its signature
+    /// (`PowitState::apply_full`): the liveness rules apply, it is signed for
+    /// the next block's epoch or the one before, and its key holds share work
+    /// in the tip's state and has not exited.
+    fn exit_admissible(&self, key: &KeyId, x: &WitnessExit) -> Result<(), String> {
+        if !core::liveness::liveness_active_at(self.next_height()) {
+            return Err("witness exits are not active on this chain".into());
+        }
+        if !core::liveness::exit_epoch_ok(self.epoch, x.epoch) {
+            return Err("witness exit not signed for the next block's epoch or the one before".into());
+        }
+        if self.state.exited.contains_key(key) {
+            return Err("witness already exited".into());
+        }
+        if !self.state.epoch_work.values().any(|m| m.contains_key(key)) {
+            return Err("witness exit by a key without share work".into());
+        }
+        Ok(())
     }
 
     /// Verify an equivocation proof's signatures as the next block will, or
@@ -450,6 +506,8 @@ struct PoolInner {
     shares: BTreeMap<Hash, (WitnessShare, u64)>,
     attestations: BTreeMap<Hash, PendingAttestation>,
     evidence: BTreeMap<KeyId, HeldEvidence>,
+    /// Witness exits waiting for a block, one per key.
+    exits: BTreeMap<KeyId, WitnessExit>,
     /// Links seen per witness-set member (gossip), to build equivocation proofs.
     seen_links: SeenLinks,
     /// The tip the pool was last pruned for, and its witness sets (`None`
@@ -527,6 +585,7 @@ impl PoolInner {
             }
         });
         self.evidence.retain(|k, _| !v.is_banned(k));
+        self.exits.retain(|k, x| v.exit_admissible(k, x).is_ok());
         self.seen_links.retain_keys(|k| v.evidence_weight(p, k).is_some());
     }
 }
@@ -547,6 +606,13 @@ pub fn pool() -> &'static PowitPool {
 pub const ITEM_SHARE: u8 = 1;
 pub const ITEM_ATTESTATION: u8 = 2;
 pub const ITEM_EVIDENCE: u8 = 3;
+/// A witness exit (liveness activation, ObenBlock).
+pub const ITEM_EXIT: u8 = 4;
+/// The highest item kind.
+pub const ITEM_KIND_MAX: u8 = ITEM_EXIT;
+
+/// `PowitPool::admit_exit`'s refusal of a bad signature (context-free).
+pub const POWIT_BAD_EXIT_SIGNATURE: &str = "invalid witness exit signature";
 
 pub fn item_id(kind: u8, data: &[u8]) -> Hash {
     use sha3::{Digest, Sha3_256};
@@ -711,6 +777,32 @@ impl PowitPool {
         Ok(key)
     }
 
+    /// Admit a witness exit for the next block (liveness activation): the
+    /// cheap checks of the next block (`TipWitnesses::exit_admissible`), then
+    /// the KES signature. One exit per key.
+    pub fn admit_exit(&self, x: WitnessExit, dag: &GhostDAG, store: &Storage) -> Result<KeyId, String> {
+        let key = x.key_id();
+        let view = self.follow_tip(dag, store).ok_or("PoWit not active at the tip")?;
+        view.exit_admissible(&key, &x)?;
+        if self.inner.lock().exits.contains_key(&key) {
+            return Ok(key);
+        }
+        if !x.verify_signature(core::node_chain_id().to_u32()) {
+            return Err(POWIT_BAD_EXIT_SIGNATURE.into());
+        }
+        let mut g = self.inner.lock();
+        if g.exits.len() >= EXIT_CAP {
+            return Err("witness exit pool full".into());
+        }
+        g.exits.insert(key, x);
+        Ok(key)
+    }
+
+    /// Exits in the pool, by key.
+    pub fn exits_snapshot(&self) -> Vec<WitnessExit> {
+        self.inner.lock().exits.values().cloned().collect()
+    }
+
     /// Forget what the current selected tip made stale (also done by every
     /// admission against a new tip).
     pub fn prune(&self, dag: &GhostDAG, store: &Storage) {
@@ -757,6 +849,7 @@ pub fn template_body(pool: &PowitPool, dag: &GhostDAG, store: &Storage, tip: Has
     let p = powit::params();
     let chain = core::node_chain_id();
     let h2 = hardening2_height();
+    let live = liveness_height();
     let epoch = p.epoch(base.activation, height);
     let recent = selected_chain_since(dag, Some(tip), height.saturating_sub(SHARE_WINDOW));
     let Ok(included) = included_share_ids(store, &recent) else { return PowitBody::default() };
@@ -777,7 +870,8 @@ pub fn template_body(pool: &PowitPool, dag: &GhostDAG, store: &Storage, tip: Has
             break;
         }
         if let Ok((k, w)) = check_share(store, &s, height, &recent, &included) {
-            if !base.is_banned(&k, epoch) && !body.shares.contains(&s) {
+            // A key that exited (liveness) earns no shares while its record lives.
+            if !base.is_banned(&k, epoch) && !base.exited.contains_key(&k) && !body.shares.contains(&s) {
                 body.shares.push(s);
                 share_work.push((k, w));
             }
@@ -786,8 +880,8 @@ pub fn template_body(pool: &PowitPool, dag: &GhostDAG, store: &Storage, tip: Has
     let view = DagChainView { dag, start: Some(tip) };
     let try_apply = |b: &PowitBody, sw: &[(KeyId, u128)]| {
         let input = BlockInput { height, hash: [0; 32], share_work: sw, attestations: &b.attestations,
-                                 evidence: &b.evidence };
-        base.apply_at(&p, chain, h2, &input, &view).is_ok()
+                                 evidence: &b.evidence, exits: &b.exits };
+        base.apply_full(&p, chain, h2, live, &input, &view).is_ok()
     };
     for ev in evidence {
         if body.evidence.len() >= p.max_evidence_per_block {
@@ -796,6 +890,27 @@ pub fn template_body(pool: &PowitPool, dag: &GhostDAG, store: &Storage, tip: Has
         body.evidence.push(ev);
         if !try_apply(&body, &share_work) {
             body.evidence.pop();
+        }
+    }
+    if core::liveness::liveness_active_at(height) {
+        for x in pool.exits_snapshot() {
+            if body.exits.len() >= core::liveness::MAX_EXITS_PER_BLOCK {
+                break;
+            }
+            // A share credited to a key exiting in this same block is
+            // invalid: the exit (the witness's own request) goes first.
+            let k = x.key_id();
+            let mut trial = body.clone();
+            let mut trial_work = share_work.clone();
+            let keep: Vec<bool> = trial_work.iter().map(|(sk, _)| *sk != k).collect();
+            let mut i = 0;
+            trial.shares.retain(|_| { i += 1; keep[i - 1] });
+            trial_work.retain(|(sk, _)| *sk != k);
+            trial.exits.push(x);
+            if try_apply(&trial, &trial_work) {
+                body = trial;
+                share_work = trial_work;
+            }
         }
     }
     for a in atts {
@@ -1137,7 +1252,11 @@ pub fn info_json(dag: &GhostDAG, store: &Storage) -> serde_json::Value {
                 "key": hex::encode(k), "weight": w.to_string() })).collect::<Vec<_>>(),
         },
         "barred_keys": st.as_ref().map(|s| s.banned.len()).unwrap_or(0),
-        "pool": { "shares": ps, "attestations": pa, "evidence": pe },
+        // Liveness (ObenBlock): the leak rule and the witness exits.
+        "liveness_active": core::liveness::liveness_active_at(tip_h + 1),
+        "inactivity_leak": match p.leak { powit::InactivityLeak::Sixteenth => "1/16", powit::InactivityLeak::Half => "1/2" },
+        "exited_keys": st.as_ref().map(|s| s.exited.len()).unwrap_or(0),
+        "pool": { "shares": ps, "attestations": pa, "evidence": pe, "exits": pool().exits_snapshot().len() },
     })
 }
 
@@ -1165,6 +1284,11 @@ pub fn admit_item(kind: u8, data: &[u8], dag: &GhostDAG, store: &Storage) -> Res
             done(&cur)?;
             pool().admit_evidence(e, dag, store).map(|_| ())
         }
+        ITEM_EXIT => {
+            let x = WitnessExit::read_wire(&mut cur)?;
+            done(&cur)?;
+            pool().admit_exit(x, dag, store).map(|_| ())
+        }
         _ => Err("unknown PoWit item kind".into()),
     }
 }
@@ -1183,6 +1307,12 @@ pub fn attestation_item(a: &Attestation) -> (Hash, u8, Vec<u8>) {
 pub fn evidence_item(e: &Equivocation) -> (Hash, u8, Vec<u8>) {
     let d = e.to_wire_bytes();
     (item_id(ITEM_EVIDENCE, &d), ITEM_EVIDENCE, d)
+}
+
+#[allow(dead_code)] // RPC and tests relay exits through `admit_item`; kept beside its siblings
+pub fn exit_item(x: &WitnessExit) -> (Hash, u8, Vec<u8>) {
+    let d = x.to_wire_bytes();
+    (item_id(ITEM_EXIT, &d), ITEM_EXIT, d)
 }
 
 // ── Finality ─────────────────────────────────────────────────────────────────

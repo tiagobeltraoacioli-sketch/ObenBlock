@@ -176,7 +176,7 @@ fn scenario(apply: &dyn Fn(&PowitState, &BlockInput<'_>, &Chain) -> Result<Powit
             _ => (shares, vec![], vec![]),
         };
         let (sw, atts, ev) = step;
-        let input = BlockInput { height: h, hash: hash(0, h), share_work: &sw, attestations: &atts, evidence: &ev };
+        let input = BlockInput { height: h, hash: hash(0, h), share_work: &sw, attestations: &atts, evidence: &ev, exits: &[] };
         st = apply(&st, &input, &Chain { fork: 0, tip: h }).unwrap_or_else(|err| panic!("h={h}: {err}"));
         out.push(st.clone());
     }
@@ -292,7 +292,7 @@ fn state_at(h: u64, work: &[(u64, KeyId, u128)]) -> PowitState {
 }
 
 fn block(st: &PowitState, h: u64, atts: &[Attestation], ev: &[Equivocation]) -> Result<PowitState, String> {
-    let input = BlockInput { height: h, hash: hash(0, h), share_work: &[], attestations: atts, evidence: ev };
+    let input = BlockInput { height: h, hash: hash(0, h), share_work: &[], attestations: atts, evidence: ev, exits: &[] };
     st.apply(&P, CHAIN, &input, &Chain { fork: 0, tip: h })
 }
 

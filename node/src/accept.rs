@@ -2207,7 +2207,9 @@ pub fn accept_block_tracking(
 
     // ── FIX VULN-01: difficulty bits must equal the ASERT schedule ───
     let parent_ts = core::difficulty_parent_timestamp(parent_data.iter().map(|(_, t)| *t));
-    let expected_bits = pow::expected_bits(parent_ts, block.height)
+    // From the liveness activation the block's own timestamp relaxes the
+    // ASERT target once it is late (stall relief, DESIGN-obenblock.md 5.1).
+    let expected_bits = pow::expected_block_bits(parent_ts, block.height, block.header.timestamp)
         .map_err(|e| format!("invalid difficulty: {}", e))?;
     if block.header.bits != expected_bits {
         return Err(format!(

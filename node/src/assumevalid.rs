@@ -343,7 +343,7 @@ pub fn own_work(dag: &GhostDAG, hash: &BlockHash) -> Option<u128> {
         height = height.max(pd.height.saturating_add(1));
         timestamps.push(pd.timestamp);
     }
-    let bits = crate::pow::expected_bits(core::difficulty_parent_timestamp(timestamps), height).ok()?;
+    let bits = crate::pow::expected_block_bits(core::difficulty_parent_timestamp(timestamps), height, d.timestamp).ok()?;
     Some(crate::pow::block_work(bits, height))
 }
 

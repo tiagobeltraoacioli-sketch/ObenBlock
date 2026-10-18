@@ -14,6 +14,7 @@ pub mod vesting;     // locked team and founder allocations (genesis ledger)
 pub mod witness_share; // reward for proven witness custody (from powit_height)
 pub mod kes;           // forward-secure (key-evolving) hybrid signatures for witnesses
 pub mod powit;         // Proof of Witnesses: witness-set finality (from powit_height)
+pub mod liveness;      // stall relief, faster leak, witness exits (ObenBlock, DESIGN-obenblock.md 5)
 
 /// Bloch Genesis-3 carryover: verified, converted opening ledger.
 pub mod carryover;
@@ -1184,7 +1185,8 @@ impl Block {
     ///   transactions Transaction::to_wire_bytes(true) × tx_count
     ///   sh_count     varint
     ///   shielded     shielded tx × sh_count
-    ///   powit        PowitBody (only when height >= powit_height())
+    ///   powit        PowitBody (only when height >= powit_height(); with its
+    ///                exits list from the liveness activation, `core::liveness`)
     /// ```
     pub fn to_wire_bytes(&self) -> Vec<u8> {
         let mut out = self.header.to_wire_bytes(self.blue_score, self.height);
@@ -1197,7 +1199,7 @@ impl Block {
             write_shielded_tx(&mut out, stx);
         }
         if powit_active(self.height) {
-            self.powit.write_wire(&mut out);
+            self.powit.write_wire_with(&mut out, liveness::liveness_active_at(self.height));
         }
         out
     }
@@ -1212,7 +1214,7 @@ impl Block {
         // The PoWit section is part of the encoding from `powit_height()`.
         let powit = if powit_active(self.height) {
             let mut v = Vec::new();
-            self.powit.write_wire(&mut v);
+            self.powit.write_wire_with(&mut v, liveness::liveness_active_at(self.height));
             v.len()
         } else {
             0
@@ -1263,7 +1265,8 @@ impl Block {
 
         let powit = if powit_active(height) {
             let mut pc = Cursor::new(&body[offset..]);
-            let pb = powit::PowitBody::read_wire(&mut pc).map_err(|e| format!("powit section: {e}"))?;
+            let pb = powit::PowitBody::read_wire_with(&mut pc, liveness::liveness_active_at(height))
+                .map_err(|e| format!("powit section: {e}"))?;
             offset += pc.position() as usize;
             pb
         } else {
@@ -1298,7 +1301,8 @@ impl Block {
             c.update(b"gnb:block:body:v2");
             c.update(tx_root.0);
             c.update(self.shielded_root());
-            c.update(self.powit.root());
+            // Exits are part of the section from the liveness activation.
+            c.update(self.powit.root_with(liveness::liveness_active_at(self.height)));
             return MerkleRoot(c.finalize().into());
         }
         if self.shielded_transactions.is_empty() {
@@ -2015,7 +2019,8 @@ mod wire_canonical_tests {
         // The PoWit section (from powit_height), read as the real decoder does.
         let powit = if powit_active(height) {
             let mut pc = Cursor::new(&body[offset..]);
-            let pb = powit::PowitBody::read_wire(&mut pc).map_err(|e| format!("powit section: {e}"))?;
+            let pb = powit::PowitBody::read_wire_with(&mut pc, liveness::liveness_active_at(height))
+                .map_err(|e| format!("powit section: {e}"))?;
             offset += pc.position() as usize;
             pb
         } else {

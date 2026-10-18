@@ -17,6 +17,8 @@
 #![forbid(unsafe_code)]
 
 pub mod difficulty;
+/// Stall relief: a late block relaxes its own target (ObenBlock, `docs/DESIGN-obenblock.md` 5.1).
+pub mod stall_relief;
 /// GnB-SMH v2 draft (SHA-256). Not consensus.
 pub mod v2;
 /// GnB-SMH v3 (Argon2d-style fill, 4 MiB): consensus from the PoWit activation height.

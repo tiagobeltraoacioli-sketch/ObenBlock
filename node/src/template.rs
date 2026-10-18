@@ -145,7 +145,9 @@ pub struct BlockTemplate {
     pub height: u64,
     /// Informational blue score (max parent blue score + 1).
     pub blue_score: u64,
-    /// Expected ASERT bits for these parents.
+    /// Expected ASERT bits for these parents. From the liveness activation a
+    /// block's bits also depend on its timestamp (`assemble_block` applies the
+    /// stall relief, `core::liveness::relieve_at`).
     pub bits: u32,
     /// Latest parent timestamp (the minimum block timestamp).
     pub parent_timestamp: u64,
@@ -464,7 +466,7 @@ pub fn build_block_template_with(
     };
     let powit_bytes = {
         let mut v = Vec::new();
-        powit_body.write_wire(&mut v);
+        powit_body.write_wire_with(&mut v, core::liveness::liveness_active_at(height));
         v.len()
     };
     // One coinbase output per witness share: value (8) + script length
@@ -684,7 +686,11 @@ pub fn assemble_block(template: &BlockTemplate, coinbase: Transaction, timestamp
             parents: template.parents.clone(),
             merkle_root: MerkleRoot::ZERO,
             timestamp: timestamp.max(template.parent_timestamp),
-            bits: template.bits,
+            // The template's ASERT bits, relaxed for this timestamp from the
+            // liveness activation (stall relief; unchanged on GnB).
+            bits: core::liveness::relieve_at(template.bits, template.parent_timestamp, template.height,
+                                             timestamp.max(template.parent_timestamp), template.activation_height,
+                                             core::liveness::liveness_activation_height()),
             nonce: 0,
         },
         transactions: all,

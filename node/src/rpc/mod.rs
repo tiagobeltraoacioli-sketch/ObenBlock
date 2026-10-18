@@ -1958,9 +1958,14 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             } else {
                 String::new()
             };
+            // From the liveness activation the bits depend on the block's own
+            // timestamp (stall relief): these are for `cur_time`.
+            let cur_bits = crate::core::liveness::relieve_at(tmpl.bits, tmpl.parent_timestamp, tmpl.height,
+                                                             now.max(tmpl.parent_timestamp), tmpl.activation_height,
+                                                             crate::core::liveness::liveness_activation_height());
             let powit_hex = {
                 let mut v = Vec::new();
-                tmpl.powit.write_wire(&mut v);
+                tmpl.powit.write_wire_with(&mut v, crate::core::liveness::liveness_active_at(tmpl.height));
                 hex::encode(v)
             };
             let coinbase_outputs: Vec<Value> = tmpl.coinbase_outputs(Vec::new()).iter().map(|o| json!({
@@ -1981,7 +1986,18 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 "parents":              tmpl.parents.iter().map(hex::encode).collect::<Vec<_>>(),
                 "height":               tmpl.height,
                 "blue_score":           tmpl.blue_score,
-                "bits":                 tmpl.bits,
+                // From the liveness activation the bits depend on the block's
+                // own timestamp (stall relief): `bits` is for `cur_time`;
+                // `asert_bits` and `stall_relief` let a pool follow the
+                // 60-second steps (`core::liveness`, DESIGN-obenblock.md 5.1).
+                "bits":                 cur_bits,
+                "asert_bits":           tmpl.bits,
+                "stall_relief":         json!({
+                    "active": crate::core::liveness::liveness_active_at(tmpl.height),
+                    "grace_secs": crate::core::liveness::OBENBLOCK_STALL_RELIEF.grace_secs,
+                    "step_secs": crate::core::liveness::OBENBLOCK_STALL_RELIEF.step_secs,
+                    "halflife_secs": crate::core::liveness::OBENBLOCK_STALL_RELIEF.halflife_secs,
+                }),
                 "cur_time":             now,
                 "parent_time":          tmpl.parent_timestamp,
                 // R3: satoshi amounts → decimal strings.
@@ -2015,7 +2031,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                     gnb_smh::Algo::V1 => gnb_smh::LOG2_N,
                     gnb_smh::Algo::V3 => gnb_smh::v3::LOG2_N,
                 },
-                "target":               hex::encode(crate::core::bits_to_target(tmpl.bits)),
+                "target":               hex::encode(crate::core::bits_to_target(cur_bits)),
                 // This chain measures the block size on the wire encoding at
                 // every height (`size_rule` above names the audit's regime).
                 "chain_size_rule":      "wire",
@@ -2061,14 +2077,15 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         "reconsiderblock" => chain_admin_call(ChainAdminOp::Reconsider, params, state),
 
         // submitpowititem [kind, hex]: kind 1 = witness share, 2 = attestation,
-        // 3 = equivocation proof. Validated like a gossiped item, then relayed.
+        // 3 = equivocation proof, 4 = witness exit (liveness activation).
+        // Validated like a gossiped item, then relayed.
         "submitpowititem" => {
             let kind = params.and_then(|p| p.get(0)).and_then(|v| v.as_u64()).unwrap_or(0);
             let data = match params.and_then(|p| p.get(1)).and_then(|v| v.as_str()).map(hex::decode) {
                 Some(Ok(d)) => d,
                 _ => return json!({ "error": "usage: submitpowititem [kind, hex]" }),
             };
-            if !(1..=3).contains(&kind) || data.len() > crate::network::MAX_WIRE_POWIT_ITEM {
+            if !(1..=u64::from(crate::powit::ITEM_KIND_MAX)).contains(&kind) || data.len() > crate::network::MAX_WIRE_POWIT_ITEM {
                 return json!({ "error": "bad kind or item too large" });
             }
             let kind = kind as u8;
