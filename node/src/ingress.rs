@@ -1095,8 +1095,10 @@ pub const REMEMBERED_KEYS_PER_ORPHAN: usize = 8;
 /// `1 / REMEMBERED_PEER_SHARE` of it; past either bound a skeleton keeps
 /// [`REMEMBERED_KEYS_PER_ORPHAN`]. Flagged blocks are a claimed target's
 /// ancestors, fixed by the ids an authentic vote signed, so only a witness
-/// signing votes for a crafted tree reaches these bounds; it then stalls its
-/// own pulls, not the store.
+/// signing votes for a crafted tree reaches these bounds; at worst the
+/// flagged skeletons evicted meanwhile are kept as before this rule (8
+/// parents, the rest flagged again when the orphan is re-fetched), and the
+/// store never grows past them. Dropped skeletons free their keys.
 pub const FLAGGED_SKELETON_EXTRA_KEYS_MAX: usize = 1 << 16;
 
 /// One delivering peer owns at most `1 / REMEMBERED_PEER_SHARE` of each
