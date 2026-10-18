@@ -101,7 +101,14 @@ valid PoW         <=> block_id, read as a 256-bit little-endian integer, <= targ
   - the 32-bit nonce;
   - version rolling (BIP 320: bits 13–28 of `version` are free, the other
     bits must equal the block version);
-  - an extranonce in the coinbase changes `merkle_root`.
+  - an extranonce in the coinbase changes `merkle_root`: the header's
+    `merkle_root` is Bitcoin's transaction Merkle root over the txids
+    (SHA-256d pairs, odd last duplicated, Bitcoin Core's mutation check),
+    which stock Stratum V1 firmware recomputes itself from `coinb1 ‖
+    extranonce1 ‖ extranonce2 ‖ coinb2` and the merkle branch. Witnesses,
+    the shielded and the PoWit sections are committed by the coinbase
+    commitment (docs/CONSENSUS.md, "Header Merkle root and body commitment
+    (ObenBlock)").
 - The full parent list travels with the header. A block is valid only if
   its list hashes to `parents_commitment` (sorted ascending, no duplicates,
   at most `MAX_PARENTS`).
@@ -157,7 +164,9 @@ expected_bits(B) = canonical bits of target_eff(B)
 - In words: after 3 minutes without a block, the target doubles every 30
   minutes, in 60-second steps.
 - The steps let a pool hand out one job per step. Within a step, `ntime`
-  rolling does not change `bits`.
+  rolling does not change `bits`; each job advertises the step's window as
+  `mintime`/`maxtime`, and pools refresh the job at each step
+  (docs/OBENBLOCK-MINING.md §3.5).
 - **Bound**: with a fraction `r` of the old hashrate left, the next block is
   expected after about `3 min + 30 min × log2(1/r)`:
   - 10 % left: about 1 h 45 min worst case, typically minutes;

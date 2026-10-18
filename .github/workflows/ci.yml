@@ -87,11 +87,14 @@ jobs:
       # docs/DESIGN-obenblock.md §4 (ObenBlock SHA-256d PoW); the Rust code
       # checks the same file in crates/gnb-smh/tests/vectors_sha256d.rs and
       # crates/gnb-crypto/tests/obb_pow_vectors.rs. Header jobs
-      # (docs/OBENBLOCK-MINING.md): node/tests/obb_sha256d_mining.rs.
+      # (docs/OBENBLOCK-MINING.md): node/tests/obb_sha256d_mining.rs. The
+      # header Merkle root (Bitcoin's tree) and body commitment:
+      # crates/gnb-crypto/tests/obb_merkle_vectors.rs.
       - name: ObenBlock SHA-256d PoW reference and reproducible vectors
         run: |
           python3 reference/obb_pow_test.py -v
           python3 reference/obb_pow_vectors.py --check
+          python3 reference/obb_merkle.py --check
           python3 reference/obb_job_test.py -v
       # docs/DESIGN-obenblock.md §6 (SHA-256d witness shares, 112-epoch
       # window); the Rust code checks the same file in

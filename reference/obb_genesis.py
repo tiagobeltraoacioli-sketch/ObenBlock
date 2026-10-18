@@ -8,16 +8,16 @@ checks the Rust code against.
 
     coinbase   = Tx(version 1,
                     in:  prev_txid 0^32, prev_index 0xffffffff, sequence 0xffffffff,
-                         script_sig = coinbase_commitment(0, [], witness_root([coinbase])) || text,
+                         script_sig = coinbase_commitment(0, [], body_commitment) || text,
                     out: value 0 to 0^20, locktime 0)
-    tx_root    = legacy_merkle_root([txid(coinbase)]) = txid(coinbase)
-                 (the genesis is outside the hardening block rules: h >= 1)
-    body_root  = SHA3-256("gnb:block:body:v2" || tx_root
-                          || SHA3-256("gnb:block:shielded:v1")
-                          || SHA3-256("GNB-POWIT-v1/body" || 00 00 00 00))
-                 (PoWit and liveness from height 0: the v2 body root, empty
-                 shares, attestations, evidence and exits)
-    header     = pow_header(version, parents_commitment([]), body_root, time, bits, nonce)   80 bytes
+    body_commitment = obb_merkle.body_commitment(witness_root([coinbase]),
+                          SHA3-256("gnb:block:shielded:v1"),
+                          SHA3-256("GNB-POWIT-v1/body" || 00 00 00 00))
+                 (PoWit and liveness from height 0: empty shares,
+                 attestations, evidence and exits)
+    merkle_root = Bitcoin's root of [txid(coinbase)] = txid(coinbase)
+                 (obb_merkle.bitcoin_merkle_root, as for every ObenBlock block)
+    header     = pow_header(version, parents_commitment([]), merkle_root, time, bits, nonce)   80 bytes
     block_id   = SHA-256d(header)
 
 Mainnet's bits are the pow limit 0x1d00ffff and regtest's 0x207fffff; the
@@ -41,6 +41,7 @@ from pathlib import Path
 
 import gnb_difficulty as d
 import gnb_merkle as m
+import obb_merkle as om
 import obb_pow as o
 
 HERE = Path(__file__).resolve().parent
@@ -70,7 +71,7 @@ NETWORKS = {
 }
 # A mainnet solution at an example timestamp (2026-10-18 00:00 UTC), found by
 # the launch tool; NOT the mainnet genesis.
-MAINNET_REHEARSAL = {"timestamp": 1_792_281_600, "version": o.BLOCK_VERSION, "nonce": 1_492_736_395}
+MAINNET_REHEARSAL = {"timestamp": 1_792_281_600, "version": o.BLOCK_VERSION, "nonce": 3_461_588_150}
 
 EMPTY_SHIELDED_ROOT = hashlib.sha3_256(b"gnb:block:shielded:v1").digest()
 EMPTY_POWIT_ROOT = hashlib.sha3_256(b"GNB-POWIT-v1/body" + b"\x00\x00\x00\x00").digest()
@@ -80,16 +81,16 @@ def coinbase(text: str) -> m.Tx:
     cb = m.Tx(version=1,
               inputs=[m.TxIn(prev_txid=bytes(32), prev_index=0xFFFFFFFF, script_sig=b"", sequence=0xFFFFFFFF)],
               outputs=[m.TxOut(value=0, script_pubkey=bytes(20))], locktime=0)
-    commitment = m.coinbase_commitment(0, [], m.witness_root([cb]))
-    cb.inputs[0].script_sig = commitment + text.encode()
-    assert m.check_coinbase_commitment(0, [], [cb]) is None
+    body = om.body_commitment(m.witness_root([cb]), EMPTY_SHIELDED_ROOT, EMPTY_POWIT_ROOT)
+    cb.inputs[0].script_sig = m.coinbase_commitment(0, [], body) + text.encode()
     return cb
 
 
 def body_root(cb: m.Tx) -> bytes:
-    tx_root = m.legacy_merkle_root([cb.txid()])
-    assert tx_root == cb.txid()
-    return hashlib.sha3_256(b"gnb:block:body:v2" + tx_root + EMPTY_SHIELDED_ROOT + EMPTY_POWIT_ROOT).digest()
+    """The header root: Bitcoin's root of the one txid, the txid itself."""
+    root, mutated = om.bitcoin_merkle_root([cb.txid()])
+    assert root == cb.txid() and not mutated
+    return root
 
 
 def header(network: str, version: int, timestamp: int, nonce: int) -> bytes:

@@ -1,6 +1,6 @@
 //! The ObenBlock genesis blocks (`core::genesis`) against
 //! `reference/obb_genesis.py` through `reference/obb_genesis_vectors.json`:
-//! the coinbase, its txid, the body root and the 80-byte header of both
+//! the coinbase, its txid, the header root and the 80-byte header of both
 //! networks, the regtest proof of work, and the mainnet rehearsal solution
 //! (the launch search, end to end). No chain is selected in this process, so
 //! the blocks are built from the constants alone, as the mining tool does.
