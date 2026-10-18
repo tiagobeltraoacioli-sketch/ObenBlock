@@ -1996,7 +1996,7 @@ impl GhostDAG {
         self.invalid_all_edges.remove(hash);
         self.body_pending.remove(hash);
         self.body_requested.remove(hash);
-        self.forget_finality_source(hash);
+        self.forget_finality_source(hash, data.blue_work);
         self.no_verdict.remove(hash);
         if self.reach_hint == Some(*hash) {
             self.reach_hint = None;

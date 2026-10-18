@@ -1170,9 +1170,11 @@ bound of B's blue work:
      selected-tip state derives for the attestation's target epoch, under the
      rules of a block at the orphan's wire height or the node's next height,
      whichever is higher (the wire height is the sender's choice), the key
-     not barred at the node's current epoch and the target not in a future
-     epoch (at most two signatures are checked per orphan, membership first,
-     and at most two first-rule witness sets built). From the second
+     not barred at the node's current epoch and the target at most three
+     epochs past the epoch of the node's next block (the lighter side of a
+     partition can be a few epochs ahead by height, review round 4; at most
+     two signatures are checked per orphan, membership first, and at most
+     two first-rule witness sets built). From the second
      hardening activation a chain that shares the node's finality reads the
      same frozen finalized window ("Witness set from finalized history");
      before it, the node's own share history of that window.
@@ -1185,16 +1187,19 @@ bound of B's blue work:
    skeletons (a flag their own parent edges carry down: an orphan that
    merely lists B as a parent neither sets nor hides it, review round 3,
    M-A), or when a claimed target is a stored block on B's selected chain at
-   most `vote_ttl` checkpoint slots below B (the blocks between a target and
-   the attestations for it). The target binds the claim to the chain it
-   reaches the node along: an authentic attestation is public, and copied
-   onto another chain it targets a block that chain does not contain, or, on
-   a chain that branches above a stored target, backs at most `vote_ttl`
-   blocks above that target. The backing is recomputed at each admission, so
-   a block requested again while orphans above it still wait is backed
-   again. A
-   backed B is admitted below `T` only if it also extends the pinned
-   checkpoint's chain (its selected parent is the pin or descends from it: a
+   most `vote_ttl` heights below B (the blocks between a target and the
+   attestations for it). The target binds the claim to the chain it reaches
+   the node along: an authentic attestation is public, and copied onto
+   another chain it targets a block that chain does not contain, or, on a
+   chain that branches above a stored target, backs the blocks of the
+   `vote_ttl` heights above that target. A wide DAG can hold many blocks per
+   height, so `vote_ttl` does not bound how many such blocks are admitted:
+   the budgets below and the orphan floor (each of them pays at least 1/16
+   of a block's work at the tip) do (review round 4). The backing is
+   recomputed at each admission, so a block requested again while orphans
+   above it still wait is backed again. A backed B is admitted below `T`
+   only if it also extends the pinned checkpoint's chain (its selected
+   parent is the pin or descends from it: a
    chain that forks below the pin cannot advance it; with no pin, only when
    no weak-subjectivity anchor is configured, since while a configured
    anchor is unknown no finality above it counts), its own bits meet the

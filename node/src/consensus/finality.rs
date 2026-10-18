@@ -57,7 +57,7 @@
 //! Cost: the pin is recomputed after every accepted block and at each step
 //! of a chain move, and almost every block after a finalization is a source
 //! of it, so one computation examines O(1) sources per candidate (sources
-//! are kept heaviest first, and the first that qualifies decides; review
+//! are read heaviest first, and the first that qualifies decides; review
 //! round 2, M1; a candidate below the minimum chain work costs O(1), round
 //! 3, M-B), walks each disqualified block at
 //! most once (shared walks), reads every source only of conflicting
@@ -85,10 +85,14 @@ use super::{BlockHash, GhostDAG};
 struct Candidate {
     /// Its PoWit slot (`Checkpoint::height`).
     slot: u64,
-    /// (blue work, source), heaviest first (ties by hash): a block's blue
-    /// work never changes, so the first entry is the heaviest source and a
-    /// candidate whose heaviest source is below the minimum chain work is
-    /// skipped in O(1) (review round 3, M-B).
+    /// (blue work, source), ascending (ties by hash), read heaviest first
+    /// from the end: a block's blue work never changes, so the last entry is
+    /// the heaviest source and a candidate whose heaviest source is below
+    /// the minimum chain work is skipped in O(1) (review round 3, M-B). A new
+    /// block is almost always the heaviest source yet (while finality stalls
+    /// every block is a source of the last checkpoint), so recording it is
+    /// an amortized O(1) push, not a shift of every earlier source (review
+    /// round 4, item 4).
     sources: Vec<(u128, BlockHash)>,
 }
 
@@ -304,16 +308,27 @@ impl GhostDAG {
         self.finality.by_source.insert(source, checkpoint);
         let c = self.finality.by_checkpoint.entry(checkpoint).or_default();
         c.slot = slot;
-        let at = c.sources.partition_point(|(w, h)| (*w, *h) > (work, source));
-        c.sources.insert(at, (work, source));
+        if c.sources.last().is_none_or(|last| *last < (work, source)) {
+            c.sources.push((work, source));
+        } else {
+            let at = c.sources.partition_point(|e| *e < (work, source));
+            c.sources.insert(at, (work, source));
+        }
         true
     }
 
-    /// Forget `source` (its block left the DAG: a rolled-back acceptance).
-    pub(super) fn forget_finality_source(&mut self, source: &BlockHash) {
+    /// Forget `source` of blue work `work` (its block left the DAG: a
+    /// rolled-back acceptance of the newest block, so its entry is found by
+    /// a binary search, usually at the end).
+    pub(super) fn forget_finality_source(&mut self, source: &BlockHash, work: u128) {
         let Some(cp) = self.finality.by_source.remove(source) else { return };
         if let Some(c) = self.finality.by_checkpoint.get_mut(&cp) {
-            c.sources.retain(|(_, s)| s != source);
+            match c.sources.binary_search(&(work, *source)) {
+                Ok(i) => {
+                    c.sources.remove(i);
+                }
+                Err(_) => c.sources.retain(|(_, s)| s != source),
+            }
             if c.sources.is_empty() {
                 self.finality.by_checkpoint.remove(&cp);
             }
@@ -389,11 +404,11 @@ impl GhostDAG {
             // finalization is a source of it). Round 3, M-B: heaviest first,
             // so a candidate below the minimum chain work (initial sync with a
             // real minimum) costs O(1).
-            if cand.sources.first().is_none_or(|(w, _)| *w < policy.min_chain_work) {
+            if cand.sources.last().is_none_or(|(w, _)| *w < policy.min_chain_work) {
                 continue;
             }
             let mut supported = false;
-            for (w, s) in &cand.sources {
+            for (w, s) in cand.sources.iter().rev() {
                 if *w < policy.min_chain_work {
                     break;
                 }
@@ -544,11 +559,11 @@ impl GhostDAG {
     }
 
     /// The blue work of the heaviest qualifying source of checkpoint `cp`
-    /// (the first that qualifies: sources are kept heaviest first).
+    /// (the first that qualifies: sources are read heaviest first).
     fn best_source_work(&self, cp: &BlockHash, min_work: u128, memo: &mut HashMap<BlockHash, bool>, visits: &mut u64)
         -> u128
     {
-        for (w, s) in self.finality.by_checkpoint.get(cp).map(|c| c.sources.as_slice()).unwrap_or(&[]) {
+        for (w, s) in self.finality.by_checkpoint.get(cp).map(|c| c.sources.as_slice()).unwrap_or(&[]).iter().rev() {
             if *w < min_work {
                 break;
             }
@@ -820,6 +835,64 @@ mod tests {
             d.note_finality_source(h(2, i), h(2, i - 1), i);
         }
         measure(&d, "with a conflicting chain");
+    }
+
+    /// Review round 4, item 4: sources stay sorted whatever order they are
+    /// recorded in (a block's PoWit state can be computed after a heavier
+    /// one's), are read heaviest first, and a rolled-back leaf is forgotten.
+    #[test]
+    fn sources_are_kept_sorted_and_forgotten() {
+        let mut d = GhostDAG::with_default_k();
+        d.add_genesis(h(0, 0), 0);
+        let mut p = h(0, 0);
+        for i in 1..=8u64 {
+            d.add_block(h(1, i), vec![p], i, 10).unwrap();
+            p = h(1, i);
+        }
+        d.add_block(h(2, 8), vec![h(1, 7)], 8, 10).unwrap();
+        for i in [5u64, 3, 8, 2, 7, 4, 6] {
+            assert!(d.note_finality_source(h(1, i), h(1, 1), 1));
+        }
+        assert!(d.note_finality_source(h(2, 8), h(1, 1), 1));
+        assert!(!d.note_finality_source(h(1, 5), h(1, 1), 1), "idempotent");
+        let srcs = |d: &GhostDAG| d.finality.by_checkpoint[&h(1, 1)].sources.clone();
+        let s = srcs(&d);
+        assert_eq!(s.len(), 8);
+        assert!(s.windows(2).all(|w| w[0] < w[1]), "ascending: {s:?}");
+        let (mut memo, mut visits) = (HashMap::new(), 0);
+        let top = d.store.get(&h(1, 8)).unwrap().blue_work.max(d.store.get(&h(2, 8)).unwrap().blue_work);
+        assert_eq!(d.best_source_work(&h(1, 1), 0, &mut memo, &mut visits), top);
+        assert_eq!(visits, 1, "the heaviest source is read first");
+        assert!(d.remove_block(&h(2, 8)));
+        assert!(d.remove_block(&h(1, 8)));
+        let s = srcs(&d);
+        assert_eq!(s.iter().map(|(_, x)| *x).collect::<Vec<_>>(),
+                   [2u64, 3, 4, 5, 6, 7].map(|i| h(1, i)).to_vec());
+        assert_eq!(d.finality_index().sources(), 6);
+    }
+
+    /// Review round 4, item 4: while finality stalls every new block is a
+    /// source of the last finalized checkpoint and the heaviest one, so
+    /// recording it must not shift the sources recorded before it.
+    #[test]
+    #[ignore = "timing probe: prints the cost of recording sources"]
+    fn measure_source_recording_cost() {
+        let mut d = GhostDAG::with_default_k();
+        d.add_genesis(h(0, 0), 0);
+        let mut p = h(0, 0);
+        let n = 60_000u64;
+        for i in 1..=n {
+            d.add_block(h(1, i), vec![p], i, 10).unwrap();
+            p = h(1, i);
+        }
+        let t = std::time::Instant::now();
+        for i in 2..=n {
+            assert!(d.note_finality_source(h(1, i), h(1, 1), 1));
+        }
+        eprintln!("{} sources of one checkpoint recorded in {:?}", n - 1, t.elapsed());
+        let none = HashSet::new();
+        let o = d.compute_finality_pin(&on(h(1, n), Some(h(1, n - 1)), &none));
+        assert_eq!(o.pin.map(|x| x.0), Some(h(1, 1)));
     }
 
     /// Review round 2, M1: the pin is refreshed after every accepted block and

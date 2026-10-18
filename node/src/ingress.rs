@@ -976,7 +976,10 @@ pub struct OrphanEntry {
 #[derive(Clone, Debug)]
 struct Skeleton {
     work:    u128,
-    /// At most [`REMEMBERED_KEYS_PER_ORPHAN`] of its missing parents.
+    /// At most [`REMEMBERED_KEYS_PER_ORPHAN`] of its missing parents; all of
+    /// them (at most `core::MAX_PARENTS`) if it was evicted under a claimed
+    /// target, within [`FLAGGED_SKELETON_EXTRA_KEYS_MAX`] (review round 4,
+    /// item 2: the flag reaches every one of them).
     parents: Vec<[u8; 32]>,
     owner:   Option<PeerId>,
     /// The evicted orphan's authenticated finality claim, if any (its target).
@@ -1048,6 +1051,10 @@ pub struct OrphanPool {
     skel_children:  HashMap<[u8; 32], HashSet<[u8; 32]>>,
     skel_by_work:   BTreeSet<WorkKey>,
     skel_by_owner:  HashMap<Option<PeerId>, BTreeSet<(u64, [u8; 32])>>,
+    /// Keys flagged skeletons hold beyond `REMEMBERED_KEYS_PER_ORPHAN`, in
+    /// all and per owner (bounded by `FLAGGED_SKELETON_EXTRA_KEYS_MAX`).
+    skel_extra_keys: usize,
+    skel_extra_by_owner: HashMap<Option<PeerId>, usize>,
     /// Missing parent -> greatest single-path work remembered above it.
     paths:          HashMap<[u8; 32], RememberedPath>,
     path_by_work:   BTreeSet<WorkKey>,
@@ -1078,6 +1085,21 @@ pub const REMEMBERED_WORK_MAX: usize = 50_000;
 /// Honest fork blocks miss a handful; a crafted orphan's 256 random parents
 /// no longer turn one eviction into 256 entries.
 pub const REMEMBERED_KEYS_PER_ORPHAN: usize = 8;
+
+/// Review round 4, item 2: the skeleton of an orphan evicted under a claimed
+/// target (`under_target`) keeps all its missing parents, so the flag still
+/// reaches each of them (the ancestors of the target the node pulls next).
+/// The keys such skeletons hold beyond [`REMEMBERED_KEYS_PER_ORPHAN`] are
+/// bounded, node-wide by this (about 256 orphans of `core::MAX_PARENTS`
+/// parents, a few MB with the reverse index), per delivering peer by
+/// `1 / REMEMBERED_PEER_SHARE` of it; past either bound a skeleton keeps
+/// [`REMEMBERED_KEYS_PER_ORPHAN`]. Flagged blocks are a claimed target's
+/// ancestors, fixed by the ids an authentic vote signed, so only a witness
+/// signing votes for a crafted tree reaches these bounds; at worst the
+/// flagged skeletons evicted meanwhile are kept as before this rule (8
+/// parents, the rest flagged again when the orphan is re-fetched), and the
+/// store never grows past them. Dropped skeletons free their keys.
+pub const FLAGGED_SKELETON_EXTRA_KEYS_MAX: usize = 1 << 16;
 
 /// One delivering peer owns at most `1 / REMEMBERED_PEER_SHARE` of each
 /// remembered store (it then pays with its own entries).
@@ -1113,6 +1135,8 @@ impl OrphanPool {
             skel_children: HashMap::new(),
             skel_by_work: BTreeSet::new(),
             skel_by_owner: HashMap::new(),
+            skel_extra_keys: 0,
+            skel_extra_by_owner: HashMap::new(),
             paths: HashMap::new(),
             path_by_work: BTreeSet::new(),
             path_by_owner: HashMap::new(),
@@ -1271,20 +1295,24 @@ impl OrphanPool {
     fn evict(&mut self, h: &[u8; 32]) {
         if let Some(e) = self.entries.get(h) {
             let work = header_work(&e.block);
-            let keys: Vec<[u8; 32]> = e.missing.iter().take(REMEMBERED_KEYS_PER_ORPHAN).copied().collect();
+            // A flagged orphan's skeleton keeps every missing parent (round 4,
+            // item 2; `add_skeleton` bounds the extra keys); the remembered
+            // paths, a work-rule store, stay at REMEMBERED_KEYS_PER_ORPHAN.
+            let kept = if e.under_target { core::MAX_PARENTS } else { REMEMBERED_KEYS_PER_ORPHAN };
+            let parents: Vec<[u8; 32]> = e.missing.iter().take(kept).copied().collect();
             let owner = e.peer;
             let (claim, under) = (e.claim, e.under_target);
             let path = work.saturating_add(self.path_work_above(h));
-            for p in &keys {
+            for p in parents.iter().take(REMEMBERED_KEYS_PER_ORPHAN) {
                 self.remember_path(*p, path, owner);
             }
-            self.add_skeleton(*h, work, keys, owner, claim, under);
+            self.add_skeleton(*h, work, parents, owner, claim, under);
         }
         self.remove(h);
     }
 
     /// Keep an evicted orphan as a skeleton, within the store's bounds.
-    fn add_skeleton(&mut self, hash: [u8; 32], work: u128, parents: Vec<[u8; 32]>, owner: Option<PeerId>,
+    fn add_skeleton(&mut self, hash: [u8; 32], work: u128, mut parents: Vec<[u8; 32]>, owner: Option<PeerId>,
                     claim: Option<([u8; 32], u64)>, under_target: bool) {
         if self.remembered_cap == 0 || self.skeletons.contains_key(&hash) {
             return;
@@ -1311,6 +1339,18 @@ impl OrphanPool {
                 },
             }
         }
+        let extra = parents.len().saturating_sub(REMEMBERED_KEYS_PER_ORPHAN);
+        if extra > 0 {
+            let owned = self.skel_extra_by_owner.get(&owner).copied().unwrap_or(0);
+            if self.skel_extra_keys + extra > FLAGGED_SKELETON_EXTRA_KEYS_MAX
+                || owned + extra > FLAGGED_SKELETON_EXTRA_KEYS_MAX / REMEMBERED_PEER_SHARE
+            {
+                parents.truncate(REMEMBERED_KEYS_PER_ORPHAN);
+            } else {
+                self.skel_extra_keys += extra;
+                *self.skel_extra_by_owner.entry(owner).or_default() += extra;
+            }
+        }
         let seq = self.rem_seq;
         self.rem_seq = self.rem_seq.wrapping_add(1);
         for p in &parents {
@@ -1330,6 +1370,16 @@ impl OrphanPool {
             self.release_claim(&t);
         }
         self.skel_by_work.remove(&(s.work, s.seq, *h));
+        let extra = s.parents.len().saturating_sub(REMEMBERED_KEYS_PER_ORPHAN);
+        if extra > 0 {
+            self.skel_extra_keys = self.skel_extra_keys.saturating_sub(extra);
+            if let Some(n) = self.skel_extra_by_owner.get_mut(&s.owner) {
+                *n = n.saturating_sub(extra);
+                if *n == 0 {
+                    self.skel_extra_by_owner.remove(&s.owner);
+                }
+            }
+        }
         if let Some(set) = self.skel_by_owner.get_mut(&s.owner) {
             set.remove(&(s.seq, *h));
             if set.is_empty() {
@@ -1686,14 +1736,16 @@ impl OrphanPool {
     ///   neither sets nor hides it (round 2 searched upward from `x` through
     ///   every orphan waiting on it, with a bound a crowd of them filled);
     /// * or a claim's target is a stored block on `x`'s selected chain, at
-    ///   most `vote_ttl` checkpoint slots below `x` (the blocks between a
-    ///   target and the votes for it: a vote is includable for `vote_ttl`).
+    ///   most `vote_ttl` heights below `x` (the blocks between a target and
+    ///   the votes for it: a vote is includable for `vote_ttl` heights).
     ///
     /// The target binds the claim to the chain: an authentic vote is public,
     /// and copied onto another chain it targets a block that chain does not
-    /// contain (or, if that chain branches above a stored target, backs at
-    /// most `vote_ttl` blocks above it, at the floor's work per block). Cost:
-    /// the orphans waiting on `x` and the claims of `vote_ttl` slots.
+    /// contain (or, if that chain branches above a stored target, backs the
+    /// blocks of the `vote_ttl` heights above it: on a wide DAG any number
+    /// of them per height, so the finality-pull budgets and the orphan
+    /// floor's work per block bound them, not `vote_ttl`). Cost: the orphans
+    /// waiting on `x` and the claims of `vote_ttl` heights.
     pub fn claim_backs(&self, x: &[u8; 32], parents: &[BlockHash], dag: &GhostDAG, vote_ttl: u64) -> bool {
         if self.node_under_target(x) == Some(true) || self.claims.contains_key(x) {
             return true;
@@ -1881,7 +1933,9 @@ pub fn work_admission(lb: u128, threshold: u128, chain_above: u128, merge_lb: u1
 //   tip's) derives for the vote's target epoch, under the rules of a block
 //   at the orphan's wire height or the node's next height, whichever is
 //   higher, the key not barred at the node's current epoch and the target
-//   not in a future epoch (`powit::authenticated_finality_claim`: at most
+//   at most `powit::MAX_CLAIM_EPOCHS_AHEAD` (three) epochs past that of the
+//   node's next block (round 4, item 6: the lighter side of a partition can
+//   be ahead by height; `powit::authenticated_finality_claim`: at most
 //   `MAX_CLAIM_SIGNATURE_CHECKS` signatures, and as many first-rule witness
 //   sets, per orphan). From the second hardening activation a chain that
 //   shares the node's finality reads the same frozen window; before it, the
@@ -1891,11 +1945,13 @@ pub fn work_admission(lb: u128, threshold: u128, chain_above: u128, merge_lb: u1
 //   buffered or remembered orphans (a flag their own parent edges carry
 //   down, so orphans that merely list a block as a parent can neither set
 //   nor hide it), or if a claimed target is stored on its selected chain at
-//   most `vote_ttl` slots below it (the blocks between a target and the
+//   most `vote_ttl` heights below it (the blocks between a target and the
 //   votes for it). An authentic vote is public: copied onto another chain
 //   it targets a block that chain does not contain, or, on a chain that
-//   branches above a stored target, backs at most `vote_ttl` blocks above
-//   that target.
+//   branches above a stored target, backs the blocks of the `vote_ttl`
+//   heights above that target (review round 4, item 1). A wide DAG has
+//   many blocks per height, so what bounds those is not their heights but
+//   the budgets below and the orphan floor's work each of them pays.
 //
 // The claim is recorded in the orphan's pool entry once it is buffered
 // (`OrphanPool::set_claim`), and survives its eviction in its skeleton, so
@@ -3481,6 +3537,164 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(!pool.is_waited_on(&h(100)), "evicted orphan detached from its parent");
+    }
+
+    // ── Review rounds 3-4: the claim/target flags of the orphan pool ─────────
+
+    fn claim_pool() -> OrphanPool {
+        OrphanPool::new(OrphanLimits {
+            max_entries: 10_000, max_bytes: 1 << 20, max_entries_per_peer: 10_000, max_bytes_per_peer: 1 << 20,
+        })
+    }
+
+    /// Buffer `x` on `parents`, all missing.
+    fn buffer(pool: &mut OrphanPool, x: u64, parents: &[u64]) {
+        let ps: Vec<[u8; 32]> = parents.iter().map(|p| h(*p)).collect();
+        assert!(matches!(pool.insert(h(x), blk(ps.clone(), x), x, 1, None, false, &ps), OrphanInsert::Inserted { .. }));
+    }
+
+    fn flagged(pool: &OrphanPool, xs: &[u64]) -> Vec<bool> {
+        xs.iter().map(|x| pool.node_under_target(&h(*x)) == Some(true)).collect()
+    }
+
+    fn claim_count(pool: &OrphanPool, t: u64) -> u32 {
+        pool.claims.get(&h(t)).map_or(0, |c| c.1)
+    }
+
+    /// The chain R(1, never buffered) <- G(2) <- P(3) <- T(4) <- O(5), O
+    /// carrying a claim that targets T: whatever the arrival order of the
+    /// orphans and of the claim, G, P and T end up flagged (ancestors of the
+    /// target), O does not, and R (the block the node pulls next) is backed.
+    #[test]
+    fn target_flags_do_not_depend_on_the_arrival_order() {
+        let dag = crate::consensus::GhostDAG::with_default_k();
+        let backed = |pool: &OrphanPool| pool.claim_backs(&h(1), &[h(0)], &dag, 20);
+        // Top down, the claim recorded on arrival (the honest pull).
+        let mut pool = claim_pool();
+        buffer(&mut pool, 5, &[4]);
+        pool.set_claim(&h(5), h(4), 40);
+        for (x, p) in [(4, 3), (3, 2), (2, 1)] {
+            buffer(&mut pool, x, &[p]);
+        }
+        assert_eq!(flagged(&pool, &[2, 3, 4, 5]), vec![true, true, true, false]);
+        assert!(backed(&pool));
+        // Bottom up, the claim recorded after all its ancestors.
+        let mut pool = claim_pool();
+        for (x, p) in [(2, 1), (3, 2), (4, 3), (5, 4)] {
+            buffer(&mut pool, x, &[p]);
+        }
+        assert!(!backed(&pool), "no claim yet");
+        pool.set_claim(&h(5), h(4), 40);
+        assert_eq!(flagged(&pool, &[2, 3, 4, 5]), vec![true, true, true, false]);
+        assert!(backed(&pool));
+        // A gap: G arrives before P, which closes it.
+        let mut pool = claim_pool();
+        buffer(&mut pool, 5, &[4]);
+        pool.set_claim(&h(5), h(4), 40);
+        buffer(&mut pool, 4, &[3]);
+        buffer(&mut pool, 2, &[1]);
+        assert_eq!(flagged(&pool, &[2, 4]), vec![false, true]);
+        assert!(!backed(&pool), "the gap hides R");
+        buffer(&mut pool, 3, &[2]);
+        assert_eq!(flagged(&pool, &[2, 3, 4]), vec![true, true, true]);
+        assert!(backed(&pool));
+        // An orphan that merely lists R as a parent neither sets nor hides it.
+        buffer(&mut pool, 90, &[1]);
+        assert_eq!(flagged(&pool, &[90]), vec![false]);
+        assert!(backed(&pool));
+    }
+
+    /// The flags and claims survive the skeleton round trip: an evicted
+    /// flagged orphan still flags the parents that arrive after it, and a
+    /// re-buffered one is flagged again.
+    #[test]
+    fn target_flags_survive_eviction_and_rebuffering() {
+        let mut pool = claim_pool();
+        buffer(&mut pool, 5, &[4]);
+        pool.set_claim(&h(5), h(4), 40);
+        buffer(&mut pool, 4, &[3]);
+        buffer(&mut pool, 3, &[2]);
+        pool.evict(&h(3));
+        assert_eq!(pool.node_under_target(&h(3)), Some(true), "the skeleton keeps the flag");
+        buffer(&mut pool, 2, &[1]);
+        assert_eq!(flagged(&pool, &[2]), vec![true], "flagged through the skeleton");
+        buffer(&mut pool, 3, &[2]);
+        assert_eq!(flagged(&pool, &[3]), vec![true], "re-buffered, flagged again");
+    }
+
+    /// Review round 4, item 2: an evicted flagged orphan with more than
+    /// `REMEMBERED_KEYS_PER_ORPHAN` missing parents keeps all of them (up to
+    /// `MAX_PARENTS`), so each one that arrives later is flagged.
+    #[test]
+    fn a_flagged_skeleton_keeps_every_missing_parent() {
+        let mut pool = claim_pool();
+        buffer(&mut pool, 50, &[40]);
+        pool.set_claim(&h(50), h(40), 400);
+        let parents: Vec<u64> = (100..112).collect();
+        buffer(&mut pool, 40, &parents);
+        assert_eq!(flagged(&pool, &[40]), vec![true]);
+        pool.evict(&h(40));
+        for p in &parents {
+            buffer(&mut pool, *p, &[1]);
+        }
+        assert_eq!(flagged(&pool, &parents), vec![true; parents.len()], "every missing parent of the target");
+    }
+
+    /// The extra keys of flagged skeletons are bounded per delivering peer
+    /// (and node-wide): past its share a peer's flagged skeletons keep
+    /// `REMEMBERED_KEYS_PER_ORPHAN` parents, and dropped skeletons free it.
+    #[test]
+    fn flagged_skeleton_keys_are_bounded() {
+        let mut pool = claim_pool();
+        let tops: Vec<u64> = (1_000..1_100).collect();
+        buffer(&mut pool, 2, &tops);
+        pool.set_claim(&h(2), h(2), 20);
+        let share = FLAGGED_SKELETON_EXTRA_KEYS_MAX / REMEMBERED_PEER_SHARE;
+        let extra = core::MAX_PARENTS - REMEMBERED_KEYS_PER_ORPHAN;
+        for (i, t) in tops.iter().enumerate() {
+            let ps: Vec<u64> = (0..core::MAX_PARENTS as u64).map(|j| 1_000_000 * (i as u64 + 1) + j).collect();
+            buffer(&mut pool, *t, &ps);
+            pool.evict(&h(*t));
+            let kept = pool.skeletons[&h(*t)].parents.len();
+            let fits = (i + 1) * extra <= share;
+            assert_eq!(kept, if fits { core::MAX_PARENTS } else { REMEMBERED_KEYS_PER_ORPHAN }, "skeleton {i}");
+            assert!(pool.skel_extra_keys <= share && pool.skel_extra_keys == pool.skel_extra_by_owner[&None]);
+        }
+        let full = pool.skel_extra_keys;
+        assert_eq!(full, (share / extra) * extra);
+        pool.forget(&h(tops[0]));
+        assert_eq!(pool.skel_extra_keys, full - extra, "a dropped skeleton frees its keys");
+        for t in &tops[1..] {
+            pool.forget(&h(*t));
+        }
+        assert_eq!(pool.skel_extra_keys, 0);
+        assert!(pool.skel_extra_by_owner.is_empty() && pool.skel_children.is_empty());
+    }
+
+    /// Claims are counted per holder (buffered orphan or skeleton): eviction
+    /// keeps the count, re-buffering re-records it, the drain (`remove`) and
+    /// `forget` release it, and a target stays claimed while any claim does.
+    #[test]
+    fn claims_are_reference_counted_through_eviction_and_removal() {
+        let mut pool = claim_pool();
+        buffer(&mut pool, 5, &[4]);
+        buffer(&mut pool, 6, &[4]);
+        pool.set_claim(&h(5), h(4), 40);
+        pool.set_claim(&h(6), h(4), 40);
+        pool.set_claim(&h(6), h(4), 40);
+        assert_eq!(claim_count(&pool, 4), 2, "one claim per orphan");
+        pool.evict(&h(5));
+        assert_eq!(claim_count(&pool, 4), 2, "the skeleton holds it");
+        buffer(&mut pool, 5, &[4]);
+        assert_eq!(claim_count(&pool, 4), 1, "the re-buffered orphan has not been authenticated again");
+        pool.set_claim(&h(5), h(4), 40);
+        assert_eq!(claim_count(&pool, 4), 2);
+        assert!(pool.remove(&h(5)).is_some());
+        assert_eq!(claim_count(&pool, 4), 1, "drained");
+        pool.evict(&h(6));
+        pool.forget(&h(6));
+        assert_eq!(claim_count(&pool, 4), 0, "forgotten");
+        assert!(pool.claims.is_empty() && pool.claims_by_slot.is_empty());
     }
 
     #[test]
