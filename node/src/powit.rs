@@ -1963,9 +1963,10 @@ mod tests {
     }
 
     /// Review round 4, item 6: the lighter side of a partition can be a few
-    /// epochs ahead of the node by height (both sides mine at the same rate,
-    /// the clocks drift): votes for targets up to three epochs ahead are
-    /// judged, beyond that they are ignored.
+    /// epochs ahead of the node by height (each side's heights advance at
+    /// its own pace): a member's votes for targets up to three epochs ahead
+    /// are judged, beyond that they are ignored (with the margin at four the
+    /// last case authenticates: it is the margin that drops it).
     #[test]
     fn a_claim_may_target_up_to_three_epochs_ahead() {
         let p = powit::params();

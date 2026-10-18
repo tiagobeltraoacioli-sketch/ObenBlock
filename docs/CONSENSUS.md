@@ -1172,8 +1172,9 @@ bound of B's blue work:
      whichever is higher (the wire height is the sender's choice), the key
      not barred at the node's current epoch and the target at most three
      epochs past the epoch of the node's next block (the lighter side of a
-     partition can be a few epochs ahead by height; at most two signatures are checked per orphan, membership first,
-     and at most two first-rule witness sets built). From the second
+     partition can be a few epochs ahead by height, review round 4; at most
+     two signatures are checked per orphan, membership first, and at most
+     two first-rule witness sets built). From the second
      hardening activation a chain that shares the node's finality reads the
      same frozen finalized window ("Witness set from finalized history");
      before it, the node's own share history of that window.
@@ -1196,8 +1197,9 @@ bound of B's blue work:
    the budgets below and the orphan floor (each of them pays at least 1/16
    of a block's work at the tip) do (review round 4). The backing is
    recomputed at each admission, so a block requested again while orphans
-   above it still wait is backed again. A backed B is admitted below `T` only if it also extends the pinned
-   checkpoint's chain (its selected parent is the pin or descends from it: a
+   above it still wait is backed again. A backed B is admitted below `T`
+   only if it also extends the pinned checkpoint's chain (its selected
+   parent is the pin or descends from it: a
    chain that forks below the pin cannot advance it; with no pin, only when
    no weak-subjectivity anchor is configured, since while a configured
    anchor is unknown no finality above it counts), its own bits meet the
