@@ -179,6 +179,9 @@ Rules for a pool:
 
 ## 4. Stratum notes
 
+The node's own V1 and V2 servers (`--stratum`, `--stratum-v2`) implement
+these notes: docs/STRATUM.md.
+
 ### 4.1 Stratum V1 (stock firmware)
 
 A pool serves an unmodified Bitcoin ASIC with the header job's `stratum`
