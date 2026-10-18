@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ObenBlock — Real work. Proofs that endure.</title>
-<meta name="description" content="ObenBlock (OBB): SHA-256d proof of work for Bitcoin ASICs, PoWit finality weighted by share work, PoCI strict finality by a later hard fork, hybrid post-quantum signatures and checkpoints anchored in Bloch both ways. Mainnet launch in preparation.">
+<meta name="description" content="ObenBlock (OBB): SHA-256d proof of work for Bitcoin ASICs, PoWit finality weighted by share work, PoCI strict finality from the genesis, hybrid post-quantum signatures and checkpoints anchored in Bloch both ways. Mainnet launch in preparation.">
 <meta name="theme-color" content="#000000">
 <meta name="color-scheme" content="dark">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
@@ -19,8 +19,7 @@
      is the honest pre-launch value. Fill them at launch with
      node scripts/site-launch-fill.mjs <launch.json> (keys: BANNER, STATUS,
      LAUNCH_TIME, GENESIS_HASH, SEED_NODES, DNS_SEED, STRATUM_ENDPOINT, RELEASE,
-     GENESIS_TARGET, FAQ_LIVE, FOOTER_STATUS). Status labels "Specified" on the
-     growth cap and "Later hard fork" on PoCI change only when that code ships. -->
+     GENESIS_TARGET, FAQ_LIVE, FOOTER_STATUS). PoCI and the growth cap are in the node from the genesis. -->
 <a class="skip" href="#main">Skip to content</a>
 <svg aria-hidden="true" width="0" height="0" style="position:absolute;overflow:hidden" xmlns="http://www.w3.org/2000/svg"><defs>
 <symbol id="obb-mark" viewBox="0 10 68 48"><defs><linearGradient id="obb-mark-g" gradientUnits="userSpaceOnUse" x1="3.19" y1="34" x2="64.81" y2="34"><stop offset="0.12" stop-color="#c8ff00"/><stop offset="0.5" stop-color="#ffe600"/><stop offset="0.88" stop-color="#ff5f15"/></linearGradient></defs><path d="M9.25 34 25.75 19.5 M9.25 34 25.75 48.5 M25.75 19.5 42.25 34 M25.75 48.5 42.25 34 M25.75 19.5 58.75 19.5 M42.25 34 58.75 19.5 M42.25 34 58.75 48.5 M25.75 48.5 58.75 48.5" stroke="url(#obb-mark-g)" stroke-width="2.8" stroke-linecap="round"/><polygon points="25.75,12.5 31.81,16 31.81,23 25.75,26.5 19.69,23 19.69,16" fill="url(#obb-mark-g)"/><polygon points="25.75,12.5 31.81,16 25.75,19.5 19.69,16" fill="#fff" fill-opacity="0.26"/><polygon points="25.75,19.5 31.81,16 31.81,23 25.75,26.5" fill="#000" fill-opacity="0.3"/><polygon points="58.75,12.5 64.81,16 64.81,23 58.75,26.5 52.69,23 52.69,16" fill="url(#obb-mark-g)"/><polygon points="58.75,12.5 64.81,16 58.75,19.5 52.69,16" fill="#fff" fill-opacity="0.26"/><polygon points="58.75,19.5 64.81,16 64.81,23 58.75,26.5" fill="#000" fill-opacity="0.3"/><polygon points="9.25,27 15.31,30.5 15.31,37.5 9.25,41 3.19,37.5 3.19,30.5" fill="url(#obb-mark-g)"/><polygon points="9.25,27 15.31,30.5 9.25,34 3.19,30.5" fill="#fff" fill-opacity="0.26"/><polygon points="9.25,34 15.31,30.5 15.31,37.5 9.25,41" fill="#000" fill-opacity="0.3"/><polygon points="42.25,27 48.31,30.5 48.31,37.5 42.25,41 36.19,37.5 36.19,30.5" fill="url(#obb-mark-g)"/><polygon points="42.25,27 48.31,30.5 42.25,34 36.19,30.5" fill="#fff" fill-opacity="0.26"/><polygon points="42.25,34 48.31,30.5 48.31,37.5 42.25,41" fill="#000" fill-opacity="0.3"/><polygon points="25.75,41.5 31.81,45 31.81,52 25.75,55.5 19.69,52 19.69,45" fill="url(#obb-mark-g)"/><polygon points="25.75,41.5 31.81,45 25.75,48.5 19.69,45" fill="#fff" fill-opacity="0.26"/><polygon points="25.75,48.5 31.81,45 31.81,52 25.75,55.5" fill="#000" fill-opacity="0.3"/><polygon points="58.75,41.5 64.81,45 64.81,52 58.75,55.5 52.69,52 52.69,45" fill="url(#obb-mark-g)"/><polygon points="58.75,41.5 64.81,45 58.75,48.5 52.69,45" fill="#fff" fill-opacity="0.26"/><polygon points="58.75,48.5 64.81,45 64.81,52 58.75,55.5" fill="#000" fill-opacity="0.3"/></symbol>
@@ -120,28 +119,28 @@
 <div class="section-source"><span>Architecture as described in the specification of 18 October 2026.</span><a href="https://github.com/gnb-smh/ObenBlock/blob/main/docs/DESIGN-obenblock.md" target="_blank" rel="noopener noreferrer">Read the protocol design ↗</a></div>
 </section>
 <section class="foundation section" id="finality" aria-labelledby="finality-title"><div class="wrap">
-<div class="section-heading"><div><p class="eyebrow">02 / FINALITY</p><h2 id="finality-title">Final means<br>strictly <span class="grad">final.</span></h2></div><p>Mainnet launches with the PoWit finality rules that are in the node today. PoCI, a strict finality profile, is specified and activates later by a hard fork.</p></div>
+<div class="section-heading"><div><p class="eyebrow">02 / FINALITY</p><h2 id="finality-title">Final means<br>strictly <span class="grad">final.</span></h2></div><p>Mainnet launches with PoCI, ObenBlock's strict finality profile, in force from the genesis. The first 4 epochs and one more of burial are proof of work only; strict finality starts at height 3,600.</p></div>
 <div class="finality-grid">
-<div><table class="spec-table"><caption>AT LAUNCH / PoWit</caption><tbody>
-<tr><th scope="row">Votes</th><td>Casper FFG links signed with KES keys<small>A link justifies its target with at least two thirds of the witness weight; a justified direct child finalizes its source</small></td></tr>
+<div><table class="spec-table"><caption>AT LAUNCH / PoWit WITH PoCI</caption><tbody>
+<tr><th scope="row">Votes</th><td>Casper FFG links signed with KES keys<small>A link justifies its target with strictly more than two thirds of the configuration in force; a justified direct child finalizes its source</small></td></tr>
 <tr><th scope="row">Weight</th><td>Share work, no stake<small>From finalized history, over a 28-day window of 112 epochs</small></td></tr>
 <tr><th scope="row">Sticky finality</th><td>No reorg below a finalized checkpoint<small>A conflicting finalization raises an alert and waits for the operator</small></td></tr>
-<tr><th scope="row">Stalls</th><td>Half leak after 24 h<small>Once finality stalls for 4 epochs, a witness whose votes were not included loses half its weight per epoch; a KES-signed exit message leaves at once</small></td></tr>
-<tr><th scope="row">Growth cap on W</th><td>Renewal first, then at most W / 64 per epoch <span class="status spec">Specified</span><small>Two thirds of W takes at least 71 epochs, about 18 days, whatever the rented hashrate; work not admitted is dropped, not banked. Python reference and vectors exist; the node does not enforce it yet</small></td></tr>
+<tr><th scope="row">Stalls</th><td>No leak for finality<small>Absence never changes the weight of a decision: without a quorum, blocks keep coming and finality waits. A KES-signed exit leaves at the next handoff</small></td></tr>
+<tr><th scope="row">Growth cap on W</th><td>Renewal first, then at most W / 64 per epoch <span class="status live">In the node</span><small>Two thirds of W takes at least 71 epochs, about 18 days, whatever the rented hashrate; work not admitted is dropped, not banked</small></td></tr>
 <tr><th scope="row">Payments</th><td>Credit at finality<small>Wallets and exchanges credit a payment once <code>getfinalityinfo</code> reports it finalized, not after N blocks</small></td></tr>
 </tbody></table></div>
 <div class="poci">
-<div class="poci-head"><p class="eyebrow">NEXT / PoCI · PROOF OF CORRUPTION OR INTEGRITY</p><span class="status fork">Later hard fork</span></div>
+<div class="poci-head"><p class="eyebrow">PoCI · PROOF OF CORRUPTION OR INTEGRITY</p><span class="status live">From the genesis</span></div>
 <p class="poci-lead">Every finality decision ends in one of two verifiable objects: a finality certificate, or evidence that a key signed two votes the rules forbid. Nothing else changes the weight of a decision: no absence, timeout, partition or local clock.</p>
 <div class="poci-grid">
 <article class="poci-card"><span class="micro lime">01</span><h3>Frozen configuration</h3><p>Each epoch's voter registry, its keys, weights and total, is fixed under a <code>config_id</code> that every vote names. A vote counts only with the registry's weight.</p></article>
 <article class="poci-card"><span class="micro lime">02</span><h3>Strictly more than 2/3</h3><p><code>3 × voted &gt; 2 × total</code>. Two quorums of one configuration overlap in more than a third, so with under a third Byzantine weight they share an honest key.</p></article>
 <article class="poci-card"><span class="micro lime">03</span><h3>Handoff</h3><p>The next configuration enters into force only when the checkpoint that opens its epoch is finalized under the current one. Exits, bans and expiring weight wait for that handoff.</p></article>
-<article class="poci-card"><span class="micro lime">04</span><h3>Absence pruning by the old committee</h3><p>A key with no included votes for 4 epochs (24 h) is left out of the next configuration, through a handoff that more than two thirds of the current one finalized. It returns with a KES-signed rejoin message, under the growth cap.</p></article>
+<article class="poci-card"><span class="micro lime">04</span><h3>Absence pruning by the old committee</h3><p>A key with no included votes in the 4 epochs (24 h) before a handoff is left out of the next configuration, but only when keys holding more than two thirds of the current one were present: a stall is not absence. It returns with a KES-signed rejoin message, under the growth cap.</p></article>
 <article class="poci-card corruption"><span class="micro orange">05</span><h3>Proof of Corruption</h3><p>A double or surround vote by one key under one configuration is evidence. The key is excluded for 100 epochs, about 25 days. Absence, slowness or a vote for a losing branch are never punished.</p></article>
 <article class="poci-card"><span class="micro lime">06</span><h3>Finality certificate</h3><p>The proof of integrity: configuration, link and signatures worth more than two thirds of it, checked against the registry. Nodes keep one for every finalized checkpoint.</p></article>
 </div>
-<p class="foundation-note">Without a quorum, blocks keep coming and finality halts until more than two thirds of the configuration vote again; recovery is a coordinated, explicit act, never automatic. Without stake, exclusion and the lost share rewards are the whole penalty: PoCI makes corruption detectable and attributable. PoCI is a design, not yet in the node; it replaces the half leak for finality when it activates. <a href="https://github.com/gnb-smh/ObenBlock/blob/main/docs/DESIGN-obenblock-poci.md" target="_blank" rel="noopener noreferrer">Read the PoCI design</a>.</p>
+<p class="foundation-note">Without a quorum, blocks keep coming and finality halts until more than two thirds of the configuration vote again; recovery is a coordinated, explicit act, never automatic. Without stake, exclusion and the lost share rewards are the whole penalty: PoCI makes corruption detectable and attributable. PoCI is in force from height 3,600, after a launch buried under one epoch of proof of work. <a href="https://github.com/gnb-smh/ObenBlock/blob/main/docs/DESIGN-obenblock-poci.md" target="_blank" rel="noopener noreferrer">Read the PoCI design</a>.</p>
 </div>
 </div>
 </div></section>
@@ -167,13 +166,35 @@
 </div>
 <div class="section-source"><span>Both directions are documented in the repository.</span><a href="https://github.com/gnb-smh/ObenBlock/blob/main/docs/OBB-ANCHOR.md" target="_blank" rel="noopener noreferrer">Read the anchor formats ↗</a></div>
 </section>
+<section class="section wrap" id="sidechain" aria-labelledby="sidechain-title">
+<div class="section-heading"><div><p class="eyebrow">UNDER STUDY / BLOCH SIDECHAIN</p><h2 id="sidechain-title">A sidechain of Bloch.<br>Being <span class="grad">studied.</span></h2></div><p>ObenBlock is being studied as a sidechain of Bloch: a DEX, a bridge, the Bloch L2 and new features built across the two chains. <span class="status spec">Under study</span> Nothing below is in the ObenBlock code base, and it is not decided whether any of it will launch.</p></div>
+<div class="suite-grid">
+<article class="suite-card" aria-labelledby="side-dex"><div class="card-top"><span>DEX</span><b>UNDER STUDY</b></div><div class="suite-body">
+<h3 id="side-dex">Trading OBB on Bloch</h3>
+<p>A market for OBB on Bloch's L2, with caps fixed in code and settlement gated on finality, following the model being developed for GnB-SMH on Bloch.</p>
+</div></article>
+<article class="suite-card conservative" aria-labelledby="side-bridge"><div class="card-top"><span>BRIDGE</span><b>UNDER STUDY</b></div><div class="suite-body">
+<h3 id="side-bridge">OBB between the two chains</h3>
+<p>A vault on ObenBlock and a wrapped token on Bloch, released only against finalized checkpoints. Which signers or proofs would secure it is part of the study.</p>
+</div></article>
+<article class="suite-card" aria-labelledby="side-l2"><div class="card-top"><span>L2</span><b>UNDER STUDY</b></div><div class="suite-body">
+<h3 id="side-l2">Bloch's L2 as the execution layer</h3>
+<p>Applications for OBB holders on Bloch's L2, with ObenBlock as the proof-of-work settlement and anchoring chain beside it.</p>
+</div></article>
+<article class="suite-card conservative" aria-labelledby="side-new"><div class="card-top"><span>NEW FEATURES</span><b>UNDER STUDY</b></div><div class="suite-body">
+<h3 id="side-new">Built across both chains</h3>
+<p>Features that use both chains' finality, such as the mutual anchoring already in the code base, extended to applications.</p>
+</div></article>
+</div>
+<p class="crypto-note"><strong>What this means.</strong> A direction under study, not a roadmap commitment. Any part that moves forward would first be written as an ObenBlock Improvement Proposal, with its security model stated, before any code or launch.</p>
+</section>
 <section class="foundation section" id="technology" aria-labelledby="tech-title"><div class="wrap foundation-grid">
 <div class="foundation-intro"><p class="eyebrow">04 / THE TECHNICAL FOUNDATION</p><h2 id="tech-title">Open on the outside.<br>Rigorous on the <span class="grad">inside.</span></h2><p>The GnB code base brings a BlockDAG, adaptive difficulty and hybrid post-quantum signatures. ObenBlock carries this architecture over to SHA-256d work, with every hardening rule in force from the genesis block.</p><div class="signature-suites"><div class="signature"><span class="suite-label">DEFAULT</span><span>ML-DSA-65</span><b>+</b><span>FALCON-1024</span></div><div class="signature"><span class="suite-label">OPTIONAL</span><span>SLH-DSA-128s</span><b>+</b><span>FALCON-1024</span></div></div><p class="foundation-note">Post-quantum protection belongs to the signature layer: both halves of every signature must verify. Mining uses SHA-256d. <a href="#cryptography">Full cryptographic specification</a>.</p></div>
 <div><table class="spec-table"><caption>OBENBLOCK / DESIGN PARAMETERS</caption><tbody>
 <tr><th scope="row">Consensus structure</th><td>GhostDAG<small>BlockDAG · k = 10</small></td></tr>
 <tr><th scope="row">Proof of work</th><td>SHA-256d<small>80-byte header · Bitcoin's chain work · pow limit 0x1d00ffff · no merged mining</small></td></tr>
 <tr><th scope="row">Difficulty</th><td>ASERT · 2 h half-life<small>30 s target; after 3 minutes without a block the target doubles every 30 minutes</small></td></tr>
-<tr><th scope="row">Finality</th><td>PoWit + KES keys<small>Share-work weight, no stake, sticky finality; PoCI strict finality by a later hard fork</small></td></tr>
+<tr><th scope="row">Finality</th><td>PoWit + KES keys<small>Share-work weight, no stake, sticky finality; PoCI strict finality from the genesis</small></td></tr>
 <tr><th scope="row">Work window</th><td>28 days · 112 epochs<small>Epochs of 720 blocks, 6-hour target</small></td></tr>
 <tr><th scope="row">Identity</th><td>OBB · obb1… addresses<small>gnb1… and bloch1… addresses are read as the same script</small></td></tr>
 <tr><th scope="row">Networks</th><td>Mainnet + regtest<small>No public testnet</small></td></tr>
@@ -279,8 +300,8 @@ cd ObenBlock</pre></div>
 <section class="faq wrap" id="about" aria-labelledby="faq-title"><div class="faq-heading"><p class="eyebrow">10 / THE NEW CHAPTER</p><h2 id="faq-title">The evolution,<br>made <span class="grad">clear.</span></h2><p>What changes with ObenBlock, and what carries over from GnB.</p></div><div class="faq-list">
 <details open><summary>Is ObenBlock live yet?</summary><p data-launch="FAQ_LIVE">Not yet. The mainnet launch is being prepared. The launch time, the genesis block hash, the seed nodes, the stratum endpoint and the release binaries are published at launch, in the <a href="#launch">launch status</a> above and in the <a href="https://github.com/gnb-smh/ObenBlock" target="_blank" rel="noopener noreferrer">repository</a>. Until then there is no ObenBlock network to connect to.</p></details>
 <details><summary>Is ObenBlock GnB's new name?</summary><p>The GnB repository was renamed ObenBlock and keeps its history. ObenBlock itself is a new chain: a clean genesis, the OBB ticker and SHA-256d mining. The relaunch does not change the GnB chain.</p></details>
-<details><summary>What is PoCI, and when does it start?</summary><p>PoCI (Proof of Corruption or Integrity) is a strict finality profile for ObenBlock: a frozen configuration per epoch, a quorum of strictly more than two thirds, a handoff between configurations, absence pruning authorized by the old committee, a 100-epoch exclusion on proven equivocation and a finality certificate. It is specified but not yet in the node. Mainnet launches with the current PoWit rules, and PoCI activates later by a hard fork, which node operators must upgrade to.</p></details>
-<details><summary>Can rented hashrate take over finality?</summary><p>Weight comes from share work in finalized history over a 28-day window, so a burst of hashrate does not buy instant weight, and checkpoints already final stay final. The specified growth cap goes further: whatever the rented hashrate, reaching two thirds of the weight takes at least 71 epochs, about 18 days, visible the whole time. The cap has a reference model and vectors; the node does not enforce it yet.</p></details>
+<details><summary>What is PoCI, and when does it start?</summary><p>PoCI (Proof of Corruption or Integrity) is a strict finality profile for ObenBlock: a frozen configuration per epoch, a quorum of strictly more than two thirds, a handoff between configurations, absence pruning authorized by the old committee, a 100-epoch exclusion on proven equivocation and a finality certificate. It is in the node from the genesis. The first 3,600 blocks (4 epochs plus one epoch of burial) are proof of work only; strict finality starts there.</p></details>
+<details><summary>Can rented hashrate take over finality?</summary><p>Weight comes from share work in finalized history over a 28-day window, so a burst of hashrate does not buy instant weight, and checkpoints already final stay final. The growth cap in the node goes further: whatever the rented hashrate, reaching two thirds of the weight takes at least 71 epochs, about 18 days, visible the whole time.</p></details>
 <details><summary>Are my GnB and Bloch keys still valid?</summary><p>Yes. A GnB keystore (v2 or v3) or the Bloch keystore you use today opens unchanged, and <code>gnb1…</code> and <code>bloch1…</code> addresses are read as the same script and shown as <code>obb1…</code>. The same key controls its coins on both chains; the chain id keeps the signatures apart. The carry-over is paid to the same key hashes as in GnB's genesis; balances from GnB's later history are not carried.</p></details>
 <details><summary>Can I mine ObenBlock with a Bitcoin ASIC?</summary><p>The block header is Bitcoin's 80-byte layout, so SHA-256d ASICs do the work, with the 32-bit nonce, version rolling and a rollable time. The node serves pools through <code>getblocktemplate</code> and <code>submitblock</code>; the stratum endpoint for ASICs is published at launch. There is no merged mining.</p></details>
 <details><summary>Do Bloch anchors decide which chain is final?</summary><p>No. An anchor is evidence, not a vote: a record carries no proof that the witness set finalized it, and anyone with a Bloch account can publish one. By the specification, a node that sees an anchor contradict its own finality raises an alert and the operator decides. Anchors that carry a verified finality certificate are a proposal (OBIP-3).</p></details>
