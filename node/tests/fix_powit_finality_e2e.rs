@@ -103,7 +103,7 @@ fn build(n: &Node, parent: BlockHash, tag: &str, shares: Vec<WitnessShare>, atts
         blue_score: height,
         height,
         shielded_transactions: Vec::new(),
-        powit: PowitBody { shares, attestations: atts, evidence: Vec::new() },
+        powit: PowitBody { shares, attestations: atts, evidence: Vec::new(), exits: Vec::new() },
     };
     commit_block(&mut b);
     b.test_only_assume_pow_valid();
