@@ -228,9 +228,16 @@ but invalid one stops the server at startup.
 - **`mining.submit [user, job_id, extranonce2, ntime, nonce, version_bits?]`**:
   - checked against the job: `extranonce2` of 4 bytes, the time window,
     duplicates, the share target, the block target;
-  - the version bits apply inside the granted mask.
+  - the version bits apply inside the granted mask;
+  - duplicates are keyed on the share's header id, so the same work under
+    another job id or hex spelling is still error 22; only shares that met
+    the share or block target are remembered;
+  - after 256 refused submits in a row (stale shares excepted) the
+    connection is closed.
 - **Also handled**: `mining.extranonce.subscribe` and
-  `mining.suggest_difficulty`.
+  `mining.suggest_difficulty`. Difficulty hints (`suggest_difficulty`,
+  `d=`, `minimum-difficulty`) apply only until the first credited share;
+  after that vardiff owns the difficulty.
 - **Error codes**:
   - 20 other
   - 21 stale or unknown job, or ntime out of the job's window

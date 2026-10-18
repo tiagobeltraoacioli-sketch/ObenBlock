@@ -53,8 +53,15 @@ pub const MAX_FUTURE_SECS: u64 = 570;
 
 /// Jobs kept per connection.
 const JOB_CACHE: usize = 16;
-/// Submitted shares remembered for duplicate detection.
-const SEEN_CAP: usize = 65_536;
+/// Credited shares remembered for duplicate detection (32-byte header ids;
+/// only shares that met the share or block target are remembered, so
+/// filling it takes real proof of work).
+const SEEN_CAP: usize = 16_384;
+/// Consecutive refused submits (low difficulty, malformed, duplicate,
+/// out-of-window) after which the connection is closed. A healthy miner
+/// sends few of them in a row; a flood of shares without proof of work
+/// never gets far.
+pub const MAX_CONSECUTIVE_BAD_SUBMITS: u32 = 256;
 
 /// A share that met the block target: the block to submit.
 #[derive(Clone, Debug)]
@@ -78,7 +85,10 @@ pub struct Reaction {
     pub close: bool,
 }
 
-type SeenKey = (String, [u8; EXTRANONCE2_LEN], u32, u32, u32);
+/// Duplicate key: the share's header id. Two submits are the same work
+/// exactly when they hash the same 80-byte header, whatever job id, hex
+/// spelling or session-local field they arrived with.
+type SeenKey = [u8; 32];
 
 pub struct Session {
     pub id: WorkerId,
@@ -96,6 +106,10 @@ pub struct Session {
     seen: HashSet<SeenKey>,
     seen_order: VecDeque<SeenKey>,
     work_sent: bool,
+    /// A share was credited: difficulty hints from the client are ignored
+    /// from now on (vardiff owns the difficulty).
+    credited_any: bool,
+    bad_streak: u32,
 }
 
 impl Session {
@@ -106,7 +120,7 @@ impl Session {
         Self {
             id, en1, cfg, metrics, ledger, subscribed: false, account: None, worker_name: String::new(),
             version_mask: None, vardiff, jobs: JobStore::new(JOB_CACHE),
-            seen: HashSet::new(), seen_order: VecDeque::new(), work_sent: false,
+            seen: HashSet::new(), seen_order: VecDeque::new(), work_sent: false, credited_any: false, bad_streak: 0,
         }
     }
 
@@ -141,10 +155,10 @@ impl Session {
 
     /// Lines for a newly published job.
     pub fn on_job(&mut self, p: &Published) -> Vec<String> {
-        if p.clean_jobs {
-            self.seen.clear();
-            self.seen_order.clear();
-        }
+        // The duplicate set is keyed on header ids and bounded; it is not
+        // cleared on clean jobs, so a share on an older job of the same
+        // parents (kept by the JobStore, or back after a tip A -> B -> A)
+        // cannot be credited twice.
         self.jobs.insert(p.job.clone(), p.clean_jobs);
         if !self.ready() {
             return Vec::new();
@@ -213,7 +227,7 @@ impl Session {
             methods::SUGGEST_DIFFICULTY => {
                 let d = req.params.first().and_then(Value::as_f64).unwrap_or(0.0);
                 let mut send = vec![result_line(&req.id, json!(true))];
-                if self.vardiff.suggest(d) && self.ready() {
+                if self.suggest(d) && self.ready() {
                     send.push(self.set_difficulty_line());
                     if let Some(job) = self.jobs.latest().cloned() {
                         send.push(self.notify_line(&job, false));
@@ -246,7 +260,7 @@ impl Session {
                 }
                 "minimum-difficulty" => {
                     let v = opts.get("minimum-difficulty.value").and_then(Value::as_f64).unwrap_or(0.0);
-                    let _ = self.vardiff.suggest(v);
+                    let _ = self.suggest(v);
                     result.insert("minimum-difficulty".into(), json!(true));
                 }
                 other => {
@@ -273,7 +287,7 @@ impl Session {
         if let Some(pass) = req.params.get(1).and_then(Value::as_str) {
             for part in pass.split([',', ';', ' ']) {
                 if let Some(d) = part.trim().strip_prefix("d=").and_then(|v| v.parse::<f64>().ok()) {
-                    let _ = self.vardiff.suggest(d);
+                    let _ = self.suggest(d);
                 }
             }
         }
@@ -291,7 +305,21 @@ impl Session {
         Reaction { send, ..Default::default() }
     }
 
-    fn reject(&self, id: &Value, outcome: ShareOutcome, message: &str) -> Reaction {
+    /// A client difficulty hint (`mining.suggest_difficulty`, `d=`,
+    /// `minimum-difficulty`): honoured only until the first credited share,
+    /// so a client cannot pin itself back to the floor once vardiff runs.
+    fn suggest(&mut self, d: f64) -> bool {
+        if self.credited_any {
+            return false;
+        }
+        self.vardiff.suggest(d)
+    }
+
+    fn reject(&mut self, id: &Value, outcome: ShareOutcome, message: &str) -> Reaction {
+        let counts = !matches!(outcome, ShareOutcome::Stale);
+        if counts {
+            self.bad_streak = self.bad_streak.saturating_add(1);
+        }
         let code = match &outcome {
             ShareOutcome::Stale => error_codes::JOB_NOT_FOUND_OR_STALE,
             ShareOutcome::Duplicate => error_codes::DUPLICATE_SHARE,
@@ -303,7 +331,11 @@ impl Session {
         if let Some(a) = &self.account {
             self.ledger.record(a.clone(), "", None, &outcome);
         }
-        Reaction { send: vec![error_line(id, code, message)], ..Default::default() }
+        let close = self.bad_streak >= MAX_CONSECUTIVE_BAD_SUBMITS;
+        if close {
+            log::warn!("{}: closing after {} consecutive refused submits", self.id, self.bad_streak);
+        }
+        Reaction { send: vec![error_line(id, code, message)], close, ..Default::default() }
     }
 
     fn submit(&mut self, req: &Request, now_unix: u64) -> Reaction {
@@ -338,16 +370,9 @@ impl Session {
             Ok(h) => h,
             Err(e) => return self.reject(&req.id, ShareOutcome::Rejected { code: error_codes::OTHER, message: e.clone() }, &e),
         };
-        let key: SeenKey = (job.job_id.clone(), en2, s.ntime, s.nonce, share.version);
+        let key: SeenKey = share.id;
         if self.seen.contains(&key) {
             return self.reject(&req.id, ShareOutcome::Duplicate, "duplicate share");
-        }
-        self.seen.insert(key.clone());
-        self.seen_order.push_back(key);
-        while self.seen_order.len() > SEEN_CAP {
-            if let Some(old) = self.seen_order.pop_front() {
-                self.seen.remove(&old);
-            }
         }
 
         let now = Instant::now();
@@ -365,6 +390,18 @@ impl Session {
             }
             return r;
         }
+
+        // Only now, with the proof checked, is the share remembered: a
+        // share without proof of work costs no memory.
+        self.seen.insert(key);
+        self.seen_order.push_back(key);
+        while self.seen_order.len() > SEEN_CAP {
+            if let Some(old) = self.seen_order.pop_front() {
+                self.seen.remove(&old);
+            }
+        }
+        self.bad_streak = 0;
+        self.credited_any = true;
 
         let mut send = vec![result_line(&req.id, json!(true))];
         let mut block = None;
@@ -760,6 +797,100 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("\"j2\"")));
         let r = s.handle_line(&submit_line(1, "j1", [0; 4], p.job.time, 0), None, p.job.time as u64);
         assert_eq!(v(&r.send[0])["error"][0], json!(21));
+    }
+
+    /// A share that misses the share target (no proof of work) for every
+    /// submit: random-looking en2/nonce pairs on the current job.
+    fn misses(s: &Session, job: &ObbJob, count: usize) -> Vec<([u8; 4], u32)> {
+        let mut out = Vec::new();
+        let hard = difficulty_to_target(1e6);
+        for i in 0..u32::MAX {
+            let en2 = (0x1000_0000u32 + i).to_be_bytes();
+            let root = job.merkle_root_for(&s.en1, &en2);
+            let id = block_id(&header80(job.version, &job.parents_commitment, &root, job.time, job.bits, i));
+            if !meets_target(&id, &job.target) && !meets_target(&id, &hard) {
+                out.push((en2, i));
+                if out.len() == count {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn shares_without_proof_of_work_are_not_remembered() {
+        let (mut s, _, _, p) = ready_session(true);
+        let job = p.job.clone();
+        let hard = Arc::new(StratumConfig { vardiff_initial: 1e6, vardiff_min: 1e6, ..(*cfg()).clone() });
+        s.vardiff = Vardiff::from_cfg(&hard);
+        for (k, (en2, nonce)) in misses(&s, &job, 200).into_iter().enumerate() {
+            let r = s.handle_line(&submit_line(100 + k as u64, &job.job_id, en2, job.time, nonce), None, job.time as u64);
+            assert_eq!(v(&r.send[0])["error"][0], json!(23));
+        }
+        assert!(s.seen.is_empty() && s.seen_order.is_empty(), "low-difficulty shares cost no duplicate-set memory");
+    }
+
+    #[test]
+    fn a_flood_of_refused_submits_closes_the_connection() {
+        let (mut s, _, _, p) = ready_session(true);
+        let job = p.job.clone();
+        let hard = Arc::new(StratumConfig { vardiff_initial: 1e6, vardiff_min: 1e6, ..(*cfg()).clone() });
+        s.vardiff = Vardiff::from_cfg(&hard);
+        let all = misses(&s, &job, MAX_CONSECUTIVE_BAD_SUBMITS as usize);
+        for (k, (en2, nonce)) in all.iter().enumerate() {
+            let r = s.handle_line(&submit_line(k as u64, &job.job_id, *en2, job.time, *nonce), None, job.time as u64);
+            assert_eq!(r.close, k + 1 == all.len(), "closed exactly at the cap ({k})");
+        }
+        // Stale shares (a tip change) do not count toward the cap.
+        let (mut s, _, _, p) = ready_session(true);
+        for k in 0..(MAX_CONSECUTIVE_BAD_SUBMITS + 10) as u64 {
+            let r = s.handle_line(&submit_line(k, "gone", [0, 0, 0, 9], p.job.time, 0), None, p.job.time as u64);
+            assert!(!r.close);
+        }
+    }
+
+    #[test]
+    fn the_same_header_under_another_job_id_is_a_duplicate() {
+        let (mut s, m, _, p) = ready_session(true);
+        let job = p.job.clone();
+        // A refresh on an unchanged tip and mempool: the same work under a
+        // new job id (not clean).
+        let mut again = (*job).clone();
+        again.job_id = "j1-refresh".into();
+        s.on_job(&Published { job: Arc::new(again), clean_jobs: false });
+        let (nonce, _) = mine(&s, &job, [0, 0, 0, 7], &difficulty_to_target(s.difficulty()));
+        let r = s.handle_line(&submit_line(1, &job.job_id, [0, 0, 0, 7], job.time, nonce), None, job.time as u64);
+        assert_eq!(v(&r.send[0])["result"], json!(true), "{:?}", r.send);
+        let r = s.handle_line(&submit_line(2, "j1-refresh", [0, 0, 0, 7], job.time, nonce), None, job.time as u64);
+        assert_eq!(v(&r.send[0])["error"][0], json!(22), "credited once");
+        // A clean job on the same parents keeps the older job, and the
+        // duplicate set survives it.
+        let mut clean = (*job).clone();
+        clean.job_id = "j1-clean".into();
+        s.on_job(&Published { job: Arc::new(clean), clean_jobs: true });
+        let r = s.handle_line(&submit_line(3, &job.job_id, [0, 0, 0, 7], job.time, nonce), None, job.time as u64);
+        assert_eq!(v(&r.send[0])["error"][0], json!(22));
+        assert_eq!(m.snapshot().shares_duplicate, 2);
+    }
+
+    #[test]
+    fn difficulty_hints_are_ignored_once_a_share_is_credited() {
+        let (mut s, _, _) = session_with(Arc::new(StratumConfig { vardiff_min: 1e-12, ..(*cfg()).clone() }));
+        let p = published(true);
+        s.handle_line(r#"{"id":1,"method":"mining.subscribe","params":[]}"#, Some(&p), 0);
+        s.handle_line(r#"{"id":2,"method":"mining.suggest_difficulty","params":[0.000001]}"#, Some(&p), 0);
+        assert_eq!(s.difficulty(), 0.000001, "honoured before work");
+        s.handle_line(&format!(r#"{{"id":3,"method":"mining.authorize","params":["{MAIN_ADDR}","x"]}}"#), Some(&p), 0);
+        let job = p.job.clone();
+        let (nonce, _) = mine(&s, &job, [0, 0, 0, 8], &difficulty_to_target(s.difficulty()));
+        let r = s.handle_line(&submit_line(4, &job.job_id, [0, 0, 0, 8], job.time, nonce), None, job.time as u64);
+        assert_eq!(v(&r.send[0])["result"], json!(true), "{:?}", r.send);
+        let before = s.difficulty();
+        let r = s.handle_line(r#"{"id":5,"method":"mining.suggest_difficulty","params":[1e-12]}"#, None, 0);
+        assert_eq!(v(&r.send[0])["result"], json!(true));
+        assert_eq!(r.send.len(), 1, "no set_difficulty");
+        assert_eq!(s.difficulty(), before, "a hint after work started does not reset vardiff");
     }
 
     #[test]
