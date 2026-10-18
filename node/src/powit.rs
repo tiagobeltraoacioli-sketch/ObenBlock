@@ -2479,6 +2479,9 @@ pub fn finality_info_json(dag: &GhostDAG, max: usize) -> serde_json::Value {
         "recorded_checkpoints": idx.candidates(),
         "recorded_sources": idx.sources(),
         "minimum_chain_work": crate::ingress::minimum_chain_work().to_string(),
+        // The advisory Bloch anchor (`--bloch-rpc`, DESIGN-obenblock §8): its
+        // conflict alert never changes the pin; the operator decides.
+        "bloch_anchor": crate::anchoring::status_json(),
     })
 }
 
@@ -2486,6 +2489,48 @@ pub fn finality_info_json(dag: &GhostDAG, max: usize) -> serde_json::Value {
 mod tests {
     use super::*;
     use gnb_crypto::core::kes::{KesPublic, KesSignature};
+
+    /// Review (witness exits on reload with O9's per-epoch store): a state
+    /// with witness exits, stored as an anchor record and as a diff of its
+    /// parent in the same epoch, keeps its exits after the database is
+    /// closed and reopened (a node restart). A state without exits writes no
+    /// exits row (GnB layout unchanged), and a child whose exits were pruned
+    /// reloads without them.
+    #[test]
+    fn witness_exits_survive_a_restart() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("db");
+        let (k1, k2, k3) = ([0x11u8; 20], [0x22u8; 20], [0x33u8; 20]);
+        let (parent, child, grandchild) = ([0xA1u8; 32], [0xA2u8; 32], [0xA3u8; 32]);
+        let mut st = PowitState::genesis(0, [0xA0; 32]);
+        st.epoch = 3;
+        st.epoch_work.insert(3, BTreeMap::from([(k1, 100u128), (k2, 50u128), (k3, 7u128)]));
+        st.exited.insert(k1, 4);
+        let mut st2 = st.clone();
+        st2.exited.insert(k2, 4);
+        let mut st3 = st2.clone();
+        st3.exited.clear();
+        {
+            let store = Storage::open(&path).unwrap();
+            save_state(&store, &parent, &st).unwrap();
+            let mut batch = rocksdb::WriteBatch::default();
+            stage_state(&store, &mut batch, &child, Some(&parent), &st2).unwrap();
+            stage_state(&store, &mut batch, &grandchild, Some(&child), &st3).unwrap();
+            store.write_batch(batch).unwrap();
+            assert_eq!(state_record_is_anchor(&store, &child), Some(false), "the child is a diff of its parent");
+            assert_eq!(store.get_meta(&exited_key(&grandchild)).unwrap(), None, "no exits, no row");
+        }
+        let store = Storage::open(&path).unwrap();
+        let back = load_state(&store, &parent).expect("parent state");
+        assert_eq!(back.exited, st.exited);
+        assert!(back.has_exited(&k1, 4) && !back.has_exited(&k1, 3));
+        let back2 = load_state(&store, &child).expect("child state");
+        assert_eq!(back2.exited, st2.exited);
+        assert!(back2.has_exited(&k2, 4));
+        assert_eq!(back2.epoch_work, st2.epoch_work);
+        let back3 = load_state(&store, &grandchild).expect("grandchild state");
+        assert!(back3.exited.is_empty());
+    }
 
     /// A link by witness `w` (unsigned: these tests exercise the pool's
     /// bounded structures, which hold items only after verification).

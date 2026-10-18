@@ -1,14 +1,16 @@
-//! The Bloch weak-subjectivity anchor (`--bloch-rpc`, docs/OBB-ANCHOR.md)
-//! through the REAL acceptance pipeline: `accept::set_finality_checkpoint`
-//! moves the applied chain onto the anchored one, and `anchoring::enforce`
-//! refuses a chain that passed the anchored slot with another block, then
-//! pins the anchored block once it arrives.
+//! The Bloch anchor (`--bloch-rpc`, docs/OBB-ANCHOR.md) is ADVISORY ONLY
+//! (docs/DESIGN-obenblock.md §8: "an anchor never sets a checkpoint by
+//! itself"). Through the REAL acceptance pipeline: a hostile registry answer
+//! (an anchor naming the lighter chain, or a block the node does not have)
+//! raises the conflict alert and changes nothing in fork choice: same applied
+//! and selected tip, same pin, same finality anchor setting, no block marked
+//! invalid, nothing persisted. An agreeing anchor is reported, not applied.
+//! One test function: the anchor status is process-wide.
 
 mod fix_common;
 use fix_common::*;
 
-use gnb::accept;
-use gnb::anchoring::{self, ChainOps, Verdict};
+use gnb::anchoring::{self, Verdict};
 use gnb::consensus::BlockHash;
 use gnb::core::Block;
 use gnb::obb_anchor::AnchorRecord;
@@ -25,23 +27,6 @@ fn chain_of(n: &Node, from: BlockHash, len: usize, tag: &str) -> Vec<Block> {
     out
 }
 
-fn pin(n: &Node, h: BlockHash) -> Result<accept::ChainOverride, accept::OverrideError> {
-    accept::set_finality_checkpoint(h, &n.dag, &n.store, &n.mempool, &n.node_state, Some(&n.tip_tx), &n.shielded)
-}
-
-struct Ops<'a>(&'a Node);
-
-impl ChainOps for Ops<'_> {
-    fn pin(&self, h: [u8; 32]) -> Result<(), String> {
-        pin(self.0, h).map(|_| ()).map_err(|e| e.to_string())
-    }
-    fn refuse(&self, h: [u8; 32]) -> Result<(), String> {
-        let n = self.0;
-        accept::invalidate_block(h, &n.dag, &n.store, &n.mempool, &n.node_state, Some(&n.tip_tx), &n.shielded)
-            .map(|_| ()).map_err(|e| e.to_string())
-    }
-}
-
 fn record(slot: u64, block: BlockHash) -> AnchorRecord {
     AnchorRecord {
         chain_id: gnb::core::node_chain_id().to_u32(),
@@ -52,60 +37,65 @@ fn record(slot: u64, block: BlockHash) -> AnchorRecord {
     }
 }
 
-/// A pin to a block of the lighter chain moves the applied chain onto it at
-/// once; a later pin that leaves it is refused.
-#[test]
-fn set_finality_checkpoint_moves_the_applied_chain() {
-    let genesis = mk_genesis(unix_now() - 50_000);
-    let gh = genesis.block_hash();
-    let n = node_with(&genesis, &[]);
-    let a = chain_of(&n, gh, 6, "pa");
-    let b = chain_of(&n, gh, 4, "pb");
-    let a_tip = a.last().unwrap().block_hash();
-    let b_tip = b.last().unwrap().block_hash();
-    assert_eq!(applied_tip(&n), Some(a_tip), "A is heavier");
-
-    assert!(pin(&n, [0x99; 32]).unwrap_err().to_string().contains("not found"));
-    let r = pin(&n, b[1].block_hash()).expect("pin");
-    assert_eq!(r.tip, b_tip);
-    assert_eq!(applied_tip(&n), Some(b_tip));
-    assert_eq!(sel_tip(&n), Some(b_tip));
-    assert_eq!(n.dag.read().finalized().map(|f| f.0), Some(b[1].block_hash()));
-
-    // A block of A that is higher than the pin does not descend from it.
-    let e = pin(&n, a[3].block_hash()).unwrap_err().to_string();
-    assert!(e.contains("does not descend"), "{e}");
-    assert_eq!(applied_tip(&n), Some(b_tip));
-    // A new block on A is never selected.
-    let a7 = empty_child(&n, a_tip, "pa7");
-    let _ = accept(&n, &a7);
-    assert_eq!(applied_tip(&n), Some(b_tip));
+/// Everything fork choice reads, as one comparable value.
+fn fork_choice(n: &Node, blocks: &[&[Block]]) -> String {
+    let dag = n.dag.read();
+    let invalid: Vec<bool> = blocks.iter().flat_map(|c| c.iter()).map(|b| dag.is_invalid(&b.block_hash())).collect();
+    let fin = gnb::powit::finality_info_json(&dag, 8);
+    format!("{:?} {:?} {:?} {} {} {:?}", applied_tip(n), dag.selected_tip(), dag.finalized(), fin["anchor"],
+            fin["anchor_source"], invalid)
 }
 
-/// The anchor's block is unknown and the node's chain passed its slot with
-/// another block: that chain is refused, and the anchored chain is pinned
-/// once it arrives.
 #[test]
-fn an_unknown_anchor_refuses_the_chain_then_pins_the_anchored_one() {
+fn a_hostile_bloch_anchor_changes_nothing_in_fork_choice() {
     let genesis = mk_genesis(unix_now() - 50_000);
     let gh = genesis.block_hash();
     let n = node_with(&genesis, &[]);
-    let a = chain_of(&n, gh, 6, "ua");
-    // Build B on a scratch node (so the node under test does not know it).
+    let a = chain_of(&n, gh, 6, "ha");
+    let b = chain_of(&n, gh, 4, "hb");
+    // A block only a scratch node knows.
     let scratch = node_with(&genesis, &[]);
-    let b = chain_of(&scratch, gh, 4, "ub");
-    // Slot 3 names the chain block below height 3: b[1] (height 2).
-    let anchor = record(3, b[1].block_hash());
-    let ops = Ops(&n);
+    let c = chain_of(&scratch, gh, 4, "hc");
+    let a_tip = a.last().unwrap().block_hash();
+    assert_eq!(applied_tip(&n), Some(a_tip), "A is heavier");
+    let before = fork_choice(&n, &[&a, &b]);
+    anchoring::restore("hostile-mock".into());
 
-    assert_eq!(anchoring::enforce(&n.dag, &ops, &anchor), Verdict::Pending);
-    assert_eq!(applied_tip(&n), Some(a[1].block_hash()), "rolled back below the slot");
-    assert!(n.dag.read().is_invalid(&a[2].block_hash()));
+    // Slot 3 names the selected-chain block below height 3 (height 2).
+    // 1. The lighter chain's block: a contradiction of the selected chain.
+    let hostile = record(3, b[1].block_hash());
+    assert!(matches!(anchoring::check(&n.dag.read(), &hostile), Verdict::Conflict(_)));
+    anchoring::take_answer(Ok(Some(hostile)), "hostile-mock", &n.dag);
+    assert_eq!(fork_choice(&n, &[&a, &b]), before, "a conflicting anchor moved fork choice");
+    let s = anchoring::status_json();
+    assert_eq!((s["status"].as_str(), s["alert"].as_bool(), s["advisory"].as_bool()),
+               (Some("conflict"), Some(true), Some(true)), "{s}");
+    let info = gnb::powit::finality_info_json(&n.dag.read(), 8);
+    assert_eq!(info["bloch_anchor"]["alert"], true, "getfinalityinfo carries the alert");
+    // A new block on A is still selected.
+    let a7 = empty_child(&n, a_tip, "ha7");
+    accept(&n, &a7).expect("A extends");
+    assert_eq!(applied_tip(&n), Some(a7.block_hash()));
+    let before = fork_choice(&n, &[&a, &b]);
 
-    for blk in &b {
-        accept(&n, blk).expect("B accepted");
-    }
-    assert_eq!(anchoring::enforce(&n.dag, &ops, &anchor), Verdict::Pinned);
-    assert_eq!(applied_tip(&n), Some(b.last().unwrap().block_hash()));
-    assert_eq!(anchoring::enforce(&n.dag, &ops, &anchor), Verdict::Pinned, "idempotent");
+    // 2. A newer anchor naming a block the node does not have: the alert,
+    //    no refusal of the chain that passed the slot.
+    let unknown = record(4, c[2].block_hash());
+    assert!(matches!(anchoring::check(&n.dag.read(), &unknown), Verdict::Unknown(_)));
+    anchoring::take_answer(Ok(Some(unknown)), "hostile-mock", &n.dag);
+    assert_eq!(fork_choice(&n, &[&a, &b]), before, "an unknown anchor moved fork choice");
+    let s = anchoring::status_json();
+    assert_eq!((s["status"].as_str(), s["alert"].as_bool()), (Some("unknown"), Some(true)), "{s}");
+
+    // 3. Nothing about an anchor is persisted (no stored key fork choice or a
+    //    restart could read).
+    assert_eq!(n.store.get_meta("bloch_anchor/latest").unwrap(), None);
+
+    // 4. An agreeing anchor: reported, never applied.
+    let agrees = record(5, a[3].block_hash());
+    assert_eq!(anchoring::check(&n.dag.read(), &agrees), Verdict::Ahead);
+    anchoring::take_answer(Ok(Some(agrees)), "mock", &n.dag);
+    assert_eq!(fork_choice(&n, &[&a, &b]), before);
+    let s = anchoring::status_json();
+    assert_eq!((s["status"].as_str(), s["alert"].as_bool()), (Some("ahead"), Some(false)), "{s}");
 }

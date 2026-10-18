@@ -172,6 +172,14 @@ pub fn display_address(s: &str) -> String {
     }
 }
 
+/// The legacy single-key address of a 20-byte hash as this process shows it
+/// (`gnb1q…`/`gnb1t…` on GnB, `obb1q…`/`obb1t…` on ObenBlock). For RPC and
+/// explorer output; keystores keep the GnB string
+/// (`crypto::address_from_hash`), which their AAD binds.
+pub fn display_hash(hash: &[u8; 20], network: Network) -> String {
+    Address::from_hash(*hash, network).to_string_in(process_family())
+}
+
 const NETWORKS: [Network; 2] = [Network::Mainnet, Network::Testnet];
 
 /// Rewrite an accepted alias prefix of a legacy single-key string to the

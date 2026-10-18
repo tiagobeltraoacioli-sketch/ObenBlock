@@ -223,3 +223,44 @@ fn half_decay_matches_repeated_halving() {
     }
     assert_eq!(decayed_with(InactivityLeak::Sixteenth, 1_000, 3), decayed(1_000, 3));
 }
+
+/// Review (mainnet launch blocker): `params_for` composes the ObenBlock
+/// PoWit parameters from GnB's, never returns GnB's. Mainnet: the mainnet
+/// clock, the 112-epoch window and ban (§6.2) and the half leak (§5.2);
+/// regtest: the short test clock and window with the half leak. GnB is
+/// unchanged.
+#[test]
+fn obenblock_params_are_composed_per_the_design() {
+    let m = params_for(ChainId::ObenBlockMainnet);
+    assert_eq!(m, PowitParams {
+        epoch_len: 720,
+        checkpoint_interval: 60,
+        window_epochs: 112,
+        max_witnesses: 64,
+        max_attestations_per_block: 32,
+        max_evidence_per_block: 4,
+        vote_ttl: 720,
+        leak_after_epochs: 4,
+        ban_epochs: 112,
+        leak: InactivityLeak::Half,
+    });
+    assert_eq!(m, OBENBLOCK_MAINNET_PARAMS);
+    assert_eq!(m.window_epochs, OBB_WINDOW_EPOCHS);
+    let r = params_for(ChainId::ObenBlockRegtest);
+    assert_eq!(r, PowitParams {
+        epoch_len: 20,
+        checkpoint_interval: 5,
+        window_epochs: 3,
+        max_witnesses: 64,
+        max_attestations_per_block: 32,
+        max_evidence_per_block: 4,
+        vote_ttl: 20,
+        leak_after_epochs: 4,
+        ban_epochs: 3,
+        leak: InactivityLeak::Half,
+    });
+    assert_eq!(params_for(ChainId::Mainnet), MAINNET_PARAMS);
+    assert_eq!(params_for(ChainId::Testnet), TESTNET_PARAMS);
+    assert_eq!((MAINNET_PARAMS.window_epochs, MAINNET_PARAMS.leak), (28, InactivityLeak::Sixteenth));
+    assert_ne!(m, MAINNET_PARAMS);
+}

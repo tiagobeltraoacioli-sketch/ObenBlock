@@ -4,8 +4,10 @@ ObenBlock publishes one **anchor record** per epoch in Bloch: the first
 PoWit-finalized checkpoint of the epoch (one every 6 hours). Once Bloch has
 finalized the record, contradicting that checkpoint means attacking Bloch's
 finality as well as ObenBlock's. A node started with `--bloch-rpc` reads the
-newest record from its own Bloch node and uses it as a weak-subjectivity
-checkpoint. This is the ObenBlock-to-Bloch half of the mutual anchoring
+newest record from its own Bloch node and compares it with its own chain.
+The anchor is **advisory only**: it never sets a checkpoint by itself
+([DESIGN-obenblock.md](DESIGN-obenblock.md) §8, owner decision 2026-10-18).
+This is the ObenBlock-to-Bloch half of the mutual anchoring
 ([DESIGN-obenblock.md](DESIGN-obenblock.md) §8, phase 1). The other half,
 Bloch's checkpoints in ObenBlock transactions, is
 [BLOCH-ANCHOR.md](BLOCH-ANCHOR.md).
@@ -62,7 +64,7 @@ Decoding is exact: the length is 84, `block_id` is not all zero, and
 new registry method (`obbanchor2_*`), never a reinterpretation.
 
 Code: `crates/gnb-crypto/src/obb_anchor.rs` (format),
-`node/src/anchoring.rs` (records, reader, pin). Reference:
+`node/src/anchoring.rs` (records, reader, advisory check). Reference:
 `reference/obb_anchor.py`, vectors `reference/obb_anchor_vectors.json`
 (`--check` regenerates and compares; `crates/gnb-crypto/tests/obb_anchor_vectors.rs`
 checks the Rust code against them).
@@ -112,45 +114,56 @@ reader refuses an entry whose fields disagree with its record.
 
 ```text
 obenblock --bloch-rpc http://127.0.0.1:<bloch rpc port> [--bloch-anchor-interval 300]
+obenblock --bloch-rpc https://bloch.example/rpc
 ```
 
 The URL is the operator's **own** Bloch node, which is the trust model of
 the bridge signers ([SIDECHAIN-BLOCH.md](SIDECHAIN-BLOCH.md): each signer
-reads from its own follower). Phase 2 replaces the trusted RPC with a Bloch
-light client in the node.
+reads from its own follower). The answer is not authenticated, so the URL
+must be `https://`, or plain `http://` to a loopback host (`localhost`,
+`127.0.0.0/8`, `::1`); the node refuses to start with plain `http://` to any
+other host. Phase 2 replaces the trusted RPC with a Bloch light client in the
+node.
 
 Every `--bloch-anchor-interval` seconds, the node calls `obbanchor_latest`
 with its chain id.
 
-- **Moves forward only.** A newer slot replaces the held anchor and is
-  persisted (`bloch_anchor/latest` in the node's database), so a restart with
-  Bloch unreachable still enforces it. An older slot, or other bytes for the
-  held slot, are refused and raise `registry_alarm`.
-- **Weak-subjectivity anchor.** Call the anchor `A` at slot `s`, and the
-  node's pinned finalized checkpoint `F`:
-  - `F` at or above `s`: the node checks that its finalized chain names `A`
-    at `s`. If it does, the status is `consistent`. If it does not, the
-    status is **`conflict`**: an error is logged, nothing changes, and the
-    operator decides, as for a conflicting finalization (package A2).
-  - `A` known and `F` below `s`: if `A`'s selected chain passes through `F`,
-    fork choice is pinned to `A` (`accept::set_finality_checkpoint`, the
-    `setfinalitycheckpoint` path). The status is `pinned`, and from then on
-    no chain that misses `A` is selected; the applied chain moves at once.
-    If `A`'s chain does not pass through `F`, the status is `conflict` and
-    nothing changes. The pin re-checks this under the acceptance lock, as
-    the node's own finality may have advanced meanwhile.
-  - `A` not known yet (initial sync, or a node fed a fork): the status is
-    `pending`. If the selected chain already passed `s` with another block,
-    its first block past `s` is disqualified (`invalidateblock`; reversible
-    with `reconsiderblock`), and the node waits below `s` for `A`'s chain.
-    A pin to an unknown block would leave no selectable tip, so the node
-    never takes one.
-- Once the status is `consistent` for an anchor it stays so (the pin only
-  moves forward along the finalized chain), and later polls returning the
-  same anchor skip the check.
-- `getblochanchor` reports `source`, `anchor`, `status`
-  (`none`/`consistent`/`pinned`/`pending`/`conflict`), `detail`,
-  `last_poll`, `last_error` and `registry_alarm`.
+- **Advisory only.** A record carries no proof that W finalized it, anyone
+  with a Bloch account can publish first, and the answer is one
+  unauthenticated JSON-RPC response. So the node only **compares** the anchor
+  with its chain. It never pins fork choice to it, never disqualifies a
+  block because of it, and stores nothing about it: a hostile answer
+  changes nothing in fork choice (`node/tests/fix_bloch_anchor.rs`).
+- **Moves forward only, in memory.** A newer slot replaces the anchor held
+  this run. An older slot, or other bytes for the held slot, are refused and
+  raise `registry_alarm`. Nothing is persisted; after a restart the next
+  poll starts afresh.
+- **Comparison.** Call the anchor `A` at slot `s`, and the node's pinned
+  finalized checkpoint `F`:
+  - `F` at or above `s` and the finalized chain names `A` at `s`: status
+    `consistent`. Bloch corroborates the node's finality
+    (`corroborated_slot`, metric `gnb_bloch_anchor_corroborated_slot`).
+  - `F` below `s`, `A` known, descending from `F` and named at `s` by the
+    selected chain: status `ahead`. The anchor agrees with the chain the
+    node follows; its own finality has not reached `s` yet.
+  - Anything else is the **conflict alert**: status `conflict` (the
+    finalized or the selected chain names another block at `s`, `A` does
+    not descend from `F`, or `A`'s height cannot be named by `s`) or
+    `unknown` (`A` is not in the node's DAG). An error is logged, the metric
+    `gnb_bloch_anchor_conflict` is 1, `getblochanchor` and the
+    `bloch_anchor` field of `getfinalityinfo` report `alert: true` with a
+    `detail`, and nothing else changes. The operator investigates and
+    decides with `setfinalitycheckpoint` / `ignorefinalized`, as for a
+    conflicting finalization (package A2).
+- Once the status is `consistent` for an anchor it stays so, and later polls
+  returning the same anchor skip the check.
+- `getblochanchor` (and `getfinalityinfo.bloch_anchor`) reports `enabled`,
+  `advisory` (always `true`), `source`, `anchor`, `status`
+  (`none`/`consistent`/`ahead`/`conflict`/`unknown`), `alert`, `detail`,
+  `corroborated_slot`, `last_poll`, `last_error` and `registry_alarm`.
+- Automatic use would need a finality certificate in the record (at least
+  2/3 of W signing, or a succinct proof of it) checked against the W of the
+  candidate chain. It is not planned now.
 
 ## Building and publishing records
 

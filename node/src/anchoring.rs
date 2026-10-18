@@ -10,15 +10,19 @@
 //! - [`AnchorReader`]: where the node reads the anchors Bloch has finalized
 //!   (`--bloch-rpc`): [`BlochRpcReader`] speaks the registry's JSON-RPC
 //!   interface; tests use [`MockReader`].
-//! - [`decide`] / [`enforce`]: the newest anchor is a weak-subjectivity
-//!   checkpoint. Once its block is known the node pins fork choice to it
-//!   (the `setfinalitycheckpoint` path, `accept::set_finality_checkpoint`),
-//!   so no chain that misses it is ever selected. Before the block arrives,
-//!   a selected chain that already passed the anchored slot with another
-//!   block is refused (`invalidateblock` on its first block past the slot).
-//!   An anchor that contradicts the node's own PoWit finality changes
-//!   nothing: it raises the conflict alert and the operator decides, as
-//!   for a conflicting finalization (package A2).
+//! - [`check`]: the newest anchor is **advisory only**
+//!   (docs/DESIGN-obenblock.md §8, owner decision 2026-10-18). A record
+//!   carries no proof that W finalized it, anyone with a Bloch account can
+//!   publish first, and the answer comes from one unauthenticated JSON-RPC
+//!   call; so an anchor never sets a checkpoint by itself. The node only
+//!   compares it with its own chain: an anchor its finalized chain contains
+//!   is reported as corroboration; one ahead of its finality on its selected
+//!   chain as agreement; one that contradicts its finality or its selected
+//!   chain, or whose block it does not have, raises the conflict alert
+//!   (`getblochanchor`, the `bloch_anchor` field of `getfinalityinfo`, an
+//!   error log line, the `gnb_bloch_anchor_conflict` metric) and the
+//!   operator decides with `setfinalitycheckpoint` / `ignorefinalized`.
+//!   Nothing here pins, invalidates or persists anything fork choice reads.
 //!
 //! Nothing here is a consensus rule: a node without `--bloch-rpc` behaves
 //! exactly as before.
@@ -50,8 +54,6 @@ pub const MAX_ANCHORS_PER_CALL: usize = 32;
 /// Largest registry answer the reader accepts.
 const MAX_REGISTRY_RESPONSE: usize = 64 * 1024;
 
-/// Storage key of the newest anchor the node accepted (the 84-byte record).
-const META_LATEST: &str = "bloch_anchor/latest";
 
 // ── Records from the node's own finality ─────────────────────────────────────
 
@@ -304,6 +306,27 @@ pub fn parse_registry_entry(v: &Value, chain_id: u32) -> Result<Option<AnchorRec
     Ok(Some(r))
 }
 
+/// `--bloch-rpc` must be `https://`, or plain `http://` to a loopback host
+/// (`localhost`, `127.0.0.0/8`, `::1`): the answer is unauthenticated, so
+/// it may not cross a network in the clear.
+pub fn check_bloch_rpc_url(u: &str) -> Result<(), String> {
+    let url = reqwest::Url::parse(u).map_err(|_| "--bloch-rpc must be an https:// URL".to_string())?;
+    match url.scheme() {
+        "https" if url.host().is_some() => Ok(()),
+        "http" => {
+            let host = url.host_str().unwrap_or("").trim_start_matches('[').trim_end_matches(']');
+            let loopback = host.eq_ignore_ascii_case("localhost")
+                || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
+            if loopback {
+                Ok(())
+            } else {
+                Err("--bloch-rpc: plain http:// is allowed only to a loopback host; use https://".into())
+            }
+        }
+        _ => Err("--bloch-rpc must be an https:// URL (or http:// to a loopback host)".into()),
+    }
+}
+
 /// The registry's JSON-RPC 2.0 interface on the operator's own Bloch node.
 pub struct BlochRpcReader {
     url: String,
@@ -313,9 +336,7 @@ pub struct BlochRpcReader {
 impl BlochRpcReader {
     pub fn new(url: &str, timeout: Duration) -> Result<Self, String> {
         let u = url.trim();
-        if !(u.starts_with("http://") || u.starts_with("https://")) {
-            return Err("--bloch-rpc must be an http:// or https:// URL".into());
-        }
+        check_bloch_rpc_url(u)?;
         let http = reqwest::Client::builder()
             .timeout(timeout)
             .redirect(reqwest::redirect::Policy::none())
@@ -393,118 +414,101 @@ impl AnchorReader for MockReader {
     }
 }
 
-// ── The weak-subjectivity anchor ─────────────────────────────────────────────
+// ── The advisory anchor ──────────────────────────────────────────────────────
 
-/// What the node made of its newest anchor.
+/// What the newest anchor says about the node's chain. Advisory only: no
+/// verdict changes fork choice.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
-    /// The node's finalized chain already contains it.
+    /// The node's own finalized chain names the anchor's block at its slot:
+    /// Bloch corroborates the node's finality.
     Consistent,
-    /// Fork choice is pinned to it (this call or an earlier one).
-    Pinned,
-    /// Its block is not known yet; chains that pass the slot with another
-    /// block are refused meanwhile.
-    Pending,
-    /// It contradicts the node's own finality (or is malformed for this
-    /// DAG): nothing changed; the operator decides.
+    /// The slot is above the node's own finality and the anchor's block is
+    /// on the node's selected chain: the anchor agrees with the chain the
+    /// node follows, which its own PoWit finality has not reached yet.
+    Ahead,
+    /// The anchor contradicts the node's own finality or its selected chain
+    /// (or is malformed for this DAG): conflict alert; nothing changed, the
+    /// operator decides.
     Conflict(String),
+    /// The anchor's block is not in the node's DAG: conflict alert (the node
+    /// may be behind, or on another chain); nothing changed, the operator
+    /// decides.
+    Unknown(String),
 }
 
-/// What [`decide`] asks the acceptance pipeline to do.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Action {
-    None,
-    /// Pin fork choice to this block (`accept::set_finality_checkpoint`).
-    Pin(Hash),
-    /// Disqualify this block and its descendants (`accept::invalidate_block`).
-    Refuse(Hash),
+impl Verdict {
+    /// Whether this verdict raises the conflict alert.
+    pub fn is_alert(&self) -> bool {
+        matches!(self, Verdict::Conflict(_) | Verdict::Unknown(_))
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Verdict::Consistent => "consistent",
+            Verdict::Ahead => "ahead",
+            Verdict::Conflict(_) => "conflict",
+            Verdict::Unknown(_) => "unknown",
+        }
+    }
+
+    fn detail(&self) -> Option<&str> {
+        match self {
+            Verdict::Conflict(m) | Verdict::Unknown(m) => Some(m),
+            _ => None,
+        }
+    }
 }
 
-/// The decision for anchor `r` on `dag`; pure, under the caller's read lock.
-pub fn decide(dag: &GhostDAG, r: &AnchorRecord) -> (Verdict, Action) {
+/// Compare anchor `r` with `dag`; pure, under the caller's read lock, and
+/// read-only: the anchor is advisory (module docs).
+pub fn check(dag: &GhostDAG, r: &AnchorRecord) -> Verdict {
     let (a, s) = (r.block_id, r.slot);
     let fin = dag.finalized().filter(|(h, _)| dag.has_block(h));
     if let Some((fh, _)) = fin {
         let fheight = dag.get_block_data(&fh).map(|d| d.height).unwrap_or(0);
         if fheight >= s {
             return match slot_block(dag, fh, s) {
-                Some((named, _)) if named == a => (Verdict::Consistent, Action::None),
-                Some((named, _)) => (Verdict::Conflict(format!(
+                Some((named, _)) if named == a => Verdict::Consistent,
+                Some((named, _)) => Verdict::Conflict(format!(
                     "the node's finalized chain names {} at slot {s}, the Bloch anchor {}",
-                    hex::encode(named), hex::encode(a))), Action::None),
-                None => (Verdict::Conflict(format!("slot {s} is not on the node's finalized chain")), Action::None),
+                    hex::encode(named), hex::encode(a))),
+                None => Verdict::Conflict(format!("slot {s} is not on the node's finalized chain")),
             };
         }
-        if fh == a {
-            return (Verdict::Pinned, Action::None);
+    }
+    let Some(ad) = dag.get_block_data(&a) else {
+        return Verdict::Unknown(format!("the Bloch anchor's block {} at slot {s} is not in this node's DAG",
+                                        hex::encode(a)));
+    };
+    if ad.height >= s {
+        return Verdict::Conflict(format!(
+            "the Bloch anchor's block {} has height {} and cannot be named by slot {s}", hex::encode(a), ad.height));
+    }
+    if let Some((fh, _)) = fin {
+        if !dag.is_on_selected_chain_of(&fh, &a) {
+            return Verdict::Conflict(format!(
+                "the Bloch anchor {} at slot {s} does not descend from the node's finalized checkpoint {}",
+                hex::encode(a), hex::encode(fh)));
         }
     }
-    if let Some(ad) = dag.get_block_data(&a) {
-        if ad.height >= s {
-            return (Verdict::Conflict(format!(
-                "the Bloch anchor's block {} has height {} and cannot be named by slot {s}",
-                hex::encode(a), ad.height)), Action::None);
-        }
-        if let Some((fh, _)) = fin {
-            if !dag.is_on_selected_chain_of(&fh, &a) {
-                return (Verdict::Conflict(format!(
-                    "the Bloch anchor {} at slot {s} does not descend from the node's finalized checkpoint {}",
-                    hex::encode(a), hex::encode(fh))), Action::None);
-            }
-        }
-        return (Verdict::Pinned, Action::Pin(a));
+    // The slot is above the node's finality: the anchor agrees iff the
+    // selected chain names its block at the slot.
+    match dag.selected_tip().and_then(|tip| slot_block(dag, tip, s)) {
+        Some((named, _)) if named == a => Verdict::Ahead,
+        Some((named, Some(_))) => Verdict::Conflict(format!(
+            "the node's selected chain names {} at slot {s}, the Bloch anchor {}", hex::encode(named), hex::encode(a))),
+        _ => Verdict::Conflict(format!(
+            "the Bloch anchor {} at slot {s} is not the block the node's selected chain names there", hex::encode(a))),
     }
-    // The block is not known yet: refuse the selected chain if it already
-    // passed the slot with another block.
-    if let Some(tip) = dag.selected_tip() {
-        if let Some((named, Some(above))) = slot_block(dag, tip, s) {
-            if named != a {
-                return (Verdict::Pending, Action::Refuse(above));
-            }
-        }
-    }
-    (Verdict::Pending, Action::None)
 }
 
-/// The acceptance-pipeline operations [`enforce`] needs (main wires them to
-/// `accept::set_finality_checkpoint` and `accept::invalidate_block`).
-pub trait ChainOps: Send + Sync {
-    fn pin(&self, hash: Hash) -> Result<(), String>;
-    fn refuse(&self, hash: Hash) -> Result<(), String>;
-}
-
-/// Most chains [`enforce`] refuses in one call; the next poll continues.
-const MAX_REFUSALS_PER_CALL: usize = 8;
-
-/// Apply anchor `r`: decide, act, and repeat after a refusal (the next best
-/// chain may contradict the anchor too).
-pub fn enforce(dag: &RwLock<GhostDAG>, ops: &dyn ChainOps, r: &AnchorRecord) -> Verdict {
-    for _ in 0..=MAX_REFUSALS_PER_CALL {
-        let (verdict, action) = decide(&dag.read(), r);
-        match action {
-            Action::None => return verdict,
-            Action::Pin(h) => {
-                return match ops.pin(h) {
-                    Ok(()) => verdict,
-                    Err(e) => Verdict::Conflict(format!("pinning the Bloch anchor failed: {e}")),
-                };
-            }
-            Action::Refuse(h) => {
-                warn!("bloch anchor: refusing chain through {} (it passes slot {} without {})",
-                      hex::encode(&h[..8]), r.slot, hex::encode(&r.block_id[..8]));
-                if let Err(e) = ops.refuse(h) {
-                    return Verdict::Conflict(format!("refusing a contradicting chain failed: {e}"));
-                }
-            }
-        }
-    }
-    Verdict::Pending
-}
-
-/// The node's anchor state, for `getblochanchor`.
+/// The node's anchor state, for `getblochanchor` and `getfinalityinfo`.
 #[derive(Clone, Debug, Default)]
 pub struct AnchorStatus {
     pub source: Option<String>,
+    /// The newest registry answer taken this run (memory only: nothing about
+    /// an anchor is persisted).
     pub anchor: Option<AnchorRecord>,
     pub verdict: Option<Verdict>,
     pub last_poll: Option<u64>,
@@ -512,6 +516,8 @@ pub struct AnchorStatus {
     /// A registry answer for the anchored slot with other bytes, or an
     /// older slot than the anchor already held.
     pub registry_alarm: Option<String>,
+    /// The highest slot the registry corroborated (`Consistent`).
+    pub corroborated_slot: Option<u64>,
 }
 
 static STATUS: Mutex<Option<AnchorStatus>> = parking_lot::const_mutex(None);
@@ -521,39 +527,29 @@ fn with_status<R>(f: impl FnOnce(&mut AnchorStatus) -> R) -> R {
     f(g.get_or_insert_with(AnchorStatus::default))
 }
 
-/// `getblochanchor`.
+/// `getblochanchor`, and the `bloch_anchor` field of `getfinalityinfo`.
 pub fn status_json() -> Value {
     let s = STATUS.lock().clone().unwrap_or_default();
-    let (verdict, detail) = match &s.verdict {
-        None => ("none", None),
-        Some(Verdict::Consistent) => ("consistent", None),
-        Some(Verdict::Pinned) => ("pinned", None),
-        Some(Verdict::Pending) => ("pending", None),
-        Some(Verdict::Conflict(m)) => ("conflict", Some(m.clone())),
-    };
     json!({
         "enabled": s.source.is_some(),
+        "advisory": true,
         "source": s.source,
         "anchor": s.anchor.as_ref().map(record_json),
-        "status": verdict,
-        "detail": detail,
+        "status": s.verdict.as_ref().map_or("none", Verdict::label),
+        "alert": s.verdict.as_ref().is_some_and(Verdict::is_alert) || s.registry_alarm.is_some(),
+        "detail": s.verdict.as_ref().and_then(Verdict::detail),
+        "corroborated_slot": s.corroborated_slot,
         "last_poll": s.last_poll,
         "last_error": s.last_error,
         "registry_alarm": s.registry_alarm,
     })
 }
 
-/// The newest anchor this node accepted, from storage.
-pub fn load_latest(store: &Storage) -> Option<AnchorRecord> {
-    let v = store.get_meta(META_LATEST).ok().flatten()?;
-    AnchorRecord::decode(&v).ok()
-}
-
-/// Take `fresh` (from Bloch) against the anchor already held: a newer slot
-/// replaces it (and is persisted); the same record is kept; an older slot
-/// or other bytes for the same slot are refused and raise the registry
-/// alarm. Returns the anchor to enforce.
-pub fn accept_fresh(store: &Storage, held: Option<AnchorRecord>, fresh: AnchorRecord) -> (Option<AnchorRecord>, Option<String>) {
+/// Take `fresh` (from Bloch) against the anchor already held this run: a
+/// newer slot replaces it; the same record is kept; an older slot or other
+/// bytes for the same slot are refused and raise the registry alarm.
+/// Returns the anchor to compare. Pure (nothing is persisted).
+pub fn accept_fresh(held: Option<AnchorRecord>, fresh: AnchorRecord) -> (Option<AnchorRecord>, Option<String>) {
     match held {
         Some(h) if h == fresh => (Some(h), None),
         Some(h) if fresh.slot < h.slot => (Some(h), Some(format!(
@@ -561,12 +557,7 @@ pub fn accept_fresh(store: &Storage, held: Option<AnchorRecord>, fresh: AnchorRe
         Some(h) if fresh.conflicts_with(&h) => (Some(h), Some(format!(
             "the Bloch registry answered record {} for slot {}, the node holds {}",
             hex::encode(fresh.record_id()), h.slot, hex::encode(h.record_id())))),
-        _ => {
-            if let Err(e) = store.put_meta(META_LATEST, &fresh.encode()) {
-                warn!("bloch anchor: cannot persist the anchor: {e}");
-            }
-            (Some(fresh), None)
-        }
+        _ => (Some(fresh), None),
     }
 }
 
@@ -575,52 +566,50 @@ fn now_secs() -> u64 {
 }
 
 fn note_verdict(r: &AnchorRecord, v: &Verdict) {
-    let changed = with_status(|s| {
+    let (changed, alarm) = with_status(|s| {
         let changed = s.anchor != Some(*r) || s.verdict.as_ref() != Some(v);
         s.anchor = Some(*r);
         s.verdict = Some(v.clone());
-        changed
+        if *v == Verdict::Consistent {
+            s.corroborated_slot = Some(s.corroborated_slot.map_or(r.slot, |c| c.max(r.slot)));
+        }
+        (changed, s.registry_alarm.is_some())
     });
+    crate::metrics::set_bloch_anchor_conflict(v.is_alert() || alarm);
+    if *v == Verdict::Consistent {
+        crate::metrics::set_bloch_anchor_corroborated_slot(r.slot);
+    }
     if !changed {
         return;
     }
     match v {
-        Verdict::Conflict(m) => error!("BLOCH ANCHOR CONFLICT at slot {}: {m}. Nothing was changed; \
-                                         the operator decides (docs/OBB-ANCHOR.md)", r.slot),
-        Verdict::Pending => info!("bloch anchor: slot {} block {} not known yet; chains without it are refused",
-                                  r.slot, hex::encode(&r.block_id[..8])),
-        Verdict::Pinned => info!("bloch anchor: fork choice pinned to slot {} block {}",
-                                 r.slot, hex::encode(&r.block_id[..8])),
-        Verdict::Consistent => info!("bloch anchor: slot {} block {} is on the node's finalized chain",
+        Verdict::Conflict(m) | Verdict::Unknown(m) => error!(
+            "BLOCH ANCHOR CONFLICT at slot {}: {m}. The anchor is advisory: nothing was changed; the operator \
+             decides with setfinalitycheckpoint / ignorefinalized (docs/OBB-ANCHOR.md)", r.slot),
+        Verdict::Ahead => info!("bloch anchor: slot {} block {} is on the selected chain, above own finality",
+                                r.slot, hex::encode(&r.block_id[..8])),
+        Verdict::Consistent => info!("bloch anchor: slot {} block {} corroborates the node's finalized chain",
                                      r.slot, hex::encode(&r.block_id[..8])),
     }
 }
 
-/// Start-up: enforce the persisted anchor before the node follows peers.
-pub fn restore(dag: &RwLock<GhostDAG>, store: &Storage, ops: &dyn ChainOps, source: String) {
+/// Start-up: record the source (`getblochanchor` reports it enabled).
+pub fn restore(source: String) {
     with_status(|s| s.source = Some(source));
-    if let Some(r) = load_latest(store) {
-        if r.chain_id != gnb_crypto::core::node_chain_id().to_u32() {
-            warn!("bloch anchor: the stored anchor belongs to chain {:#x}; ignored", r.chain_id);
-            return;
-        }
-        let v = enforce(dag, ops, &r);
-        note_verdict(&r, &v);
-    }
 }
 
-/// Take one registry answer: accept a newer anchor, keep the held one
-/// otherwise, and enforce the result. Blocking (the chain operations take the
-/// acceptance lock).
-pub fn take_answer(res: Result<Option<AnchorRecord>, String>, source: &str, dag: &RwLock<GhostDAG>,
-                   store: &Storage, ops: &dyn ChainOps) {
+/// Take one registry answer: keep the newest anchor of this run and compare
+/// it with the node's chain. Read-only on the DAG.
+pub fn take_answer(res: Result<Option<AnchorRecord>, String>, source: &str, dag: &RwLock<GhostDAG>) {
     let chain_id = gnb_crypto::core::node_chain_id().to_u32();
-    let held = load_latest(store).filter(|r| r.chain_id == chain_id);
-    with_status(|s| s.last_poll = Some(now_secs()));
+    let held = with_status(|s| {
+        s.last_poll = Some(now_secs());
+        s.anchor.filter(|r| r.chain_id == chain_id)
+    });
     let anchor = match res {
         Ok(Some(fresh)) if fresh.chain_id == chain_id => {
             with_status(|s| s.last_error = None);
-            let (a, alarm) = accept_fresh(store, held, fresh);
+            let (a, alarm) = accept_fresh(held, fresh);
             if let Some(m) = &alarm {
                 error!("bloch anchor registry alarm: {m}");
             }
@@ -644,28 +633,26 @@ pub fn take_answer(res: Result<Option<AnchorRecord>, String>, source: &str, dag:
         }
     };
     if let Some(r) = anchor {
-        // Once the node's finalized chain contains the anchor it always will
-        // (the pin only moves forward along it): skip the re-check, whose
-        // walk grows with the distance from the anchor to the pin.
+        // Once the node's finalized chain contains the anchor it always will:
+        // skip the re-check, whose walk grows with the distance to the pin.
         if with_status(|s| s.anchor == Some(r) && s.verdict == Some(Verdict::Consistent)) {
             return;
         }
-        let v = enforce(dag, ops, &r);
+        let v = check(&dag.read(), &r);
         note_verdict(&r, &v);
     }
 }
 
 /// The poller `main` spawns for `--bloch-rpc`: read the newest anchor every
-/// `every`, then take it on the blocking pool.
-pub async fn run(reader: Box<dyn AnchorReader>, every: Duration, dag: std::sync::Arc<RwLock<GhostDAG>>,
-                 store: std::sync::Arc<Storage>, ops: std::sync::Arc<dyn ChainOps>) {
+/// `every`, then compare it on the blocking pool.
+pub async fn run(reader: Box<dyn AnchorReader>, every: Duration, dag: std::sync::Arc<RwLock<GhostDAG>>) {
     let mut tick = tokio::time::interval(every);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
         let res = reader.latest(gnb_crypto::core::node_chain_id().to_u32()).await;
-        let (dag, store, ops, source) = (dag.clone(), store.clone(), ops.clone(), reader.describe());
-        if let Err(e) = tokio::task::spawn_blocking(move || take_answer(res, &source, &dag, &store, ops.as_ref())).await {
+        let (dag, source) = (dag.clone(), reader.describe());
+        if let Err(e) = tokio::task::spawn_blocking(move || take_answer(res, &source, &dag)).await {
             error!("bloch anchor: poll task failed: {e}");
         }
     }

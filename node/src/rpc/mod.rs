@@ -1355,6 +1355,20 @@ fn policy_rpc_snapshot(state: &AppState) -> Result<(u64,[u8;32]), Value> {
     Ok((crate::mempool::admission::pool_next_height(&dag,&state.store,&state.mempool),tip))
 }
 
+/// The chain identity `getnetworkinfo` reports for the network `p`:
+/// `network` (`"mainnet"`, `"testnet"` or `"regtest"`, as set once at
+/// start-up; was the literal "mainnet" on every node,
+/// test/functional/feature_test_build_guard.py), `chain` (DESIGN-obenblock
+/// §2: `"gnb"` or `"obenblock"`) and `chain_id`, the id folded into every
+/// signature.
+fn network_identity_json(p: &crate::core::chain::ChainParams) -> Value {
+    json!({
+        "network":  p.network_name,
+        "chain":    p.chain.name(),
+        "chain_id": format!("{:#010x}", p.chain_id.to_u32()),
+    })
+}
+
 async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Value {
     match method {
         "getnetworkinfo" => {
@@ -1363,15 +1377,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 crate::accept::no_verdict_branch_warning(&state.dag.read(), &state.store).into_iter().collect();
             let s = state.node_state.read();
             let pruned_h = state.store.pruned_height();
-            json!({
-                // The chain this node runs (`--testnet`), as set once at
-                // start-up. Was the literal "mainnet" on every node
-                // (test/functional/feature_test_build_guard.py).
-                "network":         crate::core::chain::node_params().network_name,
-                // DESIGN-obenblock §2: "gnb" or "obenblock", and the chain id
-                // folded into every signature.
-                "chain":           crate::core::chain::node_params().chain.name(),
-                "chain_id":        format!("{:#010x}", crate::core::node_chain_id().to_u32()),
+            let mut info = json!({
                 "version":         s.version,
                 // The hardening activation height this binary enforces on its
                 // chain (builds before 0.1.1 do not report the field), so an
@@ -1393,10 +1399,17 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 // tolerance or gave up", not "provably at the network tip".
                 "best_announced":  s.best_announced_blue_score,
                 "behind_by":       s.best_announced_blue_score.saturating_sub(s.tip_blue_score),
-                "chain":           "gnb",
                 "pruned_height":   pruned_h,
                 "warnings":        warnings,
-            })
+            });
+            // The chain identity comes from one place only: a second literal
+            // "chain" key in this object used to override it with "gnb" on
+            // every chain (found by the ObenBlock pool end-to-end run).
+            if let (Some(obj), Value::Object(id)) = (info.as_object_mut(),
+                                                      network_identity_json(crate::core::chain::node_params())) {
+                obj.extend(id);
+            }
+            info
         }
         "getblockcount"  => json!(state.node_state.read().block_count),
         // MEM-6: the size plus the relay policy in force (docs/MEMPOOL.md).
@@ -1620,7 +1633,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                         "satoshis":   sats.to_string(),
                         "gnb":       sats as f64 / 1e8,
                         "utxo_count": utxo_count,
-                        "address":    addr,
+                        "address":    crate::address::display_address(addr),
                     }),
                     Err(e) => storage_err_response(&e),
                 },
@@ -1768,7 +1781,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                             }
                         }
                         let mut result = json!({
-                            "address":    addr,
+                            "address":    crate::address::display_address(addr),
                             "utxo_count": list.len(),
                             "returned":   list.len(),
                             "truncated":  truncated,
@@ -2380,7 +2393,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                                 })
                             }).collect();
                             json!({
-                                "address":         addr,
+                                "address":         crate::address::display_address(addr),
                                 "count":           txs.len(),
                                 "total_available": total,
                                 "total_at_least":  total.unwrap_or(LISTTX_COUNT_CAP),
@@ -2585,7 +2598,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
 
             match crate::analytics::address_info(&state.store, &state.mempool, addr_str, &addr_hash) {
                 Ok(info) => json!({
-                    "address":           info.address,
+                    "address":           crate::address::display_address(&info.address),
                     // R3: satoshi amounts → decimal strings.
                     "balance_sats":      info.balance_sats.to_string(),
                     "balance_gnb":      info.balance_gnb,
@@ -2757,7 +2770,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                                 Err(_) => return json!({ "error": "cancelled" }),
                             };
                             json!({
-                                "address":               addr,
+                                "address":               crate::address::display_address(addr),
                                 "height":                height,
                                 // R3: satoshi amount → decimal string.
                                 "balance_sats":          balance.to_string(),
@@ -4675,6 +4688,31 @@ mod audit_2026_10_rpc_tests {
         let r = dispatch("getdaginfo", None, &state).await;
         assert_eq!(r["tip_height"], 5);
         assert_eq!(r["next_block_height"], 9, "the pool's next height, not tip_height + 1");
+    }
+
+    /// Regression (ObenBlock pool end-to-end run): `getnetworkinfo` built its
+    /// object with a second literal `"chain": "gnb"`, so every ObenBlock node
+    /// reported GnB. The identity now comes only from the node's chain
+    /// parameters, for each of the four networks.
+    #[tokio::test]
+    async fn getnetworkinfo_reports_the_node_chain() {
+        use crate::core::chain::{GNB_MAINNET, OBENBLOCK_MAINNET, OBENBLOCK_REGTEST};
+        let cases = [(&GNB_MAINNET, "gnb", "mainnet", "0x474e0001"),
+                     (&OBENBLOCK_MAINNET, "obenblock", "mainnet", "0x4f420001"),
+                     (&OBENBLOCK_REGTEST, "obenblock", "regtest", "0x4f420002")];
+        for (p, chain, network, id) in cases {
+            assert_eq!(network_identity_json(p), json!({"chain": chain, "network": network, "chain_id": id}));
+        }
+        let (_tmp, state) = state_with_chain(2);
+        let r = dispatch("getnetworkinfo", None, &state).await;
+        assert_eq!(r["chain"], crate::core::chain::node_params().chain.name());
+        assert_eq!(r["network"], crate::core::chain::node_params().network_name);
+        assert_eq!(r["chain_id"], format!("{:#010x}", crate::core::node_chain_id().to_u32()));
+        // No literal chain name is left in the handler.
+        let src = include_str!("mod.rs");
+        let start = src.find("\"getnetworkinfo\" => {").unwrap();
+        let end = src[start..].find("\"getblockcount\"").unwrap() + start;
+        assert!(!src[start..end].contains("\"chain\":"), "getnetworkinfo must not hard-code its chain");
     }
 
     /// `getdaginfo` and `getnetworkinfo` report the hardening activation

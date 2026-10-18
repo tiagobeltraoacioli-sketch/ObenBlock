@@ -356,9 +356,12 @@ mutual anchoring. **Both directions are used** (owner, 2026-10-17).
     have, the node raises the conflict alert (`getfinalityinfo`, the A2
     alert) and the operator decides with `setfinalitycheckpoint` /
     `ignorefinalized`. An anchor that agrees is reported as corroboration.
+  - `--bloch-rpc` must be `https://`, or `http://` to a loopback host.
   - Automatic use needs a finality certificate in the record (≥ 2/3 of W
     signing, or a succinct proof of it), checked by the node against the W of
     the candidate chain. Not planned now.
+  This is the same trust model as the bridge signers (docs/SIDECHAIN-BLOCH.md:
+  "each signer reads … from its own follower").
 - **Phase 2**: a Bloch light client in the node (header sync of Bloch
   finality), removing the trusted Bloch RPC.
 - **Bloch side**: the anchor registry needs the Bloch code base. The record

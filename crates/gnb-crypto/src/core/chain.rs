@@ -68,6 +68,22 @@ impl Chain {
         }
     }
 
+    /// The address family of this chain (prefixes and HRPs it shows).
+    pub const fn address_family(self) -> crate::address::AddressFamily {
+        match self {
+            Chain::Gnb => crate::address::AddressFamily::Gnb,
+            Chain::ObenBlock => crate::address::AddressFamily::ObenBlock,
+        }
+    }
+
+    /// The chain whose address family is `family`.
+    pub const fn of_family(family: crate::address::AddressFamily) -> Chain {
+        match family {
+            crate::address::AddressFamily::Gnb => Chain::Gnb,
+            crate::address::AddressFamily::ObenBlock => Chain::ObenBlock,
+        }
+    }
+
     /// The name of this chain's test network: GnB's public testnet, or
     /// ObenBlock's local regtest.
     pub const fn test_network_name(self) -> &'static str {
@@ -269,14 +285,23 @@ static PROCESS_CHAIN: OnceLock<Chain> = OnceLock::new();
 
 /// Fix the process chain (idempotent for the same value). Returns
 /// `Err(existing)` if it is already set to the other chain.
+///
+/// It also binds the process address family to the chain's
+/// ([`Chain::address_family`]): on ObenBlock every RPC, CLI and explorer
+/// answer shows `obb1…` and still parses `gnb1…`/`bloch1…` as aliases. If
+/// the other family was already fixed (`address::set_process_family`), the
+/// chain of that family is returned as the error.
 pub fn set_process_chain(chain: Chain) -> Result<(), Chain> {
     match PROCESS_CHAIN.set(chain) {
-        Ok(()) => Ok(()),
+        Ok(()) => {}
         Err(_) => {
             let cur = *PROCESS_CHAIN.get().expect("OnceLock set");
-            if cur == chain { Ok(()) } else { Err(cur) }
+            if cur != chain {
+                return Err(cur);
+            }
         }
     }
+    crate::address::set_process_family(chain.address_family()).map_err(Chain::of_family)
 }
 
 /// The process chain: the one set at start-up, otherwise GnB.
