@@ -1,7 +1,7 @@
-//! Review HIGH 2 of the PoWit finality pin, end to end THROUGH INGRESS
-//! (`BlockIngress::handle_block`, as the network processor feeds it), with
-//! real witness shares, KES keys and hybrid-signed attestations: every PoWit
-//! state is computed by acceptance.
+//! Review HIGH 2 of the PoWit finality pin, and round 2 of that review (H1,
+//! M2, L4), end to end THROUGH INGRESS (`BlockIngress::handle_block`, as the
+//! network processor feeds it), with real witness shares, KES keys and
+//! hybrid-signed attestations: every PoWit state is computed by acceptance.
 //!
 //! The POW-3 work rule (`ingress::work_rule`) drops every block of a chain
 //! that cannot come within `ANTI_DOS_WINDOW_BLOCKS` (360) selected-chain
@@ -9,16 +9,19 @@
 //! heavier side B, which finalized nothing, dropped every block of side A,
 //! which did, so it never stored them, never learned A's finality (the pin
 //! learns it from any STORED block, PoWit finding 2) and the network stayed
-//! split. Side A's blocks claim a finality newer than B's (their attestations
-//! link from a checkpoint A justified), so the ancestors the node pulls for
-//! them are admitted below the work threshold, within budgets
-//! (`ingress::FinalityPulls`).
+//! split. A block of side A carries a finality claim: a vote linking from a
+//! checkpoint A justified beyond B's finality, signed by a key with weight in
+//! the witness set B's own state derives, whose target lies in the chain the
+//! node pulls for it; the blocks of that chain are admitted below the work
+//! threshold, within budgets (`ingress::FinalityPulls`).
 //!
 //! Node test builds use gnb-crypto's `test-pow-limit` (every expected target
 //! is the pow limit), under which a GnB-SMH v3 block (from the PoWit
 //! activation) carries no work at all. The work gap is therefore built below
-//! the activation (here 160): side B mines four blocks per DAG layer there
-//! (each merging the other three), side A one, and both continue above it.
+//! the activation (here 400): side B mines four blocks per DAG layer there
+//! (each merging the other three), side A one. Both sides then mine witness
+//! shares for the same two keys (as a common history longer than a partition
+//! would give them), and only side A's witnesses vote.
 
 mod fix_common;
 use fix_common::*;
@@ -36,7 +39,7 @@ use gnb::pow;
 use gnb::powit::{self, DagChainView};
 use libp2p::PeerId;
 
-const ACT: u64 = 160;
+const ACT: u64 = 400;
 const P: core::powit::PowitParams = TESTNET_PARAMS;
 /// Blocks per DAG layer of side B below the activation.
 const WIDTH: usize = 4;
@@ -49,7 +52,7 @@ fn setup() {
     assert_eq!(ingress::minimum_chain_work(), 0, "testnet: no minimum chain work");
 }
 
-/// A genuine KES witness key (depth 3: PoWit epochs 0..=7, heights 160..=319).
+/// A genuine KES witness key (depth 3: PoWit epochs 0..=7, heights 400..=559).
 struct Key {
     signer: std::cell::RefCell<KesSigner>,
 }
@@ -211,36 +214,67 @@ fn ctx(n: &Node) -> ingress::AcceptCtx<'_> {
     }
 }
 
-/// The partition: a common chain C (9 blocks), then side A (150 blocks below
-/// the activation, then 60 above it: the witnesses' shares, then their votes:
-/// it finalizes) and side B (150 layers of four blocks below the activation,
-/// then 380 blocks above it, no witness: it finalizes nothing). B's tip is
-/// about 450 blocks of work above A's, more than the 360-block window.
+/// The partition: a common chain C (9 blocks), then side A (390 blocks below
+/// the activation, then 90 above it: two epochs with shares for keys K1 and
+/// K2, then their votes: it finalizes) and side B (390 layers of four blocks
+/// below the activation, then 80 blocks above it with shares for the same
+/// keys in the same epochs, no vote: it finalizes nothing). B's tip carries
+/// about 1,170 blocks of work more than A's, and the block 360 below it more
+/// than all of A.
 struct Heal {
     genesis: Block,
     common: Vec<Block>,
     a: Vec<Block>,
     b: Vec<Block>,
     a_fin: Checkpoint,
+    /// An authentic vote of side A that claims its finality.
+    claim: Attestation,
 }
+
+const K1: u8 = 61;
+const K2: u8 = 62;
 
 fn heal() -> Heal {
     setup();
     let genesis = mk_genesis(unix_now() - 100_000);
-    let (k1, k2) = (Key::new(61), Key::new(62));
+    let (k1, k2) = (Key::new(K1), Key::new(K2));
     let side_a = Producer::new(&genesis);
     let common = side_a.extend(9, "c", &[], &[]);
-    let mut a = side_a.extend(150, "a", &[], &[]);
-    a.extend(side_a.extend(40, "s", &[&k1, &k2], &[&k1, &k2]));
-    a.extend(side_a.extend(20, "v", &[], &[&k1, &k2]));
+    let mut a = side_a.extend(390, "a", &[], &[]);
+    a.extend(side_a.extend(20, "a0", &[], &[]));
+    a.extend(side_a.extend(4, "s1", &[&k1, &k2], &[]));
+    a.extend(side_a.extend(16, "a1", &[], &[]));
+    a.extend(side_a.extend(4, "s2", &[&k1, &k2], &[]));
+    a.extend(side_a.extend(16, "a2", &[], &[]));
+    a.extend(side_a.extend(30, "v", &[], &[&k1, &k2]));
     let a_fin = side_a.tip_state().finalized;
     assert!(a.iter().any(|b| b.block_hash() == a_fin.hash), "side A finalized: {a_fin:?}");
+    let claim = a.iter().flat_map(|b| b.powit.attestations.iter())
+        .find(|x| x.source.height > ACT + P.checkpoint_interval).cloned().expect("a vote claiming A's finality");
     let side_b = Producer::new(&genesis);
     side_b.adopt(&common);
-    let mut b = side_b.wide(150, "w");
-    b.extend(side_b.extend(380, "b", &[], &[]));
+    let mut b = side_b.wide(390, "w");
+    b.extend(side_b.extend(19, "b0", &[], &[]));
+    b.extend(side_b.extend(4, "t1", &[&k1, &k2], &[]));
+    b.extend(side_b.extend(16, "b1", &[], &[]));
+    b.extend(side_b.extend(4, "t2", &[&k1, &k2], &[]));
+    b.extend(side_b.extend(37, "b2", &[], &[]));
     assert_eq!(side_b.tip_state().finalized.height, ACT, "side B finalized nothing");
-    Heal { genesis, common, a, b, a_fin }
+    Heal { genesis, common, a, b, a_fin, claim }
+}
+
+/// A fork from `from` (on C) to the activation, whose last block (above it)
+/// carries `votes`: the chain an attacker pulls a node along.
+fn fork_with(h: &Heal, from: usize, to_height: u64, tag: &str, votes: impl Fn(&Producer) -> Vec<Attestation>)
+    -> Vec<Block>
+{
+    let f = Producer::new(&h.genesis);
+    f.adopt(&h.common[..=from]);
+    let n = to_height - 1 - (from as u64 + 1);
+    let mut out = f.extend(n as usize, tag, &[], &[]);
+    let top = build(&f.node, vec![f.tip()], &format!("{tag}top"), Vec::new(), votes(&f));
+    out.push(top);
+    out
 }
 
 /// A synced node of side B.
@@ -353,9 +387,9 @@ fn finality_backed_pulls_are_bounded_per_peer_and_per_node() {
     assert_eq!(pin_of(&m), None);
 }
 
-/// The claim test itself: a block claims a finality newer than the node's
-/// when one of its attestations links from a checkpoint more than one
-/// interval above the node's pin (with no pin, above the activation).
+/// The claim pre-filter: a block claims finality only with a vote that links
+/// from a checkpoint more than one interval above the node's pin (with no
+/// pin, above the activation).
 #[test]
 fn a_block_claims_finality_when_its_votes_link_from_beyond_the_pin() {
     setup();
@@ -374,4 +408,180 @@ fn a_block_claims_finality_when_its_votes_link_from_beyond_the_pin() {
     assert!(!ingress::claims_finality(&vote(ACT + P.checkpoint_interval), floor), "justified one slot on");
     assert!(ingress::claims_finality(&vote(ACT + 2 * P.checkpoint_interval), floor), "finalized one slot on");
     assert!(!ingress::claims_finality(&mk_genesis(1), floor), "no vote, no claim");
+    // With a pin, the floor is the pin's slot (here its DAG height + 1) plus
+    // one interval (review round 2, L4).
+    n.dag.write().set_finalized(genesis.block_hash(), 430);
+    assert_eq!(ingress::finality_claim_floor(&n.dag.read()), 431 + P.checkpoint_interval);
+    assert!(!ingress::claims_finality(&vote(431 + P.checkpoint_interval), 431 + P.checkpoint_interval));
+}
+
+// ── Review round 2, H1: claims are authenticated and bound to their chain ───
+
+/// A claim backs nothing unless one of its votes is signed by a key with
+/// weight in the witness set the node's own state derives (H1.1), and its
+/// target lies in the chain the claim reaches the node along: a fake vote
+/// (a key with no weight), a vote by a witness with a forged signature, and
+/// an authentic vote copied from side A onto another chain all leave that
+/// chain below the work threshold. Each used to mark the chain as backed.
+#[test]
+fn unauthenticated_or_copied_finality_claims_back_nothing() {
+    let h = heal();
+    let n = side_b_node(&h);
+    let stranger = Key::new(99);
+    let forged = {
+        let mut v = h.claim.clone();
+        for x in v.sig.sig.iter_mut().take(8) {
+            *x ^= 0x5A;
+        }
+        v
+    };
+    let cases: Vec<(&str, Vec<Attestation>)> = vec![
+        ("fake", vec![stranger.attest(h.claim.source, h.claim.target)]),
+        ("forged", vec![forged]),
+        ("copied", vec![h.claim.clone()]),
+    ];
+    for (tag, votes) in cases {
+        let fork = fork_with(&h, 8, ACT + 1, tag, |_| votes.clone());
+        let mut core = BlockIngress::new();
+        let out = pull(&mut core, &n, &fork, PeerId::random(), None, Instant::now());
+        assert!(matches!(out.last().unwrap(), BlockOutcome::Dropped(DropReason::LowWork)), "{tag}: {:?}",
+            out.last().unwrap());
+        assert_eq!(stored(&n, &fork), 0, "{tag}: nothing stored");
+    }
+    // Side A still heals the node.
+    let mut core = BlockIngress::new();
+    pull(&mut core, &n, &h.a, PeerId::random(), None, Instant::now());
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(h.a_fin.hash), Some(h.a.last().unwrap().block_hash())));
+}
+
+/// A flood of orphans with claims (fake ones and authentic copies) and 256
+/// random parents each, between the pulls of side A: the claims used to mark
+/// all 257 hashes each in a global first-in-first-out set of 8,192, evicting
+/// side A's marks, and the heal never completed. Backing now lives in the
+/// orphan pool (the claim orphan and the chain under it), so nothing
+/// evicts it but the pool's own bounds.
+#[test]
+fn a_flood_of_claims_does_not_stop_the_heal() {
+    let h = heal();
+    let n = side_b_node(&h);
+    let mut core = BlockIngress::new();
+    let now = Instant::now();
+    let top = h.a.len() - 100;
+    pull(&mut core, &n, &h.a[top..], PeerId::random(), None, now);
+    let stranger = Key::new(98);
+    let bits = h.a.last().unwrap().header.bits;
+    for i in 0..40u32 {
+        let vote = if i % 2 == 0 { stranger.attest(h.claim.source, h.claim.target) } else { h.claim.clone() };
+        let b = stray_orphan(i, bits, core::MAX_PARENTS, Some(vote));
+        let o = core.handle_block(b.clone(), b.block_hash(), b.to_wire_bytes().len(), Some(PeerId::random()), false,
+            now, unix_now(), &ctx(&n));
+        assert!(matches!(o, BlockOutcome::Buffered { .. }), "flood orphan {i}: {o:?}");
+    }
+    pull(&mut core, &n, &h.a[..top], PeerId::random(), None, now);
+    assert_eq!(pin_of(&n), Some(h.a_fin.hash), "the heal completed despite the flood");
+    assert_eq!(applied_tip(&n), Some(h.a.last().unwrap().block_hash()));
+}
+
+/// An orphan at height 470 on `parents` random parents, carrying `vote`.
+fn stray_orphan(i: u32, bits: u32, parents: usize, vote: Option<Attestation>) -> Block {
+    let parents: Vec<BlockHash> = (0..parents).map(|j| {
+        let mut x = [0u8; 32];
+        x[..4].copy_from_slice(&i.to_le_bytes());
+        x[4..8].copy_from_slice(&(j as u32).to_le_bytes());
+        x[31] = 0xF1;
+        x
+    }).collect();
+    let height = 470;
+    let mut b = Block {
+        header: BlockHeader { version: 1, parents, merkle_root: MerkleRoot::ZERO, timestamp: unix_now(), bits,
+                              nonce: u64::from(i) },
+        transactions: vec![Transaction {
+            version: 1,
+            inputs: vec![TxInput { prev_txid: [0; 32], prev_index: u32::MAX,
+                                   script_sig: format!("stray{i}").into_bytes(), sequence: u32::MAX }],
+            outputs: Block::coinbase_outputs(height, vec![0xC0; 20], 0, &[]),
+            locktime: 0,
+        }],
+        blue_score: height,
+        height,
+        shielded_transactions: Vec::new(),
+        powit: PowitBody { shares: Vec::new(), attestations: vote.into_iter().collect(), evidence: Vec::new() },
+    };
+    commit_block(&mut b);
+    b.test_only_assume_pow_valid();
+    b
+}
+
+/// Review round 2, M2: a finality-backed block must itself carry at least
+/// the orphan floor's work (1/16 of a block at the tip): a claim cannot carry
+/// a cheap chain. Under a reference target that puts side A's blocks below
+/// the floor, its first block is refused although a claim backs it; under
+/// the real one it is admitted.
+#[test]
+fn a_finality_backed_block_must_meet_the_orphan_floor() {
+    let h = heal();
+    let n = side_b_node(&h);
+    let mut core = BlockIngress::new();
+    let now = Instant::now();
+    pull(&mut core, &n, &h.a[1..], PeerId::random(), None, now);
+    let bottom = &h.a[0];
+    let mut hard = [0u8; 32];
+    hard[31] = 1;
+    core.set_reference_target(Some(hard));
+    let o = core.handle_block(bottom.clone(), bottom.block_hash(), bottom.to_wire_bytes().len(),
+        Some(PeerId::random()), true, now, unix_now(), &ctx(&n));
+    assert!(matches!(o, BlockOutcome::Dropped(DropReason::LowWork)), "{o:?}");
+    assert_eq!(stored(&n, &h.a), 0);
+    core.set_reference_target(None);
+    // (Any new orphan clears the cached LowWork verdict.)
+    let stray = stray_orphan(1_000, bottom.header.bits, 1, None);
+    core.handle_block(stray.clone(), stray.block_hash(), stray.to_wire_bytes().len(), Some(PeerId::random()), false,
+        now, unix_now(), &ctx(&n));
+    let o = core.handle_block(bottom.clone(), bottom.block_hash(), bottom.to_wire_bytes().len(),
+        Some(PeerId::random()), true, now, unix_now(), &ctx(&n));
+    assert!(matches!(o, BlockOutcome::Processed { admission: WorkAdmission::FinalityBacked, .. }), "{o:?}");
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(h.a_fin.hash), Some(h.a.last().unwrap().block_hash())));
+}
+
+/// The node-wide budget belongs to the heal: chains a third party pulls the
+/// node along with fake or copied claims spend none of it (they used to be
+/// admitted and spend it, leaving too little for side A).
+#[test]
+fn a_third_party_cannot_spend_the_heals_budget() {
+    let h = heal();
+    let n = side_b_node(&h);
+    let mut core = BlockIngress::new().with_finality_pull_budgets(10_000, h.a.len() as u32 + 10);
+    let stranger = Key::new(97);
+    for (tag, vote) in [("copied", h.claim.clone()), ("fake", stranger.attest(h.claim.source, h.claim.target))] {
+        let fork = fork_with(&h, 8, ACT + 1, tag, |_| vec![vote.clone()]);
+        pull(&mut core, &n, &fork, PeerId::random(), None, Instant::now());
+        assert_eq!(stored(&n, &fork), 0, "{tag}");
+    }
+    pull(&mut core, &n, &h.a, PeerId::random(), None, Instant::now());
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(h.a_fin.hash), Some(h.a.last().unwrap().block_hash())));
+}
+
+/// Review round 2, L4: with a pin (an operator checkpoint on C), a chain that
+/// forks below it gains nothing from a claim, even an authentic one bound to
+/// its own chain (a witness signing a link to it): it cannot move the pin
+/// (`ingress::extends_pin`). Side A, which extends the pin, still heals.
+#[test]
+fn a_claim_on_a_chain_that_forks_below_the_pin_buys_nothing() {
+    let h = heal();
+    let n = side_b_node(&h);
+    let anchor = h.common.last().unwrap().block_hash();
+    gnb::accept::override_finality(gnb::powit::FinalityOp::SetAnchor(anchor), &n.dag, &n.store, &n.mempool,
+        &n.node_state, Some(&n.tip_tx), &n.shielded).unwrap();
+    assert_eq!(pin_of(&n), Some(anchor));
+    let k1 = Key::new(K1);
+    let fork = fork_with(&h, 5, 470, "below", |f| {
+        let t = Checkpoint { height: 470, hash: f.tip() };
+        vec![k1.attest(Checkpoint { height: 465, hash: [7; 32] }, t)]
+    });
+    let mut core = BlockIngress::new();
+    let out = pull(&mut core, &n, &fork, PeerId::random(), None, Instant::now());
+    assert!(matches!(out.last().unwrap(), BlockOutcome::Dropped(DropReason::LowWork)), "{:?}", out.last());
+    assert_eq!(stored(&n, &fork), 0);
+    pull(&mut core, &n, &h.a, PeerId::random(), None, Instant::now());
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(h.a_fin.hash), Some(h.a.last().unwrap().block_hash())));
 }

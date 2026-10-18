@@ -1914,7 +1914,8 @@ fn print_usage() {
     gnb-cli reconsiderblock <hash>        Undo invalidateblock (and re-check the chain)
     gnb-cli finality                      PoWit finality pin, own finality, conflict alert
     gnb-cli ignorefinalized [hash]        Set the pinned (or given) finalized checkpoint aside
-    gnb-cli reconsiderfinalized <hash>    Undo ignorefinalized
+    gnb-cli reconsiderfinalized <hash>    Remove ignorefinalized (to move back after a
+                                          conflict: setfinalitycheckpoint)
     gnb-cli setfinalitycheckpoint <hash> [height] | none | default
                                           Weak-subjectivity checkpoint (with its DAG height,
                                           also for a block the node does not hold yet)

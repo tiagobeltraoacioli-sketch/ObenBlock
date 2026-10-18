@@ -1438,6 +1438,57 @@ fn anchor_in_force(setting: AnchorSetting) -> Option<Anchor> {
     }
 }
 
+/// Review round 2 of the PoWit finality pin, H1: the target of a vote of
+/// `block` that authentically claims a finality newer than the node's: its
+/// source lies above `floor` (`ingress::finality_claim_floor`), and it is
+/// signed, under the message of `block`'s rules, by a key with weight in the
+/// witness set `state` (the node's selected tip's PoWit state) derives for
+/// the vote's target epoch under those rules. From the second hardening
+/// activation a chain that shares the node's finality reads the same frozen
+/// finalized window (`PowitState::h2_window_epoch`); before it, the node's
+/// own share history of the target's window. At most `max_checks`
+/// signatures are verified (membership is checked first). Whether the
+/// target lies on the chain the vote reaches the node along is checked by
+/// `ingress::OrphanPool::claim_backs`.
+pub fn authenticated_finality_claim(block: &Block, floor: u64, state: &PowitState, max_checks: usize) -> Option<Hash> {
+    let p = powit::params();
+    let chain = core::node_chain_id();
+    let act = state.activation;
+    let h2 = hardening2_height();
+    let regime = Regime::at(block.height, h2);
+    let msg_h2 = if regime == Regime::Hardening2 { h2 } else { activation::NEVER };
+    let mut v1_sets: Vec<(u64, Vec<(KeyId, u128)>)> = Vec::new();
+    let mut checks = 0usize;
+    for a in &block.powit.attestations {
+        if a.source.height <= floor || a.target.height <= a.source.height || a.target.height < act {
+            continue;
+        }
+        let te = p.epoch(act, a.target.height);
+        let key = a.key_id();
+        let member = match regime {
+            Regime::Hardening2 => state.member_weight_h2(&p, te, &key).is_some(),
+            Regime::V1 => {
+                if !v1_sets.iter().any(|(e, _)| *e == te) {
+                    v1_sets.push((te, state.witness_set(&p, te)));
+                }
+                v1_sets.iter().find(|(e, _)| *e == te)
+                    .is_some_and(|(_, set)| set.iter().any(|(k, w)| *k == key && *w > 0))
+            }
+        };
+        if !member {
+            continue;
+        }
+        if checks >= max_checks {
+            return None;
+        }
+        checks += 1;
+        if a.verify_signature_at(chain, &p, act, msg_h2) {
+            return Some(a.target.hash);
+        }
+    }
+    None
+}
+
 /// The applied tip: the block the UTXO set sits on (the persisted tip
 /// pointer), else, for a store without one the DAG knows (fixtures), the
 /// selected tip.
@@ -1502,6 +1553,16 @@ pub fn refresh_finality_pin(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage
                 outcome.conflicting, hex::encode(&a[..8]), hex::encode(&b[..8])),
         }
     }
+    crate::metrics::set_finality_anchor_unknown(outcome.anchor_overdue);
+    if outcome.anchor_overdue && !previous.anchor_overdue {
+        let a = anchor_in_force(dag.read().finality_index().anchor_setting);
+        log::error!("PoWit finality anchor {} (DAG height {}) is UNKNOWN while this node's chain is above that \
+            height: no finalized checkpoint above it counts until the block arrives. The node holds its pin ({}) \
+            instead of following the most work. Check the checkpoint (`getfinalityinfo`; `--finalitycheckpoint`, \
+            `setfinalitycheckpoint`) and its peers: the block is on a chain it has not received, or on none",
+            a.map(|a| hex::encode(a.hash)).unwrap_or_default(), a.map(|a| a.height).unwrap_or(0),
+            outcome.pin.map(|(h, _)| hex::encode(&h[..8])).unwrap_or_else(|| "none".into()));
+    }
     if outcome.anchor != previous.anchor && matches!(outcome.anchor,
         crate::consensus::finality::AnchorStatus::Invalid | crate::consensus::finality::AnchorStatus::HeightMismatch)
     {
@@ -1541,7 +1602,10 @@ pub enum FinalityOp {
     /// finality, which a checkpoint that conflicted with the one set aside
     /// may now advance; the most work decides above it).
     Ignore(Hash),
-    /// Undo [`FinalityOp::Ignore`] for this block.
+    /// Remove [`FinalityOp::Ignore`] for this block: its checkpoints count
+    /// again. Not an undo of a move: if setting it aside let a conflicting
+    /// finality become the node's own, the node keeps that one (the way back
+    /// is [`FinalityOp::SetAnchor`] on the original chain).
     Reconsider(Hash),
     /// Trust this block, which the node holds, as final (an operator
     /// weak-subjectivity checkpoint): it replaces the release checkpoint as
@@ -1638,6 +1702,9 @@ pub fn finality_info_json(dag: &GhostDAG, max: usize) -> serde_json::Value {
             AnchorSetting::Operator(_) => "operator",
         },
         "anchor_status": format!("{:?}", o.anchor).to_lowercase(),
+        // Round 2, M3: the anchor is unknown while the applied tip is above
+        // its height (the pin is held, `origin: held`).
+        "anchor_overdue": o.anchor_overdue,
         "finalized": o.counted.iter().take(max).map(|(h, height, slot)| serde_json::json!({
             "hash": hex::encode(h), "block_height": height, "slot": slot })).collect::<Vec<_>>(),
         "finalized_count": o.counted.len(),

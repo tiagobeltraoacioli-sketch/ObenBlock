@@ -651,3 +651,111 @@ fn an_operator_checkpoint_set_before_sync_keeps_an_eclipsed_node_off_the_fork() 
         &n.node_state, Some(&n.tip_tx), &n.shielded).expect_err("wrong height");
     assert!(e.to_string().contains("DAG height 10"), "{e}");
 }
+
+// ── Review round 2: M3 (unknown anchor) and L4 / L2 (the persisted pin) ─────
+
+/// Review round 2, M3: an anchor the node never receives (`setfinalitycheckpoint
+/// <hash> <height>` or `--finalitycheckpoint` naming a block it does not get)
+/// made nothing count: the pin dropped to none, the persisted pin was
+/// deleted and fork choice fell back to the most work, silently. While the
+/// anchor is unknown the node now holds the checkpoint it had pinned
+/// (`origin: held`), keeps it persisted, and alerts once its applied tip is
+/// above the anchor's height (`anchor_overdue`).
+#[test]
+fn an_unknown_anchor_holds_the_pinned_checkpoint_and_alerts() {
+    setup();
+    let genesis = mk_genesis(unix_now() - 100_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let x = b.chain(gh, 20, "x");
+    let z = b.chain(gh, 30, "z");
+    let mut n = node_with(&genesis, &[]);
+    finalize(&n, &b, &x, 3, 10);
+    deliver(&n, &x);
+    deliver(&n, &z);
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(x[3].block_hash()), Some(tip(&x))));
+    let persisted = |n: &Node| n.store.get_meta(gnb::powit::FINALITY_PIN_META).unwrap();
+    assert_eq!(persisted(&n), Some(x[3].block_hash().to_vec()));
+
+    finality_op(&n, FinalityOp::SetAnchorAt([0xEE; 32], 5));
+    assert_eq!(pin_of(&n), Some(x[3].block_hash()), "the pin is held while the anchor is unknown");
+    assert_eq!(applied_tip(&n), Some(tip(&x)), "not the most work (Z)");
+    assert_eq!(persisted(&n), Some(x[3].block_hash().to_vec()), "and stays persisted");
+    let info = gnb::powit::finality_info_json(&n.dag.read(), 8);
+    assert_eq!((info["anchor_status"].as_str(), info["origin"].as_str(), info["anchor_overdue"].as_bool()),
+        (Some("unknown"), Some("held"), Some(true)), "{info}");
+    restart(&mut n);
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(x[3].block_hash()), Some(tip(&x))));
+    assert_eq!(persisted(&n), Some(x[3].block_hash().to_vec()));
+
+    finality_op(&n, FinalityOp::DefaultAnchor);
+    let info = gnb::powit::finality_info_json(&n.dag.read(), 8);
+    assert_eq!((info["origin"].as_str(), info["anchor_overdue"].as_bool()), (Some("finalized"), Some(false)));
+}
+
+fn genesis_seed(genesis: &Block) -> impl Fn(&gnb::storage::Storage, &mut rocksdb::WriteBatch) -> Result<(), String> {
+    let gh = genesis.block_hash();
+    let txids: Vec<[u8; 32]> = genesis.transactions.iter().map(|t| t.txid()).collect();
+    move |st: &gnb::storage::Storage, batch: &mut rocksdb::WriteBatch| {
+        for t in &txids {
+            st.stage_tx_index(batch, t, &gh, 0).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+/// The DAG reloaded from storage, nothing reconciled (a process that
+/// crashed in the middle of a chain-state rebuild, before it resumes it).
+fn reload(n: &mut Node) {
+    let mut d = GhostDAG::with_default_k();
+    let entries = n.store.load_all_dag_data().unwrap();
+    let im = n.store.load_all_integrity_hashes().unwrap();
+    d.load_persisted_validated(entries, im).expect("integrity chain verifies");
+    d.rebuild_reachability_from_store().unwrap();
+    n.dag = std::sync::Arc::new(parking_lot::RwLock::new(d));
+    n.shielded = std::sync::Arc::new(parking_lot::RwLock::new(
+        gnb::coherence::ShieldedPool::load(&n.store).expect("shielded state loads")));
+}
+
+/// Review round 2, L4 (and L2): a chain-state rebuild reconnects from
+/// genesis, so while it runs, and after a crash in its middle, the applied
+/// chain's own finality is far below the pin. In a conflict, the pin the
+/// node persisted keeps it on its side: here the node keeps H[30] against
+/// the heavier A's A[5], the rebuild is interrupted at H[15] (where the
+/// applied chain's own finality is H[3], which both H[30] and A[5] advance:
+/// without the persisted pin the most work, A, would win), the process
+/// restarts from storage, and the resumed rebuild ends on H with the same
+/// pin. (A lost write of the pin plus such a rebuild can switch sides: the
+/// write follows every change of pin, docs/CONSENSUS.md.)
+#[test]
+fn an_interrupted_rebuild_resumes_on_the_persisted_pin_during_a_conflict() {
+    setup();
+    let genesis = mk_genesis(unix_now() - 100_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let h = b.chain(gh, 40, "h");
+    let a = b.chain(h[4].block_hash(), 50, "a");
+    assert!(b.work(&tip(&a)) > b.work(&tip(&h)));
+    let mut n = node_with(&genesis, &[]);
+    n.store.put_tx_index(&genesis.transactions[0].txid(), &gh, 0).unwrap();
+    finalize(&n, &b, &h, 3, 8);
+    finalize(&n, &b, &h, 30, 35);
+    finalize(&n, &b, &a, 5, 20);
+    deliver(&n, &h);
+    deliver(&n, &a);
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(h[30].block_hash()), Some(tip(&h))));
+
+    gnb::reorg::fault_injection::fail_after_commits(Some(1));
+    let r = gnb::accept::rebuild_chain_state(&n.dag, &n.store, &n.shielded, &genesis_seed(&genesis));
+    gnb::reorg::fault_injection::fail_after_commits(None);
+    assert!(r.is_err(), "the rebuild was interrupted");
+    let mid = applied_tip(&n).unwrap();
+    let mid_height = n.dag.read().get_block_data(&mid).unwrap().height;
+    assert!(mid_height < b.height(&h[30].block_hash()), "interrupted below the pin (at {mid_height})");
+    reload(&mut n);
+    gnb::accept::rebuild_chain_state(&n.dag, &n.store, &n.shielded, &genesis_seed(&genesis)).expect("resumes");
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(h[30].block_hash()), Some(tip(&h))),
+        "the persisted pin, not the most work");
+    restart(&mut n);
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(h[30].block_hash()), Some(tip(&h))));
+}

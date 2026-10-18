@@ -148,7 +148,8 @@ pub enum ChainAdminOp {
     /// `ignorefinalized`: never pin a finalized checkpoint at or above the
     /// block on its chain.
     IgnoreFinalized,
-    /// `reconsiderfinalized`: undo `ignorefinalized` for the block.
+    /// `reconsiderfinalized`: remove `ignorefinalized` for the block (it does
+    /// not move the node back off a finality it adopted meanwhile).
     ReconsiderFinalized,
     /// `setfinalitycheckpoint <hash>`: the operator's weak-subjectivity anchor.
     SetFinalityCheckpoint,

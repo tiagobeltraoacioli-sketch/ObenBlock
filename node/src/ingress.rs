@@ -959,6 +959,9 @@ pub struct OrphanEntry {
     /// the only keys its eviction remembers work under (POW-3). A parent
     /// already in the DAG is never looked up by the work rule.
     pub missing: Vec<[u8; 32]>,
+    /// Review round 2, H1: the target of an authenticated finality claim it
+    /// carries ([`OrphanPool::set_claim`], [`OrphanPool::claim_backs`]).
+    pub claim:  Option<[u8; 32]>,
     seq:        u64,
 }
 
@@ -973,6 +976,8 @@ struct Skeleton {
     /// At most [`REMEMBERED_KEYS_PER_ORPHAN`] of its missing parents.
     parents: Vec<[u8; 32]>,
     owner:   Option<PeerId>,
+    /// The evicted orphan's authenticated finality claim, if any (its target).
+    claim:   Option<[u8; 32]>,
     seq:     u64,
 }
 
@@ -1230,7 +1235,7 @@ impl OrphanPool {
         self.drop_skeleton(&hash);
         self.generation = self.generation.wrapping_add(1);
         self.entries.insert(hash, OrphanEntry {
-            block, height, bytes, peer, evidence, missing: missing_parents.to_vec(), seq,
+            block, height, bytes, peer, evidence, missing: missing_parents.to_vec(), claim: None, seq,
         });
         OrphanInsert::Inserted { evicted }
     }
@@ -1244,17 +1249,19 @@ impl OrphanPool {
             let work = header_work(&e.block);
             let keys: Vec<[u8; 32]> = e.missing.iter().take(REMEMBERED_KEYS_PER_ORPHAN).copied().collect();
             let owner = e.peer;
+            let claim = e.claim;
             let path = work.saturating_add(self.path_work_above(h));
             for p in &keys {
                 self.remember_path(*p, path, owner);
             }
-            self.add_skeleton(*h, work, keys, owner);
+            self.add_skeleton(*h, work, keys, owner, claim);
         }
         self.remove(h);
     }
 
     /// Keep an evicted orphan as a skeleton, within the store's bounds.
-    fn add_skeleton(&mut self, hash: [u8; 32], work: u128, parents: Vec<[u8; 32]>, owner: Option<PeerId>) {
+    fn add_skeleton(&mut self, hash: [u8; 32], work: u128, parents: Vec<[u8; 32]>, owner: Option<PeerId>,
+                    claim: Option<[u8; 32]>) {
         if self.remembered_cap == 0 || self.skeletons.contains_key(&hash) {
             return;
         }
@@ -1287,7 +1294,7 @@ impl OrphanPool {
         }
         self.skel_by_work.insert((work, seq, hash));
         self.skel_by_owner.entry(owner).or_default().insert((seq, hash));
-        self.skeletons.insert(hash, Skeleton { work, parents, owner, seq });
+        self.skeletons.insert(hash, Skeleton { work, parents, owner, claim, seq });
     }
 
     fn drop_skeleton(&mut self, h: &[u8; 32]) -> Option<Skeleton> {
@@ -1571,6 +1578,67 @@ impl OrphanPool {
 
     /// Remove one orphan, detaching it from every parent it waited on.
     /// Orphans waiting on IT keep waiting (their parent is just not buffered).
+    /// Review round 2, H1: record that the buffered orphan `hash` carries an
+    /// authenticated finality claim whose vote targets `target`. Only a
+    /// buffered orphan can carry one (nothing is recorded for a refused
+    /// insert), and it lives and goes with the orphan (or its skeleton): the
+    /// pool's per-peer quotas and its eviction rules bound it, and no claim
+    /// displaces another.
+    pub fn set_claim(&mut self, hash: &[u8; 32], target: [u8; 32]) {
+        if let Some(e) = self.entries.get_mut(hash) {
+            e.claim = Some(target);
+        }
+    }
+
+    /// Review round 2, H1: whether an authenticated finality claim backs `x`,
+    /// a block about to be stored below the work threshold whose parents are
+    /// `parents`: in the closure of the buffered orphans (and skeletons of
+    /// evicted ones) waiting on `x`, transitively, `x` itself included, one
+    /// carries a claim whose vote targets `x`, a block of that closure, or a
+    /// stored block on `x`'s selected chain. The target binds the claim to
+    /// the chain it reaches the node along: an authentic vote copied onto
+    /// another chain targets a block that chain does not contain, and a
+    /// block another chain hangs a claim on (a random parent of a crafted
+    /// orphan) is not below its target. Recomputed at each admission, so a
+    /// block requested again while it is still waited on is backed again. At
+    /// most `limit` blocks of the closure are visited (breadth first from
+    /// `x`, so the nearest claim above it is found first).
+    pub fn claim_backs(&self, x: &[u8; 32], parents: &[BlockHash], dag: &GhostDAG, limit: usize) -> bool {
+        let sp = dag.preview_selected_parent(parents);
+        let below = |t: &[u8; 32]| sp.is_some_and(|p| dag.has_block(t) && dag.is_chain_ancestor_or_self(t, &p));
+        let mut visited: HashSet<[u8; 32]> = HashSet::new();
+        let mut targets: HashSet<[u8; 32]> = HashSet::new();
+        let mut queue: VecDeque<[u8; 32]> = VecDeque::new();
+        visited.insert(*x);
+        queue.push_back(*x);
+        while let Some(v) = queue.pop_front() {
+            if targets.contains(&v) {
+                return true;
+            }
+            let claim = self.entries.get(&v).and_then(|e| e.claim).or_else(|| self.skeletons.get(&v).and_then(|s| s.claim));
+            if let Some(t) = claim {
+                if visited.contains(&t) || below(&t) {
+                    return true;
+                }
+                targets.insert(t);
+            }
+            let waiters = self.waiting_for.get(&v).into_iter().flatten()
+                .chain(self.skel_children.get(&v).into_iter().flatten());
+            for w in waiters {
+                if visited.len() >= limit {
+                    return false;
+                }
+                if visited.insert(*w) {
+                    if targets.contains(w) {
+                        return true;
+                    }
+                    queue.push_back(*w);
+                }
+            }
+        }
+        false
+    }
+
     pub fn remove(&mut self, h: &[u8; 32]) -> Option<OrphanEntry> {
         let e = self.entries.remove(h)?;
         self.order.remove(&e.seq);
@@ -1723,32 +1791,59 @@ pub fn work_admission(lb: u128, threshold: u128, chain_above: u128, merge_lb: u1
 // never stored the other side's blocks, never computed their PoWit states,
 // never learned their finality, and the network stayed split.
 //
-// The fix (the review's option (a), the simplest that is DoS-bounded): a
-// block whose PoWit section claims that its chain justified a checkpoint
-// beyond this node's finality is a FINALITY CLAIM, and the ancestors the node
-// pulls for it (directed: the missing parents of buffered orphans it backs)
-// are admitted below the work threshold, within budgets. The claim is the
-// block itself, no new wire message: an attestation's source is its chain's
-// justified checkpoint (consensus rejects any other), so a block of a chain
-// that finalized `F` beyond this node's pin carries sources at least one
-// checkpoint interval above `F`. A claim is only a reason to fetch: the
-// claimed chain's finality counts once its blocks are stored and their PoWit
-// states computed, like any other (`powit::refresh_finality_pin`); a false
-// claim costs the claimer its budget and leaves stored fork-loser blocks,
-// pruned like any other.
+// The fix (the review's option (a), no new wire message): a buffered orphan
+// whose PoWit section carries a FINALITY CLAIM backs the chain under it, and
+// the blocks of that chain the node then pulls are admitted below the work
+// threshold, within budgets. A claim is a vote of the orphan that
 //
-// Bounds (`FinalityPulls`): each admission stores one block that passed every
-// check a block passes, proof of work included, and that the node requested
-// (a missing parent of a buffered orphan the claim backs; the claiming
-// orphan itself met the orphan floor, `ORPHAN_WORK_FLOOR_SHIFT`, and its
-// proof). At most `FINALITY_PULL_PEER_BURST` admissions per delivering peer
-// (the connection that answered the pull or relayed the orphan, refilled at
-// `FINALITY_PULL_PEER_REFILL`) and `FINALITY_PULL_BURST` for the node (refilled
-// at one block interval's rate): two mainnet epochs, more than an honest side
-// needs to show a newer finality (a checkpoint every 60 blocks, finalized
-// one interval later); a side that finalized only through inactivity decay
-// is fetched at the refill rate after the burst. At most `FINALITY_MARKS_MAX`
-// blocks are marked as backed at once (oldest forgotten first).
+// * links from a checkpoint more than one interval above the node's pin
+//   (`claims_finality`): consensus makes a vote's source the including
+//   chain's justified checkpoint, so a chain that finalized `F` beyond the
+//   pin links from `F` + one interval or later, the node's own chain from at
+//   most its pin + one interval;
+// * is AUTHENTIC (review round 2, H1): signed, under the message of the
+//   orphan's rules, by a key with weight in the witness set the node's own
+//   state (its selected tip's) derives for the vote's target epoch
+//   (`powit::authenticated_finality_claim`, at most
+//   `MAX_CLAIM_SIGNATURE_CHECKS` signatures per orphan). From the second
+//   hardening activation a chain that shares the node's finality reads the
+//   same frozen window; before it, the node's own recent share history;
+// * is BOUND to the chain (`OrphanPool::claim_backs`): a block is backed
+//   only if the vote's target is that block, lies in the pulled chain above
+//   it, or is a stored block below it. An authentic vote is public: copied
+//   onto another chain, it targets a block that chain does not contain.
+//
+// The claim is recorded in the orphan's pool entry once it is buffered
+// (`OrphanPool::set_claim`), and survives its eviction in its skeleton, so
+// the pool's bounds (per delivering peer, and evictions that favour work)
+// bound the claims and no claim displaces another; backing is recomputed
+// from the pool at each admission, so a block requested again while it is
+// still waited on is backed again. A claim is only a reason to fetch: the
+// claimed finality counts once the blocks are stored and their PoWit states
+// computed, like any other (`powit::refresh_finality_pin`).
+//
+// What an admission requires besides the claim (review round 2, M2, L3):
+// the block extends the pinned checkpoint's chain (`extends_pin`; with no
+// pin, only when no weak-subjectivity anchor is configured), its own bits
+// meet the orphan floor (`ORPHAN_WORK_FLOOR_SHIFT`: at least 1/16 of a
+// block's work at the tip, so a cheap deep fork cannot ride on a claim), it
+// passes the checks `accept_block` runs before the proof, and its proof.
+//
+// Budgets (`FinalityPulls`): at most `FINALITY_PULL_PEER_BURST` admissions per
+// delivering peer (the connection that answered the pull or relayed the
+// orphan, refilled at `FINALITY_PULL_PEER_REFILL`) and `FINALITY_PULL_BURST`
+// for the node (refilled at one block interval's rate): two mainnet epochs,
+// more than an honest side needs to show a newer finality (a checkpoint
+// every 60 blocks, finalized one interval later); a side that finalized only
+// through inactivity decay is fetched at the refill rate after the burst. A
+// block refused for a spent budget is dropped without penalty and requested
+// again (the orphan sweep, while the orphans above it wait). The
+// DAG-7 merge-backed budget (four, then one per 30 s) is not charged: it
+// rations deep insertions an unauthenticated crafted orphan can make
+// needed, and would hold a heal of hundreds of blocks for hours; these
+// budgets ration the finality-backed ones. An attacker with no witness key
+// can spend none of them; a witness signing links to its own chain spends
+// at most these, at the floor's work per block.
 
 /// Admissions below the work threshold per delivering peer (burst).
 pub const FINALITY_PULL_PEER_BURST: u32 = 1_440;
@@ -1758,16 +1853,20 @@ pub const FINALITY_PULL_PEER_REFILL: f64 = 1.0 / 60.0;
 pub const FINALITY_PULL_BURST: u32 = 2_880;
 /// Node-wide, tokens per second (one per 30 s block interval).
 pub const FINALITY_PULL_REFILL: f64 = 1.0 / 30.0;
-/// Blocks marked as finality-backed at once.
-pub const FINALITY_MARKS_MAX: usize = 8_192;
 /// Delivering peers tracked by the per-peer budget.
 const FINALITY_PULL_PEERS_TRACKED: usize = 1_024;
+/// Blocks of the orphan closure above a block that [`OrphanPool::claim_backs`]
+/// visits looking for a claim (an honest side claims within a few checkpoint
+/// intervals of the fork point).
+pub const FINALITY_CLAIM_SEARCH_MAX: usize = 4_096;
+/// Attestation signatures checked per orphan to authenticate a claim.
+pub const MAX_CLAIM_SIGNATURE_CHECKS: usize = 2;
 
 /// Whether `block` claims a finality newer than this node's: one of its
 /// attestations links from a checkpoint above `floor` ([`finality_claim_floor`]),
 /// i.e. its chain justified a checkpoint more than one interval beyond the
-/// node's finalized one. Cheap (no signature is checked: a claim is only a
-/// reason to fetch, see the section comment).
+/// node's finalized one. The cheap pre-filter of a claim (no signature is
+/// checked here: `powit::authenticated_finality_claim` authenticates it).
 pub fn claims_finality(block: &core::Block, floor: u64) -> bool {
     block.powit.attestations.iter().any(|a| a.source.height > floor)
 }
@@ -1788,25 +1887,29 @@ pub fn finality_claim_floor(dag: &GhostDAG) -> u64 {
 
 /// Whether a block on `parents` extends the pinned checkpoint's chain (its
 /// selected parent is the pin or descends from it), so that a finality its
-/// chain carries could advance the pin (`consensus::finality`); with no pin,
-/// every block does. O(1) (reachability). A finality-backed admission
-/// requires it: a chain that forks below the pin cannot move it, whatever
-/// it claims.
+/// chain carries could advance the pin (`consensus::finality`). With no pin,
+/// only when no weak-subjectivity anchor is configured (review round 2, M2:
+/// while a configured anchor is unknown or invalid no finality above it
+/// counts, so no claim can help). O(1) (reachability). A finality-backed
+/// admission requires it: a chain that forks below the pin cannot move it,
+/// whatever it claims.
 pub fn extends_pin(dag: &GhostDAG, parents: &[BlockHash]) -> bool {
     match (dag.finalized(), dag.preview_selected_parent(parents)) {
-        (None, _) => true,
+        (None, _) => dag.finality_outcome().anchor == crate::consensus::finality::AnchorStatus::None,
         (Some((pin, _)), Some(sp)) => dag.is_chain_ancestor_or_self(&pin, &sp),
         (Some(_), None) => false,
     }
 }
 
-/// Review HIGH 2: the blocks a finality claim backs, and the budgets of
-/// their admission below the work threshold (section comment above).
+/// Review HIGH 2: the budgets of finality-backed admissions below the work
+/// threshold, and the state claims are authenticated against (section
+/// comment above).
 pub struct FinalityPulls {
-    marks:    HashSet<[u8; 32]>,
-    order:    VecDeque<[u8; 32]>,
     per_peer: crate::network::ratelimit::TokenBuckets<Option<PeerId>>,
     global:   crate::network::ratelimit::TokenBuckets<()>,
+    /// The selected tip and its PoWit state (none below the activation),
+    /// decoded once per tip.
+    tip_state: Option<(BlockHash, Option<core::powit::PowitState>)>,
 }
 
 impl Default for FinalityPulls {
@@ -1820,54 +1923,28 @@ impl FinalityPulls {
     /// rates are the constants').
     pub fn new(per_peer: u32, global: u32) -> Self {
         Self {
-            marks: HashSet::new(),
-            order: VecDeque::new(),
             per_peer: crate::network::ratelimit::TokenBuckets::new(per_peer, FINALITY_PULL_PEER_REFILL,
                 FINALITY_PULL_PEERS_TRACKED),
             global: crate::network::ratelimit::TokenBuckets::new(global, FINALITY_PULL_REFILL, 1),
+            tip_state: None,
         }
     }
 
-    /// Whether a finality claim backs `hash`.
-    pub fn backs(&self, hash: &[u8; 32]) -> bool {
-        self.marks.contains(hash)
-    }
-
-    /// Number of blocks marked as backed.
-    #[allow(dead_code)] // tests only; the node binary compiles this module too
-    pub fn len(&self) -> usize {
-        self.marks.len()
-    }
-
-    fn mark(&mut self, hash: [u8; 32]) {
-        if !self.marks.insert(hash) {
-            return;
+    /// The target of an authentic finality claim `block` carries, given the
+    /// node's claim floor and selected tip (read under the DAG lock by the
+    /// caller; the state is decoded and the signatures checked without it).
+    pub fn authenticate(&mut self, block: &core::Block, floor: u64, tip: Option<BlockHash>, store: &Storage)
+        -> Option<[u8; 32]>
+    {
+        if !claims_finality(block, floor) {
+            return None;
         }
-        self.order.push_back(hash);
-        while self.marks.len() > FINALITY_MARKS_MAX {
-            match self.order.pop_front() {
-                Some(old) => { self.marks.remove(&old); }
-                None => break,
-            }
+        let tip = tip?;
+        if self.tip_state.as_ref().map(|(h, _)| *h) != Some(tip) {
+            self.tip_state = Some((tip, crate::powit::load_state(store, &tip)));
         }
-        // Entries `forget` left behind: keep the queue within twice the bound.
-        if self.order.len() > 2 * FINALITY_MARKS_MAX {
-            let marks = &self.marks;
-            self.order.retain(|h| marks.contains(h));
-        }
-    }
-
-    /// A buffered orphan `hash` with these missing parents: if it claims a
-    /// finality newer than the node's, or a claim already backs it, mark it
-    /// and its missing parents (the ancestors the node requests next).
-    pub fn note_orphan(&mut self, hash: [u8; 32], claims: bool, missing: &[[u8; 32]]) {
-        if !claims && !self.backs(&hash) {
-            return;
-        }
-        self.mark(hash);
-        for p in missing {
-            self.mark(*p);
-        }
+        let state = self.tip_state.as_ref()?.1.as_ref()?;
+        crate::powit::authenticated_finality_claim(block, floor, state, MAX_CLAIM_SIGNATURE_CHECKS)
     }
 
     /// Spend one admission delivered by `peer`: its budget and the node's.
@@ -1881,11 +1958,6 @@ impl FinalityPulls {
             return false;
         }
         true
-    }
-
-    /// `hash` was stored: its mark is no longer needed.
-    pub fn forget(&mut self, hash: &[u8; 32]) {
-        self.marks.remove(hash);
     }
 }
 
@@ -2367,6 +2439,7 @@ fn work_rule(
     block:           &core::Block,
     hash:            &[u8; 32],
     peer:            Option<PeerId>,
+    reference:       &[u8; 32],
     now:             Instant,
     now_unix:        u64,
     dag:             &GhostDAG,
@@ -2391,10 +2464,14 @@ fn work_rule(
         let chain_above = orphans.announced_work_capped(hash, threshold - lb);
         if lb.saturating_add(chain_above) >= threshold {
             (chain_above, 0) // ChainBacked: the merge bound is not needed
-        } else if finality.backs(hash) && extends_pin(dag, &block.header.parents) {
-            // Review HIGH 2: a requested ancestor of a finality claim, on a
-            // chain whose finality could advance the pin.
-            if charge && !finality.charge(peer, now) {
+        } else if finality_backed(orphans, block, hash, reference, dag) {
+            // Review HIGH 2 (round 2: H1, M2, L3): an authentic claim backs
+            // it, on a chain whose finality could advance the pin, with at
+            // least the orphan floor's work. Charged once the checks
+            // `accept_block` runs before the proof pass (a block that fails
+            // them is refused there, uncharged).
+            let act = core::activation::hardening_activation_height();
+            if charge && passes_pre_pow_checks(block, dag, act) && !finality.charge(peer, now) {
                 return Err(DropReason::FinalityBudgetExhausted);
             }
             return Ok(WorkAdmission::FinalityBacked);
@@ -2414,6 +2491,22 @@ fn work_rule(
         WorkAdmission::MergeBacked if budget.is_some_and(|b| !b.allow_at(now)) => Err(DropReason::DeepBudgetExhausted),
         ok => Ok(ok),
     }
+}
+
+/// Review HIGH 2: whether `block` (parents all known, below the work
+/// threshold) may be stored as finality-backed: an authentic finality claim
+/// bound to its chain backs it (`OrphanPool::claim_backs`), it extends the
+/// pinned checkpoint's chain ([`extends_pin`]), and its own bits meet the
+/// orphan floor derived from `reference` (the target of the selected tip's
+/// next block: round 2, M2).
+fn finality_backed(orphans: &OrphanPool, block: &core::Block, hash: &[u8; 32], reference: &[u8; 32], dag: &GhostDAG)
+    -> bool
+{
+    let tip_h = dag.selected_tip().and_then(|t| dag.get_block_data(&t)).map(|d| d.height).unwrap_or(0);
+    let floor = orphan_floor_from(&reference_for_height(reference, tip_h.saturating_add(1), block.height), block.height);
+    bits_meet_floor(block.header.bits, &floor)
+        && extends_pin(dag, &block.header.parents)
+        && orphans.claim_backs(hash, &block.header.parents, dag, FINALITY_CLAIM_SEARCH_MAX)
 }
 
 impl BlockIngress {
@@ -2533,8 +2626,17 @@ impl BlockIngress {
         now_unix: u64,
         dag: &GhostDAG,
     ) -> Result<WorkAdmission, DropReason> {
+        let tip_h = dag.selected_tip().and_then(|t| dag.get_block_data(&t)).map(|d| d.height).unwrap_or(0);
+        let reference = self.reference(tip_h, now_unix);
         work_rule(&self.orphans, Some(&mut self.deep_budget), &mut self.finality, &mut self.threshold_cache,
-            &mut self.low_work, block, hash, None, now, now_unix, dag)
+            &mut self.low_work, block, hash, None, &reference, now, now_unix, dag)
+    }
+
+    /// POW-4 test seam, mid-test: replace (or, with `None`, clear) the
+    /// reference target ([`Self::with_reference_target`]).
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
+    pub fn set_reference_target(&mut self, t: Option<[u8; 32]>) {
+        self.reference_override = t;
     }
 
     /// The reference target of the orphan floor and the IBD evidence.
@@ -2654,10 +2756,15 @@ impl BlockIngress {
                 PowCheck::Deferred => return Gated::PowPending(Box::new(block)),
             }
             let evidence = orphan_is_sync_evidence_from(block.header.bits, block.height, tip_h, &reference);
-            // Review HIGH 2: a claim of a newer finality (or an ancestor of
-            // one) backs the parents the node requests for it.
-            let claims = claims_finality(&block, finality_claim_floor(&ctx.dag.read()));
-            self.finality.note_orphan(hash, claims, &missing);
+            // Review HIGH 2 (round 2, H1): an authentic claim of a newer
+            // finality, recorded once the orphan is buffered.
+            let claim = {
+                let (floor, tip) = {
+                    let d = ctx.dag.read();
+                    (finality_claim_floor(&d), d.selected_tip())
+                };
+                self.finality.authenticate(&block, floor, tip, ctx.store)
+            };
             // Request each missing parent that nobody is waiting for and that
             // is not itself buffered (a deep gap fans out one level at a time).
             let fresh: Vec<[u8; 32]> = missing.iter()
@@ -2667,6 +2774,9 @@ impl BlockIngress {
             let height = block.height;
             match self.orphans.insert(hash, block, height, wire_bytes, peer, evidence, &missing) {
                 OrphanInsert::Inserted { evicted } => {
+                    if let Some(t) = claim {
+                        self.orphans.set_claim(&hash, t);
+                    }
                     for mp in &fresh {
                         self.parent_fetch.note_requested(*mp, now);
                     }
@@ -2683,8 +2793,9 @@ impl BlockIngress {
                 let d = ctx.dag.read();
                 // The work rule on the read guard's DAG; a merge-backed
                 // admission is charged below, once its proof is known valid.
+                let reference = self.reference(tip_h, now_unix);
                 let a = match work_rule(&self.orphans, None, &mut self.finality, &mut self.threshold_cache,
-                    &mut self.low_work, &block, &hash, peer, now, now_unix, &d)
+                    &mut self.low_work, &block, &hash, peer, &reference, now, now_unix, &d)
                 {
                     Ok(a) => a,
                     Err(r) => return Gated::Done(BlockOutcome::Dropped(r)),
@@ -2730,7 +2841,6 @@ impl BlockIngress {
             let drained = match &result {
                 Ok(h) => {
                     self.orphans.forget(h);
-                    self.finality.forget(h);
                     self.drain_orphans_at(*h, now, now_unix, ctx)
                 }
                 Err(_) => Vec::new(),
@@ -2817,17 +2927,19 @@ impl BlockIngress {
     }
 
     fn drain_orphans_at(&mut self, accepted: [u8; 32], now: Instant, now_unix: u64, ctx: &AcceptCtx) -> Vec<[u8; 32]> {
+        let reference = {
+            let d = ctx.dag.read();
+            let tip_h = d.selected_tip().and_then(|t| d.get_block_data(&t)).map(|x| x.height).unwrap_or(0);
+            self.reference(tip_h, now_unix)
+        };
         let Self { orphans, deep_budget, finality, threshold_cache, low_work, chain, .. } = self;
         let mut gate = |pool: &OrphanPool, block: &core::Block, hash: &[u8; 32], d: &GhostDAG| {
             let peer = pool.get(hash).and_then(|e| e.peer);
             work_rule(pool, Some(&mut *deep_budget), &mut *finality, threshold_cache, low_work, block, hash, peer,
-                now, now_unix, d)
+                &reference, now, now_unix, d)
         };
         let mut events = OrphanBlockEvents::default();
         process_orphans_gated(accepted, orphans, ctx, chain, &mut gate, &mut events);
-        for h in &events.accepted {
-            self.finality.forget(h);
-        }
         let out = events.accepted.clone();
         self.orphan_events.accepted.extend(events.accepted);
         self.orphan_events.rejected.extend(events.rejected);

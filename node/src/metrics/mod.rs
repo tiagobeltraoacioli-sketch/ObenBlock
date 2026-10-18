@@ -86,6 +86,9 @@ pub struct MetricsState {
     /// PoWit finality conflict alert (review HIGH 1): counted finalized
     /// checkpoints that conflict with the node's pin; 0 when none.
     pub finality_conflicts:              IntGauge,
+    /// The configured weak-subjectivity anchor is unknown while the applied
+    /// tip is above its height (review round 2, M3): 1, else 0.
+    pub finality_anchor_unknown:         IntGauge,
 
     // ── Histograms (Phase 2) ────────────────────────────────────
     pub block_validation_seconds:        Histogram,
@@ -232,6 +235,13 @@ impl MetricsState {
             registry
         ).expect("register finality_conflicts");
 
+        let finality_anchor_unknown = register_int_gauge_with_registry!(
+            opts!("gnb_finality_anchor_unknown",
+                  "1 while the PoWit finality anchor (release, --finalitycheckpoint or setfinalitycheckpoint) is \
+                   unknown and this node's chain is above its height (the pin is held: getfinalityinfo)"),
+            registry
+        ).expect("register finality_anchor_unknown");
+
         // ── Histograms ───────────────────────────────────────────
         // Block validation buckets tuned for expected range: 1ms..10s
         let block_validation_seconds = register_histogram_with_registry!(
@@ -276,6 +286,7 @@ impl MetricsState {
             reorg_depth,
             deep_reorgs_total,
             finality_conflicts,
+            finality_anchor_unknown,
             block_validation_seconds,
             rpc_latency_seconds,
         }
@@ -420,6 +431,12 @@ pub fn inc_deep_reorg() {
 #[inline]
 pub fn set_finality_conflicts(n: i64) {
     if let Some(m) = METRICS.get() { m.finality_conflicts.set(n); }
+}
+
+/// Review round 2, M3: the anchor is unknown above its height.
+#[inline]
+pub fn set_finality_anchor_unknown(overdue: bool) {
+    if let Some(m) = METRICS.get() { m.finality_anchor_unknown.set(i64::from(overdue)); }
 }
 
 #[inline]
