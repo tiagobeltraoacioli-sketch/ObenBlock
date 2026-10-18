@@ -147,6 +147,18 @@ obtain from a future timestamp to about 6%.
 > (`core::chain::ChainParams`): ObenBlock P2P 18110, RPC 18210, metrics
 > 18310, DNS seed `seed.obenblock.xyz`; regtest 18111 / 18211 / 18311, no
 > seed. The rest of this section describes GnB's two networks.
+>
+> **ObenBlock genesis** (docs/OBENBLOCK-GENESIS.md; `core::genesis`). Each
+> ObenBlock network has its own genesis: an 80-byte SHA-256d header at the
+> network's pow limit, whose coinbase starts with the height-0 coinbase
+> commitment and whose Merkle field is the v2 body root. The ASERT anchor
+> is the genesis (mainnet: launch bits `0x19009d69`). The genesis ledger is
+> GnB's: the same carryover conversion to the same key hashes and the same
+> locked tranches. The chain id binds the SHA-256d scheme. PoWit applies
+> from height 0 (no `--powit-height`), witnesses are committed from height
+> 1, and the subsidy has a 5,760-block slow start. The mainnet genesis
+> timestamp, version and nonce are mined at launch; until then a node
+> refuses to start ObenBlock mainnet.
 
 Mainnet and testnet share the genesis block (`core::genesis_block()`, the
 same id `a63fd2c1…`), so they also share the ASERT anchor (the genesis time

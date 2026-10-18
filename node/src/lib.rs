@@ -52,6 +52,7 @@ pub mod coherence;    // Coherence C2 — shielded pool (notes, tree, spend stat
 pub mod sync;         // Phase 2 — drop-in Kaspa sync-negotiation layer (frontier reconciliation)
 #[cfg(feature = "node")]
 pub mod powit;        // PoW + PoWit node side (shares, attestations, finality)
+pub mod genesis_init; // first-boot genesis and the data-dir genesis check (both chains)
 pub mod ingress;      // audit fixes: block-ingress / orphan / IBD-latch policy
 // Block acceptance pipeline (accept / connect split, audit DAG-1/10/11),
 // moved out of main.rs so integration tests drive the real path.

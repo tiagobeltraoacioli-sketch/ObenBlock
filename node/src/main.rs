@@ -46,6 +46,7 @@ mod assumevalid;  // assumed-valid block (Core's -assumevalid), P5-G
 mod template;     // Block templates for the miner + getblocktemplate (MEM-2, DAG-2)
 mod blockval;     // this chain's tx rules on top of the audit set (locktime, policy, BIP30)
 mod powit;        // PoW + PoWit: witness shares, attestations, finality (node side)
+mod genesis_init; // first-boot genesis and the data-dir genesis check (both chains)
 
 // The acceptance pipeline lives in `accept.rs` (shared with the library so
 // integration tests drive the real path); same names and signatures as the
@@ -554,7 +555,17 @@ async fn main() {
         .expect("node chain-id must be settable exactly once at startup");
     info!("chain {} {} (chain id {:#010x})", net_params.chain.name(), net_params.network_name,
           net_params.chain_id.to_u32());
+    // docs/DESIGN-obenblock.md §3: the ObenBlock mainnet genesis is mined at
+    // launch; until its constants are pasted the node refuses to start.
+    if let Some(why) = core::genesis::launch_refusal(net_params.chain_id) {
+        eprintln!("❌ {why}");
+        std::process::exit(2);
+    }
     if let Some(h) = cli.powit_height {
+        if net_params.chain == core::chain::Chain::ObenBlock {
+            eprintln!("--powit-height is refused on ObenBlock: PoWit applies from height 0 on both its networks");
+            std::process::exit(2);
+        }
         if !test_network {
             eprintln!("--powit-height is for test networks only; mainnet activation is a consensus constant");
             std::process::exit(2);
@@ -562,7 +573,7 @@ async fn main() {
         core::set_powit_height_override(h).expect("PoWit height must be settable once at startup");
     }
     info!("proof of work: {} (PoWit activation height {})",
-          core::pow_algo(0).name(),
+          if core::pow_scheme::node_sha256d_params().is_some() { "sha256d" } else { core::pow_algo(0).name() },
           match core::powit_height() { u64::MAX => "off".to_string(), h => h.to_string() });
 
     // POW-3 (Phase 4): the minimum chain work (Bitcoin Core's
@@ -765,8 +776,9 @@ async fn main() {
     }
 
     if store.get_meta("genesis_hash").ok().flatten().is_none() {
-        // ── Genesis ledger: verified Bloch Genesis-3 carryover ───────────
-        // Verify fully, then write in one atomic batch, before block 0. A
+        // ── Genesis: verified Bloch Genesis-3 carryover, locked allocations
+        // and the genesis block of the node's chain (genesis_init). Verify
+        // fully, then write the ledger in one atomic batch, before block 0. A
         // crash between ingestion and genesis init re-runs both (same keys).
         let Some(snap_path) = cli.carryover_snapshot.as_ref() else {
             error!("first boot requires --carryover-snapshot <bloch-g3-carryover.tsv> \
@@ -777,125 +789,17 @@ async fn main() {
             error!("cannot read {}: {e}", snap_path.display());
             std::process::exit(1);
         });
-        // Locked team and founder allocations (core::vesting): the keys must
-        // be configured and match the consensus hash before any ledger exists.
-        let locked = core::vesting::genesis_tranches().unwrap_or_else(|e| {
-            error!("locked allocations unavailable: {e}. Refusing to start.");
-            std::process::exit(1);
-        });
-        info!("locked allocations: {} tranches (team {} + founder {} sat), first unlock h={}, last h={}",
-              locked.len(), core::tokenomics::TEAM_ALLOCATION_SAT, core::tokenomics::FOUNDER_ALLOCATION_SAT,
-              core::tokenomics::vesting_unlock_height(1),
-              core::tokenomics::vesting_unlock_height(core::tokenomics::VESTING_TRANCHES));
-        match core::carryover::verify_and_convert(&bytes) {
-            Ok(snap) => {
-                info!("carryover VERIFIED: {} Bloch outputs ({} BLCH sat) -> {} UTXOs, {} GNB sat \
-                       ({} zero-value dropped, {} vouts fixed)",
-                      snap.source_rows, snap.source_total_sat, snap.utxos.len(),
-                      snap.converted_total_sat, snap.dropped_zero, snap.fixed_vouts);
-                match store.ingest_carryover(&snap, &locked) {
-                    Ok(n) => info!("genesis ledger ingested: {n} UTXOs (carryover + locked) written atomically"),
-                    Err(e) => {
-                        error!("carryover ingestion failed: {e}. Nothing was written. Refusing to start.");
-                        std::process::exit(1);
-                    }
-                }
-            }
-            Err(failures) => {
-                for f in &failures { error!("carryover verification FAILED: {f}"); }
-                error!("REFUSING TO START: the snapshot is not this chain's carryover.");
-                std::process::exit(1);
-            }
-        }
-
-        // Construct the canonical genesis from constants and verify its
-        // GnB-SMH proof; refuse to start if it does not check out.
-        info!("Initialising canonical genesis and verifying its GnB-SMH proof...");
-        let genesis = core::genesis_block();
-        if !genesis.validate_pow() {
-            error!("Genesis PoW invalid: the genesis does not verify against this \
-                    binary's constants. Refusing to start.");
+        info!("Initialising the genesis ledger and the canonical genesis ({} proof of work)...",
+              core::pow_scheme::node_pow_scheme().name());
+        if let Err(failures) = genesis_init::initialise(&store, &dag, &bytes) {
+            for f in &failures { error!("{f}"); }
+            error!("REFUSING TO START: the genesis could not be initialised.");
             std::process::exit(1);
         }
-        if core::GENESIS_EXPECTED_HASH != [0u8; 32]
-            && genesis.block_hash() != core::GENESIS_EXPECTED_HASH {
-            error!("Genesis block hash {} != expected {} — a baked constant drifted. \
-                    Refusing to start.",
-                   hex::encode(genesis.block_hash()),
-                   hex::encode(core::GENESIS_EXPECTED_HASH));
-            std::process::exit(1);
-        }
-
-        let hash = genesis.block_hash();
-        store.put_block(&genesis).expect("store genesis");
-        store.put_meta("genesis_hash", &hash).expect("meta genesis_hash");
-        store.put_meta("tip_hash", &hash).expect("meta tip_hash");
-        // Audit DAG-8: a new data dir starts with the position-keyed chain
-        // indexes (no migration at its first reconciliation).
-        store.put_meta(storage::CHAIN_INDEX_VERSION_META, &storage::CHAIN_INDEX_VERSION.to_le_bytes())
-            .expect("meta chain_index_version");
-        store.put_meta("current_bits", &core::GENESIS_BITS.to_le_bytes())
-            .expect("meta current_bits");
-        dag.write().add_genesis(hash, genesis.header.timestamp);
-        // Bind in a `let` so the read guard drops before the `dag.write()` inside
-        // (parking_lot RwLock is not reentrant — holding this read across the
-        // write deadlocks once the reachability gate is armed).
-        let gdata_opt = dag.read().get_block_data(&hash).cloned();
-        if let Some(gdata) = gdata_opt {
-            // Sprint Y (M-2): atomic put to CF_DAG + CF_DAG_INTEGRITY.
-            // Genesis anchors the hash-chain with an all-zero parent
-            // integrity; see `compute_integrity_hash` for the convention.
-            store.put_dag_with_integrity(&hash, &gdata)
-                .expect("persist genesis dag + integrity");
-            // Phase 1: when the reachability index is maintained (Fast / armed),
-            // persist the genesis reachability record + version tag + root.
-            // (Live Legacy path leaves CF_REACHABILITY untouched.)
-            if dag.read().maintains_reachability_index() {
-                let _ = dag.write().reach_take_delta(); // start tracking clean
-                store.store_reachability_snapshot(&dag.read().reach_export_all(),
-                                                  dag.read().reach_root())
-                    .expect("persist genesis reachability index");
-            }
-        }
-        // The genesis coinbase is unspendable: index it, but create no UTXO.
-        for tx in &genesis.transactions {
-            store.put_tx_index(&tx.txid(), &hash, 0).expect("tx_index");
-        }
-        info!("Genesis: {}", hex::encode(hash));
-        info!("Supply: hard cap {} GNB (carryover {} sat, locked team+founder {} sat), initial subsidy {} sat/block, halving every {} blocks",
-              core::tokenomics::MAX_SUPPLY_SAT / core::tokenomics::SAT_PER_GNB,
-              core::carryover::CARRYOVER_CONVERTED_TOTAL_SAT,
-              core::tokenomics::TEAM_ALLOCATION_SAT + core::tokenomics::FOUNDER_ALLOCATION_SAT,
-              core::tokenomics::INITIAL_SUBSIDY_SAT,
-              core::tokenomics::HALVING_INTERVAL);
     } else {
-        // A data-dir from another chain (or another genesis) must never be
-        // reused: refuse to start unless its genesis is this binary's genesis.
-        let canonical = core::genesis_block().block_hash();
-        match store.get_meta("genesis_hash").ok().flatten() {
-            Some(g) if g.as_slice() == canonical => {}
-            other => {
-                error!("data-dir genesis {} != this binary's genesis {}. Refusing to start; \
-                        use a fresh --data-dir.",
-                       other.map(hex::encode).unwrap_or_default(), hex::encode(canonical));
-                std::process::exit(1);
-            }
-        }
-        match store.get_meta("carryover_sha3").ok().flatten() {
-            Some(r) if r.as_slice() == core::carryover::CARRYOVER_SNAPSHOT_SHA3 => {}
-            _ => {
-                error!("data-dir has no (or a different) carryover marker. Refusing to start; \
-                        use a fresh --data-dir with --carryover-snapshot.");
-                std::process::exit(1);
-            }
-        }
-        match store.get_meta("vesting_sha3").ok().flatten() {
-            Some(r) if r.as_slice() == core::vesting::VESTING_SPEC_SHA3 => {}
-            _ => {
-                error!("data-dir has no (or a different) locked-allocation marker. Refusing to start; \
-                        use a fresh --data-dir.");
-                std::process::exit(1);
-            }
+        if let Err(e) = genesis_init::check_data_dir(&store) {
+            error!("{e}. Refusing to start.");
+            std::process::exit(1);
         }
         // Full DAG reconstruction from persisted data (accept::load_dag).
         //

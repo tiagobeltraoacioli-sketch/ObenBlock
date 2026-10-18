@@ -164,15 +164,18 @@ pub fn set_node_pow_scheme(scheme: PowScheme) -> Result<(), PowScheme> {
     }
 }
 
-/// The process-wide PoW scheme; [`PowScheme::GnbSmh`] until set.
+/// The process-wide PoW scheme. Until set, the scheme of the node's chain
+/// (`genesis::pow_scheme_for(node_chain_id())`): [`PowScheme::GnbSmh`] in a
+/// process that selected no chain or GnB, SHA-256d in one that selected
+/// ObenBlock (a process can never run ObenBlock under GnB-SMH).
 pub fn node_pow_scheme() -> PowScheme {
-    NODE_POW_SCHEME.get().copied().unwrap_or(PowScheme::GnbSmh)
+    NODE_POW_SCHEME.get().copied().unwrap_or_else(|| super::genesis::pow_scheme_for(super::node_chain_id()))
 }
 
 /// The SHA-256d parameters when the process runs the SHA-256d scheme.
 #[inline]
 pub fn node_sha256d_params() -> Option<Sha256dParams> {
-    NODE_POW_SCHEME.get().and_then(PowScheme::sha256d_params)
+    node_pow_scheme().sha256d_params()
 }
 
 // ── The header under SHA-256d ───────────────────────────────────────────────
