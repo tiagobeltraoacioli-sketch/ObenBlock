@@ -4948,7 +4948,7 @@ mod tests {
         for height in [activation - 1, activation, activation + 7] {
             let powit = PowitBody {
                 shares: (0..3u8)
-                    .map(|i| WitnessShare { attested: [i; 32], witness: [0x44; 20], payout: vec![0x76; 25], bits: 0x1f00_ffff, nonce: u64::from(i) << 40 })
+                    .map(|i| WitnessShare { attested: [i; 32], witness: [0x44; 20], payout: vec![0x76; 25], bits: 0x1f00_ffff, nonce: u64::from(i) << 40, sha256d: None })
                     .collect(),
                 attestations: Vec::new(),
                 evidence: Vec::new(),

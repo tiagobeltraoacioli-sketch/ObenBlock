@@ -119,6 +119,20 @@ pub const TESTNET_PARAMS: PowitParams = PowitParams {
     ban_epochs: 3,
 };
 
+/// ObenBlock's witness-weight window (docs/DESIGN-obenblock.md §6.2): 112
+/// epochs, 28 days of 6-hour epochs (GnB mainnet: 28 epochs, 7 days). To own
+/// two thirds of `W` an attacker must out-mine the honest share work for
+/// about four weeks.
+pub const OBB_WINDOW_EPOCHS: u64 = 112;
+
+/// `p` with ObenBlock's long window. The ban lasts as long as the window, as
+/// on GnB (28 and 28, testnet 3 and 3), so a barred key's earlier share work
+/// has left the window when the ban ends. The state then keeps
+/// `OBB_WINDOW_EPOCHS + 2` epochs of share work and of links per key.
+pub const fn obenblock_window(p: PowitParams) -> PowitParams {
+    PowitParams { window_epochs: OBB_WINDOW_EPOCHS, ban_epochs: OBB_WINDOW_EPOCHS, ..p }
+}
+
 pub fn params_for(chain: ChainId) -> PowitParams {
     match chain {
         ChainId::Mainnet => MAINNET_PARAMS,
