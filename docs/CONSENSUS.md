@@ -811,7 +811,14 @@ above it: a heavier fork that finalized its own rolled every synced node's
 finalized history back, and a cheap one froze a syncing node's pin at the
 fork point for good.) The (source, checkpoint) pairs are persisted with each
 block's PoWit state and the pinned checkpoint on its own, so a
-restart rebuilds the same pin. The
+restart rebuilds the same pin. The pin is recomputed after every accepted
+block; what that computation derives from the candidates alone (which count,
+which conflict with the pin) is kept between computations and updated only
+for the candidates whose sources changed and the new counted ones (package
+O2, `consensus::finality::PinCache`): a computation that visited every
+candidate cost about 5 to 9 ms at 10,000 candidates, after every block, so
+initial sync grew quadratically with the chain's age; the cached one gives
+the same outcome (tested against the full computation) at about 0.15 ms. The
 former 1,000-block `MAX_REORG_DEPTH` and the `finalized_height` gate compared
 a fork with the node's own history, so nodes that received the same blocks in
 different orders could end on different chains. As in Bitcoin Core (no depth
