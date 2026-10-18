@@ -427,7 +427,7 @@ fn main() {
                         Some(3) if sk.len() == gnb::crypto::CONSERVATIVE_SECRET_KEY_LEN => "enveloped suite 0x0003",
                         _ => "does not match the public key's suite",
                     };
-                    println!("address:      {}", kp.address);
+                    println!("address:      {}", gnb::address::display_address(&kp.address));
                     println!("pubkey  len:  {}  ({})", pk.len(), pk_form);
                     println!("privkey len:  {}  ({})", sk.len(), sk_form);
                     println!("expected: hybrid pk=3745 raw / 3749 enveloped, sk=6337 raw / 6341 enveloped; \
@@ -657,7 +657,7 @@ fn do_send(params: &[&str], target: &RpcTarget, stated_network: Option<gnb::addr
     drop(password);
 
     checked_destination(to_address, &keypair.address).unwrap_or_else(|message| die(message));
-    let to = gnb::address::Address::parse(to_address).unwrap_or_else(|_| die("invalid destination address"));
+    let to = gnb::address::Address::parse_in(to_address, gnb::address::process_family()).unwrap_or_else(|_| die("invalid destination address"));
 
     // Fetch UTXOs (bounded), verify the selected ones against their
     // transactions (WAL-1), build and sign under the fee guard.
@@ -677,7 +677,7 @@ fn do_send(params: &[&str], target: &RpcTarget, stated_network: Option<gnb::addr
 
     // Show what will be signed — with the ACTUAL fee — and confirm (WAL-7).
     println!("UTXOs seen: {} ({} GNB)", prepared.utxos_seen, prepared.value_seen as f64 / 1e8);
-    for (k, v) in prepared.summary(&keypair.address, to_address) {
+    for (k, v) in prepared.summary(&gnb::address::display_address(&keypair.address), to_address) {
         println!("{:<14} {}", format!("{k}:"), v);
     }
     if !yes && !gnb::wallet::send::confirm("Broadcast this transaction?") {
@@ -773,7 +773,7 @@ fn do_newseed(output_path: &str, testnet: bool) {
         println!("Passphrase is ALSO required to unlock.");
     }
     println!();
-    println!("First address: {}", first_addr);
+    println!("First address: {}", gnb::address::display_address(&first_addr));
     println!("Wallet file:   {}", output_path);
 }
 
@@ -830,7 +830,7 @@ fn do_newaddress(wallet_path: &str, label: &str, allow_large_hd_wallet: bool) {
     }
 
     println!();
-    println!("New address: {}", new_addr);
+    println!("New address: {}", gnb::address::display_address(&new_addr));
     println!("Label:       {}", label);
 }
 
@@ -871,7 +871,7 @@ fn do_list_addresses(wallet_path: &str, allow_large_hd_wallet: bool) {
     println!("  {:<4} {:<56} {}", "idx", "address", "label");
     println!("  {}", "-".repeat(80));
     for addr in &wallet.addresses {
-        println!("  {:<4} {:<56} {}", addr.index, addr.address, addr.label);
+        println!("  {:<4} {:<56} {}", addr.index, gnb::address::display_address(&addr.address), addr.label);
     }
     println!();
     println!("Total: {} address(es)", wallet.addresses.len());
@@ -896,7 +896,7 @@ fn do_import_founder(
         Err(e) => { eprintln!("Failed to load founder.json: {}", e); process::exit(1); }
     };
 
-    println!("Founder address: {}", founder_kp.address);
+    println!("Founder address: {}", gnb::address::display_address(&founder_kp.address));
     println!();
 
     let hd_password = read_password("HD wallet password: ");
@@ -922,7 +922,7 @@ fn do_import_founder(
     }
 
     println!();
-    println!("Imported: {}", addr);
+    println!("Imported: {}", gnb::address::display_address(&addr));
     println!("Label:    founder");
 }
 
@@ -971,7 +971,7 @@ fn do_new_wallet(output_path: &str, testnet: bool, random_key: bool, suite: gnb:
     match keypair.save_encrypted(path, &password) {
         Ok(_) => {
             println!("Wallet saved: {}", output_path);
-            println!("Address:      {}", keypair.address);
+            println!("Address:      {}", gnb::address::display_address(&keypair.address));
             println!("Network:      {}", if testnet { "testnet" } else { "mainnet" });
             println!();
             if random_key {
@@ -994,7 +994,7 @@ fn do_restore_wallet(output_path: &str, testnet: bool, suite: gnb::crypto::KeySu
     let keypair = gnb::wallet::keypair_from_mnemonic_for_suite(&phrase, network_of(testnet), suite)
         .unwrap_or_else(|e| die(&format!("restore failed: {e}")));
     drop(phrase);
-    println!("Address: {}", keypair.address);
+    println!("Address: {}", gnb::address::display_address(&keypair.address));
     let password = read_new_password();
     match keypair.save_encrypted(std::path::Path::new(output_path), &password) {
         Ok(_) => println!("Wallet saved: {}", output_path),
@@ -1039,8 +1039,10 @@ fn checked_payment_sats(value: &str) -> Result<u64, &'static str> {
 }
 
 fn checked_destination(destination: &str, source: &str) -> Result<String, &'static str> {
-    let destination = gnb::address::Address::parse(destination).map_err(|_| "invalid destination address")?;
-    let source = gnb::address::Address::parse(source).map_err(|_| "invalid wallet address")?;
+    // The process's family: on ObenBlock obb1 and every GnB form of a key.
+    let family = gnb::address::process_family();
+    let destination = gnb::address::Address::parse_in(destination, family).map_err(|_| "invalid destination address")?;
+    let source = gnb::address::Address::parse_in(source, family).map_err(|_| "invalid wallet address")?;
     if destination.network() != source.network() { return Err("destination address network differs from wallet"); }
     Ok(hex::encode(destination.hash()))
 }
@@ -1101,7 +1103,7 @@ fn policy_network(stated: Option<gnb::address::Network>) -> gnb::address::Networ
 /// single-key address's checksum does not cover its prefix, so a mistyped
 /// prefix would otherwise make the spend one of the other chain).
 fn destination_on(address: &str, network: gnb::address::Network, what: &str) -> Result<Vec<u8>, String> {
-    let (dest_net, script) = gnb::address::destination_script(address)
+    let (dest_net, script) = gnb::address::destination_script_in(address, gnb::address::process_family())
         .map_err(|_| format!("invalid {what}"))?;
     if dest_net != network {
         return Err(format!("the {what} is a {dest_net:?} address; this spend is on {network:?} \
@@ -1208,7 +1210,7 @@ fn do_policy_address(params: &[&str], stated: Option<gnb::address::Network>) {
     if policy.has_conservative_key() {
         check_suite_for_new_key(gnb::crypto::KeySuite::Conservative, network);
     }
-    println!("address: {}", gnb::address::PolicyAddress::from_policy(&policy, network));
+    println!("address: {}", gnb::address::PolicyAddress::from_policy(&policy, network).to_string_in(gnb::address::process_family()));
     println!("policy:  {}", hex::encode(policy.encode()));
     println!("{}-of-{}{}{}", policy.threshold, policy.pubkeys.len(),
         if after > 0 { format!(", spendable from height {}", after) } else { String::new() },
@@ -1726,7 +1728,7 @@ fn do_bloch_check_anchor(params: &[&str], target: &RpcTarget) {
     let txid = params[0];
     let min_conf: u64 = flag_value(params, "--min-conf").and_then(|v| v.parse().ok()).unwrap_or(6);
     let want_final = params.contains(&"--finalized");
-    let anchorer = flag_value(params, "--anchorer").map(|a| gnb::address::Address::parse(a)
+    let anchorer = flag_value(params, "--anchorer").map(|a| gnb::address::Address::parse_in(a, gnb::address::process_family())
         .unwrap_or_else(|_| die("invalid --anchorer address")));
     let verdict = (|| -> Result<serde_json::Value, String> {
         let raw = rpc_call(target, "getrawtransaction", &serde_json::json!([txid]))?;

@@ -5,9 +5,8 @@ destinations. It changes no output script, transaction byte, signature message,
 key derivation, or consensus rule. A recipient must explicitly choose v2 output
 until the application supports it. Existing legacy address formats remain
 accepted with their existing bytes and checksums. The strings below use the
-`gnb` prefixes the code implements today; ObenBlock's address prefixes are
-specified in [DESIGN-obenblock.md](DESIGN-obenblock.md) §2 and not implemented
-yet.
+`gnb` prefixes; ObenBlock's prefixes ([DESIGN-obenblock.md](DESIGN-obenblock.md)
+§2) are listed under "Address families" and change nothing else.
 
 The checksum and alphabet are the generic Bech32m format from
 [BIP350](https://github.com/bitcoin/bips/blob/master/bip-0350.mediawiki#bech32m),
@@ -26,7 +25,42 @@ address and must not be passed through a Segwit script constructor.
 | Mainnet | `gnb` |
 | Testnet | `tgnb` |
 
-No other HRP is valid. An application operating on a particular network must
+No other HRP is valid for GnB.
+
+### Address families
+
+The code selects a family (`address::AddressFamily`) with the network. The
+family picks only prefixes and HRPs; hashes, scripts and the rules below are
+the same.
+
+| Family | Network | Legacy single-key | Legacy policy | v2 HRP |
+| --- | --- | --- | --- | --- |
+| GnB | Mainnet | `gnb1q` | `gnb1m` | `gnb` |
+| GnB | Testnet | `gnb1t` | `gnb1n` | `tgnb` |
+| ObenBlock | Mainnet | `obb1q` | `obb1m` | `obb` |
+| ObenBlock | Regtest | `obb1t` | `obb1n` | `tobb` |
+
+ObenBlock regtest occupies the GnB testnet slot of `Network`, hence `tobb`
+like `tgnb`. A GnB parser accepts only GnB forms (and the Bloch aliases
+`bloch1q`/`bloch1t`), so its behaviour and diagnostics are unchanged. An
+ObenBlock parser also accepts every GnB form and the Bloch aliases as the
+same script and network, and `normalize_legacy_address_in` shows them in the
+ObenBlock form (legacy stays legacy, v2 stays v2). The legacy single-key
+checksum covers only the hash, so `gnb1q…` and `obb1q…` of one key differ in
+the prefix only; the legacy policy checksum covers the prefix, so the
+`obb1m…` form of a `gnb1m…` address has a new checksum, and swapping the
+prefix alone fails. The reference is `reference/obb_address.py`, with vectors
+in `reference/obb_address_vectors.json`.
+
+A wallet, CLI or node process fixes its family once at startup
+(`address::set_process_family`, from the chain selection; GnB when nothing is
+selected). Its display (`address::display_address`) and its address inputs
+(destinations, RPC queries, `validateaddress`) use that family. Keystores keep
+the address string they were written with (the GnB form): the v3 associated
+data binds it, so a GnB v2/v3 keystore opens unchanged on either chain and is
+shown as `obb1…` on ObenBlock.
+
+An application operating on a particular network must
 compare the decoded network with that network and reject mismatches. A valid
 address for the other network is not a recipient on the current network.
 Changing the HRP without recomputing the checksum must fail. The checksum is

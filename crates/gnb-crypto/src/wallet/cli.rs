@@ -228,7 +228,7 @@ pub fn main() {
                 kp
             };
 
-            println!("  {} {}", amber("address"), bold(&kp.address));
+            println!("  {} {}", amber("address"), bold(&crate::address::display_address(&kp.address)));
             println!();
             label("pubkey size",  &format!("{} bytes", kp.public_key.len()));
             label("privkey size", &format!("{} bytes (never share!)", kp.private_key.len()));
@@ -257,7 +257,7 @@ pub fn main() {
             let kp = crate::wallet::keypair_from_mnemonic(&phrase, network)
                 .unwrap_or_else(|e| err(&format!("Restore failed: {e}")));
             drop(phrase);
-            println!("  {} {}", amber("address"), bold(&kp.address));
+            println!("  {} {}", amber("address"), bold(&crate::address::display_address(&kp.address)));
             label("network", if cli.testnet { "testnet" } else { "mainnet" });
             println!();
             let pw = prompt_new_password();
@@ -271,7 +271,7 @@ pub fn main() {
 
         Cmd::Address { keystore } => {
             let kp = load_kp(&keystore, stated_network(cli.testnet, cli.mainnet));
-            println!("  {}", amber(&kp.address));
+            println!("  {}", amber(&crate::address::display_address(&kp.address)));
         }
 
         Cmd::Pubkey { keystore } => {
@@ -313,7 +313,7 @@ pub fn main() {
             let fee_policy  = crate::wallet::send::parse_max_fee_arg(max_fee.as_deref())
                 .unwrap_or_else(|message| err(message));
             checked_destination(&to, &kp.address).unwrap_or_else(|message| err(&message));
-            let to_addr = crate::address::Address::parse(&to).unwrap_or_else(|_| err("invalid destination address"));
+            let to_addr = crate::address::Address::parse_in(&to, crate::address::process_family()).unwrap_or_else(|_| err("invalid destination address"));
 
             // 1-4: fetch UTXOs, select, verify claimed values against their
             // transactions (WAL-1), build and sign under the fee guard.
@@ -336,7 +336,7 @@ pub fn main() {
             // 5. Show what will be signed — the ACTUAL fee — and confirm (WAL-7).
             println!("  {}transaction preview{}", BOLD, RESET);
             println!();
-            for (k, v) in prepared.summary(&kp.address, &to) {
+            for (k, v) in prepared.summary(&crate::address::display_address(&kp.address), &to) {
                 if k == "warning" { label(&k, &red(&v)) } else { label(&k, &v) }
             }
             println!();
@@ -403,7 +403,7 @@ pub fn main() {
                     ok(&format!("Disclosure bundle saved: {}", amber(&output.display().to_string())));
                     println!();
                     for e in &bundle.entries {
-                        label(&format!("index {}", e.index), &e.address);
+                        label(&format!("index {}", e.index), &crate::address::display_address(&e.address));
                     }
                     println!();
                     println!("  {}Share this file with '{}' only — anyone holding it can see{}",
@@ -749,8 +749,10 @@ fn checked_cli_satoshis(value: &str, allow_zero: bool) -> Result<u64, &'static s
 }
 
 fn checked_destination(destination: &str, source: &str) -> Result<String, String> {
-    let destination = crate::address::Address::parse(destination).map_err(|_| "invalid destination address".to_string())?;
-    let source = crate::address::Address::parse(source).map_err(|_| "invalid wallet address".to_string())?;
+    // The process's family: on ObenBlock obb1 and every GnB form of a key.
+    let family = crate::address::process_family();
+    let destination = crate::address::Address::parse_in(destination, family).map_err(|_| "invalid destination address".to_string())?;
+    let source = crate::address::Address::parse_in(source, family).map_err(|_| "invalid wallet address".to_string())?;
     if destination.network() != source.network() { return Err("destination address network differs from wallet".into()); }
     Ok(hex::encode(destination.hash()))
 }

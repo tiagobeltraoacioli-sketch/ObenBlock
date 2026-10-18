@@ -17,12 +17,15 @@
 //! * V2 strings retain parsing/network/round-trip invariants and reject one
 //!   changed character or a network-prefix swap. The independent v2 verdict
 //!   comparison is the Python differential corpus, not this legacy reference.
+//! * ObenBlock (DESIGN-obenblock.md §2) accepts every string GnB accepts as
+//!   the same address, and its display (`normalize_legacy_address_in`)
+//!   parses back to it with an `obb` prefix or HRP.
 #![no_main]
 
 mod common;
 
 use common::*;
-use gnb_crypto::address::{normalize_legacy_address, Address, AddressError, Network};
+use gnb_crypto::address::{normalize_legacy_address, normalize_legacy_address_in, Address, AddressError, AddressFamily, Network};
 use libfuzzer_sys::fuzz_target;
 
 fn ref_parse(s: &str) -> Result<([u8; 20], Network), AddressError> {
@@ -89,6 +92,15 @@ fn check_str(s: &str) {
         assert_eq!(lib, ref_parse(s).map_err(|e| format!("{e:?}")), "legacy parse differs from the reference");
     }
     assert_eq!(s.parse::<Address>(), got, "FromStr differs from parse");
+    let obb = Address::parse_in(s, AddressFamily::ObenBlock);
+    if let Ok(a) = &got {
+        assert_eq!(obb.as_ref().ok(), Some(a), "ObenBlock refused or changed a GnB address");
+    }
+    if let Ok(a) = obb {
+        let shown = normalize_legacy_address_in(s, AddressFamily::ObenBlock);
+        assert_eq!(Address::parse_in(&shown, AddressFamily::ObenBlock), Ok(a), "ObenBlock display does not round-trip");
+        assert!(shown.starts_with("obb1") || shown.starts_with("tobb1"), "ObenBlock display is not obb");
+    }
     match got {
         Ok(a) => {
             let canon = a.to_string();
