@@ -130,19 +130,27 @@ impl AssumedValidBlock {
     /// compile error where the constant is defined).
     #[allow(dead_code)] // the form a release sets `MAINNET_ASSUME_VALID` in
     pub const fn from_hex(hex: &str, height: u64) -> Self {
-        let b = hex.as_bytes();
-        assert!(b.len() == 64, "an assumed-valid block hash has 64 hex digits");
-        let mut hash = [0u8; 32];
-        let mut i = 0;
-        while i < 32 {
-            hash[i] = (hex_digit(b[2 * i]) << 4) | hex_digit(b[2 * i + 1]);
-            i += 1;
-        }
-        AssumedValidBlock { hash, height }
+        AssumedValidBlock { hash: hash_from_hex(hex), height }
     }
 }
 
-#[allow(dead_code)] // see `AssumedValidBlock::from_hex`
+/// A block id from the 64 hex digits the RPC prints, at compile time (for
+/// the release constants: this one and `powit::MAINNET_FINALITY_CHECKPOINT`;
+/// a malformed literal is a compile error where the constant is defined).
+#[allow(dead_code)] // the form a release sets the constants in
+pub(crate) const fn hash_from_hex(hex: &str) -> [u8; 32] {
+    let b = hex.as_bytes();
+    assert!(b.len() == 64, "a block hash has 64 hex digits");
+    let mut hash = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        hash[i] = (hex_digit(b[2 * i]) << 4) | hex_digit(b[2 * i + 1]);
+        i += 1;
+    }
+    hash
+}
+
+#[allow(dead_code)] // see `hash_from_hex`
 const fn hex_digit(c: u8) -> u8 {
     match c {
         b'0'..=b'9' => c - b'0',

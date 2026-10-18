@@ -6,9 +6,11 @@
 //!   rebuild) commit in bounded chunks, each one a consistent applied tip that
 //!   start-up resumes from; a move larger than the memory available to one
 //!   commit still completes.
-//! * B2-T0 × PoWit — each committed chunk pins the finality its applied tip
-//!   reached (`GhostDAG::set_finalized`), and start-up restores the pin from
-//!   the applied tip before it resumes a move.
+//! * B2-T0 × PoWit — a chunked move goes to the best chain under the
+//!   finality pin, which the node learns from any stored block's PoWit state
+//!   (PoWit audit finding 2: a fork-loser's finalization moves the node at
+//!   once), and start-up rebuilds the pin from the persisted finality rows
+//!   before it resumes a move.
 //! * B1-T20 — reorg re-injection is capped by Bitcoin Core's 20 MB
 //!   `DisconnectedBlockTransactions` budget; into a full pool, a candidate
 //!   that would only be trimmed again is skipped (`Mempool::would_only_trim`)
@@ -453,7 +455,7 @@ struct FinalityFixture {
 
 fn finality_fixture() -> FinalityFixture {
     // The pin is taken only at or above the node's minimum chain work
-    // (`powit::pin_finalized_of`); these few-block chains test the chunked
+    // (`consensus::finality`); these few-block chains test the chunked
     // move, not that gate (fix_powit_finality_min_work.rs), so this binary
     // runs with 0 whatever the mainnet `core::MIN_CHAIN_WORK` becomes.
     let _ = gnb::ingress::set_minimum_chain_work(0);
@@ -488,54 +490,54 @@ fn save_finality_states(n: &Node, fork: &[Block], finalized: BlockHash) {
     }
 }
 
-/// Main's PoWit finality pins fork choice to the checkpoint the applied
-/// chain's witness set finalized (`GhostDAG::set_finalized`), refreshed after
-/// each acceptance. A chunked move makes intermediate states applied: here
-/// the reorg from A onto B commits B's first 32 blocks (whose witness set
-/// finalized B[5]) before the chunk holding the invalid B[35] fails. Without
-/// a pin per chunk the move was resolved again unpinned and went back to A,
-/// rolling back finalized history the applied chain had reached; the
-/// committed chunk now pins B[5], so the move ends on B[34] like the node
-/// that followed B block by block. A restart keeps it there: start-up
-/// restores the pin from the applied tip before it reconciles (main pinned
-/// only after reconciling, from the unpinned selected tip, which is A).
+/// PoWit finality pins fork choice to the highest finalized checkpoint any
+/// stored block's PoWit state carries (`consensus::finality`; PoWit audit
+/// finding 2, which replaced "the applied tip's state, pinned per committed
+/// chunk"). Here B[20], arriving as a fork-loser of the heavier A, carries
+/// B[5]'s finalization: the pin is taken before the chain move, so the move
+/// from A onto B goes at once, in chunks (3 rollback chunks, then B[0..16]
+/// and B[16..21]), although B is lighter (the node used to stay on A until B
+/// was heavier, then could fall back to A when a later chunk failed). The
+/// rest of B then connects up to B[34], B[35] being invalid: the node ends
+/// where the node that followed B block by block ends, and a restart keeps
+/// it there (start-up rebuilds the pin from the finality rows).
 #[test]
-fn b2_t0_finality_reached_by_a_committed_chunk_binds_the_rest_of_the_move() {
+fn b2_t0_finality_learned_from_a_fork_loser_binds_the_chunked_move() {
     let _guard = NoFaults;
     let fx = finality_fixture();
     let mut n = node_with(&fx.genesis, &[]);
     save_finality_states(&n, &fx.fork, fx.finalized);
     deliver_all(&n, &fx.a);
-    deliver_all(&n, &fx.fork[..44]);
-    assert_eq!(applied_tip(&n), Some(fx.a.last().unwrap().block_hash()), "B is lighter than A so far");
-    assert_eq!(n.dag.read().finalized(), None);
+    deliver_all(&n, &fx.fork[..20]);
+    assert_eq!(applied_tip(&n), Some(fx.a.last().unwrap().block_hash()), "B is lighter than A");
+    assert_eq!(n.dag.read().finalized(), None, "no block of B carries a finalization yet");
 
-    // B[44] (equal to A: the tie-break decides) or B[45] makes B the best:
-    // 2 rollback chunks (A's 29 tip-most blocks), then the last 16 rollbacks
-    // with B[0..16] in one batch (review of PR #15, finding 5), B[16..32]
-    // (pins B[5]), B[32..] (fails on B[35]), then B[32..35].
-    for blk in &fx.fork[44..] {
+    deliver_all(&n, &fx.fork[20..21]);
+    assert_eq!(n.dag.read().finalized(), Some((fx.finalized, 6)), "pinned from B[20]'s state");
+    assert_eq!(applied_tip(&n), Some(fx.fork[20].block_hash()),
+        "the move goes to the finalized branch (A forks below B[5]), lighter or not");
+    for blk in &fx.fork[21..] {
         let _ = accept(&n, blk);
     }
-    assert_eq!(n.dag.read().finalized(), Some((fx.finalized, 6)), "pinned by the committed chunk");
-    assert_eq!(applied_tip(&n), Some(fx.fork[34].block_hash()),
-        "the move stays on the finalized branch (A forks below B[5])");
+    assert_eq!(n.dag.read().finalized(), Some((fx.finalized, 6)));
+    assert_eq!(applied_tip(&n), Some(fx.fork[34].block_hash()), "B's last valid block");
     let reason = n.store.invalid_block_reason(&fx.fork[35].block_hash()).unwrap().expect("B[35] disqualified");
     assert_eq!(accept::mark_kind(&reason), accept::MarkKind::Consensus, "{reason}");
     assert_eq!(digest(&n), digest(&fx.reference), "same UTXO set as the node that followed B");
     assert!(accept::check_chain_state(&n.dag, &n.store).unwrap().is_empty());
 
     restart(&mut n);
-    assert_eq!(n.dag.read().finalized(), Some((fx.finalized, 6)), "restored from the applied tip");
+    assert_eq!(n.dag.read().finalized(), Some((fx.finalized, 6)), "rebuilt from the finality rows");
     assert_eq!(applied_tip(&n), Some(fx.fork[34].block_hash()), "a restart does not leave finality");
     assert_eq!(digest(&n), digest(&fx.reference));
 }
 
-/// A crash between two chunks of that move, right after the chunk that
-/// pinned B[5]: the pin lives in memory, so start-up restores it from the
-/// persisted applied tip's witness set BEFORE it picks the block to resume
-/// to. Unpinned, the resumed move went back to A (heavier than B's valid
-/// part); it now completes on B[34] with the reference UTXO set.
+/// A crash between two chunks of that move (B[20]'s record, its PoWit state
+/// and its finality row were committed with the first one): the pin lives in
+/// memory, so start-up rebuilds it from the persisted finality rows BEFORE it
+/// picks the block to resume to. Unpinned, the resumed move went back to A
+/// (heavier than B); it completes on B[20], and the rest of B on B[34], with
+/// the reference UTXO set.
 #[test]
 fn b2_t0_crash_resume_restores_the_finality_pin() {
     let _guard = NoFaults;
@@ -543,21 +545,15 @@ fn b2_t0_crash_resume_restores_the_finality_pin() {
     let mut n = node_with(&fx.genesis, &[]);
     save_finality_states(&n, &fx.fork, fx.finalized);
     deliver_all(&n, &fx.a);
-    deliver_all(&n, &fx.fork[..44]);
-    let a_tip = fx.a.last().unwrap().block_hash();
+    deliver_all(&n, &fx.fork[..20]);
 
     // Commits 1-2 roll A's 29 tip-most blocks back, 3 rolls back the last
-    // 16 with B[0..16] (one batch, review of PR #15, finding 5), 4 applies
-    // B[16..32]; the next one "crashes".
-    reorg::fault_injection::fail_after_commits(Some(4));
-    for blk in &fx.fork[44..] {
-        if applied_tip(&n) != Some(a_tip) {
-            break;
-        }
-        let _ = accept(&n, blk);
-    }
+    // 16 with B[0..16] (one batch, review of PR #15, finding 5); the next
+    // one "crashes".
+    reorg::fault_injection::fail_after_commits(Some(3));
+    let _ = accept(&n, &fx.fork[20]);
     reorg::fault_injection::fail_after_commits(None);
-    assert_eq!(applied_tip(&n), Some(fx.fork[31].block_hash()), "stopped after the pinning chunk");
+    assert_eq!(applied_tip(&n), Some(fx.fork[15].block_hash()), "stopped between two chunks");
     assert!(accept::check_chain_state(&n.dag, &n.store).unwrap().is_empty());
 
     // Crash: the in-memory pin is lost with the rest of the DAG state.
@@ -565,7 +561,11 @@ fn b2_t0_crash_resume_restores_the_finality_pin() {
     assert_eq!(n.dag.read().finalized(), None);
     accept::reconcile_on_startup(&n.dag, &n.store, &n.shielded).expect("reconcile resumes the move");
     assert_eq!(n.dag.read().finalized(), Some((fx.finalized, 6)));
-    assert_eq!(applied_tip(&n), Some(fx.fork[34].block_hash()), "resumed on the finalized branch");
+    assert_eq!(applied_tip(&n), Some(fx.fork[20].block_hash()), "resumed on the finalized branch");
+    for blk in &fx.fork[21..] {
+        let _ = accept(&n, blk);
+    }
+    assert_eq!(applied_tip(&n), Some(fx.fork[34].block_hash()));
     assert_eq!(digest(&n), digest(&fx.reference));
     restart(&mut n);
     assert_eq!(applied_tip(&n), Some(fx.fork[34].block_hash()));

@@ -612,6 +612,7 @@ rule is the one that produced the existing chain, bit for bit. The rules:
 | PoWit attestation message v2: the signed digest commits the witness's KES key (depth, root) | PoWit audit 1 | the attestation's **target** height (every message checked in a block below the activation is v1) | "PoWit", "Attestation messages" |
 | An equivocation proof is valid only against a member of `W(E-1)`, `W(E)` or `W(E+1)` | PoWit audit 1 | `B.height` of the containing block | "PoWit", "Equivocation proofs" |
 | `W(e)` = every unbarred share key with weight (no 64-key cap); justification = two thirds of the total window weight; decay entries go with their key's share work | PoWit audit 4 | `B.height` | "PoWit", "Witness set and justification" |
+| Every `W(e)` a block reads comes from finalized history: the share window of `h2_window_epoch(e)` (frozen at the last epoch entirely below the finalized checkpoint while finality lags), whose epochs the state keeps | PoWit audit 3 | `B.height` | "PoWit", "Witness set from finalized history" |
 | A revealed spend policy (or policy-tree branch) may not name one key twice in its raw and enveloped encodings | PF-4 | `B.height` of the containing block (mempool and templates: the next block's height) | "Spend-policy key identity (PF-4)" |
 | The conservative signature suite 0x0003 (SLH-DSA-SHAKE-128s AND Falcon-1024) is valid in sighash-v3 key-hash witnesses and spend-policy keys; policy signatures may be up to 10 KiB | P5-S (opt-in conservative suite) | `B.height` of the containing block (mempool and templates: the next block's height) | "Conservative suite 0x0003" |
 
@@ -714,16 +715,75 @@ every block whose selected-parent chain passes through one, are disqualified
 and never selected.
 
 There is no reorg-depth limit and no depth-based finality (audit DAG-6).
-From the PoWit height (mainnet 10,000) the checkpoint the applied chain's
-witness set has finalized pins fork choice: a block whose selected-parent
-chain does not pass through it is never selected, nor offered as a template
-parent (`GhostDAG::set_finalized`; docs/DESIGN-pow-powit.md). It restricts
-which blocks are selectable, never a block's GhostDAG data (selected parent,
-coloring, blue work). A node takes or advances the pin only while the chain
-whose state finalized it has at least the node's minimum chain work
-(node-local, "Minimum chain work and unrequested blocks" below): a cheap fork
-carries its own witness set, so its finality pins nothing while the node may
-still be syncing a low-work chain. The
+From the PoWit height (mainnet 10,000) a finalized checkpoint pins fork
+choice: a block whose selected-parent chain does not pass through the pin is
+never selected, nor offered as a template parent (`GhostDAG::finalized`;
+docs/DESIGN-pow-powit.md §7.6). It restricts which blocks are selectable,
+never a block's GhostDAG data (selected parent, coloring, blue work). The
+pin is node-local (`consensus::finality`, PoWit audit findings 2 and 3 and
+the review of their fix). As Gasper's fork choice starts from the highest
+checkpoint learned from any block, the node learns finality from every
+block it stores; as every Ethereum client does, it never gives up finality
+it has reached because a conflicting finality appeared:
+
+- a candidate is a finalized checkpoint carried by the PoWit state of any
+  stored block (its source), on the applied chain or not;
+- it counts when some source is not disqualified for a reason its id
+  commits to (a block waiting for a body or a verdict still counts) and has
+  at least the node's minimum chain work ("Minimum chain work and
+  unrequested blocks" below: a cheap chain pulled during initial sync proves
+  nothing), the operator has not set it aside (`ignorefinalized`), and it
+  agrees with the weak-subjectivity anchor: the release finality checkpoint
+  (`powit::MAINNET_FINALITY_CHECKPOINT`, printed by
+  `tools/release/min_chain_work.py` with the minimum chain work; none yet on
+  mainnet; `--finalitycheckpoint HASH:HEIGHT` replaces it for a run) or the
+  operator's (`setfinalitycheckpoint`). A candidate at or below the anchor
+  never counts, one above it only if the anchor is on its selected chain,
+  and once the node holds the anchor block no chain that forks below it is
+  selectable. An anchor given by hash and DAG height may be a block the node
+  does not hold yet (set before syncing): until it arrives no candidate
+  above its height counts and none at or below it is decided;
+- the node's own finality is the highest counted candidate on its applied
+  chain, or the counted candidate it pinned last (persisted) when that one
+  descends from it (pinned before the chain move to it was done: a move
+  stopped between chunks, a chain-state rebuild);
+- a candidate that descends from the own finality advances it: the pin is
+  the highest such candidate. A node with no finality of its own, or an
+  older one on the same chain, thus learns a newer one from a stored
+  fork-loser. When advancing candidates conflict with each other (neither on
+  the other's selected chain), all were learned from chains the node has not
+  applied, and the node takes the one whose best source carries the most
+  blue work (then the higher, then the larger hash), never their latest
+  common block;
+- a counted candidate that conflicts with the pin means that a third of the
+  witness weight signed both, or that the two chains derived different
+  witness sets (a fork from before any common finality, a long partition
+  finalized through inactivity decay, or, below the second hardening
+  activation, a majority of the hashrate mining its own witness set on a
+  private fork). It never moves the pin, whatever its chain's work: the node
+  keeps its finality and raises a persistent conflict alert for as long as
+  the candidate counts (`getfinalityinfo` `conflict`, `conflicting_finalized`
+  and `conflict_resolution`; `getpowitinfo` `finality_conflict`; an error
+  log line; the `gnb_finality_conflicts` metric). Only the operator moves it
+  (`setfinalitycheckpoint`, `ignorefinalized`, below).
+
+Without a conflict, two nodes holding the same blocks (and the same
+disqualifications, minimum chain work, anchor and operator settings)
+compute the same pin whatever the arrival order, and a node that never
+applied the blocks carrying a finalization still learns it: after a
+partition heals, every node holding both sides pins the same checkpoint and
+converges on one chain (the heavier side stores the finalized side's blocks
+even below its anti-DoS work window, as they claim a newer finality: "Anti-DoS
+work rule" below, item 4). With a conflict, each node keeps the finality it
+reached first: the weak-subjectivity assumption of every finality protocol,
+which the release anchor and the minimum chain work make hold for a node
+that syncs while eclipsed. (The first fix of finding 2 pinned the latest
+common block of conflicting finalities instead, so the most work decided
+above it: a heavier fork that finalized its own rolled every synced node's
+finalized history back, and a cheap one froze a syncing node's pin at the
+fork point for good.) The (source, checkpoint) pairs are persisted with each
+block's PoWit state and the pinned checkpoint on its own, so a
+restart rebuilds the same pin. The
 former 1,000-block `MAX_REORG_DEPTH` and the `finalized_height` gate compared
 a fork with the node's own history, so nodes that received the same blocks in
 different orders could end on different chains. As in Bitcoin Core (no depth
@@ -741,13 +801,13 @@ every intermediate state is a consistent applied tip, and start-up continues
 an interrupted move. When a block of a later chunk turns out invalid the best
 valid chain is resolved again from where the applied chain stands, which can
 move back to the old branch; the end state is the same as with one batch.
-The PoWit finality pin above (`GhostDAG::set_finalized`) moves with the
-applied chain: each committed chunk pins the checkpoint its applied tip
-finalized before the move goes on, and start-up restores the pin
-from the applied tip before it resumes a move, so neither a block of a later
-chunk that turns out invalid nor a crash between chunks takes the node back
-across finality its applied chain reached (it ends where a node that
-followed the branch block by block ends). A block's PoWit state and the
+The PoWit finality pin above is recomputed before each resolution step
+(`powit::refresh_finality_pin`) from the stored blocks and the node's own
+finality, which a move toward the pin never lowers, so a chunk committing or
+failing changes it only through what the step disqualified (a disqualified
+block's finalization stops counting), and start-up rebuilds it from the
+persisted finality rows and pinned checkpoint before it resumes a move: neither a block of a later chunk that turns out invalid nor a crash
+between chunks changes where the move ends. A block's PoWit state and the
 reachability records its insertion changed are committed in the same batch
 as its DAG record (the in-memory copy of those records is marked written
 only once that batch commits), and the selected-chain index rows of the
@@ -794,6 +854,45 @@ has just validated in its own context, so an applied block never carries a
 mark that would disqualify it again at the next start. On a
 pruned node, an override whose new chain needs pruned bodies changes nothing,
 requests the next (at most 4,096) of those bodies and asks to be retried.
+
+The finality pin has the same kind of escape hatch, also node-local and
+persistent, and it is the only way off a finality the node keeps against a
+conflict: `ignorefinalized [hash]` sets aside the pinned checkpoint (or the
+given block): no finalized checkpoint at or above it on its selected chain
+counts any more, so the node's own finality falls back to the highest
+remaining one, which a checkpoint that conflicted with the one set aside may
+now advance, and the most work decides above the pin; `reconsiderfinalized
+<hash>` removes that setting (the checkpoint counts again; see below for
+what it does not undo); `setfinalitycheckpoint <hash> [height]|none|default`
+sets the operator's weak-subjectivity anchor (every candidate that conflicts
+with it stops counting, the node's own finality included; with the block's
+DAG height, also for a block the node does not hold yet), removes every
+anchor, or goes back to the release one (or `--finalitycheckpoint`'s).
+`getfinalityinfo` reports the pin, its origin (`anchor`, `finalized`, or
+`held` while the anchor is unknown), the node's own finality, the anchor,
+the candidates and the conflict alert. `reconsiderfinalized` is not an undo
+once the node has moved: if setting a
+checkpoint aside let a conflicting finality advance the node's own (the
+node moved to that chain and pinned it), the reconsidered checkpoint
+counts again but conflicts with the node's finality, which it keeps; the
+way back is `setfinalitycheckpoint` on a block of the original chain.
+
+While a configured anchor (release, `--finalitycheckpoint` or
+`setfinalitycheckpoint <hash> <height>`) is unknown, the node holds the
+block it pinned last, a finalized checkpoint or a previous anchor
+(`origin: held`): it neither clears nor replaces the persisted pin, so an
+anchor it never receives does not take its finality away. It alerts
+(`anchor_overdue` in `getfinalityinfo`, an error log line, the metric
+`gnb_finality_anchor_unknown`) once its applied tip is above the anchor's
+height, or once the anchor has stayed unknown for 30 minutes out of initial
+block download (the height an unknown block is given is unchecked: a typo
+above the tip must not silence the alert). The pinned checkpoint is persisted
+after each change of pin, outside the block's own write: if that write were
+lost and the chain state then rebuilt from genesis during a conflict, the
+node's own finality would fall back to the highest checkpoint of the
+rebuilt part, and conflicting checkpoints above it would resolve by work
+(a narrow window: a crash right after a change of pin, followed by a
+`--carryover-snapshot` rebuild).
 
 ### Blue work
 
@@ -1053,7 +1152,73 @@ bound of B's blue work:
    admitted, and only admissions more than 1,000 blocks deep were rationed.
    From the activation no orphan vouches: B's own chain cannot come within
    the 360-block window, so B is below the merge-depth root of every block
-   that builds on the tip and merging it is a `MergeDepthViolation`.
+   that builds on the tip and merging it is a `MergeDepthViolation`; or
+4. B is FINALITY-BACKED (review of the PoWit finality pin, HIGH 2, and its
+   second round, H1, M2, L3): a lighter chain wins fork choice when it
+   carries a finality newer than the node's ("Selected parent and fork
+   choice"), and the node learns that finality only from blocks it stores,
+   so the rule above split a healed partition for good once the side
+   without new finality was more than 360 blocks of work ahead. A buffered
+   orphan carries a FINALITY CLAIM when one of its attestations
+   - links from a source checkpoint more than one checkpoint interval above
+     the node's pin (its slot; with no pin, the PoWit activation): consensus
+     requires the source to be the including chain's justified checkpoint,
+     so a chain that finalized `F` beyond the pin links from `F` + one
+     interval or later, and the node's own chain from at most its pin + one
+     interval;
+   - is signed by a key with weight in the witness set the node's own
+     selected-tip state derives for the attestation's target epoch, under the
+     rules of a block at the orphan's wire height or the node's next height,
+     whichever is higher (the wire height is the sender's choice), the key
+     not barred at the node's current epoch and the target not in a future
+     epoch (at most two signatures are checked per orphan, membership first,
+     and at most two first-rule witness sets built). From the second
+     hardening activation a chain that shares the node's finality reads the
+     same frozen finalized window ("Witness set from finalized history");
+     before it, the node's own share history of that window.
+
+   The claim is recorded in the orphan's pool entry once the orphan is
+   buffered (and in its skeleton if it is evicted): the pool's bounds per
+   delivering peer and its eviction rules bound the claims, and no claim
+   displaces another. B (its parents all known) is backed when B is a
+   claimed target, or an ancestor of one through buffered orphans and
+   skeletons (a flag their own parent edges carry down: an orphan that
+   merely lists B as a parent neither sets nor hides it, review round 3,
+   M-A), or when a claimed target is a stored block on B's selected chain at
+   most `vote_ttl` checkpoint slots below B (the blocks between a target and
+   the attestations for it). The target binds the claim to the chain it
+   reaches the node along: an authentic attestation is public, and copied
+   onto another chain it targets a block that chain does not contain, or, on
+   a chain that branches above a stored target, backs at most `vote_ttl`
+   blocks above that target. The backing is recomputed at each admission, so
+   a block requested again while orphans above it still wait is backed
+   again. A
+   backed B is admitted below `T` only if it also extends the pinned
+   checkpoint's chain (its selected parent is the pin or descends from it: a
+   chain that forks below the pin cannot advance it; with no pin, only when
+   no weak-subjectivity anchor is configured, since while a configured
+   anchor is unknown no finality above it counts), its own bits meet the
+   orphan bits floor above (at least 1/16 of a block's work at the tip, so a
+   cheap deep fork cannot ride on a claim), it passes the checks
+   `accept_block` runs before the proof, and its proof of work. Each
+   admission is then charged, once, to the peer that delivered the block
+   (at most 1,440, refilled at one a minute) and to the node (at most 2,880,
+   refilled at one per 30 s; about two mainnet epochs, more than an honest
+   side needs to reach the block whose state carries its newer finality; a
+   side that finalized only through inactivity decay is fetched at the
+   refill rate). A spent budget drops the block without penalty: the
+   parent tracker requests it again with back-off for up to 15 minutes or 8
+   attempts, after which the orphans above it are dropped and the side is
+   fetched again when it is next announced. The DAG-7 merge-backed budget
+   (item 3) is not charged: it rations deep insertions an unauthenticated
+   orphan can make needed, and would hold a heal of hundreds of blocks for
+   hours. Whoever spends these budgets (a chain built on a stored target
+   with a copied attestation, or a witness signing links to a chain of its
+   own) pays the floor's work per block. A claim is only a reason to fetch: the claimed
+   finality counts once the blocks are stored and their PoWit states
+   computed, like any other. Once the node pins the claimed finality, its
+   selected tip is on that chain and the rest of it is within the window
+   (`node/tests/fix_powit_finality_heal_ingress.rs`).
 
 Otherwise B is ignored without penalty (a refused block is not re-evaluated
 until the orphan pool, the DAG or the selected tip changes). A chain that
@@ -1354,8 +1519,8 @@ checked in context before the block is stored, and the block's PoWit state is
 `PowitState::apply_at(parent state, block)` (`powit::block_state`), a pure
 function of the block, its selected-parent chain and the parent's state.
 docs/DESIGN-pow-powit.md describes the design; this section specifies the
-rules the second hardening activation changes (PoWit audit findings 1 and
-4), byte for byte where they define encodings. The executable reference is
+rules the second hardening activation changes (PoWit audit findings 1, 3
+and 4), byte for byte where they define encodings. The executable reference is
 `reference/powit_reference.py`, its vectors `reference/powit_vectors.json`
 (regenerated and diffed by CI's `python-reference` job), checked against the
 Rust code by `crates/gnb-crypto/tests/powit_vectors.rs`.
@@ -1444,6 +1609,56 @@ FFG counts two thirds of all stake: the attacker (30%) cannot justify alone
 and the honest keys (70%) justify without it (191 of the 200 votes, six
 blocks of 32), which `finding4_a_split_minority_neither_justifies_alone_nor_stalls_from_hardening2`
 runs with real signatures.
+
+### Witness set from finalized history
+
+Under `Regime::Hardening2` the share window `W(e)` reads is that of epoch
+`h2_window_epoch(e)` instead of `e` (`PowitState::h2_window_epoch`; bars
+still apply at `e`). With `nf = (finalized.height - act) / epoch_len`, the
+number of epochs entirely below the state's finalized checkpoint:
+
+```text
+anchored(e)        = e                    if nf = 0 (nothing beyond the activation checkpoint is final)
+                   = min(e, nf + 1)       otherwise (the window ends at min(e - 2, nf - 1))
+h2_window_epoch(e) = e                    if anchored(e) != e and that window has no member at e
+                   = anchored(e)          otherwise
+```
+
+While finality keeps up (the finalized slot lies in epoch `e - 1` or
+later) this is `e`, the window of the old rule. When finality lags, the set
+freezes at the last finalized window (DESIGN-pow-powit.md §7.4, "if nothing
+has finalized for two epochs, W_e = W_{e-1}") until a new checkpoint is
+finalized. The fallback to `e`'s own window lets finality restart on a chain
+whose frozen window holds no member at all (possible only across the
+upgrade, or when every member of it is barred). At an epoch boundary the
+state keeps the epochs of the frozen window (`nf - window ..= nf - 1`) besides
+the `window + 2` most recent ones; nothing older is read again because a
+vote is includable for at most one epoch and a newly finalized checkpoint
+lies less than two epochs below the block that finalizes it (`vote_ttl <=
+epoch_len` and `vote_ttl + checkpoint_interval < 2 * epoch_len`, asserted at
+compile time for both networks, `powit::params_keep_the_frozen_window`). The
+"has no member" test stops at the first unbarred key with work in the
+window (a key's decayed weight is positive exactly when its work is), so a
+membership lookup never aggregates the frozen window; the node's pool checks
+an attestation's target slot before any such lookup. Inactivity decay, attester weights,
+justification totals and equivocation evidence all read these sets
+(`witness_set_in`, `member_weight_h2`, `total_weight_h2`,
+`may_be_proven_h2`).
+
+Why (finding 3): under the old rule a fork's witness set came from the
+fork's own share work. A private fork from the PoWit height, where shares
+are free while the fork lags the difficulty schedule, owned its witness set
+two epochs later and finalized its own checkpoints in about ten CPU-minutes,
+and an eclipsed node that synced it pinned it for good. From the activation
+two chains whose states finalized the same checkpoint derive the same
+witness set from the share history below it until one of them finalizes
+another checkpoint, so a fork above an honest finalized checkpoint is voted
+on by the honest witnesses only and never finalizes without them
+(`a_private_fork_with_its_own_shares_never_finalizes_from_hardening_2`). A
+fork from below every finalized checkpoint is the weak-subjectivity case:
+the node-local finality pin rules out such forks once the node holds the
+release finality checkpoint, and their finality never counts below the
+minimum chain work ("Selected parent and fork choice").
 
 ### Equivocation proofs
 

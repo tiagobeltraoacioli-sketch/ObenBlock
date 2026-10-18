@@ -29,7 +29,10 @@ as `nMinimumChainWork`): the candidate block's hash and DAG height, as the
 line for `MAINNET_ASSUME_VALID` in node/src/assumevalid.rs and the
 `--assumevalid` form. The node skips signature checks only for that block's
 selected-chain ancestors buried two weeks below its best block
-(docs/RUNNING.md). Nothing is written. Standard library only.
+(docs/RUNNING.md). The same block is the release finality checkpoint
+(weak subjectivity, PoWit finding 3): the line for
+`MAINNET_FINALITY_CHECKPOINT` in node/src/powit.rs. Nothing is written.
+Standard library only.
 
     python3 tools/release/min_chain_work.py \\
         --rpc http://127.0.0.1:17210 --rpc https://node2.example:17210
@@ -182,6 +185,14 @@ def assume_valid_line(cand: dict) -> str:
             f"        Some(AssumedValidBlock::from_hex(\"{h}\", {cand['height']}));")
 
 
+def finality_checkpoint_line(cand: dict) -> str:
+    """The `MAINNET_FINALITY_CHECKPOINT` line of node/src/powit.rs (the
+    release finality checkpoint, weak subjectivity) for the candidate block."""
+    assume_valid_line(cand)  # the same checks on the block id and height
+    return (f"    pub const MAINNET_FINALITY_CHECKPOINT: Option<ReleaseCheckpoint> =\n"
+            f"        Some(ReleaseCheckpoint::from_hex(\"{cand['hash']}\", {cand['height']}));")
+
+
 def report(readings: list[dict], cand: dict, value: int, depth: int, warnings: list[str]) -> str:
     lines = [f"Readings (selected-chain block {depth} below each node's tip):"]
     for r in readings:
@@ -202,6 +213,9 @@ def report(readings: list[dict], cand: dict, value: int, depth: int, warnings: l
         "node/src/assumevalid.rs (the assumed-valid block, the same block):",
         assume_valid_line(cand),
         f"--assumevalid {cand['hash']}",
+        "",
+        "node/src/powit.rs (the release finality checkpoint, the same block):",
+        finality_checkpoint_line(cand),
         "",
         "Then update the reading in its documentation and in docs/MAINNET-READINESS.md §1,",
         "the arithmetic test (`min_chain_work_cross_check`) and the node tests that pin",

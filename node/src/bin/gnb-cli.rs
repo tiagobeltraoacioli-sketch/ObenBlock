@@ -243,6 +243,29 @@ fn main() {
             ("reconsiderblock", serde_json::json!([params[0]]))
         }
 
+        // ── PoWit finality pin (docs/RUNNING.md, "PoWit finality") ──
+        "getfinalityinfo" | "finality" => {
+            ("getfinalityinfo", serde_json::Value::Null)
+        }
+        "ignorefinalized" => {
+            ("ignorefinalized", serde_json::json!(params.iter().take(1).collect::<Vec<_>>()))
+        }
+        "reconsiderfinalized" => {
+            require_params(params, 1, "reconsiderfinalized <block_hash>");
+            ("reconsiderfinalized", serde_json::json!([params[0]]))
+        }
+        "setfinalitycheckpoint" => {
+            require_params(params, 1, "setfinalitycheckpoint <block_hash> [dag_height] | none | default");
+            match params.get(1).map(|h| h.parse::<u64>()) {
+                None => ("setfinalitycheckpoint", serde_json::json!([params[0]])),
+                Some(Ok(height)) => ("setfinalitycheckpoint", serde_json::json!([params[0], height])),
+                Some(Err(_)) => {
+                    eprintln!("setfinalitycheckpoint: the DAG height must be a decimal number");
+                    process::exit(1);
+                }
+            }
+        }
+
         "listtransactions" | "txlist" => {
             require_params(params, 1, "listtransactions <address> [count]");
             let count: u64 = params.get(1).and_then(|s| s.parse().ok()).unwrap_or(20);
@@ -1889,6 +1912,13 @@ fn print_usage() {
     gnb-cli invalidateblock <hash>        Leave the chain through <hash>: mark it and its
                                           selected-chain descendants invalid (persisted)
     gnb-cli reconsiderblock <hash>        Undo invalidateblock (and re-check the chain)
+    gnb-cli finality                      PoWit finality pin, own finality, conflict alert
+    gnb-cli ignorefinalized [hash]        Set the pinned (or given) finalized checkpoint aside
+    gnb-cli reconsiderfinalized <hash>    Remove ignorefinalized (to move back after a
+                                          conflict: setfinalitycheckpoint)
+    gnb-cli setfinalitycheckpoint <hash> [height] | none | default
+                                          Weak-subjectivity checkpoint (with its DAG height,
+                                          also for a block the node does not hold yet)
 
   TRANSACTIONS
     gnb-cli tx <txid>                     Get transaction

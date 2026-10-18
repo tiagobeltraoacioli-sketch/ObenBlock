@@ -1625,15 +1625,17 @@ fn commit_chunk(
 /// branch then waits for them like any best chain without bodies,
 /// `MissingBodies::Wait`.)
 ///
-/// PoWit finality (`GhostDAG::set_finalized`): the candidate is always the
-/// best block whose selected chain passes through the pinned checkpoint, and
-/// each committed chunk that applies blocks pins the checkpoint ITS applied
-/// tip's witness set finalized (`powit::pin_finalized_of`) before the next
-/// chunk or the next resolution: a block of a later chunk that turns out
-/// invalid never sends the move back across finality the applied chain has
-/// already reached (as a node that had followed the branch block by block
-/// would not go back). That checkpoint is on the candidate's own selected
-/// chain, so the candidate stays the best selectable block.
+/// PoWit finality (`consensus::finality`): the candidate is always the best
+/// block whose selected chain passes through the pin, and the pin is
+/// recomputed (`powit::refresh_finality_pin`) before each resolution step.
+/// It depends on every stored block's PoWit state (PoWit audit finding 2)
+/// and on the node's own finality: the checkpoint it pinned last (sticky,
+/// persisted), which the applied chain only raises. A chunk moving toward
+/// the pin never lowers it (the applied chain stays at or above the fork
+/// point, which is at or above the pin's chain below the pin), so a chunk
+/// committing or failing changes the pin only through what the step
+/// disqualified: a disqualified block's finalization stops counting, and the
+/// move goes to the best chain under what remains.
 #[allow(clippy::too_many_arguments)]
 fn resolve_best_chain(
     dag: &Arc<RwLock<consensus::GhostDAG>>,
@@ -1672,6 +1674,9 @@ fn resolve_best_chain(
     // least one more block; the DAG is finite, so this terminates. The bound
     // is a guard.
     'resolve: for _ in 0..10_000 {
+        // The pin first: blocks disqualified by the previous step no longer
+        // carry their finality (`consensus::finality`).
+        crate::powit::refresh_finality_pin(dag, store);
         let cand = match dag.read().selected_tip() {
             Some(c) => c,
             None => break 'resolve,
@@ -1789,12 +1794,6 @@ fn resolve_best_chain(
                     clears_pending = false;
                     // Marks were persisted in the batch.
                     log.invalid.clear();
-                    // The finality the applied chain reached binds the rest
-                    // of the move (a rollback chunk ends on an ancestor of a
-                    // tip already pinned: nothing to advance).
-                    if !sub.to_apply.is_empty() {
-                        crate::powit::pin_finalized_of(dag, store, &applied);
-                    }
                 }
                 Err(ChunkFailure::Invalid { block, reason, witness }) => {
                     if reorg_depth > 0 { crate::metrics::inc_reorg_failure(); }
@@ -2353,6 +2352,17 @@ pub fn accept_block_tracking(
         // if the block never joins the selected chain), is committed with
         // its DAG record below (`TriggerRecord`): in the first chunk of the
         // chain move it triggers, or with its fork-loser record.
+        //
+        // PoWit audit finding 2: the checkpoint it finalized counts for the
+        // finality pin whether or not it ever joins the selected chain
+        // (Gasper's fork choice starts from the highest justified
+        // checkpoint learned from ANY block), so the pin is refreshed before
+        // the chain move: a node that learns a finalization from a lighter
+        // branch moves to that branch when it advances the node's own
+        // finality; one that conflicts with it only raises the conflict
+        // alert (review HIGH 1, `consensus::finality`).
+        crate::powit::note_block_finality(dag, store, &block_hash, powit_state.as_ref());
+        crate::powit::refresh_finality_pin(dag, store);
     }
     // Informational only (RPC / tip notifications).
     let _ = store.put_meta("current_bits", &block.header.bits.to_le_bytes());
@@ -2367,6 +2377,8 @@ pub fn accept_block_tracking(
         } else if !dag.write().remove_block(&block_hash) {
             warn!("could not roll back DAG insertion of {} ({})", hex::encode(&block_hash[..8]), why);
         }
+        // Its finalization, if any, left with it.
+        crate::powit::refresh_finality_pin(dag, store);
     };
 
     let mut log = ResolveLog::default();
@@ -2535,11 +2547,11 @@ pub fn accept_block_tracking(
     }
 
     // No depth-based finality any more (audit DAG-6). PoWit finality: the
-    // checkpoint the applied chain's witness set finalized pins fork choice
-    // (`GhostDAG::set_finalized`). The pruning cursor below uses the
-    // selected tip's DAG height, never tip_blue_score(); see the DAG-8 note
-    // on `GhostdagData::height`.
-    crate::powit::update_finalized(dag, store);
+    // pin was refreshed before the move (`consensus::finality`); refreshed
+    // again for what the move disqualified. The pruning cursor below uses
+    // the selected tip's DAG height, never tip_blue_score(); see the DAG-8
+    // note on `GhostdagData::height`.
+    crate::powit::refresh_finality_pin(dag, store);
     let tip_height = {
         let d = dag.read();
         d.selected_tip()
@@ -2982,14 +2994,13 @@ pub fn reconcile_on_startup(
     // Step 4: applied tip vs best valid block.
     let applied = store.get_meta("tip_hash").ok().flatten()
         .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok());
-    // PoWit finality first (B2-T0): the pin lives in memory, so after a
-    // crash between two chunks of a move it is restored from the applied
-    // tip's witness set (what the committed chunks had pinned) BEFORE the
-    // best block is chosen: the resumed move never leaves finality the
-    // applied chain reached. `main` pins the selected tip's afterwards.
-    if let Some(a) = applied.filter(|a| dag.read().has_block(a)) {
-        crate::powit::pin_finalized_of(dag, store, &a);
-    }
+    // PoWit finality first (B2-T0, PoWit audit finding 2): the pin lives in
+    // memory, so it is rebuilt from the persisted finality rows of every
+    // stored block (`powit::load_finality_index`) BEFORE the best block is
+    // chosen: the node restarts with exactly the pin it had, and a resumed
+    // move never leaves finality it had learned.
+    crate::powit::load_finality_index(dag, store)?;
+    crate::powit::refresh_finality_pin(dag, store);
     let best = dag.read().selected_tip();
     if let (Some(applied), Some(best)) = (applied, best) {
         if applied != best && dag.read().has_block(&applied) {
@@ -3433,13 +3444,12 @@ pub fn rebuild_chain_state(
     let applied = store.get_meta("tip_hash").map_err(|e| e.to_string())?
         .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
         .filter(|t| dag.read().has_block(t));
-    // PoWit finality: the checkpoint the applied chain's witness set
-    // finalized pins the chain the rebuild (or its resumption) reconnects,
-    // as it pinned the node's fork choice before the restart (the PoWit
-    // state is per block, never part of the chain state cleared below).
-    if let Some(t) = applied {
-        crate::powit::pin_finalized_of(dag, store, &t);
-    }
+    // PoWit finality: the pin the node had before the restart pins the
+    // chain the rebuild (or its resumption) reconnects (the PoWit states and
+    // their finality rows are per block, never part of the chain state
+    // cleared below).
+    crate::powit::load_finality_index(dag, store)?;
+    crate::powit::refresh_finality_pin(dag, store);
     let resume_from = match applied {
         Some(tip) if check_chain_state(dag, store)? == vec![ChainStateFault::RebuildInterrupted] => Some(tip),
         _ => None,
@@ -4041,6 +4051,45 @@ pub fn reconsider_block(
     info!("reconsiderblock {}: {} mark(s) removed, {} re-validated by the move, {} block(s) re-qualified",
         hex::encode(&hash[..8]), clears.always.len(), clears.if_applied.len(), affected);
     let res = apply_operator_override(dag, store, mempool, node_state, tip_tx, shielded, Vec::new(), clears, affected);
+    if let Err(e) = &res {
+        after_failed_override(dag, store, e);
+    }
+    res
+}
+
+/// Operator finality settings (RPC `ignorefinalized`, `reconsiderfinalized`,
+/// `setfinalitycheckpoint`; PoWit audit findings 2 and 3): the escape hatch
+/// Bitcoin Core's `invalidateblock` / `reconsiderblock` give for blocks,
+/// for the finality pin. Persist the setting (`powit::apply_finality_op`),
+/// recompute the pin, and move the applied chain to the best valid block
+/// under it, committed in chunks like [`invalidate_block`]. No block is
+/// marked: setting a finalized checkpoint aside leaves its blocks valid; the
+/// pin falls back to the node's remaining own finality, which a finalized
+/// checkpoint that conflicted with the one set aside may now advance, and
+/// the most work decides above it. This is how an operator moves a node off
+/// a finality it keeps against a conflict (review HIGH 1). The setting stands even when
+/// the move first needs pruned bodies ([`OverrideError::MissingBodies`]: they
+/// are requested, retry) or stops on a storage failure (the next acceptance
+/// or start resumes it). `affected` in the result is 1 when the pin moved.
+#[allow(clippy::too_many_arguments)]
+pub fn override_finality(
+    op: crate::powit::FinalityOp,
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &Arc<storage::Storage>,
+    mempool: &Arc<mempool::Mempool>,
+    node_state: &Arc<RwLock<rpc::NodeState>>,
+    tip_tx: Option<&broadcast::Sender<tip::TipChanged>>,
+    shielded: &Arc<RwLock<ShieldedPool>>,
+) -> Result<ChainOverride, OverrideError> {
+    let _guard = store.acceptance_lock();
+    ensure_invalid_set_loaded(dag, store);
+    crate::powit::apply_finality_op(op, dag, store)?;
+    let before = dag.read().finalized();
+    let after = crate::powit::refresh_finality_pin(dag, store).pin;
+    warn!("operator finality setting {:?}: pin {:?} -> {:?}", op,
+        before.map(|(h, x)| (hex::encode(&h[..8]), x)), after.map(|(h, x)| (hex::encode(&h[..8]), x)));
+    let res = apply_operator_override(dag, store, mempool, node_state, tip_tx, shielded, Vec::new(),
+                                      MarkClears::default(), usize::from(before != after));
     if let Err(e) = &res {
         after_failed_override(dag, store, e);
     }

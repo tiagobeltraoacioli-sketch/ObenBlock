@@ -235,6 +235,22 @@ struct Cli {
     /// (`assumevalid::MAINNET_ASSUME_VALID`, none until a release sets it);
     /// `0` checks every signature. Non-consensus — node-local (docs/RUNNING.md).
     #[arg(long = "assumevalid")]                         assume_valid: Option<String>,
+    /// PoWit finality checkpoint (weak subjectivity, review MEDIUM 6):
+    /// `HASH:HEIGHT`, a block of the real chain (its id in 64 hex digits and
+    /// its DAG height, as `getblockdag` prints them, read from nodes you
+    /// trust) that this node treats as final from the start, before it holds
+    /// the block: a finalized checkpoint that conflicts with it never pins
+    /// fork choice, and once the block arrives no chain forking below it is
+    /// selectable. Replaces the release finality checkpoint for this run
+    /// (`powit::MAINNET_FINALITY_CHECKPOINT`); `none` removes it. An
+    /// operator setting made with `setfinalitycheckpoint` takes precedence.
+    /// Until the block arrives no finalized checkpoint above its height
+    /// counts; a node that had a pin holds it, and once its chain is above
+    /// that height, or after 30 minutes out of initial block download, it
+    /// alerts (`anchor_overdue`, error log, metric
+    /// `gnb_finality_anchor_unknown`). Non-consensus, node-local
+    /// (docs/RUNNING.md).
+    #[arg(long = "finalitycheckpoint")]                  finality_checkpoint: Option<String>,
 
 }
 
@@ -480,6 +496,26 @@ async fn main() {
         };
         let _ = assumevalid::set_assume_valid(av.block);
         info!("{}", av.describe());
+        // Review MEDIUM 6: the weak-subjectivity finality checkpoint, before
+        // the finality index is loaded (the block need not be held yet).
+        if let Some(arg) = cli.finality_checkpoint.as_deref() {
+            let cp = match powit::parse_finality_checkpoint(arg) {
+                Ok(cp) => cp,
+                Err(e) => {
+                    eprintln!("❌ --finalitycheckpoint: {e}");
+                    std::process::exit(2);
+                }
+            };
+            if let Err(e) = powit::set_finality_checkpoint_flag(cp) {
+                eprintln!("❌ --finalitycheckpoint: {e}");
+                std::process::exit(2);
+            }
+            match cp {
+                Some(c) => info!("PoWit finality checkpoint (--finalitycheckpoint): {} at DAG height {}",
+                    hex::encode(c.hash), c.height),
+                None => warn!("⚠ --finalitycheckpoint none: no release finality checkpoint"),
+            }
+        }
     }
 
     // FIX v0.5.1 BLK-3: apply --rpc-public escape hatch.
@@ -1078,8 +1114,10 @@ async fn main() {
             }
         }
     }
-    // PoWit finality: pin fork choice to the checkpoint the applied chain's
-    // witness set has finalized (kept current by accept_block from here on).
+    // PoWit finality: pin fork choice to the node's own finalized checkpoint
+    // (the one it pinned last, the applied chain's), advanced by those it
+    // learns from any stored block (kept current by accept_block from here
+    // on; `consensus::finality`).
     powit::update_finalized(&dag, &store);
     if let Some((h, height)) = dag.read().finalized() {
         info!("PoWit finalized checkpoint: {} (DAG height {})", hex::encode(&h[..8]), height);
@@ -2826,10 +2864,22 @@ fn make_chain_admin_cb(
     body_requests: Arc<tokio::sync::Notify>,
 ) -> Arc<rpc::ChainAdminFn> {
     Arc::new(move |op: rpc::ChainAdminOp, hash: [u8; 32]| -> Result<serde_json::Value, String> {
-        let res = match op {
-            rpc::ChainAdminOp::Invalidate => accept::invalidate_block(
+        // PoWit audit findings 2 and 3: the finality settings.
+        let finality_op = match op {
+            rpc::ChainAdminOp::Invalidate | rpc::ChainAdminOp::Reconsider => None,
+            rpc::ChainAdminOp::IgnoreFinalized => Some(powit::FinalityOp::Ignore(hash)),
+            rpc::ChainAdminOp::ReconsiderFinalized => Some(powit::FinalityOp::Reconsider(hash)),
+            rpc::ChainAdminOp::SetFinalityCheckpoint => Some(powit::FinalityOp::SetAnchor(hash)),
+            rpc::ChainAdminOp::SetFinalityCheckpointAt(height) => Some(powit::FinalityOp::SetAnchorAt(hash, height)),
+            rpc::ChainAdminOp::DisableFinalityCheckpoint => Some(powit::FinalityOp::DisableAnchor),
+            rpc::ChainAdminOp::DefaultFinalityCheckpoint => Some(powit::FinalityOp::DefaultAnchor),
+        };
+        let res = match (op, finality_op) {
+            (_, Some(f)) => accept::override_finality(
+                f, &dag, &store, &mempool, &node_state, Some(&tip_tx), &shielded),
+            (rpc::ChainAdminOp::Invalidate, None) => accept::invalidate_block(
                 hash, &dag, &store, &mempool, &node_state, Some(&tip_tx), &shielded),
-            rpc::ChainAdminOp::Reconsider => accept::reconsider_block(
+            (_, None) => accept::reconsider_block(
                 hash, &dag, &store, &mempool, &node_state, Some(&tip_tx), &shielded),
         };
         let r = match res {
@@ -2846,14 +2896,18 @@ fn make_chain_admin_cb(
             }
             Err(e) => return Err(e.to_string()),
         };
-        Ok(serde_json::json!({
+        let mut out = serde_json::json!({
             "block":       hex::encode(hash),
             "affected":    r.affected,
             "rolled_back": r.rolled_back,
             "connected":   r.connected,
             "tip":         hex::encode(r.tip),
             "tip_height":  r.tip_height,
-        }))
+        });
+        if finality_op.is_some() {
+            out["finality"] = powit::finality_info_json(&dag.read(), 8);
+        }
+        Ok(out)
     })
 }
 
@@ -3656,14 +3710,24 @@ mod ingress_processor_tests {
         sweep_orphan_parents(&mut orphans, &mut tracker, &dag, &otx).await;
         assert_eq!(drain(&mut orx), 0);
         assert_eq!(tracker.len(), cap);
-        // Bodies that arrive make room for the next ones.
+        // Bodies that arrive make room for the next ones. An arrived block
+        // can become the selected tip, and only the bodies of blocks that
+        // could beat it stay wanted (`GhostDAG::wanted_body_blocks`), so how
+        // many fresh bodies are still wanted depends on the window the
+        // sweep's random rotation tracked (a fixed 30 failed about one run
+        // in ten). The request path fills exactly the room the in-flight
+        // bodies leave, from what is still wanted and not tracked.
         let arrived: Vec<[u8; 32]> = dag.read().body_pending_blocks().into_iter()
             .filter(|h| tracker.is_awaited(h)).take(30).collect();
         for h in &arrived {
             dag.write().clear_body_pending(h);
         }
+        let wanted = dag.read().wanted_body_blocks();
+        let in_flight = wanted.iter().filter(|h| tracker.is_awaited(h)).count();
+        let fresh = wanted.len() - in_flight;
+        assert!(in_flight <= cap - arrived.len(), "the arrived bodies are no longer in flight");
         request_awaited_bodies(&dag, &mut tracker, &otx).await;
-        assert_eq!(drain(&mut orx), 30);
+        assert_eq!(drain(&mut orx), fresh.min(cap - in_flight));
     }
 
     /// The latch with the minimum chain work off: the NET-6 rules below are

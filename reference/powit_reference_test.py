@@ -118,6 +118,25 @@ class Regime(unittest.TestCase):
         self.assertEqual(r.regime_at(17_500, 17_500), r.H2)
         self.assertEqual(r.regime_at(r.NEVER - 1, r.NEVER), r.V1)
 
+    def test_finding3_the_window_freezes_at_finalized_history(self):
+        p = r.PARAMS["testnet"]
+        a, n = r.key("t3", 0), r.key("t3", 1)
+        work = {e: {a: 1_000, **({n: 5_000} if e >= 4 else {})} for e in range(10)}
+        lag = {"epoch_work": work, "banned": {}, "decay": {}, "activation": 100, "finalized_height": 165}
+        self.assertEqual(r.finalized_epochs(lag, p), 3)
+        for e in (5, 9, 11):
+            self.assertEqual(r.h2_window_epoch(lag, p, e), 4)
+            self.assertEqual([k for k, _ in r.witness_set(lag, p, e, r.H2)], [a], "the newcomer is not final")
+            if e >= 6:  # the old window reaches the newcomer's first epoch, 4
+                self.assertIn(n, [k for k, _ in r.witness_set(lag, p, e, r.V1)], "the old rule admits it")
+        up = dict(lag, finalized_height=100 + 8 * 20)
+        self.assertEqual(r.h2_window_epoch(up, p, 9), 9, "finality keeps up: the old window")
+        nothing = dict(lag, finalized_height=100)
+        self.assertEqual(r.h2_window_epoch(nothing, p, 9), 9, "nothing final: the chain's own window")
+        empty = {"epoch_work": {e: {n: 1} for e in range(5, 10)}, "banned": {}, "decay": {},
+                 "activation": 100, "finalized_height": 165}
+        self.assertEqual(r.h2_window_epoch(empty, p, 9), 9, "an empty frozen window gives way")
+
     def test_vectors_are_current(self):
         self.assertEqual(r.VECTOR_FILE.read_bytes(), r.serialized())
 

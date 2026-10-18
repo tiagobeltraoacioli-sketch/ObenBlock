@@ -3,7 +3,7 @@ messages -- executable reference specification.
 
 The normative definition of the PoWit rules that the second hardening
 upgrade changes (docs/CONSENSUS.md, "PoWit"; docs/DESIGN-pow-powit.md, sections
-3-5; PoWit audit findings 1 and 4). Written from the specification with
+3-5 and 7.4; PoWit audit findings 1, 3 and 4). Written from the specification with
 hashlib only. `crates/gnb-crypto/src/core/powit.rs` must reproduce
 `powit_vectors.json` exactly (`crates/gnb-crypto/tests/powit_vectors.rs`).
 
@@ -34,6 +34,20 @@ Witness set W(e) of a state (epochs counted from the PoWit activation):
     weight descending then key ascending;
     V1: the first max_witnesses (64) of them; H2: all of them.
     decayed(w, n) = w after min(n, 64) steps of w -= w // 16.
+
+H2 reads finalized history (PoWit audit finding 3). With act the state's
+PoWit activation height and nf = (finalized.height - act) // epoch_len (the
+epochs entirely below the state's finalized checkpoint):
+
+    anchored(e)        = e if nf == 0 else min(e, nf + 1)
+    h2_window_epoch(e) = e if anchored(e) != e and the window of anchored(e)
+                           has no member at e, else anchored(e)
+    W_H2(e)            = the members of h2_window_epoch(e)'s window (epochs
+                         max(0, x-1-window) ..= x-2 for x = h2_window_epoch(e)),
+                         bars applied at e, uncapped.
+
+While finality keeps up h2_window_epoch(e) = e; when it lags the set freezes
+at the last finalized window until another checkpoint is finalized.
 
 Justification: votes for a target t from the justified source justify t iff
 total(W(epoch(t))) != 0 and 3 * sum(votes) >= 2 * total (both sides
@@ -148,11 +162,12 @@ def window(params: dict, epoch: int) -> tuple[int, int]:
     return max(0, epoch - 1 - params["window_epochs"]), epoch - 2
 
 
-def witness_set(state: dict, params: dict, epoch: int, regime: str) -> list[tuple[bytes, int]]:
-    """W(epoch): [(key, weight)], heaviest first, ties by key."""
-    if epoch < 2:
+def window_members(state: dict, params: dict, window_epoch: int, bar_epoch: int) -> list[tuple[bytes, int]]:
+    """Every key with positive decayed work in window_epoch's window, not
+    barred at bar_epoch: [(key, weight)] in key order."""
+    if window_epoch < 2:
         return []
-    lo, hi = window(params, epoch)
+    lo, hi = window(params, window_epoch)
     total: dict[bytes, int] = {}
     for e, m in state["epoch_work"].items():
         if lo <= e <= hi:
@@ -160,11 +175,37 @@ def witness_set(state: dict, params: dict, epoch: int, regime: str) -> list[tupl
                 total[k] = sat_add(total.get(k, 0), w)
     out = []
     for k in sorted(total):
-        if is_banned(state, k, epoch):
+        if is_banned(state, k, bar_epoch):
             continue
         w = decayed(total[k], state["decay"].get(k, 0))
         if w > 0:
             out.append((k, w))
+    return out
+
+
+def finalized_epochs(state: dict, params: dict) -> int:
+    act = state.get("activation", 0)
+    return max(0, state.get("finalized_height", act) - act) // params["epoch_len"]
+
+
+def anchored_epoch(state: dict, params: dict, epoch: int) -> int:
+    nf = finalized_epochs(state, params)
+    return epoch if nf == 0 else min(epoch, nf + 1)
+
+
+def h2_window_epoch(state: dict, params: dict, epoch: int) -> int:
+    a = anchored_epoch(state, params, epoch)
+    if a != epoch and not window_members(state, params, a, epoch):
+        return epoch
+    return a
+
+
+def witness_set(state: dict, params: dict, epoch: int, regime: str) -> list[tuple[bytes, int]]:
+    """W(epoch): [(key, weight)], heaviest first, ties by key."""
+    if regime == V1:
+        out = window_members(state, params, epoch, epoch)
+    else:
+        out = window_members(state, params, h2_window_epoch(state, params, epoch), epoch)
     out.sort(key=lambda kw: (-kw[1], kw[0]))
     if regime == V1:
         out = out[:params["max_witnesses"]]
@@ -208,11 +249,15 @@ def hash32(label: str, i: int) -> bytes:
 
 
 def state_json(state: dict) -> dict:
-    return {
+    out = {
         "epoch_work": {str(e): {k.hex(): str(w) for k, w in sorted(m.items())} for e, m in sorted(state["epoch_work"].items())},
         "banned": {k.hex(): u for k, u in sorted(state["banned"].items())},
         "decay": {k.hex(): d for k, d in sorted(state["decay"].items())},
     }
+    for f in ("activation", "finalized_height"):
+        if f in state:
+            out[f] = state[f]
+    return out
 
 
 def ws_json(ws) -> list:
@@ -279,6 +324,22 @@ def generate() -> dict:
     sets.append(("mainnet_window_saturation", "mainnet", st, [2, 29, 30, 31, 32], [(30, k) for k in (a, b, c)]))
     st, honest, attacker = finding4_state()
     sets.append(("finding4", "testnet", st, [2], [(2, honest[0]), (2, attacker[0])]))
+    # Finding 3: W from finalized history (testnet epochs of 20 blocks,
+    # activation 100). Two witnesses a, b every epoch; a newcomer n from
+    # epoch 4 on, with as much work as both.
+    work = {e: {a: 1_000, b: 1_000, **({n: 2_000} if e >= 4 else {})} for e in range(10)
+            for n in [key("newcomer", 0)]}
+    n = key("newcomer", 0)
+    st = {"epoch_work": work, "banned": {}, "decay": {}, "activation": 100, "finalized_height": 100 + 8 * 20 + 5}
+    sets.append(("finalized_history_keeps_up", "testnet", st, list(range(2, 12)), [(9, n)]))
+    st = {"epoch_work": work, "banned": {}, "decay": {}, "activation": 100, "finalized_height": 100 + 3 * 20 + 5}
+    sets.append(("finalized_history_lags_frozen", "testnet", st, list(range(2, 12)), [(e, n) for e in (4, 5, 6, 9)]))
+    st = {"epoch_work": {e: {n: 2_000} for e in range(5, 10)}, "banned": {}, "decay": {},
+          "activation": 100, "finalized_height": 100 + 3 * 20 + 5}
+    sets.append(("finalized_history_empty_frozen_window", "testnet", st, [4, 5, 6, 7, 9, 11], [(9, n)]))
+    st = {"epoch_work": {0: {a: 1_000}, 1: {a: 1_000}, 2: {b: 500}, 5: {c: 3_000}, 6: {c: 3_000}},
+          "banned": {a: 8}, "decay": {b: 2}, "activation": 100, "finalized_height": 100 + 3 * 20 + 5}
+    sets.append(("finalized_history_bars_at_the_epoch", "testnet", st, [4, 5, 7, 8, 9], [(e, k) for e in (7, 8) for k in (a, b, c)]))
 
     witness_sets = []
     for name, net, st, epochs, proofs in sets:

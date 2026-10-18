@@ -9,7 +9,7 @@ const SAT = 100000000n;
 const IDLE_LOCK_MS = 10 * 60 * 1000;
 const MAX_INPUTS = 50;            // each input carries ~8.5 kB of post-quantum signature
 const PRE_POWIT_DEPTH = 1000;     // signers' rule before PoWit finality is active
-const CORE_SHA256 = "d3d1d58a39fd3e55cf9a65551e57618e84841c7e2abc8d8341d600050e5bf070";
+const CORE_SHA256 = "b91372ded4265e51eddd0842d991d6a6602d5531d46600d107e6d2e6b11c6c66";
 
 const $ = (s, el = document) => el.querySelector(s);
 const content = $("#content");

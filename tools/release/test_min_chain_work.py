@@ -124,6 +124,8 @@ class Choose(unittest.TestCase):
         self.assertEqual(cand["height"], 9_000 - 1 - 2_880)
         self.assertIn(f'Some(AssumedValidBlock::from_hex("{cand["hash"]}", {cand["height"]}));', text)
         self.assertIn(f"--assumevalid {cand['hash']}", text)
+        # So is the release finality checkpoint (P5-A2, weak subjectivity).
+        self.assertIn(f'Some(ReleaseCheckpoint::from_hex("{cand["hash"]}", {cand["height"]}));', text)
 
     def test_assume_valid_line_refuses_a_malformed_id(self):
         good = {"hash": h(0xABCDEF), "height": 5}

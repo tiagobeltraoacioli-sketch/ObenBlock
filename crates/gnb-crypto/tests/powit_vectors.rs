@@ -64,7 +64,13 @@ fn regime(s: &str) -> Regime {
 }
 
 fn state(v: &Value) -> PowitState {
-    let mut st = PowitState::genesis(0, [0; 32]);
+    // Finding 3: the PoWit activation and the finalized checkpoint's slot
+    // (the window of a `Regime::Hardening2` set ends below it).
+    let act = v.get("activation").map_or(0, u);
+    let mut st = PowitState::genesis(act, [0; 32]);
+    if let Some(f) = v.get("finalized_height") {
+        st.finalized.height = u(f);
+    }
     for (e, m) in v["epoch_work"].as_object().unwrap() {
         let e: u64 = e.parse().unwrap();
         for (k, w) in m.as_object().unwrap() {

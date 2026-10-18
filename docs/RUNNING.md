@@ -667,9 +667,10 @@ key are never charged.
 ## Chain selection and operator recovery
 
 The node always follows the best valid chain of the blocks it holds, at any
-depth: there is no reorg-depth limit and no finality checkpoint. A reorg of
-more than 1,000 blocks is logged at error level ("DEEP REORG committed") and
-counted in `gnb_deep_reorgs_total`; it is never refused.
+depth, among the chains through its PoWit finality pin (below): there is no
+reorg-depth limit. A reorg of more than 1,000 blocks is logged at error
+level ("DEEP REORG committed") and counted in `gnb_deep_reorgs_total`; it is
+never refused.
 
 To leave a chain anyway (for example while an incident is investigated), or
 to return to it:
@@ -732,6 +733,83 @@ for it (it requested it, or the body it had was rejected) and only as the
 answer to its own request; it is checked like a new block (height implied by
 its parents, difficulty, timestamp, proof of work, the witness commitment
 rules) before it is stored.
+
+### PoWit finality: the pin, conflicts and the operator
+
+From the PoWit activation the node never leaves a finalized checkpoint it
+has reached (docs/CONSENSUS.md, "Selected parent and fork choice"):
+`gnb-cli finality` (RPC `getfinalityinfo`) shows the pin, its `origin`
+(`finalized`, `anchor`, or `held` while the anchor is unknown), the node's
+`own_finality`, the anchor and the
+finalized checkpoints it counts. It learns finality from every block it
+stores, also from a chain it has not applied, but such a finality only
+advances its own: after a partition heals, the side without new finality
+moves to the side that has it.
+
+A finalized checkpoint that conflicts with the node's is a serious event: a
+third of the witness weight signed both, or two chains derived different
+witness sets (an eclipse while syncing, a long partition, or a majority of
+the hashrate building its own witness set before the second hardening
+activation). The node keeps its finality whatever the work of the other
+chain, and alerts for as long as the other checkpoint counts: an error log
+line ("PoWit FINALITY CONFLICT"), `conflict` (the pinned checkpoint and the
+highest conflicting one), `conflicting_finalized` and
+`conflict_resolution` (`own_finality`) in `getfinalityinfo`,
+`finality_conflict: true` in `getpowitinfo`, and the metric
+`gnb_finality_conflicts`. Find out which side the rest of the network and
+the witnesses are on before acting. If this node is on the wrong side, move
+it, persistently:
+
+```sh
+GNB_RPC_API_KEY=<key> gnb-cli setfinalitycheckpoint <block-hash-on-the-right-chain> [dag-height]
+GNB_RPC_API_KEY=<key> gnb-cli ignorefinalized [checkpoint-hash]   # default: the current pin
+GNB_RPC_API_KEY=<key> gnb-cli reconsiderfinalized <checkpoint-hash>
+GNB_RPC_API_KEY=<key> gnb-cli setfinalitycheckpoint none|default
+```
+
+`reconsiderfinalized` lets a checkpoint you set aside count again, but it
+does not move the node back: if setting it aside let the other chain's
+finality become the node's own, the node keeps that one (the reconsidered
+checkpoint now conflicts with it). To go back, run `setfinalitycheckpoint`
+with a block of the original chain.
+
+`setfinalitycheckpoint` makes the block a weak-subjectivity anchor: every
+finalized checkpoint that conflicts with it stops counting (the node's own
+included) and no chain forking below it is selectable once the node holds
+it. `ignorefinalized` sets the checkpoint aside (and every one at or above
+it on its chain): the node falls back to its remaining own finality, which
+the other chain's checkpoint may then advance. A node with no finality of
+its own above two conflicting checkpoints it learned from other chains
+(`conflict_resolution: most_work`) takes the one whose chain carries the
+most work, and alerts the same way.
+
+A weak-subjectivity checkpoint protects a node best before it syncs: give
+the block's DAG height with its hash and the node accepts it before it
+holds the block (`anchor_status: unknown` until it arrives; the height is
+checked then). Either with the RPC above on a fresh data dir, or at
+start-up:
+
+```sh
+gnb --finalitycheckpoint <block-hash>:<dag-height> ...
+```
+
+`--finalitycheckpoint` replaces the release finality checkpoint
+(`powit::MAINNET_FINALITY_CHECKPOINT`, none yet) for that run
+(`anchor_source: flag`; `none` removes it); a setting made with
+`setfinalitycheckpoint` is persisted and takes precedence, and
+`setfinalitycheckpoint default` returns to the flag's or the release's. Read
+the block from nodes you trust (`getblockdag`). While the anchor is unknown,
+no finalized checkpoint above its height counts and none at or below it is
+decided, so a node eclipsed on a fork during sync is never pinned to the
+fork's finality. A node that already had a pin (a finalized checkpoint or
+a previous anchor) holds it meanwhile (`origin: held` in `getfinalityinfo`;
+the persisted pin is kept), instead of falling back to the most work. If
+the node's chain passes the anchor's height, or the anchor stays unknown
+for 30 minutes after initial block download, it alerts: an error log line
+("PoWit finality anchor ... is UNKNOWN"), `anchor_overdue: true`, and the
+metric `gnb_finality_anchor_unknown` = 1. Check the hash and height you
+gave, and that your peers serve that chain; `setfinalitycheckpoint
+default` or `none` removes the setting.
 
 ## Chain-state check at start-up
 
