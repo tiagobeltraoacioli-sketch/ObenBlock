@@ -294,6 +294,16 @@ signatures assumed valid" when it applies.
   onto the real chain of a node that sat on another branch (a partition or
   an eclipse), bodies fetched again, and a restart that resumes a chain move.
 
+### The Bloch anchor (`--bloch-rpc`)
+
+`--bloch-rpc <URL of your own Bloch node>` makes the newest ObenBlock
+checkpoint that Bloch has finalized in its anchor registry a
+weak-subjectivity checkpoint: fork choice is pinned to it and chains that
+contradict it are refused. An anchor that contradicts the node's own PoWit
+finality changes nothing and is reported as `conflict` by `getblochanchor`.
+Node-local, not consensus; details, the registry interface and the
+`obenblock-anchor` publisher in [OBB-ANCHOR.md](OBB-ANCHOR.md).
+
 ## Peers and connections
 
 Connection management follows Bitcoin Core's `CConnman` / `addrman` design

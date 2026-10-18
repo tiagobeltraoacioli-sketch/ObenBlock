@@ -1,0 +1,122 @@
+{
+ "format": "obb-anchor-v1",
+ "record_len": 84,
+ "w_digest_tag": "OBB-ANCHOR-v1/W",
+ "w_digest": [
+  {
+   "name": "empty",
+   "set": [],
+   "digest": "2777a890bdc6883438d8cbc2b230ddd1fb22afd0acec1a8f8a6d7a79ddcd895b"
+  },
+  {
+   "name": "one",
+   "set": [
+    {
+     "key": "6271a8c38c2289200f9965825a12717c468280fe",
+     "weight": "1"
+    }
+   ],
+   "digest": "69240fb7c8e2f0fbc020dbd336897001c74a7422dcca61c08361a4bb8ef9d7f4"
+  },
+  {
+   "name": "three_heaviest_first",
+   "set": [
+    {
+     "key": "ebe7f3ae7e8d45a298d8bd42d6703a1775bea0c1",
+     "weight": "9000"
+    },
+    {
+     "key": "d09d01bf442c652f5c4631f064d29378dca8111f",
+     "weight": "500"
+    },
+    {
+     "key": "6151dba737d3071d704586fe195ef06f7087992a",
+     "weight": "7"
+    }
+   ],
+   "digest": "1b45c74d62a9205b66c393ec5a7c8aa940a6e8590f4c49528350ab8a077db2c0"
+  },
+  {
+   "name": "extremes",
+   "set": [
+    {
+     "key": "0000000000000000000000000000000000000000",
+     "weight": "0"
+    },
+    {
+     "key": "ffffffffffffffffffffffffffffffffffffffff",
+     "weight": "340282366920938463463374607431768211455"
+    },
+    {
+     "key": "2fdd8827d985ec7e9d6b83beb8a52f12adb1128e",
+     "weight": "18446744073709551616"
+    }
+   ],
+   "digest": "e7e7c101d2786512ddf0a1feb45b0c59379a5a58756e44023cd7747c8db630cd"
+  }
+ ],
+ "records": [
+  {
+   "name": "obb_mainnet_epoch1",
+   "chain_id": 1329725441,
+   "slot": 720,
+   "block_id": "073af51ddfccbe51470c0d8bfb573797e993c95eb8d0c49d20326cfb82053fb9",
+   "finalized_at": 845,
+   "w_digest": "1b45c74d62a9205b66c393ec5a7c8aa940a6e8590f4c49528350ab8a077db2c0",
+   "record": "0100424fd002000000000000073af51ddfccbe51470c0d8bfb573797e993c95eb8d0c49d20326cfb82053fb94d030000000000001b45c74d62a9205b66c393ec5a7c8aa940a6e8590f4c49528350ab8a077db2c0",
+   "record_id": "f1b11e6e9824bfd54342c7e6a485d0d24259b0bc58e7b3bdf3d94b66c183759d"
+  },
+  {
+   "name": "obb_regtest_epoch3",
+   "chain_id": 1329725442,
+   "slot": 60,
+   "block_id": "f479a24d5272fcc5fb2e4fdf3c11ea8cb9e6b4e163dcd83a1214309f4c64be71",
+   "finalized_at": 71,
+   "w_digest": "69240fb7c8e2f0fbc020dbd336897001c74a7422dcca61c08361a4bb8ef9d7f4",
+   "record": "0200424f3c00000000000000f479a24d5272fcc5fb2e4fdf3c11ea8cb9e6b4e163dcd83a1214309f4c64be71470000000000000069240fb7c8e2f0fbc020dbd336897001c74a7422dcca61c08361a4bb8ef9d7f4",
+   "record_id": "eafef2f97f66de6eb40f6a179b15af71a284a0613f0bda84de4579eacb0846de"
+  },
+  {
+   "name": "gnb_chain_id",
+   "chain_id": 1196294145,
+   "slot": 1440,
+   "block_id": "1fed0806db70c20206e84f0948bd9e23cb08a49a1140645919c77366949be543",
+   "finalized_at": 1500,
+   "w_digest": "2777a890bdc6883438d8cbc2b230ddd1fb22afd0acec1a8f8a6d7a79ddcd895b",
+   "record": "01004e47a0050000000000001fed0806db70c20206e84f0948bd9e23cb08a49a1140645919c77366949be543dc050000000000002777a890bdc6883438d8cbc2b230ddd1fb22afd0acec1a8f8a6d7a79ddcd895b",
+   "record_id": "72309cb1b5e0a028d83269234726cb3a34e8e0d04db07a19e52388598c8f9a11"
+  },
+  {
+   "name": "max_fields",
+   "chain_id": 4294967295,
+   "slot": 18446744073709551614,
+   "block_id": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+   "finalized_at": 18446744073709551615,
+   "w_digest": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+   "record": "fffffffffeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+   "record_id": "f0dc76ceef576caef256c4a5e9829966ee2c95269d13ad36e601b086726e1cdf"
+  }
+ ],
+ "invalid_records": [
+  {
+   "name": "short",
+   "record": "0100424fd002000000000000073af51ddfccbe51470c0d8bfb573797e993c95eb8d0c49d20326cfb82053fb94d0300000000000000000000000000000000000000000000000000000000000000000000000000"
+  },
+  {
+   "name": "long",
+   "record": "0100424fd002000000000000073af51ddfccbe51470c0d8bfb573797e993c95eb8d0c49d20326cfb82053fb94d03000000000000000000000000000000000000000000000000000000000000000000000000000000"
+  },
+  {
+   "name": "zero_block_id",
+   "record": "0100424fd00200000000000000000000000000000000000000000000000000000000000000000000000000004d030000000000000000000000000000000000000000000000000000000000000000000000000000"
+  },
+  {
+   "name": "finalized_at_equal_slot",
+   "record": "0100424fd002000000000000073af51ddfccbe51470c0d8bfb573797e993c95eb8d0c49d20326cfb82053fb9d0020000000000000000000000000000000000000000000000000000000000000000000000000000"
+  },
+  {
+   "name": "finalized_at_below_slot",
+   "record": "0100424fd002000000000000073af51ddfccbe51470c0d8bfb573797e993c95eb8d0c49d20326cfb82053fb9cf020000000000000000000000000000000000000000000000000000000000000000000000000000"
+  }
+ ]
+}

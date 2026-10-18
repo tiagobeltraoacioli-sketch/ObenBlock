@@ -9,7 +9,8 @@ Anyone can check an anchor against Bloch with read-only RPC calls. Until the
 relaunch lands, the code does this on the GnB chain, under GnB-SMH proof of
 work. This is the Bloch-to-ObenBlock half of the mutual anchoring; the other
 half, ObenBlock's finalized checkpoints recorded in Bloch, is specified in
-[DESIGN-obenblock.md](DESIGN-obenblock.md) §8 and not implemented yet.
+[OBB-ANCHOR.md](OBB-ANCHOR.md) (ObenBlock side implemented; the Bloch
+registry is pending).
 
 Nothing here is a consensus rule on either chain. No node needs to upgrade.
 
