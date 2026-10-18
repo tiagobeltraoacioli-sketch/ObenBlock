@@ -35,7 +35,7 @@ path = "src/lib.rs"
 # the matching platform/hardware; the default build stays clean + unattested.
 #   sev-snp — AMD SEV-SNP confidential VM (Linux). Wires the virtee/sev crate.
 #   mobile  — device-TEE verification (Android Key Attestation / iOS App Attest).
-default = ["node"]
+default = ["node", "stratum-v2"]
 # `node` gates the heavy full-node modules (storage/consensus/mining/network/
 # rpc/…) and their exclusive deps (rocksdb, libp2p, axum, …) so the pure
 # wallet/crypto subset cross-compiles for mobile with `default-features = false`.
@@ -54,6 +54,20 @@ node = [
 ]
 sev-snp = ["dep:sev"]
 mobile  = ["dep:x509-parser", "dep:ciborium"]
+# The built-in Stratum V2 server (node/src/stratum_v2, docs/STRATUM.md):
+# Noise NX (secp256k1 ElligatorSwift + BIP 340 certificate) and the SV2
+# binary messages from the Stratum V2 reference implementation (SRI). On by
+# default; `--stratum-v2` still has to be passed to start it. A build
+# without this feature has no secp256k1 at all (audit CRY-6, deny.toml).
+stratum-v2 = [
+    "node",
+    "dep:noise_sv2",
+    "dep:binary_sv2",
+    "dep:mining_sv2",
+    "dep:common_messages_sv2",
+    "dep:secp256k1",
+    "dep:bs58",
+]
 # FUNCTIONAL TESTS ONLY (test/functional, docs/testing/FUNCTIONAL.md): forwards
 # gnb-crypto's dev feature, which pins every expected target to the pow limit
 # (about one GnB-SMH evaluation per block). Consensus-breaking, so it is off by
@@ -174,6 +188,23 @@ primitive-types = "0.13"
 
 gnb-smh                   = { path = "../crates/gnb-smh" }
 
+# ── Stratum V2 (feature `stratum-v2`, node/src/stratum_v2) ──
+# The SRI crates the legacy Bloch node used through the `stratum-core` 0.2.1
+# umbrella, pinned to the exact versions of its Cargo.lock. Only the
+# constituent crates the server needs are named: the umbrella also pulls
+# rust-bitcoin 0.32 (a second secp256k1) and the job-declaration, template
+# distribution and channel crates, none of which the server uses.
+noise_sv2           = { version = "=1.4.2", optional = true }
+binary_sv2          = { version = "=5.0.1", optional = true }
+mining_sv2          = { version = "=8.0.0", optional = true }
+common_messages_sv2 = { version = "=7.0.0", optional = true }
+# The authority key of the Noise NX handshake (x-only public key, BIP 340):
+# the same release noise_sv2 links, so one copy of libsecp256k1. Allowed by
+# deny.toml only as a dependency of noise_sv2 and of this crate.
+secp256k1           = { version = "=0.28.2", default-features = false, features = ["alloc"], optional = true }
+# Base58Check form of the authority public key (SRI key-utils format).
+bs58                = { version = "0.5", optional = true }
+
 # Lean crypto/wallet/tx surface extracted from this node (crates/gnb-crypto).
 # The node re-exports its modules (types/crypto/core/address/wallet/hd_wallet/
 # util) so every `crate::core::…` path keeps working; downstream products depend
@@ -219,6 +250,11 @@ proptest = "1"
 # tests (versions already in Cargo.lock through libp2p / reqwest).
 rcgen  = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# The SV2 test client of node/tests/stratum_e2e.rs frames its messages with
+# SRI's own codec, so the server's framing is checked against the reference
+# implementation (same pins as the legacy stratum-core 0.2.1 lock).
+codec_sv2   = { version = "=5.0.0", features = ["noise_sv2"] }
+framing_sv2 = "=6.0.1"
 
 [lints.rust]
 # `sp1-verify` gates an optional SP1 shielded-proof verifier whose dependency

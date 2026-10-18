@@ -54,6 +54,13 @@ pub fn empty_shielded_root() -> [u8; 32] {
     Sha3_256::digest(SHIELDED_TAG).into()
 }
 
+/// The PoWit section root folded into the body root of a block built from
+/// `tmpl`: with the witness exits from the liveness activation (ObenBlock:
+/// height 0), as `Block::body_merkle_root_at` computes it.
+pub fn powit_root(tmpl: &BlockTemplate) -> [u8; 32] {
+    tmpl.powit.root_with(core::liveness::liveness_active_at(tmpl.height))
+}
+
 /// The rule a pool applies to compute the header Merkle root from the
 /// coinbase txid, or why this template has none a pool can use.
 fn merkle_rule(tmpl: &BlockTemplate) -> Result<&'static str, String> {
@@ -70,7 +77,9 @@ fn merkle_rule(tmpl: &BlockTemplate) -> Result<&'static str, String> {
 /// The header Merkle root of a block built from `tmpl` whose coinbase has
 /// txid `coinbase_txid`: fold the txid through `coinbase_merkle_branch`
 /// (tagged tree), then, where PoWit is active,
-/// `SHA3-256("gnb:block:body:v2" ‖ tx_root ‖ shielded_root ‖ powit_root)`.
+/// `SHA3-256("gnb:block:body:v2" ‖ tx_root ‖ shielded_root ‖ powit_root)`
+/// with [`powit_root`] (the exits list is part of it from the liveness
+/// activation, which on ObenBlock is height 0).
 pub fn header_merkle_root(tmpl: &BlockTemplate, coinbase_txid: &[u8; 32]) -> Result<MerkleRoot, String> {
     let rule = merkle_rule(tmpl)?;
     let tx_root = core::block_rules::merkle_root_from_coinbase_branch(coinbase_txid, &tmpl.coinbase_merkle_branch(), true);
@@ -81,7 +90,7 @@ pub fn header_merkle_root(tmpl: &BlockTemplate, coinbase_txid: &[u8; 32]) -> Res
     h.update(BODY_V2_TAG);
     h.update(tx_root.0);
     h.update(empty_shielded_root());
-    h.update(tmpl.powit.root());
+    h.update(powit_root(tmpl));
     Ok(MerkleRoot(h.finalize().into()))
 }
 
@@ -102,7 +111,7 @@ pub fn template_fields(tmpl: &BlockTemplate, request: Option<&Value>, now: u64) 
     let mut display = commitment;
     display.reverse();
     let (rule, shielded_root, powit_root) = match merkle_rule(tmpl) {
-        Ok(r) => (r, hex::encode(empty_shielded_root()), hex::encode(tmpl.powit.root())),
+        Ok(r) => (r, hex::encode(empty_shielded_root()), hex::encode(powit_root(tmpl))),
         Err(_) => ("unsupported", String::new(), String::new()),
     };
     let max_time = now.saturating_add(core::MAX_FUTURE_SECS).min(u32::MAX as u64);

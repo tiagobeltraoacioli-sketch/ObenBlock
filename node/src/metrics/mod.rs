@@ -31,9 +31,10 @@ use axum::{
 };
 use log::{info, error, warn};
 use prometheus::{
-    Encoder, IntGauge, IntCounter, IntCounterVec, HistogramVec, Histogram,
+    Encoder, IntGauge, IntGaugeVec, IntCounter, IntCounterVec, HistogramVec, Histogram,
     Registry, TextEncoder,
     register_int_gauge_with_registry,
+    register_int_gauge_vec_with_registry,
     register_int_counter_with_registry,
     register_int_counter_vec_with_registry,
     register_histogram_with_registry,
@@ -89,6 +90,19 @@ pub struct MetricsState {
     /// The configured weak-subjectivity anchor is unknown while the applied
     /// tip is above its height (review round 2, M3): 1, else 0.
     pub finality_anchor_unknown:         IntGauge,
+
+    // ── Built-in stratum servers (docs/STRATUM.md) ──────────────
+    // The legacy Bloch server's series, prefixed and labelled by protocol
+    // (`v1`, `v2`).
+    /// Connections accepted.
+    pub stratum_sessions_total:          IntCounterVec,
+    /// Sessions open now.
+    pub stratum_sessions_active:         IntGaugeVec,
+    /// Shares by result (`ok`, `stale`, `dup`, `low_diff`, `unauthorized`,
+    /// `rejected`).
+    pub stratum_shares_submitted_total:  IntCounterVec,
+    /// Blocks found through stratum and accepted by the node.
+    pub stratum_blocks_found_total:      IntCounterVec,
 
     // ── Histograms (Phase 2) ────────────────────────────────────
     pub block_validation_seconds:        Histogram,
@@ -242,6 +256,28 @@ impl MetricsState {
             registry
         ).expect("register finality_anchor_unknown");
 
+        let stratum_sessions_total = register_int_counter_vec_with_registry!(
+            opts!("gnb_stratum_sessions_total", "Stratum connections accepted (by protocol)"),
+            &["protocol"],
+            registry
+        ).expect("register stratum_sessions_total");
+        let stratum_sessions_active = register_int_gauge_vec_with_registry!(
+            opts!("gnb_stratum_sessions_active", "Stratum sessions open now (by protocol)"),
+            &["protocol"],
+            registry
+        ).expect("register stratum_sessions_active");
+        let stratum_shares_submitted_total = register_int_counter_vec_with_registry!(
+            opts!("gnb_stratum_shares_submitted_total",
+                  "Stratum shares by protocol and result (ok, stale, dup, low_diff, unauthorized, rejected)"),
+            &["protocol", "result"],
+            registry
+        ).expect("register stratum_shares_submitted_total");
+        let stratum_blocks_found_total = register_int_counter_vec_with_registry!(
+            opts!("gnb_stratum_blocks_found_total", "Blocks found through stratum and accepted by the node (by protocol)"),
+            &["protocol"],
+            registry
+        ).expect("register stratum_blocks_found_total");
+
         // ── Histograms ───────────────────────────────────────────
         // Block validation buckets tuned for expected range: 1ms..10s
         let block_validation_seconds = register_histogram_with_registry!(
@@ -287,6 +323,10 @@ impl MetricsState {
             deep_reorgs_total,
             finality_conflicts,
             finality_anchor_unknown,
+            stratum_sessions_total,
+            stratum_sessions_active,
+            stratum_shares_submitted_total,
+            stratum_blocks_found_total,
             block_validation_seconds,
             rpc_latency_seconds,
         }
@@ -308,6 +348,35 @@ pub fn get() -> Option<&'static Arc<MetricsState>> {
 //
 // All of these are no-ops if metrics are disabled (METRICS not set).
 // This lets callers instrument code without branching on a config flag.
+
+/// A stratum session opened (`protocol`: `v1` or `v2`).
+pub fn stratum_session_opened(protocol: &str) {
+    if let Some(m) = METRICS.get() {
+        m.stratum_sessions_total.with_label_values(&[protocol]).inc();
+        m.stratum_sessions_active.with_label_values(&[protocol]).inc();
+    }
+}
+
+/// A stratum session closed.
+pub fn stratum_session_closed(protocol: &str) {
+    if let Some(m) = METRICS.get() {
+        m.stratum_sessions_active.with_label_values(&[protocol]).dec();
+    }
+}
+
+/// One stratum share and its result.
+pub fn stratum_share(protocol: &str, result: &str) {
+    if let Some(m) = METRICS.get() {
+        m.stratum_shares_submitted_total.with_label_values(&[protocol, result]).inc();
+    }
+}
+
+/// A block found through stratum was accepted.
+pub fn stratum_block_found(protocol: &str) {
+    if let Some(m) = METRICS.get() {
+        m.stratum_blocks_found_total.with_label_values(&[protocol]).inc();
+    }
+}
 
 #[inline]
 pub fn set_block_count(v: i64) {

@@ -130,6 +130,9 @@ the second parameter is ignored, as before.
 
 ## 4. Stratum notes
 
+The node's own V1 and V2 servers (`--stratum`, `--stratum-v2`) implement
+these notes: docs/STRATUM.md.
+
 - **Stratum V2, standard channels (header-only mining)**: maps directly.
   `SetNewPrevHash.prev_hash` = `parents_commitment` (header byte order),
   `nBits` = `bits`, `min_ntime` = `mintime`; `NewMiningJob.version` =

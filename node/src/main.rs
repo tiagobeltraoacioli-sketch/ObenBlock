@@ -48,6 +48,11 @@ mod anchoring;    // ObenBlock checkpoints anchored in Bloch: records + --bloch-
 mod blockval;     // this chain's tx rules on top of the audit set (locktime, policy, BIP30)
 mod powit;        // PoW + PoWit: witness shares, attestations, finality (node side)
 mod genesis_init; // first-boot genesis and the data-dir genesis check (both chains)
+#[allow(dead_code)]
+mod stratum;      // built-in Stratum V1 server + the work feed shared with V2 (docs/STRATUM.md)
+#[cfg(feature = "stratum-v2")]
+#[allow(dead_code)]
+mod stratum_v2;   // built-in Stratum V2 server (Noise NX, SRI messages)
 
 // The acceptance pipeline lives in `accept.rs` (shared with the library so
 // integration tests drive the real path); same names and signatures as the
@@ -284,6 +289,33 @@ struct Cli {
     /// Seconds between two reads of the Bloch anchor registry.
     #[arg(long = "bloch-anchor-interval", default_value_t = 300)] bloch_anchor_interval: u64,
 
+    // ── Built-in stratum servers (SHA-256d chains only, docs/STRATUM.md) ──
+    /// Start the Stratum V1 server (solo mode). Miners connect to
+    /// stratum+tcp://<host>:3333 with their obb1… address as the worker name.
+    /// V1 is plaintext; prefer --stratum-v2 on untrusted networks. Refused on
+    /// GnB-SMH chains.
+    #[arg(long)]                                         stratum: bool,
+    /// Bind address of the Stratum V1 server.
+    #[arg(long, default_value = stratum::DEFAULT_STRATUM_ADDR)] stratum_addr: String,
+    /// Maximum concurrent Stratum V1 sessions.
+    #[arg(long, default_value_t = stratum::DEFAULT_MAX_SESSIONS)] stratum_max_sessions: usize,
+    /// Stratum mode. Only `solo` exists: each block pays its finder's address.
+    #[arg(long, default_value = "solo")]                 stratum_mode: String,
+    /// Payout address for workers that authorize with a plain label (e.g.
+    /// `rig1`) instead of an obb1… address. Default: --miner-address. Without
+    /// either, the worker name must be an address.
+    #[arg(long)]                                         stratum_payout: Option<String>,
+    /// Start the Stratum V2 server (Noise NX encrypted, standard channels).
+    /// Pool URL: stratum2+tcp://<host>:3334/<authority key> (logged at start).
+    #[arg(long)]                                         stratum_v2: bool,
+    /// Bind address of the Stratum V2 server.
+    #[arg(long, default_value = "0.0.0.0:3334")]         stratum_v2_addr: String,
+    /// Authority keypair file of the Stratum V2 server (created, mode 0600,
+    /// on first start). Default: <data-dir>/stratum-v2-authority.json. Keep it:
+    /// miners pin its public key.
+    #[arg(long)]                                         stratum_v2_key: Option<PathBuf>,
+    /// Maximum concurrent Stratum V2 sessions.
+    #[arg(long, default_value_t = 500)]                  stratum_v2_max_sessions: usize,
 }
 
 // Bloch-SIS founder address}
@@ -378,6 +410,94 @@ mod resolve_network_tests {
 /// network is compared explicitly against the node's chain (set from
 /// `--testnet` before any caller runs): a testnet address on a mainnet node
 /// (or the reverse) is refused instead of silently paying the same hash.
+/// The validated stratum settings (`None` when neither server is enabled).
+struct StratumSetup {
+    params: core::pow_scheme::Sha256dParams,
+    payout: Option<stratum::Payout>,
+    v1_addr: Option<std::net::SocketAddr>,
+    v1_max_sessions: usize,
+    v2_addr: Option<std::net::SocketAddr>,
+    v2_max_sessions: usize,
+}
+
+/// Check the stratum flags once the chain is known: a SHA-256d chain, solo
+/// mode, valid bind addresses and session caps, and a payout address of this
+/// chain and network (`--stratum-payout`, else `--miner-address`, optional).
+fn stratum_startup_checks(cli: &Cli) -> Result<Option<StratumSetup>, String> {
+    if !cli.stratum && !cli.stratum_v2 {
+        return Ok(None);
+    }
+    let params = stratum::require_sha256d_chain()?;
+    if !cli.stratum_mode.eq_ignore_ascii_case("solo") {
+        return Err(format!("--stratum-mode {:?}: only `solo` is supported (each block pays its finder)", cli.stratum_mode));
+    }
+    let payout = match cli.stratum_payout.as_deref().or(cli.miner_address.as_deref()) {
+        None => None,
+        Some(a) => Some(stratum::payout::parse_payout_address(a)
+            .map_err(|e| format!("stratum payout address (--stratum-payout / --miner-address): {e}"))?),
+    };
+    let addr = |flag: &str, v: &str| v.parse::<std::net::SocketAddr>().map_err(|e| format!("{flag} {v:?}: {e}"));
+    let v1_addr = if cli.stratum { Some(addr("--stratum-addr", &cli.stratum_addr)?) } else { None };
+    let v2_addr = if cli.stratum_v2 { Some(addr("--stratum-v2-addr", &cli.stratum_v2_addr)?) } else { None };
+    if cli.stratum_v2 && !cfg!(feature = "stratum-v2") {
+        return Err("--stratum-v2: this binary was built without the `stratum-v2` feature".into());
+    }
+    if let (Some(a), Some(b)) = (v1_addr, v2_addr) {
+        if a.port() == b.port() && (a.ip() == b.ip() || a.ip().is_unspecified() || b.ip().is_unspecified()) {
+            return Err(format!("--stratum-addr {a} and --stratum-v2-addr {b} use the same port"));
+        }
+    }
+    let v1_max_sessions = stratum::check_max_sessions(cli.stratum_max_sessions)
+        .map_err(|e| format!("--stratum-max-sessions: {e}"))?;
+    let v2_max_sessions = stratum::check_max_sessions(cli.stratum_v2_max_sessions)
+        .map_err(|e| format!("--stratum-v2-max-sessions: {e}"))?;
+    Ok(Some(StratumSetup { params, payout, v1_addr, v1_max_sessions, v2_addr, v2_max_sessions }))
+}
+
+/// Start the Stratum V2 server (feature `stratum-v2`): load or create the
+/// authority key, bind, log the pool URL, serve. Exits the process on a
+/// configuration error, as the other servers do.
+#[cfg(feature = "stratum-v2")]
+async fn start_stratum_v2(addr: std::net::SocketAddr, key_path: PathBuf, setup: &StratumSetup,
+                          accept: Arc<rpc::SubmitBlockFn>, work: stratum::work::WorkReceiver) {
+    let authority = match stratum_v2::AuthorityKeypair::load_or_generate(&key_path) {
+        Ok(k) => k,
+        Err(e) => {
+            error!("stratum_v2: authority key {}: {e}", key_path.display());
+            std::process::exit(1);
+        }
+    };
+    let config = match stratum_v2::Sv2Config::new(addr, setup.v2_max_sessions, key_path.clone(),
+                                                   setup.payout.clone(), accept) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("stratum_v2: {e}");
+            std::process::exit(2);
+        }
+    };
+    let listener = match stratum_v2::bind(addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            error!("stratum_v2: cannot bind {addr}: {e}");
+            std::process::exit(1);
+        }
+    };
+    info!("stratum_v2: pool URL {} (authority key file {})",
+          stratum_v2::pool_url("<host>", addr.port(), &authority), key_path.display());
+    let params = setup.params;
+    tokio::spawn(async move {
+        if let Err(e) = stratum_v2::serve(listener, config, authority, params, work).await {
+            error!("stratum_v2: server stopped: {e}");
+        }
+    });
+}
+
+/// Without the `stratum-v2` feature `--stratum-v2` is refused at start-up
+/// (`stratum_startup_checks`); this is never reached.
+#[cfg(not(feature = "stratum-v2"))]
+async fn start_stratum_v2(_addr: std::net::SocketAddr, _key_path: PathBuf, _setup: &StratumSetup,
+                          _accept: Arc<rpc::SubmitBlockFn>, _work: stratum::work::WorkReceiver) {}
+
 fn address_to_script_pubkey(addr: &str) -> Result<Vec<u8>, address::AddressError> {
     let network = core::node_chain_id().network();
     Ok(address::Address::parse_for_network_in(addr, network, address::process_family())?.hash().to_vec())
@@ -585,6 +705,16 @@ async fn main() {
     info!("proof of work: {} (PoWit activation height {})",
           if core::pow_scheme::node_sha256d_params().is_some() { "sha256d" } else { core::pow_algo(0).name() },
           match core::powit_height() { u64::MAX => "off".to_string(), h => h.to_string() });
+
+    // Stratum (docs/STRATUM.md): only for SHA-256d chains; the flags and the
+    // payout address are checked before anything else starts.
+    let stratum_setup = match stratum_startup_checks(&cli) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("❌ {e}");
+            std::process::exit(2);
+        }
+    };
 
     // POW-3 (Phase 4): the minimum chain work (Bitcoin Core's
     // nMinimumChainWork), once, before any block is handled.
@@ -2607,6 +2737,46 @@ async fn main() {
         dag.clone(), store.clone(), mempool.clone(), node_state.clone(),
         shielded.clone(), outbound_tx.clone(), tip_tx.clone(), ingress::minimum_chain_work(),
     );
+    // ── Built-in stratum servers (docs/STRATUM.md) ───────────────────────────
+    // One work feed (templates from the getblocktemplate builder, rebuilt on
+    // every tip change, every 60 s and at every stall-relief step) serves V1
+    // and V2; found blocks take the submitblock hook above.
+    if let Some(setup) = stratum_setup {
+        let ctx = Arc::new(stratum::NodeContext {
+            dag: dag.clone(), store: store.clone(), mempool: mempool.clone(),
+            min_chain_work: ingress::minimum_chain_work(),
+        });
+        let work = stratum::work::spawn(ctx, tip_tx.subscribe());
+        if let Some(addr) = setup.v1_addr {
+            let listener = match stratum::bind(addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    error!("stratum: cannot bind {addr}: {e}");
+                    std::process::exit(1);
+                }
+            };
+            if !addr.ip().is_loopback() {
+                warn!("stratum: V1 on {addr} is plaintext and unauthenticated (anyone reaching the port can mine \
+                       to their own address); firewall it or prefer --stratum-v2 (docs/STRATUM.md)");
+            }
+            let config = stratum::StratumConfig {
+                bind_addr: addr, max_sessions: setup.v1_max_sessions,
+                payout: setup.payout.clone(), accept_block: rpc_submit_block.clone(),
+            };
+            let (params, work) = (setup.params, work.clone());
+            tokio::spawn(async move {
+                if let Err(e) = stratum::serve(listener, config, params, work).await {
+                    error!("stratum: V1 server stopped: {e}");
+                }
+            });
+        }
+        if let Some(addr) = setup.v2_addr {
+            let key_path = cli.stratum_v2_key.clone()
+                .unwrap_or_else(|| PathBuf::from(&cli.data_dir).join("stratum-v2-authority.json"));
+            start_stratum_v2(addr, key_path, &setup, rpc_submit_block.clone(), work).await;
+        }
+    }
+
     // Audit DAG-6: operator recovery (invalidateblock / reconsiderblock).
     let rpc_chain_admin: Arc<rpc::ChainAdminFn> = make_chain_admin_cb(
         dag.clone(), store.clone(), mempool.clone(), node_state.clone(),

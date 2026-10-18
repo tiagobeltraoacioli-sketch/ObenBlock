@@ -73,10 +73,23 @@ allow-wildcard-paths = true # path deps in the workspace are fine
 # Falcon-1024 only. (node/tests/supply_chain_lockfile_guard.rs checks the
 # same on Cargo.lock in `cargo test`.) The rust-bitcoin oracle of the audit
 # harness (audit/consistency) is a separate workspace and is not affected.
+#
+# One reviewed exception (ObenBlock Stratum V2, docs/STRATUM.md): the SV2
+# Noise NX handshake is defined over secp256k1 (ElligatorSwift keys, a BIP 340
+# certificate), so the node's built-in SV2 server (feature `stratum-v2`,
+# node/src/stratum_v2) links secp256k1 0.28.2 through SRI's noise_sv2, and
+# reads its authority key with the same release. `wrappers` allows the crate
+# only as a direct dependency of those two crates: any other path back to
+# secp256k1 fails here. cargo-deny matches a package spec by name and exact
+# version only, so the ban of every OTHER release is the lockfile guard's
+# (node/tests/supply_chain_lockfile_guard.rs: exactly these two releases,
+# only under these parents); `multiple-versions = "deny"` also refuses a
+# second copy. Nothing on the consensus path uses secp256k1; transactions
+# stay ML-DSA-65 + Falcon-1024.
 deny = [
     { crate = "blst", reason = "audit CRY-6: unused BLS12-381 C/assembly, removed" },
-    { crate = "secp256k1", reason = "audit CRY-6: unused, removed; GnB has no ECDSA" },
-    { crate = "secp256k1-sys", reason = "audit CRY-6: C library of secp256k1, removed" },
+    { crate = "secp256k1@=0.28.2", wrappers = ["noise_sv2", "gnb"], reason = "audit CRY-6: only the Stratum V2 Noise NX handshake (noise_sv2) and the node's SV2 authority key may link it" },
+    { crate = "secp256k1-sys@=0.9.2", wrappers = ["secp256k1"], reason = "audit CRY-6: C library of secp256k1, only under the Stratum V2 exception" },
 ]
 
 # Known-benign duplicate allowlist. Every entry pins the EXACT older version
@@ -102,9 +115,14 @@ deny = [
 #     fiat-crypto 0.3. The 0.10-generation copies are the node's and
 #     gnb-crypto's own (aes-gcm, hmac, hkdf, sha2 pins of the consensus and
 #     wallet code) and snow 0.10's; nothing passes values between the copies.
+#   * bitcoin_hashes 0.13 and hex-conservative 0.1 come with secp256k1
+#     0.28.2 (the Stratum V2 exception above, its `hashes` feature that
+#     noise_sv2 enables); the 0.14 / 0.2 copies are another dependency's.
+#     Hash and hex helpers only, nothing passes values between the copies.
 skip = [
     { crate = "base64@=0.22.1" },
     { crate = "bindgen@=0.69.5" },
+    { crate = "bitcoin_hashes@=0.13.1" },
     { crate = "block-buffer@=0.9.0" },
     { crate = "block-buffer@=0.10.4" },
     { crate = "chacha20@=0.9.1" },
@@ -117,6 +135,7 @@ skip = [
     { crate = "getrandom@=0.2.17" },
     { crate = "getrandom@=0.3.4" },
     { crate = "hashbrown@=0.14.5" },
+    { crate = "hex-conservative@=0.1.2" },
     { crate = "hkdf@=0.12.4" },
     { crate = "hmac@=0.12.1" },
     { crate = "r-efi@=5.3.0" },

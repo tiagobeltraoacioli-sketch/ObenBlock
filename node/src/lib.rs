@@ -70,6 +70,12 @@ pub mod template;
 // reader and the weak-subjectivity pin (docs/OBB-ANCHOR.md).
 #[cfg(feature = "node")]
 pub mod anchoring;
+// Built-in stratum servers for SHA-256d chains (ObenBlock): V1 on 3333 and,
+// with the `stratum-v2` feature, V2 (Noise NX) on 3334 (docs/STRATUM.md).
+#[cfg(feature = "node")]
+pub mod stratum;
+#[cfg(feature = "stratum-v2")]
+pub mod stratum_v2;
 
 // The libp2p crate the node is built with, for code that drives the node's
 // protocol implementations through libp2p traits and must name the SAME crate
