@@ -50,7 +50,7 @@ set_sri() { # <html file> <url path> <local file>
   sed "s#\\(\"$2\" integrity=\"\\)sha384-[A-Za-z0-9+/=]*\"#\\1$H\"#g" "$1" > "$1.tmp"
   mv "$1.tmp" "$1"
 }
-for page in site/wallet.html site/explorer.html site/index.html site/brand.html; do
+for page in site/wallet.html site/explorer.html site/index.html site/brand.html site/downloads.html; do
   set_sri "$page" /wallet/app.js     site/wallet/app.js
   set_sri "$page" /wallet/core.js    site/wallet/core.js
   set_sri "$page" /wallet/qrcode.js  site/wallet/qrcode.js

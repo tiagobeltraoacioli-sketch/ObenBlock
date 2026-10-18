@@ -8,7 +8,7 @@ import { readFileSync } from "node:fs";
 
 const site = (p) => new URL(`../${p.replace(/^\//, "")}`, import.meta.url);
 const read = (p) => readFileSync(site(p));
-const PAGES = ["index.html", "brand.html", "explorer.html", "wallet.html"];
+const PAGES = ["index.html", "brand.html", "downloads.html", "explorer.html", "wallet.html"];
 
 test("the wallet core hash is pinned in app.js and matches the binary", () => {
   const app = read("wallet/app.js").toString();

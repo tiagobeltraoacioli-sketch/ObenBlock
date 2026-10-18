@@ -1,4 +1,4 @@
-// GnB web wallet. Keys are decrypted and used only inside the WebAssembly
+// ObenBlock web wallet. Keys are decrypted and used only inside the WebAssembly
 // core (core.js / gnb_wallet.wasm); this file never sees a private key.
 //
 // Audit fixes: all markup is built with the escaping `html` template and API
@@ -100,12 +100,12 @@ window.addEventListener("pagehide", () => { try { core?.wipe(); } catch {} });
 // ── the gate (locked) ────────────────────────────────────────────────────────
 function renderGate(message) {
   show(app, html`<div class="gate">
-  <div class="gate-head"><span class="eyebrow">GnB Wallet</span><h1>Hold GNB with post-quantum keys.</h1>
-   <p>Open a GnB or Bloch keystore, create a new one, or watch an address. Your keystore is decrypted in this tab with its password, and signing happens here too. Nothing secret is uploaded.</p></div>
+  <div class="gate-head"><span class="eyebrow">ObenBlock Wallet</span><h1>Hold OBB with post-quantum keys.</h1>
+   <p>Open an ObenBlock, GnB or Bloch keystore, create a new one, or watch an address. Your keystore is decrypted in this tab with its password, and signing happens here too. Nothing secret is uploaded.</p></div>
   ${message ? html`<div class="alert ok">${message}</div>` : ""}
   <div class="doors">
    <section class="door primary"><span class="num">01 · OPEN</span><h2>Open a keystore</h2>
-    <p>A <span class="mono">.json</span> keystore from GnB or from Bloch (Genesis-3). A Bloch address becomes the same <span class="mono">gnb1q…</span> address.</p>
+    <p>A <span class="mono">.json</span> keystore from ObenBlock, GnB or Bloch (Genesis-3). A Bloch address becomes the same <span class="mono">gnb1q…</span> address.</p>
     <div class="drop" id="drop" tabindex="0" role="button" aria-label="Choose keystore file"><b>Drop the keystore here</b><br>or click to choose a file</div>
     <input type="file" id="file" accept=".json,application/json" hidden>
     <label>Password<input type="password" id="pw" autocomplete="current-password"></label>
@@ -127,7 +127,7 @@ function renderGate(message) {
     <button class="btn ghost" id="watch">Watch</button><div id="watch-msg"></div></section>
   </div>
   <div class="trust">
-   <div><b>Keys stay in the tab</b><span>Decryption (Argon2id, AES-256-GCM) and signing run in WebAssembly in this page. The page loads only code from gnb-smh.com, checked against pinned hashes.</span></div>
+   <div><b>Keys stay in the tab</b><span>Decryption (Argon2id, AES-256-GCM) and signing run in WebAssembly in this page. The page loads only code from this site, checked against pinned hashes.</span></div>
    <div><b>Post-quantum signatures</b><span>Every input is signed with ML-DSA-65 and Falcon-1024 together; both must verify.</span></div>
    <div><b>Locks itself</b><span>The key is wiped from memory on Lock, when the tab closes, and after 10 minutes idle.</span></div>
   </div></div>`);
@@ -250,7 +250,7 @@ function paintSlab() {
   const el = document.getElementById("slab"); if (!el) return;
   const keys = state.mode === "keys";
   show(el, html`<span class="k">Balance</span>
-   <div class="bal">${state.balance === null ? raw(`<span class="busy"></span>`) : fmt(state.balance)}<small>GNB</small></div>
+   <div class="bal">${state.balance === null ? raw(`<span class="busy"></span>`) : fmt(state.balance)}<small>OBB</small></div>
    <div class="row">${keys ? raw(`<span class="chip on">● Unlocked</span>`) : raw(`<span class="chip watch">◌ Watching</span>`)}<a class="chip" href="/explorer#/address/${state.address}" target="_blank" rel="noopener">Explorer ↗</a></div>
    <span class="k">Address</span><div class="addr" id="addr">${state.address}</div>
    <div class="row"><button class="chip" id="copy">Copy address</button><button class="chip" id="refresh">Refresh</button></div>
@@ -296,10 +296,10 @@ async function fetchPrevTxs(txids) {
 }
 
 function paintSend(pane = document.getElementById("pane")) {
-  show(pane, html`<h3>Send GNB</h3>
+  show(pane, html`<h3>Send OBB</h3>
    <label>To<input id="to" spellcheck="false" placeholder="gnb1q… (a bloch1q… address is accepted)"></label>
-   <div class="field-row"><label>Amount (GNB)<input id="amt" inputmode="decimal" placeholder="0.00"></label><button class="btn ghost" id="max">Max</button></div>
-   <p class="note">The network fee is the consensus minimum for the transaction's real size (≈ 0.00002 GNB per kB, at least 0.0001 GNB). Fees above 0.02 GNB are refused.</p>
+   <div class="field-row"><label>Amount (OBB)<input id="amt" inputmode="decimal" placeholder="0.00"></label><button class="btn ghost" id="max">Max</button></div>
+   <p class="note">The network fee is the consensus minimum for the transaction's real size (≈ 0.00002 OBB per kB, at least 0.0001 OBB). Fees above 0.02 OBB are refused.</p>
    <button class="btn" id="review">Review payment</button><div id="send-out"></div>`);
   document.getElementById("max").addEventListener("click", () => {
     // Leave room for the fee of up to 50 inputs (~430 kB at 2,000 sat/kB).
@@ -332,14 +332,14 @@ function paintSend(pane = document.getElementById("pane")) {
       const dust = sats(tx.dust_to_fee) ?? 0n;
       show(out, html`<div class="review">
         <div><span>To</span><b>${to}</b></div>
-        <div><span>Amount</span><b>${fmt(tx.amount)} GNB</b></div>
-        <div><span>Network fee (actual)</span><b>${fmt(tx.fee)} GNB${dust > 0n ? html` <small>incl. ${fmt(dust)} GNB change too small to return</small>` : ""}</b></div>
+        <div><span>Amount</span><b>${fmt(tx.amount)} OBB</b></div>
+        <div><span>Network fee (actual)</span><b>${fmt(tx.fee)} OBB${dust > 0n ? html` <small>incl. ${fmt(dust)} OBB change too small to return</small>` : ""}</b></div>
         <div><span>Inputs · size</span><b>${count(tx.inputs)} · ${(num(tx.size) / 1024).toFixed(1)} kB</b></div>
         ${tx.amounts_committed === true
           ? html`<div><span>Input values</span><b>committed by the signature (version 3)</b></div>`
           : html`<div><span>Inputs verified against the chain</span><b>${count(tx.verified_inputs)} of ${count(tx.inputs)}</b></div>`}
-        <div><span>Change back to you</span><b>${fmt(tx.change)} GNB</b></div>
-        <div><span>Total leaving this address</span><b>${fmt((sats(tx.amount) ?? 0n) + (sats(tx.fee) ?? 0n))} GNB</b></div></div>
+        <div><span>Change back to you</span><b>${fmt(tx.change)} OBB</b></div>
+        <div><span>Total leaving this address</span><b>${fmt((sats(tx.amount) ?? 0n) + (sats(tx.fee) ?? 0n))} OBB</b></div></div>
         ${unverified ? html`<div class="alert bad" style="margin-top:12px">${unverified} input value(s) come only from the server (genesis carryover or pruned history) and could not be checked against their transaction. If the server lied, the difference would be paid as fee.
           <label class="check"><input type="checkbox" id="accept-unverified"> I accept the unverified input value(s) shown above.</label></div>` : ""}
         <div class="row" style="margin-top:14px"><button class="btn" id="confirm" ${unverified ? raw("disabled") : ""}>Confirm and send</button><button class="btn ghost" id="cancel">Cancel</button></div>`);
@@ -363,9 +363,9 @@ function paintReceive(pane = document.getElementById("pane")) {
   let qr = "";
   // The QR library returns SVG markup for the (validated) address only.
   try { const q = window.qrcode(0, "M"); q.addData(state.address, "Byte"); q.make(); qr = raw(q.createSvgTag({ cellSize: 6, margin: 0, scalable: true })); } catch {}
-  show(pane, html`<h3>Receive GNB</h3><div class="receive"><div class="qr" aria-label="QR code of the address">${qr}</div>
-   <div style="display:grid;gap:12px"><p>Share this address. Anyone can send GNB to it; only the keystore can spend it.</p><div class="addr">${state.address}</div>
-   <p class="note">Same key as the Bloch address <span class="mono">bloch1q${state.address.slice(5)}</span>: GNB from the Genesis-3 carryover is already here.</p></div></div>`);
+  show(pane, html`<h3>Receive OBB</h3><div class="receive"><div class="qr" aria-label="QR code of the address">${qr}</div>
+   <div style="display:grid;gap:12px"><p>Share this address. Anyone can send OBB to it; only the keystore can spend it.</p><div class="addr">${state.address}</div>
+   <p class="note">Same key as the Bloch address <span class="mono">bloch1q${state.address.slice(5)}</span>: OBB from the Genesis-3 carryover is already here.</p></div></div>`);
 }
 
 async function paintActivity(pane = document.getElementById("pane")) {
@@ -377,8 +377,8 @@ async function paintActivity(pane = document.getElementById("pane")) {
     const c = carry?.result;
     const items = Array.isArray(h.items) ? h.items : [];
     show(pane, html`<h3>Activity</h3>
-     ${c?.in_carryover === true ? html`<div class="alert ok">Genesis carryover: ${fmt(c.amount)} GNB from the Bloch Genesis-3 snapshot (${count(c.utxos)} outputs).</div>` : ""}
-     ${items.length ? html`<table class="activity"><thead><tr><th>Height</th><th>Transaction</th><th></th><th class="num">GNB</th></tr></thead><tbody>
+     ${c?.in_carryover === true ? html`<div class="alert ok">Genesis carryover: ${fmt(c.amount)} OBB from the Bloch Genesis-3 snapshot (${count(c.utxos)} outputs).</div>` : ""}
+     ${items.length ? html`<table class="activity"><thead><tr><th>Height</th><th>Transaction</th><th></th><th class="num">OBB</th></tr></thead><tbody>
       ${items.map((i) => { const txid = isHex64(i.txid) ? i.txid : ""; const incoming = i.direction === "in";
         return html`<tr><td class="mono">${count(i.height)}</td><td><a class="mono" href="/explorer#/tx/${txid}" target="_blank" rel="noopener">${txid.slice(0, 12)}…</a></td><td class="muted">${incoming ? "received" : "sent"}</td><td class="num ${incoming ? "in" : ""}">${incoming ? "+" : "−"}${fmt(i.amount)}</td></tr>`; })}
       </tbody></table>${num(h.total) > 25 ? html`<p class="note">Showing the latest 25 of ${count(h.total)}. <a href="/explorer#/address/${state.address}" target="_blank" rel="noopener">Full history in the explorer ↗</a></p>` : ""}`
@@ -388,11 +388,11 @@ async function paintActivity(pane = document.getElementById("pane")) {
 
 function paintBackup(pane = document.getElementById("pane")) {
   show(pane, html`<h3>Back up this wallet</h3>
-   <p>Download the key again as an encrypted GnB keystore (v3: its network and address are authenticated). Choose a password; it is the only way to open the file.</p>
+   <p>Download the key again as an encrypted keystore (v3: its network and address are authenticated). Choose a password; it is the only way to open the file.</p>
    <label>Password<input type="password" id="bpw" autocomplete="new-password"></label>
    <label>Repeat password<input type="password" id="bpw2" autocomplete="new-password"></label>
    <button class="btn ghost" id="bdl">Download encrypted keystore</button><div id="b-out"></div>
-   <p class="note">The file can be opened here, with <span class="mono">gnb-cli send</span>, and with any GnB node tool. Never share it together with its password.</p>`);
+   <p class="note">The file can be opened here, with <span class="mono">obenblock-cli send</span>, and with the other node tools. Never share it together with its password.</p>`);
   document.getElementById("bdl").addEventListener("click", async (ev) => {
     const btn = ev.currentTarget, out = document.getElementById("b-out"); out.innerHTML = "";
     const p1 = document.getElementById("bpw").value, p2 = document.getElementById("bpw2").value;

@@ -12,7 +12,8 @@ test("pin-only generator replaces stale pins in both served wallets", () => {
   const files = ["scripts/build-wallet-wasm.sh", "site/wallet/app.js", "site/wallet/main.js",
     "site/wallet/core.js", "site/wallet/qrcode.js", "site/assets/safe.js",
     "site/assets/site.js", "site/explorer.js", "site/assets/explorer-views.js",
-    "site/wallet.html", "site/explorer.html", "site/index.html", "site/brand.html"];
+    "site/wallet.html", "site/explorer.html", "site/index.html", "site/brand.html",
+    "site/downloads.html"];
   try {
     for (const name of files) {
       const target = join(fixture, name);

@@ -5,7 +5,7 @@
 import { html, raw, hex64, address, num, numOr, sats, isHex } from "./safe.js";
 
 export const SAT = 100000000n, CAP = 1250000000000000n, CARRY = 99999999789793n;
-// Team and founder allocations (core::vesting): 2 × 36 tranches of 1,250,000 GNB / 36,
+// Team and founder allocations (core::vesting): 2 × 36 tranches of 1,250,000 OBB / 36,
 // tranche k spendable from height 1,051,200 + k × 87,600.
 export const LOCK_EACH = 125000000000000n, LOCK_CLIFF = 1051200, LOCK_STEP = 87600, LOCK_N = 36;
 export const unlockedSat = (h) => {
@@ -27,7 +27,7 @@ export function gnb(sat, { dp = 8, unit = true } = {}) {
   const neg = v < 0n; if (neg) v = -v;
   const whole = (v / SAT).toLocaleString("en-US");
   const frac = (v % SAT).toString().padStart(8, "0").slice(0, dp).replace(/0+$/, "");
-  return html`${neg ? "−" : ""}${whole}${frac ? "." + frac : ""}${unit ? raw(" <small>GNB</small>") : ""}`;
+  return html`${neg ? "−" : ""}${whole}${frac ? "." + frac : ""}${unit ? raw(" <small>OBB</small>") : ""}`;
 }
 export function compact(sat) {
   const v = sats(sat) ?? 0n;
@@ -180,7 +180,7 @@ export function txCard(t, standalone = false, offChain = false) {
 }
 
 // ── pages ────────────────────────────────────────────────────────────────────
-export const homeHead = () => html`<div class="pagehead"><span class="eyebrow">GnB mainnet</span><h1>Network overview</h1><p class="sub">A BlockDAG secured by GnB-SMH, a sequential memory-hard proof of work. Live data, refreshed every 10 seconds.</p></div><div id="h-stats">${loading("Reading the chain")}</div><div id="h-rest"></div>`;
+export const homeHead = () => html`<div class="pagehead"><span class="eyebrow">ObenBlock mainnet</span><h1>Network overview</h1><p class="sub">A BlockDAG mined with SHA-256d and finalized by PoWit. Live data, refreshed every 10 seconds.</p></div><div id="h-stats">${loading("Reading the chain")}</div><div id="h-rest"></div>`;
 
 export function homeStats({ dag, supply, stats, pct, chain, mem }) {
   const height = num(supply.current_height);
@@ -193,11 +193,11 @@ export function homeStats({ dag, supply, stats, pct, chain, mem }) {
   return html`<div class="stats">
    ${stat("Chain height", int(dag.tip_height), `blue score ${int(dag.tip_blue_score)} · ${int(dag.block_count)} blocks in DAG`, true)}
    ${stat("Block time", `${numOr(pct.p50_secs)}s`, `median of last ${numOr(pct.window)} · mean ${numOr(pct.avg_secs, (n) => n.toFixed(1))}s · target ${numOr(pct.target_secs)}s`)}
-   ${stat("Hashrate", hashrate(stats.hashrate_hs), "GnB-SMH evaluations per second")}
+   ${stat("Hashrate", hashrate(stats.hashrate_hs), "SHA-256d hashes per second")}
    ${stat("Difficulty", diff(first?.difficulty || 0), `ASERT · bits ${first?.bits || ""}`)}
-   ${stat("Circulating", compact(total.toString()), html`of 12.5M GNB cap · ${pctCarry.toFixed(2)}% carryover + ${pctMined.toFixed(4)}% mined · ${compact(locked.toString())} team/founder locked<div class="meter" aria-hidden="true"><i style="width:${pctWidth(pctCarry)}%;background:var(--mark)"></i><i style="width:${pctWidth(Math.max(pctMined, 0.3))}%;background:var(--fluor-hi)"></i></div>`)}
-   ${stat("Block reward", numOr(supply.subsidy_per_block_sat, (n) => (n / 1e8).toFixed(4)), `GNB · next halving in ${int(nextHalving)} blocks`)}
-   ${stat("Mempool", int(mem.size), `min fee ${numOr(supply.min_tx_fee_sat, (n) => (n / 1e8).toFixed(4))} GNB`)}
+   ${stat("Circulating", compact(total.toString()), html`of 12.5M OBB cap · ${pctCarry.toFixed(2)}% carryover + ${pctMined.toFixed(4)}% mined · ${compact(locked.toString())} team/founder locked<div class="meter" aria-hidden="true"><i style="width:${pctWidth(pctCarry)}%;background:var(--mark)"></i><i style="width:${pctWidth(Math.max(pctMined, 0.3))}%;background:var(--fluor-hi)"></i></div>`)}
+   ${stat("Block reward", numOr(supply.subsidy_per_block_sat, (n) => (n / 1e8).toFixed(4)), `OBB · next halving in ${int(nextHalving)} blocks`)}
+   ${stat("Mempool", int(mem.size), `min fee ${numOr(supply.min_tx_fee_sat, (n) => (n / 1e8).toFixed(4))} OBB`)}
    ${stat("Tips", int(dag.tip_count), `GhostDAG k = ${numOr(dag.k)}`)}
   </div>`;
 }
@@ -320,7 +320,7 @@ export function holdersPage(rich, dist) {
   return html`
   <div class="callout" style="margin-bottom:20px">The carryover is concentrated: in the Bloch Genesis-3 snapshot one address held about 94% of all coins, and that share carries over unchanged.</div>
   <section class="card"><div class="cardhead"><h2>By balance</h2><span class="note">${int(dist.holders)} addresses · ${gnb(dist.total_supply, { dp: 2 })}</span></div>
-   <div class="tablewrap"><table><thead><tr><th>Balance</th><th class="num">Addresses</th><th class="num">GNB</th><th style="width:40%">Share of supply</th></tr></thead><tbody>
+   <div class="tablewrap"><table><thead><tr><th>Balance</th><th class="num">Addresses</th><th class="num">OBB</th><th style="width:40%">Share of supply</th></tr></thead><tbody>
    ${tiers.map((t) => { const pct = numOr(t.pct_of_supply, (n) => n, 0); return html`<tr><td class="mono">${t.label}</td><td class="num">${int(t.address_count)}</td><td class="num amount">${gnb(t.total_sats, { dp: (sats(t.total_sats) ?? 0n) < SAT ? 8 : 2 })}</td><td><div style="display:flex;align-items:center;gap:10px"><div class="bartrack" style="flex:1"><div class="bar" style="width:${pctWidth((pct / max) * 100)}%"></div></div><span class="mono muted" style="width:7ch;text-align:right">${pct.toFixed(pct < 0.01 ? 4 : 2)}%</span></div></td></tr>`; })}
    </tbody></table></div></section>
   <section class="block card"><div class="cardhead"><h2>Top holders</h2><span class="note">updated every ~2 minutes</span></div>
