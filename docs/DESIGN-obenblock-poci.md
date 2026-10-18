@@ -1,7 +1,7 @@
 # PoCI: Proof of Corruption or Integrity (ObenBlock strict finality)
 
 Status: design, 2026-10-18 (owner request, from the technical note
-"Votos sobre shares, provas compactas e finalidade segura", P0 items).
+"Votes on shares, compact proofs and safe finality", P0 items).
 Applies to ObenBlock only; GnB keeps its PoWit rules. Package O11.
 
 PoCI is the strict finality profile of PoWit on ObenBlock. Every finality

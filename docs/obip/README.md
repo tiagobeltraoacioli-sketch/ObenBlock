@@ -22,8 +22,8 @@ It is implemented on branches and written in:
 
 OBIPs cite that text by document and section. They never restate it.
 
-"The technical note" in the OBIPs is "Votos sobre shares, provas compactas e
-finalidade segura" (2026-10-18), with its P1/P2 items and references R1–R18.
+"The technical note" in the OBIPs is "Votes on shares, compact proofs and
+safe finality" (2026-10-18), with its P1/P2 items and references R1–R18.
 "The partition simulator" is `reference/sim/partition_sim.py` and
 `docs/research/obenblock-partition-sim.md` on branch
 `obenblock/o11b-partition-sim`.
