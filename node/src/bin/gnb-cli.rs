@@ -262,7 +262,7 @@ fn main() {
         // includes it. Prints the exit hex (kind 4). `chain` is mainnet,
         // testnet or a raw chain id (0x...). Evolves the key file.
         "powitexit" => {
-            require_params(params, 3, "powitexit <witness-key.json> <mainnet|testnet|0xCHAINID> <epoch>");
+            require_params(params, 3, "powitexit <witness-key.json> <mainnet|testnet|regtest|0xCHAINID> <epoch>");
             let pw = match std::env::var("GNB_WALLET_PASSWORD") {
                 Ok(p) => zeroize::Zeroizing::new(p),
                 Err(_) => read_password("Witness key password: "),
@@ -270,11 +270,12 @@ fn main() {
             let path = std::path::Path::new(params[0]);
             let file = gnb::core::kes::KesKeyFile::load(path).unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
             let mut signer = file.open(&pw).unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
+            // As in powitattest: the network of the selected chain (--chain).
             let chain_id = match params[1] {
-                "mainnet" => gnb::core::ChainId::Mainnet.to_u32(),
-                "testnet" => gnb::core::ChainId::Testnet.to_u32(),
+                "mainnet" => gnb::core::ChainId::for_network(gnb::address::Network::Mainnet).to_u32(),
+                "testnet" | "regtest" => gnb::core::ChainId::for_network(gnb::address::Network::Testnet).to_u32(),
                 raw => u32::from_str_radix(raw.trim_start_matches("0x"), 16)
-                    .unwrap_or_else(|_| { eprintln!("chain must be mainnet, testnet or 0xCHAINID"); process::exit(1) }),
+                    .unwrap_or_else(|_| { eprintln!("chain must be mainnet, testnet, regtest or 0xCHAINID"); process::exit(1) }),
             };
             let e: u64 = params[2].parse().unwrap_or_else(|_| { eprintln!("epoch must be a number"); process::exit(1) });
             if e > signer.epoch() {

@@ -177,20 +177,26 @@ pub const fn obenblock_window(p: PowitParams) -> PowitParams {
 }
 
 /// ObenBlock mainnet (`docs/DESIGN-obenblock.md` §5.2): GnB mainnet's clock
-/// and bounds with the half leak. Package O6a's ObenBlock chain ids select it
-/// in [`params_for`]; until then no chain id maps here.
+/// and bounds with the half leak. [`params_for`] selects it, with the
+/// 112-epoch window of [`obenblock_window`], for [`ChainId::ObenBlockMainnet`].
 pub const OBENBLOCK_MAINNET_PARAMS: PowitParams = PowitParams { leak: InactivityLeak::Half, ..MAINNET_PARAMS };
 
-/// ObenBlock regtest: the short test clock with the half leak.
+/// ObenBlock regtest: the short test clock (and window) with the half leak.
 pub const OBENBLOCK_REGTEST_PARAMS: PowitParams = PowitParams { leak: InactivityLeak::Half, ..TESTNET_PARAMS };
 
+const _: () = assert!(params_keep_the_frozen_window(&OBENBLOCK_MAINNET_PARAMS));
+const _: () = assert!(params_keep_the_frozen_window(&OBENBLOCK_REGTEST_PARAMS));
+
 /// The PoWit parameters of `chain`. ObenBlock mainnet uses the mainnet
-/// clock and its regtest the testnet one; ObenBlock's own window and leak
-/// (docs/DESIGN-obenblock.md §5.2, §6.2) are set by those packages.
+/// clock with the half leak (docs/DESIGN-obenblock.md §5.2) and the
+/// 112-epoch window (§6.2); its regtest keeps the short test clock and
+/// window, with the half leak.
 pub fn params_for(chain: ChainId) -> PowitParams {
     match chain {
-        ChainId::Mainnet | ChainId::ObenBlockMainnet => MAINNET_PARAMS,
-        ChainId::Testnet | ChainId::ObenBlockRegtest => TESTNET_PARAMS,
+        ChainId::Mainnet => MAINNET_PARAMS,
+        ChainId::Testnet => TESTNET_PARAMS,
+        ChainId::ObenBlockMainnet => obenblock_window(OBENBLOCK_MAINNET_PARAMS),
+        ChainId::ObenBlockRegtest => OBENBLOCK_REGTEST_PARAMS,
     }
 }
 
@@ -1251,4 +1257,5 @@ mod tests;
 mod hardening2_tests;
 #[cfg(test)]
 mod finalized_history_tests;
+#[cfg(test)]
 mod liveness_tests;

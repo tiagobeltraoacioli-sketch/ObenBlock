@@ -40,8 +40,8 @@ pub use gnb_smh::stall_relief::{StallReliefParams, OBENBLOCK_STALL_RELIEF};
 pub const GNB_LIVENESS_ACTIVATION_HEIGHT: u64 = NEVER;
 
 /// ObenBlock (mainnet and regtest): every liveness rule from the genesis
-/// block. The ObenBlock chain ids map here (package O6a adds them to
-/// [`ChainId`]; [`liveness_activation_height_for_chain`] then names them).
+/// block ([`liveness_activation_height_for_chain`] maps the ObenBlock chain
+/// ids here).
 pub const OBENBLOCK_LIVENESS_ACTIVATION_HEIGHT: u64 = 0;
 
 /// Witness exits one block may carry (each costs a KES verification).
@@ -51,6 +51,7 @@ pub const MAX_EXITS_PER_BLOCK: usize = 4;
 pub const fn liveness_activation_height_for_chain(id: ChainId) -> u64 {
     match id {
         ChainId::Mainnet | ChainId::Testnet => GNB_LIVENESS_ACTIVATION_HEIGHT,
+        ChainId::ObenBlockMainnet | ChainId::ObenBlockRegtest => OBENBLOCK_LIVENESS_ACTIVATION_HEIGHT,
     }
 }
 

@@ -83,7 +83,7 @@ fn step(st: &PowitState, h: u64, fork: u8, shares: &[(KeyId, u128)], atts: &[Att
 {
     let _g = activation::scoped_override_v2(h2);
     let input = BlockInput { height: h, hash: slot_hash(fork, h + 1), share_work: shares,
-                             attestations: atts, evidence: &[] };
+                             attestations: atts, evidence: &[], exits: &[] };
     st.apply(&P, CHAIN, &input, &View { fork, tip: h })
 }
 

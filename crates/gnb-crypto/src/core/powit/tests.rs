@@ -337,7 +337,7 @@ fn obenblock_window_keeps_work_for_112_epochs() {
     let last = ACT + (OBB_WINDOW_EPOCHS + 3) * p.epoch_len;
     for h in ACT + 1..=last {
         let sw = if h == ACT + 1 { vec![(k, 1_000u128)] } else { vec![] };
-        let input = BlockInput { height: h, hash: hash(0, h), share_work: &sw, attestations: &[], evidence: &[] };
+        let input = BlockInput { height: h, hash: hash(0, h), share_work: &sw, attestations: &[], evidence: &[], exits: &[] };
         st = st.apply_at(&p, CHAIN, 0, &input, &Chain { fork: 0, tip: h }).unwrap_or_else(|e| panic!("h={h}: {e}"));
         let e = p.epoch(ACT, h);
         let w = st.member_weight_h2(&p, e, &k);

@@ -133,7 +133,6 @@ pub fn save_state(store: &Storage, hash: &Hash, state: &PowitState) -> Result<()
     stage_state(store, &mut batch, hash, None, state)?;
     store.write_batch(batch).map_err(|e| format!("storage: powit state: {e}"))
 }
-}
 
 /// [`save_state`] into a caller-owned batch: the acceptance pipeline commits
 /// a block's PoWit state in the same batch as its DAG record (the first chunk
@@ -1451,6 +1450,8 @@ pub fn release_finality_checkpoint() -> Option<ReleaseCheckpoint> {
         None => match core::node_chain_id() {
             core::ChainId::Mainnet => MAINNET_FINALITY_CHECKPOINT,
             core::ChainId::Testnet => TESTNET_FINALITY_CHECKPOINT,
+            // A clean chain from genesis: no release checkpoint yet.
+            core::ChainId::ObenBlockMainnet | core::ChainId::ObenBlockRegtest => None,
         },
     }
 }
@@ -2073,7 +2074,7 @@ mod tests {
             blue_score: height,
             height,
             shielded_transactions: Vec::new(),
-            powit: PowitBody { shares: Vec::new(), attestations: vec![vote], evidence: Vec::new() },
+            powit: PowitBody { shares: Vec::new(), attestations: vec![vote], evidence: Vec::new(), exits: Vec::new() },
         }
     }
 

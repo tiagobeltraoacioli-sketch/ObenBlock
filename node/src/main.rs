@@ -380,7 +380,7 @@ mod resolve_network_tests {
 /// (or the reverse) is refused instead of silently paying the same hash.
 fn address_to_script_pubkey(addr: &str) -> Result<Vec<u8>, address::AddressError> {
     let network = core::node_chain_id().network();
-    Ok(address::Address::parse_for_network(addr, network)?.hash().to_vec())
+    Ok(address::Address::parse_for_network_in(addr, network, address::process_family())?.hash().to_vec())
 }
 
 #[cfg(test)]

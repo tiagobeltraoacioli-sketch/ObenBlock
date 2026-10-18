@@ -2788,8 +2788,9 @@ impl BlockIngress {
         now_unix: u64,
         dag: &GhostDAG,
     ) -> Result<WorkAdmission, DropReason> {
-        let tip_h = dag.selected_tip().and_then(|t| dag.get_block_data(&t)).map(|d| d.height).unwrap_or(0);
-        let reference = self.reference(tip_h, now_unix);
+        let (tip_h, tip_ts) = dag.selected_tip().and_then(|t| dag.get_block_data(&t))
+            .map(|d| (d.height, d.timestamp)).unwrap_or((0, 0));
+        let reference = self.reference(tip_h, tip_ts, now_unix);
         work_rule(&self.orphans, Some(&mut self.deep_budget), &mut self.finality, &mut self.threshold_cache,
             &mut self.low_work, block, hash, None, &reference, now, now_unix, dag)
     }
@@ -2957,7 +2958,7 @@ impl BlockIngress {
                 let d = ctx.dag.read();
                 // The work rule on the read guard's DAG; a merge-backed
                 // admission is charged below, once its proof is known valid.
-                let reference = self.reference(tip_h, now_unix);
+                let reference = self.reference(tip_h, tip_ts, now_unix);
                 let a = match work_rule(&self.orphans, None, &mut self.finality, &mut self.threshold_cache,
                     &mut self.low_work, &block, &hash, peer, &reference, now, now_unix, &d)
                 {
@@ -3093,8 +3094,9 @@ impl BlockIngress {
     fn drain_orphans_at(&mut self, accepted: [u8; 32], now: Instant, now_unix: u64, ctx: &AcceptCtx) -> Vec<[u8; 32]> {
         let reference = {
             let d = ctx.dag.read();
-            let tip_h = d.selected_tip().and_then(|t| d.get_block_data(&t)).map(|x| x.height).unwrap_or(0);
-            self.reference(tip_h, now_unix)
+            let (tip_h, tip_ts) = d.selected_tip().and_then(|t| d.get_block_data(&t))
+                .map(|x| (x.height, x.timestamp)).unwrap_or((0, 0));
+            self.reference(tip_h, tip_ts, now_unix)
         };
         let Self { orphans, deep_budget, finality, threshold_cache, low_work, chain, .. } = self;
         let mut gate = |pool: &OrphanPool, block: &core::Block, hash: &[u8; 32], d: &GhostDAG| {

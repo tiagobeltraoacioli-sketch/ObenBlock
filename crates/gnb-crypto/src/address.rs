@@ -139,9 +139,9 @@ static PROCESS_FAMILY: std::sync::OnceLock<AddressFamily> = std::sync::OnceLock:
 /// Fix the process's address family (idempotent for the same value).
 /// Returns `Err(existing)` if it was already set to the other family.
 ///
-/// Integration point (O6a): the chain selector (`core::chain::
-/// set_process_chain`, `set_node_chain_id`) calls this with the selected
-/// chain's family, or `process_family` reads the selected chain directly.
+/// Unset, [`process_family`] follows the process chain
+/// (`core::chain::process_chain`, fixed by `set_node_chain_id` or the
+/// wallet's `--chain`).
 pub fn set_process_family(family: AddressFamily) -> Result<(), AddressFamily> {
     match PROCESS_FAMILY.set(family) {
         Ok(()) => Ok(()),
@@ -152,10 +152,14 @@ pub fn set_process_family(family: AddressFamily) -> Result<(), AddressFamily> {
     }
 }
 
-/// The process's address family: GnB until [`set_process_family`].
+/// The process's address family: the one [`set_process_family`] fixed,
+/// else the process chain's (GnB unless the process selected ObenBlock).
 /// Consensus never reads this; scripts and hashes are family-independent.
 pub fn process_family() -> AddressFamily {
-    PROCESS_FAMILY.get().copied().unwrap_or(AddressFamily::Gnb)
+    PROCESS_FAMILY.get().copied().unwrap_or_else(|| match crate::core::chain::process_chain() {
+        crate::core::chain::Chain::Gnb => AddressFamily::Gnb,
+        crate::core::chain::Chain::ObenBlock => AddressFamily::ObenBlock,
+    })
 }
 
 /// An address string as this process shows it: unchanged on GnB, the
