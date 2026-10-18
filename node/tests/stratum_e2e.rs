@@ -270,7 +270,8 @@ async fn v1_client_mines_a_block_the_node_accepts() {
     let feed = work::spawn(ctx(&n), n.tip_tx.subscribe());
     let listener = stratum::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let config = stratum::StratumConfig { bind_addr: addr, max_sessions: 8, payout: None, accept_block: accept_hook(&n) };
+    let config = stratum::StratumConfig { bind_addr: addr, max_sessions: 8, max_sessions_per_ip: 8, payout: None,
+                                          accept_block: accept_hook(&n) };
     tokio::spawn(stratum::serve(listener, config, params, feed));
 
     let (rd, mut wr) = TcpStream::connect(addr).await.unwrap().into_split();
@@ -538,7 +539,226 @@ fn stall_relief_steps_change_the_job_bits() {
     assert!(matches!(e, stratum::jobs::SolveError::BitsChanged { .. }), "{e}");
 
     // The work feed's check: due exactly when the bits for "now" differ.
-    let w = work::Work { seq: 1, template: t.clone(), clean: true, reason: work::WorkReason::Start, bits: b0 };
+    let w = work::Work::new(1, t.clone(), true, work::WorkReason::Start, b0);
     assert_eq!(work::stall_step_due(&w, now), None);
     assert_eq!(work::stall_step_due(&w, now + 60), Some(b1));
+}
+
+// ── 5. Pre-launch hardening: light jobs, the submit path, the limits ─────────
+
+/// A V1 `mining.submit` request.
+fn v1_submit(job: &str, en2: &str, ntime: &str, nonce: &str) -> stratum::StratumRequest {
+    stratum::StratumRequest { id: Some(json!(1)), method: "mining.submit".into(), params: json!(["w", job, en2, ntime, nonce]) }
+}
+
+#[test]
+fn light_jobs_are_the_header_job_without_a_block() {
+    let n = regtest_node();
+    let params = params();
+    let tmpl = Arc::new(template::build_block_template(&n.dag, &n.store, &n.mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap());
+    let now = unix_now();
+    let w = work::Work::new(1, tmpl.clone(), true, work::WorkReason::Start, stratum::jobs::bits_at(&tmpl, now));
+    assert!(w.prep.light, "the light build reproduces the header job on ObenBlock");
+    for (fill, en) in [(0x11u8, [0u8; 8]), (0x22, [0xff; 8]), (0x33, [1, 2, 3, 4, 5, 6, 7, 8])] {
+        let spk = vec![fill; 20];
+        let light = Job::build_with(tmpl.clone(), w.prep.clone(), &params, &spk, en, now).unwrap();
+        let full = gnb::mining::sha256d::header_job(&tmpl, &params, &spk, en, now).unwrap();
+        assert_eq!(light.header, full.header);
+        assert_eq!((&light.coinb1, &light.coinb2), (&full.coinb1, &full.coinb2));
+        assert_eq!(light.merkle_branch, full.merkle_branch);
+        assert_eq!(light.window, full.window);
+        assert_eq!(light.stratum, full.stratum_json(), "the V1 notify object is the RPC's");
+        // The block of a share is assembled only on demand, and it is the
+        // header job's block with the share's fields.
+        let solved = light.solve(&en, light.version, light.time, 0).unwrap();
+        assert_eq!(solved.block.header.sha256d_pow_bytes().unwrap(), full.header);
+        assert_eq!(solved.block.transactions[0].txid(), full.block.transactions[0].txid());
+    }
+}
+
+#[test]
+fn v1_submit_hashes_first_forwards_blocks_over_the_rate_and_dedups_on_the_header() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let n = regtest_node();
+    let params = params();
+    let tmpl = Arc::new(template::build_block_template(&n.dag, &n.store, &n.mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap());
+    let now = unix_now();
+    let w = work::Work::new(1, tmpl.clone(), true, work::WorkReason::Start, stratum::jobs::bits_at(&tmpl, now));
+    let blocks = Arc::new(AtomicUsize::new(0));
+    let b2 = blocks.clone();
+    let cb: Box<stratum::AcceptBlockFn> = Box::new(move |_b| {
+        b2.fetch_add(1, Ordering::SeqCst);
+        Ok("accepted".into())
+    });
+    let payout = payout::parse_payout_address(&obb_address(0x44)).unwrap();
+    let mk = || {
+        let s = Arc::new(stratum::Session::new(1, "127.0.0.1:9".parse().unwrap()));
+        s.set_authorized("w".into(), payout.clone());
+        let job = Arc::new(Job::build_with(tmpl.clone(), w.prep.clone(), &params, &payout.script_pubkey,
+                                           s.extranonce(&[0; 4]), now).unwrap());
+        s.replace_jobs(stratum::session::SessionJob { job_id: "j".into(), job: job.clone() });
+        (s, job)
+    };
+    let code = |r: &stratum::StratumResponse| r.error.as_ref().map(|e| e[0].as_u64().unwrap());
+
+    // Over the submit rate (junk on an unknown job)...
+    let (s, job) = mk();
+    for _ in 0..(stratum::session::SUBMIT_RATE_PER_MIN + 5) {
+        assert_eq!(code(&stratum::submit::handle_submit(&s, &v1_submit("nope", "00000000", "0", "0"), &*cb)), Some(21));
+    }
+    // ...a block share is still hashed, judged and submitted.
+    let en2 = [0x0a, 0x0b, 0x0c, 0x0d];
+    let h = job.share_header(&s.extranonce(&en2), job.version, job.time, 0).unwrap();
+    let nonce = solve(&h, job.bits);
+    let r = stratum::submit::handle_submit(&s, &v1_submit("j", "0a0b0c0d", &format!("{:08x}", job.time),
+                                                         &format!("{nonce:08x}")), &*cb);
+    assert_eq!(code(&r), None, "{:?}", r.error);
+    assert_eq!(blocks.load(Ordering::SeqCst), 1);
+    // The same share in another spelling (upper case, 0x, no leading zeros)
+    // is the same header: a duplicate, not a second block.
+    let r = stratum::submit::handle_submit(&s, &v1_submit("j", "0A0B0C0D", &format!("0X{:X}", job.time),
+                                                         &format!("0x{nonce:x}")), &*cb);
+    assert_eq!(code(&r), Some(22));
+    assert_eq!(blocks.load(Ordering::SeqCst), 1);
+    // Over the rate, a share that is not a block is refused (and raises the
+    // difficulty) without being remembered.
+    let miss = (0u32..).find(|&k| {
+        let mut hh = h;
+        hh[76..80].copy_from_slice(&k.to_le_bytes());
+        !gnb_smh::sha256d::meets_target(&gnb_smh::sha256d::block_id(&hh), &job.block_target())
+    }).unwrap();
+    let before = s.remembered_shares();
+    let r = stratum::submit::handle_submit(&s, &v1_submit("j", "0a0b0c0d", &format!("{:08x}", job.time),
+                                                         &format!("{miss:08x}")), &*cb);
+    assert_eq!(code(&r), Some(20));
+    assert!(r.error.as_ref().unwrap()[1].as_str().unwrap().contains("rate"), "{:?}", r.error);
+    assert_eq!(s.remembered_shares(), before);
+
+    // Under the rate, the same miss is low difficulty and not remembered.
+    let (s, _) = mk();
+    let r = stratum::submit::handle_submit(&s, &v1_submit("j", "0a0b0c0d", &format!("{:08x}", job.time),
+                                                         &format!("{miss:08x}")), &*cb);
+    assert_eq!(code(&r), Some(23));
+    assert_eq!(s.remembered_shares(), 0, "a share without proof of work costs no memory");
+}
+
+/// True once `stream` is closed by the server (EOF or reset) within `secs`.
+async fn closed_within(stream: &mut TcpStream, secs: u64) -> bool {
+    let mut buf = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    loop {
+        match tokio::time::timeout_at(deadline, stream.read(&mut buf)).await {
+            Err(_) => return false,
+            Ok(Ok(0)) | Ok(Err(_)) => return true,
+            Ok(Ok(_)) => continue,
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v1_listener_caps_sessions_per_ip() {
+    let n = regtest_node();
+    let feed = work::spawn(ctx(&n), n.tip_tx.subscribe());
+    let listener = stratum::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let config = stratum::StratumConfig { bind_addr: addr, max_sessions: 8, max_sessions_per_ip: 1, payout: None,
+                                          accept_block: accept_hook(&n) };
+    tokio::spawn(stratum::serve(listener, config, params(), feed));
+    let first = TcpStream::connect(addr).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut second = TcpStream::connect(addr).await.unwrap();
+    assert!(closed_within(&mut second, 5).await, "a second session from the same IP is refused");
+    let (rd, mut wr) = first.into_split();
+    let mut rd = BufReader::new(rd);
+    send_line(&mut wr, json!({"id": 1, "method": "mining.subscribe", "params": []})).await;
+    assert!(read_msg(&mut rd).await["result"].is_array(), "the first session still works");
+}
+
+async fn sv2_setup(addr: std::net::SocketAddr, pinned: [u8; 32]) -> Sv2Client {
+    use common_messages_sv2::{Protocol, SetupConnection, MESSAGE_TYPE_SETUP_CONNECTION, MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS};
+    let mut c = Sv2Client::connect(addr, pinned).await;
+    c.send(SetupConnection {
+        protocol: Protocol::MiningProtocol, min_version: 2, max_version: 2, flags: 0b101,
+        endpoint_host: "127.0.0.1".to_string().try_into().unwrap(), endpoint_port: addr.port(),
+        vendor: "obb-test\n[INFO] forged".to_string().try_into().unwrap(),
+        hardware_version: "cpu".to_string().try_into().unwrap(),
+        firmware: "1.0".to_string().try_into().unwrap(),
+        device_id: "dev1".to_string().try_into().unwrap(),
+    }, MESSAGE_TYPE_SETUP_CONNECTION, false).await;
+    c.recv_type(MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS).await;
+    c
+}
+
+async fn sv2_server(n: &Node, per_ip: usize) -> (std::net::SocketAddr, [u8; 32], tempfile::TempDir) {
+    let feed = work::spawn(ctx(n), n.tip_tx.subscribe());
+    let dir = tempfile::TempDir::new().unwrap();
+    let key_path = dir.path().join("authority.json");
+    let authority = AuthorityKeypair::load_or_generate(&key_path).unwrap();
+    let pinned = stratum_v2::keypair::parse_public_key_base58(&authority.public_base58()).unwrap();
+    let listener = stratum_v2::bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut config = stratum_v2::Sv2Config::new(addr, 8, key_path, None, accept_hook(n)).unwrap();
+    config.max_sessions_per_ip = per_ip;
+    tokio::spawn(stratum_v2::serve(listener, config, authority, params(), feed));
+    (addr, pinned, dir)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sv2_caps_sessions_per_ip_and_closes_a_session_without_a_channel() {
+    let n = regtest_node();
+    let (addr, pinned, _dir) = sv2_server(&n, 1).await;
+    let mut c = sv2_setup(addr, pinned).await;
+    let mut second = TcpStream::connect(addr).await.unwrap();
+    assert!(closed_within(&mut second, 5).await, "a second session from the same IP is refused");
+    // No OpenStandardMiningChannel within NO_CHANNEL_TIMEOUT: closed.
+    let secs = stratum_v2::session::NO_CHANNEL_TIMEOUT.as_secs();
+    assert!(closed_within(&mut c.stream, secs + 10).await, "a session that opens no channel is closed");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sv2_block_share_over_the_channel_rate_is_still_a_block() {
+    use mining_sv2::*;
+    let n = regtest_node();
+    let (addr, pinned, _dir) = sv2_server(&n, 4).await;
+    let mut c = sv2_setup(addr, pinned).await;
+    c.send(OpenStandardMiningChannel {
+        request_id: 1u32.into(), user_identity: obb_address(0x55).try_into().unwrap(),
+        nominal_hash_rate: 1.0e6, max_target: binary_sv2::U256::from([0xff; 32]),
+    }, MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL, false).await;
+    let mut p = c.recv_type(MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS).await;
+    let open: OpenStandardMiningChannelSuccess = binary_sv2::from_bytes(&mut p).unwrap();
+    let channel_id = open.channel_id;
+    let mut p = c.recv_type(MESSAGE_TYPE_NEW_MINING_JOB).await;
+    let job: NewMiningJob = binary_sv2::from_bytes(&mut p).unwrap();
+    let mut p = c.recv_type(MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH).await;
+    let prev: SetNewPrevHash = binary_sv2::from_bytes(&mut p).unwrap();
+
+    // Exceed the channel's rate with shares on an unknown job.
+    let junk = stratum_v2::channel::SUBMIT_RATE_PER_MIN_PER_CHANNEL + 5;
+    for seq in 0..junk {
+        c.send(SubmitSharesStandard { channel_id, sequence_number: seq, job_id: 999_999, nonce: seq, ntime: prev.min_ntime,
+                                      version: job.version }, MESSAGE_TYPE_SUBMIT_SHARES_STANDARD, true).await;
+    }
+    let h = header(job.version, prev.prev_hash.inner_as_ref().try_into().unwrap(),
+                   job.merkle_root.inner_as_ref().try_into().unwrap(), prev.min_ntime, prev.nbits, 0);
+    let nonce = solve(&h, prev.nbits);
+    let real = junk + 1;
+    c.send(SubmitSharesStandard { channel_id, sequence_number: real, job_id: job.job_id, nonce, ntime: prev.min_ntime,
+                                  version: job.version }, MESSAGE_TYPE_SUBMIT_SHARES_STANDARD, true).await;
+    loop {
+        let (t, _, mut p) = c.recv().await;
+        if t == MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS {
+            let s: SubmitSharesSuccess = binary_sv2::from_bytes(&mut p).unwrap();
+            assert_eq!(s.last_sequence_number, real);
+            break;
+        }
+        if t == MESSAGE_TYPE_SUBMIT_SHARES_ERROR {
+            let e: SubmitSharesError = binary_sv2::from_bytes(&mut p).unwrap();
+            assert_ne!(e.sequence_number, real, "the block share was refused: {:?}",
+                       String::from_utf8_lossy(e.error_code.inner_as_ref()));
+        }
+    }
+    let mut h1 = h;
+    h1[76..80].copy_from_slice(&nonce.to_le_bytes());
+    assert_eq!(sel_tip(&n), Some(gnb_smh::sha256d::block_id(&h1)), "the node accepted the block");
 }

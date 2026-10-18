@@ -22,6 +22,7 @@
 //! GnB-SMH chain, whose blocks a SHA-256d share can never prove.
 
 pub mod difficulty;
+pub mod guard;
 pub mod jobs;
 pub mod payout;
 pub mod protocol;
@@ -34,7 +35,10 @@ pub use jobs::Job;
 pub use payout::Payout;
 #[allow(unused_imports)]
 pub use protocol::{ErrorCode, StratumError, StratumRequest, StratumResponse};
+#[allow(unused_imports)]
 pub use session::{Session, SessionState};
+#[allow(unused_imports)]
+pub use guard::DEFAULT_MAX_SESSIONS_PER_IP;
 #[allow(unused_imports)]
 pub use work::{Work, WorkReceiver};
 
@@ -43,7 +47,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use log::{error, info, warn};
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 use tokio::net::TcpListener;
 
 use crate::consensus::GhostDAG;
@@ -95,6 +99,8 @@ pub fn require_sha256d_chain() -> Result<Sha256dParams, String> {
 pub struct StratumConfig {
     pub bind_addr: SocketAddr,
     pub max_sessions: usize,
+    /// Concurrent sessions per source IP (`--stratum-max-sessions-per-ip`).
+    pub max_sessions_per_ip: usize,
     /// Payout of workers that authorize with a plain label instead of an
     /// address (`--stratum-payout`, else `--miner-address`).
     pub payout: Option<Payout>,
@@ -106,6 +112,7 @@ impl std::fmt::Debug for StratumConfig {
         f.debug_struct("StratumConfig")
             .field("bind_addr", &self.bind_addr)
             .field("max_sessions", &self.max_sessions)
+            .field("max_sessions_per_ip", &self.max_sessions_per_ip)
             .field("payout", &self.payout.as_ref().map(|p| p.address.as_str()))
             .finish()
     }
@@ -119,48 +126,9 @@ pub fn check_max_sessions(n: usize) -> Result<usize, String> {
     Ok(n)
 }
 
-/// Registry of live sessions (cap and metrics).
-pub struct SessionRegistry {
-    sessions: Mutex<Vec<Arc<Session>>>,
-    max: usize,
-}
-
-impl SessionRegistry {
-    pub fn new(max: usize) -> Self {
-        Self { sessions: Mutex::new(Vec::new()), max }
-    }
-
-    /// Register `s` if fewer than `max` sessions are live (a session in
-    /// teardown does not count against the cap).
-    pub fn register(&self, s: Arc<Session>) -> bool {
-        let mut g = self.sessions.lock();
-        if g.iter().filter(|x| !x.is_dead()).count() >= self.max {
-            return false;
-        }
-        g.push(s);
-        true
-    }
-
-    pub fn deregister(&self, id: u64) {
-        self.sessions.lock().retain(|s| s.id != id);
-    }
-
-    pub fn len(&self) -> usize {
-        self.sessions.lock().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// Sessions that count against the cap.
-    pub fn live_len(&self) -> usize {
-        self.sessions.lock().iter().filter(|s| !s.is_dead()).count()
-    }
-
-    pub fn authorized_sessions(&self) -> Vec<Arc<Session>> {
-        self.sessions.lock().iter().filter(|s| s.state() == SessionState::Authorized).cloned().collect()
-    }
+/// The tail of a rate-limited log line that follows suppressed ones.
+pub fn suppressed_note(n: u64) -> String {
+    if n == 0 { String::new() } else { format!(" ({n} similar lines suppressed)") }
 }
 
 /// Bind the V1 listener (separate from [`serve`] so a caller learns the
@@ -178,9 +146,10 @@ pub async fn serve(
     params: Sha256dParams,
     work: WorkReceiver,
 ) -> std::io::Result<()> {
-    let registry = Arc::new(SessionRegistry::new(config.max_sessions));
+    let tracker = Arc::new(guard::ConnTracker::new(config.max_sessions, config.max_sessions_per_ip));
     let config = Arc::new(config);
     let mut next_session_id: u64 = 1;
+    let mut refusal_log = guard::LogLimiter::per_session();
     loop {
         let (socket, peer) = match listener.accept().await {
             Ok(x) => x,
@@ -193,19 +162,25 @@ pub async fn serve(
         let id = next_session_id;
         next_session_id += 1;
         let session = Arc::new(Session::new(id, peer));
-        if !registry.register(session.clone()) {
-            warn!("stratum: rejecting {peer}: session cap {} reached", config.max_sessions);
-            continue;
-        }
+        let slot = match tracker.admit(id, peer.ip(), session.activity.clone()) {
+            Ok(g) => g,
+            Err(why) => {
+                if let Some(n) = refusal_log.allow() {
+                    warn!("stratum: rejecting {peer}: {why} ({} total, {} per IP){}", config.max_sessions,
+                          config.max_sessions_per_ip, suppressed_note(n));
+                }
+                continue;
+            }
+        };
         crate::metrics::stratum_session_opened("v1");
-        info!("stratum: session {id} accepted from {peer} (total: {})", registry.len());
-        let (registry, config, work) = (registry.clone(), config.clone(), work.clone());
+        info!("stratum: session {id} accepted from {peer} (total: {})", tracker.len());
+        let (config, work) = (config.clone(), work.clone());
         tokio::spawn(async move {
             match session::run(session, socket, config, params, work).await {
                 Ok(()) => info!("stratum: session {id} closed"),
                 Err(e) => warn!("stratum: session {id} ended with error: {e}"),
             }
-            registry.deregister(id);
+            drop(slot);
             crate::metrics::stratum_session_closed("v1");
         });
     }
@@ -228,25 +203,5 @@ mod tests {
     fn refuses_a_gnb_smh_chain() {
         let e = require_sha256d_chain().unwrap_err();
         assert!(e.contains("only for SHA-256d chains") && e.contains("GnB-SMH"), "{e}");
-    }
-
-    #[test]
-    fn registry_caps_live_sessions() {
-        let r = SessionRegistry::new(2);
-        let peer: SocketAddr = "127.0.0.1:1".parse().unwrap();
-        let a = Arc::new(Session::new(1, peer));
-        let b = Arc::new(Session::new(2, peer));
-        let c = Arc::new(Session::new(3, peer));
-        assert!(r.register(a.clone()));
-        assert!(r.register(b));
-        assert!(!r.register(c.clone()), "cap reached");
-        // A session in teardown no longer counts against the cap.
-        a.set_state(SessionState::Dead);
-        assert_eq!(r.live_len(), 1);
-        assert!(r.register(c));
-        r.deregister(1);
-        assert_eq!(r.len(), 2);
-        assert!(!r.is_empty());
-        assert!(r.authorized_sessions().is_empty());
     }
 }

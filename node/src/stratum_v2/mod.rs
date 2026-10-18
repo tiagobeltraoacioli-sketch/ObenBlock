@@ -37,14 +37,15 @@ pub use keypair::AuthorityKeypair;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use tokio::net::TcpListener;
 
 use crate::core::pow_scheme::Sha256dParams;
+use crate::stratum::guard::{ConnActivity, ConnTracker, LogLimiter};
 use crate::stratum::work::WorkReceiver;
 use crate::stratum::{AcceptBlockFn, Payout};
 
@@ -54,6 +55,10 @@ pub const DEFAULT_SV2_PORT: u16 = 3334;
 pub const DEFAULT_SV2_ADDR: &str = "0.0.0.0:3334";
 /// Default maximum of concurrent V2 sessions.
 pub const DEFAULT_MAX_SESSIONS: usize = 500;
+/// Connections in the Noise handshake at once (the rest are dropped at
+/// accept): a silent or slow handshake holds no session slot for long and
+/// cannot crowd out the cap.
+pub const MAX_CONCURRENT_HANDSHAKES: usize = 64;
 /// Default authority key file name (in the data directory).
 pub const DEFAULT_KEY_FILE: &str = "stratum-v2-authority.json";
 
@@ -72,6 +77,9 @@ pub enum Sv2Error {
 pub struct Sv2Config {
     pub bind_addr: SocketAddr,
     pub max_sessions: usize,
+    /// Concurrent sessions per source IP (`--stratum-v2-max-sessions-per-ip`;
+    /// `new` sets the default).
+    pub max_sessions_per_ip: usize,
     /// Authority key file (`--stratum-v2-key`).
     pub key_path: PathBuf,
     /// Payout of workers that open a channel with a plain label.
@@ -84,6 +92,7 @@ impl std::fmt::Debug for Sv2Config {
         f.debug_struct("Sv2Config")
             .field("bind_addr", &self.bind_addr)
             .field("max_sessions", &self.max_sessions)
+            .field("max_sessions_per_ip", &self.max_sessions_per_ip)
             .field("key_path", &self.key_path)
             .field("payout", &self.payout.as_ref().map(|p| p.address.as_str()))
             .finish()
@@ -94,7 +103,8 @@ impl Sv2Config {
     pub fn new(bind_addr: SocketAddr, max_sessions: usize, key_path: PathBuf, payout: Option<Payout>,
                accept_block: Arc<AcceptBlockFn>) -> Result<Self, Sv2Error> {
         crate::stratum::check_max_sessions(max_sessions).map_err(Sv2Error::Config)?;
-        Ok(Self { bind_addr, max_sessions, key_path, payout, accept_block })
+        Ok(Self { bind_addr, max_sessions, max_sessions_per_ip: crate::stratum::guard::DEFAULT_MAX_SESSIONS_PER_IP,
+                  key_path, payout, accept_block })
     }
 }
 
@@ -118,12 +128,15 @@ pub async fn serve(
     params: Sha256dParams,
     work: WorkReceiver,
 ) -> std::io::Result<()> {
+    let tracker = Arc::new(ConnTracker::new(config.max_sessions, config.max_sessions_per_ip));
+    let handshakes = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HANDSHAKES));
+    let channels = Arc::new(AtomicUsize::new(0));
     let config = Arc::new(config);
     let authority = Arc::new(authority);
-    let live = Arc::new(AtomicUsize::new(0));
     let mut next_id: u64 = 1;
-    info!("stratum_v2: authority key {} (fingerprint {}), max {} sessions",
-          authority.public_base58(), authority.fingerprint_hex(), config.max_sessions);
+    let mut refusal_log = LogLimiter::per_session();
+    info!("stratum_v2: authority key {} (fingerprint {}), max {} sessions ({} per IP)",
+          authority.public_base58(), authority.fingerprint_hex(), config.max_sessions, config.max_sessions_per_ip);
     loop {
         let (mut socket, peer) = match listener.accept().await {
             Ok(x) => x,
@@ -133,28 +146,42 @@ pub async fn serve(
                 continue;
             }
         };
-        if live.load(Ordering::Relaxed) >= config.max_sessions {
-            warn!("stratum_v2: rejecting {peer}: session cap {} reached", config.max_sessions);
-            continue;
-        }
-        live.fetch_add(1, Ordering::Relaxed);
-        crate::metrics::stratum_session_opened("v2");
         let id = next_id;
         next_id += 1;
-        let (config, authority, live, work) = (config.clone(), authority.clone(), live.clone(), work.clone());
+        let Ok(permit) = handshakes.clone().try_acquire_owned() else {
+            if let Some(n) = refusal_log.allow() {
+                warn!("stratum_v2: rejecting {peer}: {MAX_CONCURRENT_HANDSHAKES} handshakes in progress{}",
+                      crate::stratum::suppressed_note(n));
+            }
+            continue;
+        };
+        let activity = Arc::new(ConnActivity::new());
+        let slot = match tracker.admit(id, peer.ip(), activity.clone()) {
+            Ok(g) => g,
+            Err(why) => {
+                if let Some(n) = refusal_log.allow() {
+                    warn!("stratum_v2: rejecting {peer}: {why}{}", crate::stratum::suppressed_note(n));
+                }
+                continue;
+            }
+        };
+        crate::metrics::stratum_session_opened("v2");
+        let (config, authority, work, channels) = (config.clone(), authority.clone(), work.clone(), channels.clone());
         tokio::spawn(async move {
-            match handshake::perform_handshake(&mut socket, &authority, handshake::DEFAULT_CERT_VALIDITY_SECS,
-                                               handshake::DEFAULT_HANDSHAKE_TIMEOUT).await {
+            let shaken = handshake::perform_handshake(&mut socket, &authority, handshake::DEFAULT_CERT_VALIDITY_SECS,
+                                                      handshake::DEFAULT_HANDSHAKE_TIMEOUT).await;
+            drop(permit);
+            match shaken {
                 Ok(codec) => {
-                    info!("stratum_v2: session {id} from {peer}: handshake OK");
-                    match session::run(id, peer, socket, codec, config, params, work).await {
+                    debug!("stratum_v2: session {id} from {peer}: handshake OK");
+                    match session::run(id, peer, socket, codec, config, params, work, activity, channels).await {
                         Ok(state) => info!("stratum_v2: session {id} closed ({state:?})"),
                         Err(e) => warn!("stratum_v2: session {id} ended with error: {e}"),
                     }
                 }
-                Err(e) => warn!("stratum_v2: session {id} from {peer}: handshake failed: {e}"),
+                Err(e) => debug!("stratum_v2: session {id} from {peer}: handshake failed: {e}"),
             }
-            live.fetch_sub(1, Ordering::Relaxed);
+            drop(slot);
             crate::metrics::stratum_session_closed("v2");
         });
     }

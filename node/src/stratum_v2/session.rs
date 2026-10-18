@@ -9,16 +9,28 @@
 //!
 //! A reader task decrypts frames (its own copy of the Noise codec, decrypt
 //! only) and hands them to the session loop, which owns the write half and
-//! the encrypting copy. The legacy Bloch session read one TCP `read()` as one
-//! frame and dropped a miner after 10 s of silence; here frames are read
-//! exactly (framing.rs) and a quiet miner is kept (a solo miner on a hard
-//! target may submit rarely), until EOF, a protocol error or a failed write.
+//! the encrypting copy. Frames are read exactly (framing.rs).
+//!
+//! Limits (pre-launch review): a session that opens no channel within
+//! [`NO_CHANNEL_TIMEOUT`] of SetupConnection, or has no share accepted for
+//! [`SHARE_IDLE_TIMEOUT`], is closed; the listener may evict an idle one
+//! when its cap is reached; channels are capped per session and across the
+//! server (`channel::MAX_CHANNELS_PER_SESSION`, `MAX_CHANNELS_GLOBAL`);
+//! every channel's job is a light job (the block is assembled only for a
+//! share that meets the block target); the submit rate is limited per
+//! channel after the share is hashed (a block share is never refused for
+//! rate; an over-rate channel gets a harder target), and
+//! [`SUBMIT_FLOOD_PER_MIN`] submits per session close it; decode errors
+//! count toward [`MAX_PROTOCOL_ERRORS`]; warnings are rate-limited and peer
+//! strings truncated and escaped.
 //!
 //! Ported from the legacy Bloch server (genesis3-node `src/stratum_v2/session.rs`).
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use log::{debug, info, warn};
 use noise_sv2::NoiseCodec;
@@ -27,16 +39,18 @@ use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-use super::block_reconstruct::{reconstruct_block_for_sv2_submit, BlockReconstructError};
-use super::channel::{ChannelRegistry, ChannelState, Sv2CachedJob, MAX_CHANNELS_PER_SESSION};
+use super::block_reconstruct::{sv2_block, sv2_share, BlockReconstructError};
+use super::channel::{ChannelRegistry, ChannelState, Sv2CachedJob, MAX_CHANNELS_GLOBAL, MAX_CHANNELS_PER_SESSION};
 use super::framing::{self, Frame, FramingError};
 use super::messages::{self as msg, Encoded};
 use super::setup_connection;
-use super::template_adapter::build_channel_job;
+use super::template_adapter::build_channel_job_with;
 use super::Sv2Config;
 use crate::core::pow_scheme::Sha256dParams;
 use crate::stratum::difficulty;
+use crate::stratum::guard::{peer_str, ConnActivity, LogLimiter};
 use crate::stratum::jobs::SolveError;
+use crate::stratum::suppressed_note;
 use crate::stratum::payout;
 use crate::stratum::work::{Work, WorkReceiver};
 use gnb_smh::difficulty::{bits_to_target, Target};
@@ -48,8 +62,16 @@ pub const SETUP_CONNECTION_TIMEOUT: Duration = Duration::from_secs(10);
 pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Seconds between shares a channel's initial target aims at.
 pub const TARGET_SHARE_INTERVAL_SEC: f64 = 10.0;
-/// Shares per minute per session (anti-flood).
-pub const SUBMIT_RATE_PER_MIN: u32 = 120;
+/// Submits per minute per session that close it (a flood, not a miner;
+/// the per-channel rate is `channel::SUBMIT_RATE_PER_MIN_PER_CHANNEL`).
+pub const SUBMIT_FLOOD_PER_MIN: u32 = 2_000;
+/// A session that opens no channel within this time of SetupConnection is
+/// closed.
+pub const NO_CHANNEL_TIMEOUT: Duration = Duration::from_secs(10);
+/// A session with no share accepted for this long is closed.
+pub const SHARE_IDLE_TIMEOUT: Duration = Duration::from_secs(1_800);
+/// Decode errors that close the session.
+pub const MAX_PROTOCOL_ERRORS: u32 = 16;
 /// Decrypted frames queued from the reader task.
 pub const INBOUND_QUEUE: usize = 64;
 
@@ -90,6 +112,13 @@ struct Session {
     next_job_id: u32,
     submit_window: Instant,
     submits_in_window: u32,
+    activity: Arc<ConnActivity>,
+    /// Channels open across the server.
+    channels_global: Arc<AtomicUsize>,
+    protocol_errors: u32,
+    log: LogLimiter,
+    /// Set when the session must close (flood, too many errors).
+    closing: Option<&'static str>,
 }
 
 impl Session {
@@ -110,14 +139,19 @@ impl Session {
     async fn push_job(&mut self, channel_id: u32, work: &Arc<Work>, clean: bool) -> std::io::Result<()> {
         let Some(ch) = self.channels.get(channel_id) else { return Ok(()) };
         let (spk, extranonce) = (ch.payout.script_pubkey.clone(), ch.extranonce_prefix);
-        let (template, params) = (work.template.clone(), self.params);
-        let built = tokio::task::spawn_blocking(move || build_channel_job(template, &params, &spk, extranonce, now_secs()))
+        let (template, prep, params) = (work.template.clone(), work.prep.clone(), self.params);
+        let built = tokio::task::spawn_blocking(move || {
+            build_channel_job_with(template, prep, &params, &spk, extranonce, now_secs())
+        })
             .await
             .map_err(io_err)?;
         let (job, root) = match built {
             Ok(x) => x,
             Err(e) => {
-                warn!("stratum_v2: session {} channel {channel_id} job on work #{} failed: {e}", self.id, work.seq);
+                if let Some(n) = self.log.allow() {
+                    warn!("stratum_v2: session {} channel {channel_id} job on work #{} failed: {e}{}", self.id, work.seq,
+                          suppressed_note(n));
+                }
                 return Ok(());
             }
         };
@@ -149,8 +183,8 @@ impl Session {
             self.push_job(id, work, work.clean).await?;
         }
         if !self.channels.is_empty() {
-            info!("stratum_v2: session {} work #{} h={} to {} channel(s) ({:?})",
-                  self.id, work.seq, work.template.height, self.channels.len(), work.reason);
+            debug!("stratum_v2: session {} work #{} h={} to {} channel(s) ({:?})",
+                   self.id, work.seq, work.template.height, self.channels.len(), work.reason);
         }
         Ok(())
     }
@@ -159,17 +193,23 @@ impl Session {
         let req = match msg::decode_open_standard_channel(payload) {
             Ok(r) => r,
             Err(e) => {
-                warn!("stratum_v2: session {} OpenStandardMiningChannel decode failed: {e}", self.id);
+                self.decode_error("OpenStandardMiningChannel", &e);
                 return Ok(());
             }
         };
-        if self.channels.len() >= MAX_CHANNELS_PER_SESSION {
+        if self.channels.len() >= MAX_CHANNELS_PER_SESSION
+            || self.channels_global.load(Ordering::Relaxed) >= MAX_CHANNELS_GLOBAL
+        {
             return self.send_result(msg::open_mining_channel_error(req.request_id, msg::ERR_TOO_MANY_CHANNELS)).await;
         }
         let (payout, label) = match payout::resolve_worker(&req.user_identity, self.config.payout.as_ref()) {
             Ok(x) => x,
             Err(e) => {
-                warn!("stratum_v2: session {} refused user {:?}: {e}", self.id, req.user_identity);
+                if let Some(n) = self.log.allow() {
+                    warn!("stratum_v2: session {} refused user {}: {e}{}", self.id, peer_str(&req.user_identity),
+                          suppressed_note(n));
+                }
+                self.protocol_errors += 1;
                 return self.send_result(msg::open_mining_channel_error(req.request_id, msg::ERR_UNKNOWN_USER)).await;
             }
         };
@@ -187,10 +227,11 @@ impl Session {
             warn!("stratum_v2: session {} channel insert failed: {e}", self.id);
             return self.send_result(msg::open_mining_channel_error(req.request_id, msg::ERR_TOO_MANY_CHANNELS)).await;
         }
+        self.channels_global.fetch_add(1, Ordering::Relaxed);
         self.send_result(msg::open_standard_channel_success(req.request_id, channel_id, &target, &extranonce)).await?;
         info!("stratum_v2: session {} channel {channel_id} opened for {} -> pays {}{} (nominal {:.3e} H/s)",
-              self.id, req.user_identity, payout.address,
-              label.map(|l| format!(" (worker {l})")).unwrap_or_default(), req.nominal_hash_rate);
+              self.id, peer_str(&req.user_identity), payout.address,
+              label.map(|l| format!(" (worker {})", peer_str(&l))).unwrap_or_default(), req.nominal_hash_rate);
         match current {
             Some(w) => self.push_job(channel_id, &w, true).await,
             None => {
@@ -200,13 +241,22 @@ impl Session {
         }
     }
 
-    fn rate_ok(&mut self) -> bool {
+    /// Count a submit against the session's flood cap.
+    fn flood_ok(&mut self) -> bool {
         if self.submit_window.elapsed() >= Duration::from_secs(60) {
             self.submit_window = Instant::now();
             self.submits_in_window = 0;
         }
-        self.submits_in_window += 1;
-        self.submits_in_window <= SUBMIT_RATE_PER_MIN
+        self.submits_in_window = self.submits_in_window.saturating_add(1);
+        self.submits_in_window <= SUBMIT_FLOOD_PER_MIN
+    }
+
+    /// A message that does not decode: logged (rate-limited) and counted.
+    fn decode_error(&mut self, what: &str, e: &str) {
+        if let Some(n) = self.log.allow() {
+            warn!("stratum_v2: session {} {what} decode failed: {}{}", self.id, peer_str(e), suppressed_note(n));
+        }
+        self.protocol_errors += 1;
     }
 
     async fn submit_error(&mut self, channel_id: u32, seq: u32, code: &str, result: &str) -> std::io::Result<()> {
@@ -218,25 +268,28 @@ impl Session {
         let s = match msg::decode_submit_shares_standard(payload) {
             Ok(s) => s,
             Err(e) => {
-                warn!("stratum_v2: session {} SubmitSharesStandard decode failed: {e}", self.id);
+                self.decode_error("SubmitSharesStandard", &e);
                 return Ok(());
             }
         };
         let (cid, seq) = (s.channel_id, s.sequence_number);
-        if !self.rate_ok() {
+        if !self.flood_ok() {
+            self.closing = Some("submit flood");
             return self.submit_error(cid, seq, msg::ERR_RATE_LIMITED, "rejected").await;
         }
         let Some(ch) = self.channels.get_mut(cid) else {
             return self.submit_error(cid, seq, msg::ERR_INVALID_CHANNEL_ID, "stale").await;
         };
+        let over_rate = !ch.note_submit();
         let Some(cached) = ch.find_job(s.job_id).cloned() else {
             return self.submit_error(cid, seq, msg::ERR_INVALID_JOB_ID, "stale").await;
         };
-        if !ch.record_share(s.job_id, s.nonce, s.ntime, s.version) {
+        if ch.is_duplicate(s.job_id, s.nonce, s.ntime, s.version) {
             return self.submit_error(cid, seq, msg::ERR_DUPLICATE_SHARE, "dup").await;
         }
-        let (extranonce, target) = (ch.extranonce_prefix, Target(ch.target));
-        let solved = match reconstruct_block_for_sv2_submit(&cached, &extranonce, s.version, s.ntime, s.nonce) {
+        let (extranonce, target) = (ch.extranonce_prefix, Target(ch.judged_target()));
+        // The header first (cheap: no block), then the rate.
+        let share = match sv2_share(&cached, &extranonce, s.version, s.ntime, s.nonce) {
             Ok(x) => x,
             Err(BlockReconstructError::Solve(SolveError::BadVersion(_))) =>
                 return self.submit_error(cid, seq, msg::ERR_INVALID_VERSION, "rejected").await,
@@ -245,18 +298,43 @@ impl Session {
             Err(BlockReconstructError::Solve(SolveError::BitsChanged { .. })) =>
                 return self.submit_error(cid, seq, msg::ERR_STALE_SHARE, "stale").await,
             Err(e) => {
-                warn!("stratum_v2: session {} channel {cid} job {}: {e}", self.id, s.job_id);
+                if let Some(n) = self.log.allow() {
+                    warn!("stratum_v2: session {} channel {cid} job {}: {e}{}", self.id, s.job_id, suppressed_note(n));
+                }
                 return self.submit_error(cid, seq, msg::ERR_OTHER, "rejected").await;
             }
         };
-        let is_block = sha256d::meets_target(&solved.id, &cached.job.block_target());
-        if !is_block && !sha256d::meets_target(&solved.id, &target) {
-            return self.submit_error(cid, seq, msg::ERR_DIFFICULTY_TOO_LOW, "low_diff").await;
+        let block_target = cached.job.block_target();
+        let is_block = sha256d::meets_target(&share.id, &block_target);
+        if !is_block {
+            if over_rate {
+                let raised = self.channels.get_mut(cid)
+                    .and_then(|c| c.raise_for_rate(&block_target.0, TARGET_SHARE_INTERVAL_SEC));
+                if let Some(t) = raised {
+                    self.send_result(msg::set_target(cid, &t)).await?;
+                }
+                return self.submit_error(cid, seq, msg::ERR_RATE_LIMITED, "rejected").await;
+            }
+            if !sha256d::meets_target(&share.id, &target) {
+                return self.submit_error(cid, seq, msg::ERR_DIFFICULTY_TOO_LOW, "low_diff").await;
+            }
         }
+        if let Some(c) = self.channels.get_mut(cid) {
+            c.record_share(s.job_id, s.nonce, s.ntime, s.version);
+        }
+        self.activity.mark_share();
         if is_block {
-            let height = solved.block.height;
+            // Only a block share pays for the block (whatever the rate).
+            let block = match sv2_block(&cached, &extranonce, &share) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!("stratum_v2: session {} channel {cid} block share on job {}: {e}", self.id, s.job_id);
+                    return self.submit_error(cid, seq, msg::ERR_OTHER, "rejected").await;
+                }
+            };
+            let height = block.height;
             let cb = self.config.accept_block.clone();
-            let verdict = tokio::task::spawn_blocking(move || cb(solved.block)).await.map_err(io_err)?;
+            let verdict = tokio::task::spawn_blocking(move || cb(block)).await.map_err(io_err)?;
             match verdict {
                 Ok(hash) => {
                     crate::metrics::stratum_block_found("v2");
@@ -313,6 +391,7 @@ async fn reader_loop(mut rd: tokio::net::tcp::OwnedReadHalf, mut codec: NoiseCod
 }
 
 /// Serve one session after its handshake.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     id: u64,
     peer: SocketAddr,
@@ -321,6 +400,8 @@ pub async fn run(
     config: Arc<Sv2Config>,
     params: Sha256dParams,
     mut work: WorkReceiver,
+    activity: Arc<ConnActivity>,
+    channels_global: Arc<AtomicUsize>,
 ) -> std::io::Result<SessionState> {
     let _ = stream.set_nodelay(true);
     let (rd, wr) = stream.into_split();
@@ -334,9 +415,15 @@ pub async fn run(
         next_job_id: 1,
         submit_window: Instant::now(),
         submits_in_window: 0,
+        activity,
+        channels_global,
+        protocol_errors: 0,
+        log: LogLimiter::per_session(),
+        closing: None,
     };
     let result = drive(&mut s, &mut rx, &mut work).await;
     reader.abort();
+    s.channels_global.fetch_sub(s.channels.len(), Ordering::Relaxed);
     result
 }
 
@@ -362,15 +449,16 @@ async fn drive(
     let setup = match setup_connection::decode_setup_connection(first.msg_type, &mut payload) {
         Ok(x) => x,
         Err(e) => {
-            warn!("stratum_v2: session {} SetupConnection decode failed: {e}; closing", s.id);
+            warn!("stratum_v2: session {} SetupConnection decode failed: {}; closing", s.id, peer_str(&e.to_string()));
             return Ok(SessionState::Closed);
         }
     };
     let outcome = setup_connection::evaluate(&setup);
     info!("stratum_v2: session {} from {} SetupConnection protocol={} versions={}..={} flags={:#010x} \
-           vendor={:?} hardware={:?} firmware={:?} device={:?}: {}",
+           vendor={} hardware={} firmware={} device={}: {}",
           s.id, s.peer, setup.protocol, setup.min_version, setup.max_version, setup.flags,
-          setup.vendor, setup.hardware_version, setup.firmware, setup.device_id,
+          peer_str(&setup.vendor), peer_str(&setup.hardware_version), peer_str(&setup.firmware),
+          peer_str(&setup.device_id),
           match &outcome { Ok(_) => "accepted".to_string(), Err(e) => format!("refused ({e})") });
     let (t, p) = setup_connection::encode_response(&outcome).map_err(io_err)?;
     s.send(Encoded { msg_type: t, channel_msg: false, payload: p }).await?;
@@ -380,8 +468,31 @@ async fn drive(
     work.borrow_and_update();
 
     // ── Phase 2: live ────────────────────────────────────────────────────
+    let setup_at = Instant::now();
     loop {
+        if let Some(why) = s.closing {
+            info!("stratum_v2: session {} closed: {why}", s.id);
+            return Ok(SessionState::Closed);
+        }
+        if s.protocol_errors >= MAX_PROTOCOL_ERRORS {
+            info!("stratum_v2: session {} closed after {MAX_PROTOCOL_ERRORS} protocol errors", s.id);
+            return Ok(SessionState::Closed);
+        }
+        let (deadline, why) = if s.channels.is_empty() {
+            (setup_at + NO_CHANNEL_TIMEOUT, "no channel opened")
+        } else {
+            (s.activity.last_productive() + SHARE_IDLE_TIMEOUT, "no accepted share")
+        };
+        let activity = s.activity.clone();
         tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                info!("stratum_v2: session {} closed: {why}", s.id);
+                return Ok(SessionState::Closed);
+            }
+            _ = activity.killed() => {
+                info!("stratum_v2: session {} evicted (idle at the session cap)", s.id);
+                return Ok(SessionState::Closed);
+            }
             f = rx.recv() => match f {
                 None => return Ok(SessionState::Live),
                 Some(Err(FramingError::Io(e))) if e.kind() == std::io::ErrorKind::UnexpectedEof => {

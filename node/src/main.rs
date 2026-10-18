@@ -299,6 +299,9 @@ struct Cli {
     #[arg(long, default_value = stratum::DEFAULT_STRATUM_ADDR)] stratum_addr: String,
     /// Maximum concurrent Stratum V1 sessions.
     #[arg(long, default_value_t = stratum::DEFAULT_MAX_SESSIONS)] stratum_max_sessions: usize,
+    /// Maximum concurrent Stratum V1 sessions from one IP address (raise it
+    /// when many miners share an address: a rental proxy, a farm behind NAT).
+    #[arg(long, default_value_t = stratum::DEFAULT_MAX_SESSIONS_PER_IP)] stratum_max_sessions_per_ip: usize,
     /// Stratum mode. Only `solo` exists: each block pays its finder's address.
     #[arg(long, default_value = "solo")]                 stratum_mode: String,
     /// Payout address for workers that authorize with a plain label (e.g.
@@ -316,6 +319,8 @@ struct Cli {
     #[arg(long)]                                         stratum_v2_key: Option<PathBuf>,
     /// Maximum concurrent Stratum V2 sessions.
     #[arg(long, default_value_t = 500)]                  stratum_v2_max_sessions: usize,
+    /// Maximum concurrent Stratum V2 sessions from one IP address.
+    #[arg(long, default_value_t = stratum::DEFAULT_MAX_SESSIONS_PER_IP)] stratum_v2_max_sessions_per_ip: usize,
 }
 
 // Bloch-SIS founder address}
@@ -416,8 +421,10 @@ struct StratumSetup {
     payout: Option<stratum::Payout>,
     v1_addr: Option<std::net::SocketAddr>,
     v1_max_sessions: usize,
+    v1_max_per_ip: usize,
     v2_addr: Option<std::net::SocketAddr>,
     v2_max_sessions: usize,
+    v2_max_per_ip: usize,
 }
 
 /// Check the stratum flags once the chain is known: a SHA-256d chain, solo
@@ -451,7 +458,12 @@ fn stratum_startup_checks(cli: &Cli) -> Result<Option<StratumSetup>, String> {
         .map_err(|e| format!("--stratum-max-sessions: {e}"))?;
     let v2_max_sessions = stratum::check_max_sessions(cli.stratum_v2_max_sessions)
         .map_err(|e| format!("--stratum-v2-max-sessions: {e}"))?;
-    Ok(Some(StratumSetup { params, payout, v1_addr, v1_max_sessions, v2_addr, v2_max_sessions }))
+    let v1_max_per_ip = stratum::check_max_sessions(cli.stratum_max_sessions_per_ip)
+        .map_err(|e| format!("--stratum-max-sessions-per-ip: {e}"))?;
+    let v2_max_per_ip = stratum::check_max_sessions(cli.stratum_v2_max_sessions_per_ip)
+        .map_err(|e| format!("--stratum-v2-max-sessions-per-ip: {e}"))?;
+    Ok(Some(StratumSetup { params, payout, v1_addr, v1_max_sessions, v1_max_per_ip, v2_addr, v2_max_sessions,
+                           v2_max_per_ip }))
 }
 
 /// Start the Stratum V2 server (feature `stratum-v2`): load or create the
@@ -469,7 +481,10 @@ async fn start_stratum_v2(addr: std::net::SocketAddr, key_path: PathBuf, setup: 
     };
     let config = match stratum_v2::Sv2Config::new(addr, setup.v2_max_sessions, key_path.clone(),
                                                    setup.payout.clone(), accept) {
-        Ok(c) => c,
+        Ok(mut c) => {
+            c.max_sessions_per_ip = setup.v2_max_per_ip;
+            c
+        }
         Err(e) => {
             error!("stratum_v2: {e}");
             std::process::exit(2);
@@ -2760,7 +2775,7 @@ async fn main() {
                        to their own address); firewall it or prefer --stratum-v2 (docs/STRATUM.md)");
             }
             let config = stratum::StratumConfig {
-                bind_addr: addr, max_sessions: setup.v1_max_sessions,
+                bind_addr: addr, max_sessions: setup.v1_max_sessions, max_sessions_per_ip: setup.v1_max_per_ip,
                 payout: setup.payout.clone(), accept_block: rpc_submit_block.clone(),
             };
             let (params, work) = (setup.params, work.clone());

@@ -25,6 +25,7 @@ use std::time::Duration;
 use log::{debug, info, warn};
 use tokio::sync::{broadcast, watch};
 
+use super::jobs::JobPrep;
 use super::NodeContext;
 use crate::template::{self, BlockTemplate};
 use crate::tip::TipChanged;
@@ -63,6 +64,17 @@ pub struct Work {
     pub reason: WorkReason,
     /// The bits a block stamped at publication time needs.
     pub bits: u32,
+    /// The parts every job of `template` shares (built once here, so a
+    /// session's job costs O(coinbase), not a pass over the template).
+    pub prep: Arc<JobPrep>,
+}
+
+impl Work {
+    /// A publication of `template` (its [`JobPrep`] computed here).
+    pub fn new(seq: u64, template: Arc<BlockTemplate>, clean: bool, reason: WorkReason, bits: u32) -> Work {
+        let prep = Arc::new(JobPrep::new(&template, crate::core::pow_scheme::node_sha256d_params().as_ref(), now_secs()));
+        Work { seq, template, clean, reason, bits, prep }
+    }
 }
 
 /// Receiver of the feed: `None` until the first template is built.
@@ -89,11 +101,15 @@ pub fn build_template(ctx: &NodeContext) -> Result<BlockTemplate, String> {
     template::build_block_template(&ctx.dag, &ctx.store, &ctx.mempool, template::EXTERNAL_COINBASE_RESERVE)
 }
 
-async fn build_async(ctx: &Arc<NodeContext>) -> Result<BlockTemplate, String> {
+async fn build_async(ctx: &Arc<NodeContext>) -> Result<(Arc<BlockTemplate>, Arc<JobPrep>), String> {
     let ctx = ctx.clone();
-    tokio::task::spawn_blocking(move || build_template(&ctx))
-        .await
-        .map_err(|e| format!("template task failed: {e}"))?
+    tokio::task::spawn_blocking(move || {
+        let t = build_template(&ctx)?;
+        let prep = JobPrep::new(&t, crate::core::pow_scheme::node_sha256d_params().as_ref(), now_secs());
+        Ok((Arc::new(t), Arc::new(prep)))
+    })
+    .await
+    .map_err(|e| format!("template task failed: {e}"))?
 }
 
 /// Start the feed. The returned receiver (and its clones) see every
@@ -112,9 +128,8 @@ pub fn spawn(ctx: Arc<NodeContext>, mut tip_rx: broadcast::Receiver<TipChanged>)
             if let Some(why) = reason.take() {
                 last_try = std::time::Instant::now();
                 match build_async(&ctx).await {
-                    Ok(t) => {
+                    Ok((t, prep)) => {
                         last_error.clear();
-                        let t = Arc::new(t);
                         let prev = tx.borrow().clone();
                         let clean = match (&prev, why) {
                             (_, WorkReason::Refresh) => prev.as_ref().is_none_or(|p| p.template.parents != t.parents),
@@ -122,9 +137,9 @@ pub fn spawn(ctx: Arc<NodeContext>, mut tip_rx: broadcast::Receiver<TipChanged>)
                         };
                         seq += 1;
                         let bits = super::jobs::bits_at(&t, now_secs());
-                        info!("stratum: work #{seq} h={} bits={bits:08x} txs={} ({why:?}, clean={clean})",
-                              t.height, t.transactions.len());
-                        let _ = tx.send(Some(Arc::new(Work { seq, template: t, clean, reason: why, bits })));
+                        info!("stratum: work #{seq} h={} bits={bits:08x} txs={} ({why:?}, clean={clean}, light jobs {})",
+                              t.height, t.transactions.len(), prep.light);
+                        let _ = tx.send(Some(Arc::new(Work { seq, template: t, clean, reason: why, bits, prep })));
                     }
                     Err(e) => {
                         // Logged once per distinct reason (IBD can last hours).
@@ -165,7 +180,7 @@ pub fn spawn(ctx: Arc<NodeContext>, mut tip_rx: broadcast::Receiver<TipChanged>)
                                       w.template.height, w.bits);
                                 let _ = tx.send(Some(Arc::new(Work {
                                     seq, template: w.template.clone(), clean: true,
-                                    reason: WorkReason::StallStep, bits,
+                                    reason: WorkReason::StallStep, bits, prep: w.prep.clone(),
                                 })));
                             }
                         }

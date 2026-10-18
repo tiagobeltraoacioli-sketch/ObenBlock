@@ -262,3 +262,47 @@ fn cargo_deny_covers_every_feature_and_ci_pins_the_tools() {
         );
     }
 }
+
+/// Rust sources under `dir` (recursive), skipping build output.
+fn rust_sources(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            if p.file_name().is_some_and(|n| n == "target") {
+                continue;
+            }
+            rust_sources(&p, out);
+        } else if p.extension().is_some_and(|x| x == "rs") {
+            out.push(p);
+        }
+    }
+}
+
+/// The Stratum V2 exception at source level (pre-launch review): the lock
+/// guard allows secp256k1 as a dependency of the whole `gnb` crate, so a use
+/// outside the SV2 server (consensus, wallet, RPC) would pass it. Only
+/// node/src/stratum_v2/ may name the crate in code.
+#[test]
+fn secp256k1_is_used_only_by_the_stratum_v2_server() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut files = Vec::new();
+    rust_sources(&root.join("node/src"), &mut files);
+    rust_sources(&root.join("crates"), &mut files);
+    assert!(files.len() > 50, "source walk looks broken: {} files", files.len());
+    let allowed = root.join("node/src/stratum_v2");
+    let mut offenders = Vec::new();
+    for f in files {
+        if f.starts_with(&allowed) {
+            continue;
+        }
+        let text = std::fs::read_to_string(&f).unwrap_or_default();
+        for (i, line) in text.lines().enumerate() {
+            let code = line.split("//").next().unwrap_or("");
+            if code.contains("secp256k1::") || code.contains("extern crate secp256k1") {
+                offenders.push(format!("{}:{}", f.display(), i + 1));
+            }
+        }
+    }
+    assert!(offenders.is_empty(), "secp256k1 used outside node/src/stratum_v2: {offenders:?}");
+}

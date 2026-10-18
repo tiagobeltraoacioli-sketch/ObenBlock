@@ -48,10 +48,15 @@ block the node finally checks carry the same 80 bytes:
 u32le version ‖ parents_commitment ‖ merkle_root ‖ u32le time ‖ u32le bits ‖ u32le nonce
 ```
 
-`node/tests/stratum_e2e.rs` checks this byte identity, and every share is
-rebuilt into its block with two checks before anything is submitted: the
-root derived from the extranonce equals the block's own root, and the
-header hashed equals the block's serialized header. Found blocks go to the
+`node/tests/stratum_e2e.rs` checks this byte identity. Jobs are light: they
+share the template and its coinbase commitment and Merkle branch (computed
+once per work publication, and checked once against a full header job), and
+hold only their own coinbase split and header fields, never a block. A share
+is judged on its header (coinbase txid, branch, header hash); only a share
+that meets the block target is rebuilt into its block, with two checks
+before anything is submitted: the root derived from the extranonce equals
+the block's own root, and the header hashed equals the block's serialized
+header. Found blocks go to the
 same hook as RPC `submitblock` (dedup, minimum chain work, structure, then
 `accept_block` and gossip); the node's verdict is the answer to the miner.
 
@@ -97,12 +102,14 @@ obenblock --chain obenblock \
 | `--stratum` | off | start the V1 server |
 | `--stratum-addr` | `0.0.0.0:3333` | V1 bind address |
 | `--stratum-max-sessions` | 256 | V1 session cap (1..=10,000) |
+| `--stratum-max-sessions-per-ip` | 16 | V1 sessions from one IP address (raise it for a rental proxy or a farm behind NAT) |
 | `--stratum-mode` | `solo` | only `solo` exists (kept for the legacy command line) |
 | `--stratum-payout` | `--miner-address` | payout of workers that use a plain label instead of an address |
 | `--stratum-v2` | off | start the V2 server |
 | `--stratum-v2-addr` | `0.0.0.0:3334` | V2 bind address |
 | `--stratum-v2-key` | `<data-dir>/stratum-v2-authority.json` | authority keypair file (created on first start, mode 0600) |
 | `--stratum-v2-max-sessions` | 500 | V2 session cap |
+| `--stratum-v2-max-sessions-per-ip` | 16 | V2 sessions from one IP address |
 
 The node checks everything at start-up and refuses to start on a mistake:
 a GnB-SMH chain, an unknown mode, a payout address of another chain or
@@ -148,9 +155,33 @@ Share difficulty is per session (vardiff, about one share every 10 s, never
 harder than a block; Bitcoin's difficulty unit, so `difficulty × 2^32` hashes
 per share). Error codes: 20 other or block rejected by the node, 21 unknown
 or stale job (also a time outside the job's stall-relief step), 22
-duplicate, 23 low difficulty, 24 unauthorized, 25 not subscribed. Limits per
-session: 30 submits per minute, 16 jobs kept, 8 KiB per line, 30 s to
-authorize; an authorized miner is never dropped for being quiet.
+duplicate, 23 low difficulty, 24 unauthorized, 25 not subscribed.
+
+Vardiff starts at difficulty 1 (`OBB_STRATUM_START_DIFF`), or at the
+miner's `mining.suggest_difficulty` or `d=<difficulty>` password if it sends
+one before its first accepted share; after that, hints are acknowledged and
+ignored. Without a share for 180 s the difficulty drops by 4 (to the floor,
+`OBB_STRATUM_MIN_DIFF`) and the job is re-sent.
+
+Limits per session:
+
+- 8 KiB per line, 16 jobs kept, 30 s to authorize;
+- an authorized session with no accepted share for 30 minutes is closed
+  (`OBB_STRATUM_SHARE_IDLE_SECS`); at the session cap, a session without a
+  share for 2 minutes may be evicted for a new connection;
+- control requests (subscribe, authorize, configure, suggest, ping,
+  unknown methods): 16, then one per 30 s, else the session is closed;
+  `mining.authorize` may switch to a new worker at most 4 times (repeating
+  the current worker is free and builds no job);
+- 16 malformed or refused requests close the session; peer strings in the
+  log are truncated to 64 bytes and escaped, and per-session warnings are
+  rate-limited;
+- submits: every share is hashed first, and a share that meets the block
+  target is always submitted. Above 60 submits per minute other shares are
+  refused (error 20) and the difficulty jumps to the observed rate (shares
+  at the previous difficulty still count for 10 s); above 600 per minute
+  the session is closed. Duplicates are keyed on the header id, so another
+  hex spelling or job id is still error 22.
 
 ### 3.1 MiningRigRentals
 
@@ -158,10 +189,11 @@ MRR rigs are Bitcoin SHA-256 ASICs that speak Stratum V1. In MRR, add a pool
 with host `stratum+tcp://<node-host>:3333` (or the ParallelismLinux proxy's
 port, 4.1), worker `obb1q….mrr` and password `x`, then point a rental at it.
 The rental mines unmodified (1.3); its blocks pay the address in the
-worker name. The server's vardiff starts at difficulty 0.01 and adapts
-within about 90 s (capped at the network difficulty); set the rental's
-minimum difficulty in MRR if needed, and keep `--stratum-max-sessions`
-above the number of rigs. MRR checks a pool with a short test connection
+worker name. The server's vardiff starts at difficulty 1 and jumps to the
+rig's rate within seconds (capped at the network difficulty); `d=<diff>` in
+the password sets the start. MRR connects from a few proxy addresses: raise
+`--stratum-max-sessions-per-ip` and keep `--stratum-max-sessions` above the
+number of rigs. MRR checks a pool with a short test connection
 before a rental starts; it shows as a session that authorizes and closes.
 
 ## 4. Stratum V2 (port 3334)
@@ -197,6 +229,15 @@ stratum_v2: pool URL stratum2+tcp://<host>:3334/9b…Ef (authority key file …/
   `duplicate-share`, `invalid-version`, `invalid-time`, `stale-share` (the
   time left the job's stall-relief step), `difficulty-too-low`,
   `block-rejected` (the node refused the block), `rate-limited`.
+- Limits: 8 channels per session and 2,048 across the server; a session
+  that opens no channel within 10 s of SetupConnection, or has no accepted
+  share for 30 minutes, is closed (and one idle for 2 minutes may be
+  evicted at the cap); at most 64 connections in the Noise handshake at
+  once (the handshake's secp256k1 work runs off the async runtime). Each
+  channel may submit 120 shares per minute judged below the block target:
+  a block share is never refused for rate, and an over-rate channel gets a
+  harder target (SetTarget; the previous target still counts for 10 s).
+  2,000 submits per minute, or 16 undecodable messages, close the session.
 
 SV2 firmware (for example Braiins OS) and SRI's translator or job
 declarator clients connect with the URL above. Messages, framing and the
@@ -220,13 +261,16 @@ test drives the server with SRI's client-side codec.
   protection against an impostor; always configure the full URL.
 - The authority key file is a secret (mode 0600). It never signs anything
   on the chain; it only identifies the server to miners.
-- Both servers bound every input: line and frame sizes, sessions, jobs and
-  shares per session, submit rates, handshake and authorization deadlines.
+- Both servers bound every input: line and frame sizes, sessions (in total
+  and per IP, with idle eviction), channels, control requests, jobs and
+  shares per session, submit rates, handshake, authorization and share
+  idle deadlines, and the log volume a peer can cause.
   Shares are checked by the server; blocks only by the node's acceptance
   path, never trusted from the miner.
 - secp256k1 (libsecp256k1 0.28.2) is linked only for the V2 handshake and
   the authority key, under a scoped exception of the audit CRY-6 ban
-  (deny.toml `wrappers`, node/tests/supply_chain_lockfile_guard.rs). A node
+  (deny.toml `wrappers`, node/tests/supply_chain_lockfile_guard.rs, which
+  also fails if code outside node/src/stratum_v2/ names the crate). A node
   built without the `stratum-v2` feature has no secp256k1 at all.
 
 ## 6. The external proxies

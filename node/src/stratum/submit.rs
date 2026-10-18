@@ -7,16 +7,22 @@
 //!
 //! The sixth parameter is BIP 310's rolled version bits; the header version
 //! is `(job_version & !mask) | (version_bits & mask)` with the session's
-//! negotiated mask. The share is turned into its block by
-//! [`Job::solve`](super::jobs::Job::solve) (the extranonce gives the
-//! coinbase and ObenBlock's header root; the header must be the block's own
-//! 80 bytes), then:
+//! negotiated mask (the extranonce gives the coinbase and ObenBlock's
+//! header root; a block's header must be its own 80 bytes):
 //!
-//! * the id is checked against the session's share target (never harder than
-//!   the block target): below it, error 23;
-//! * a share that also meets the job's block target is a block: it goes to
-//!   the same hook as `submitblock` (`AcceptBlockFn`), and the node's verdict
-//!   is the answer.
+//! * the header and id come first, cheaply ([`Job::share`](super::jobs::Job::share):
+//!   coinbase txid and branch, no block);
+//! * a share that meets the job's block target is a block, whatever the
+//!   submit rate: only then is the block assembled
+//!   ([`Job::block_for`](super::jobs::Job::block_for)) and sent to the same
+//!   hook as `submitblock` (`AcceptBlockFn`); the node's verdict is the
+//!   answer;
+//! * any other share over the session's submit rate is refused and raises
+//!   vardiff to the observed rate; otherwise the id is checked against the
+//!   session's share target (never harder than the block target): below
+//!   it, error 23;
+//! * duplicates are keyed on the header id and remembered only once
+//!   credited.
 //!
 //! Error codes (Bitcoin stratum convention): 20 other / rejected block,
 //! 21 unknown or stale job, 22 duplicate, 23 low difficulty, 24 unauthorized.
@@ -31,7 +37,8 @@ use serde_json::Value;
 use super::difficulty::{self, difficulty_from_bits, target_from_difficulty};
 use super::jobs::{SolveError, EXTRANONCE2_BYTES};
 use super::protocol::{ErrorCode, StratumError, StratumRequest, StratumResponse};
-use super::session::{Session, MAX_JOB_ID_LEN};
+use super::guard::peer_str;
+use super::session::{Session, SessionState, SubmitRate, MAX_JOB_ID_LEN, SUBMIT_FLOOD_PER_MIN, SUBMIT_RATE_PER_MIN};
 use super::AcceptBlockFn;
 use gnb_smh::sha256d;
 
@@ -68,11 +75,13 @@ pub fn handle_submit(session: &Arc<Session>, req: &StratumRequest, accept_block:
 
 fn submit_inner(session: &Arc<Session>, req: &StratumRequest, accept_block: &AcceptBlockFn) -> StratumResponse {
     let id = req.id.clone();
-    if let Err(e) = session.check_submit_rate() {
-        return StratumResponse::error(id, e);
-    }
     if !session.is_authorized() {
         return err(id, ErrorCode::Unauthorized, "unauthorized worker");
+    }
+    let rate = session.note_submit();
+    if rate == SubmitRate::Flood {
+        session.set_state(SessionState::Dead);
+        return err(id, ErrorCode::Other, format!("submit flood (over {SUBMIT_FLOOD_PER_MIN}/min): closing"));
     }
     let params = match req.params.as_array() {
         Some(a) if a.len() >= 5 => a,
@@ -103,12 +112,8 @@ fn submit_inner(session: &Arc<Session>, req: &StratumRequest, accept_block: &Acc
         },
     };
 
-    // Duplicate before lookup: a repeat against an evicted job is still 22.
-    if !session.record_submission(job_id, en2_hex, ntime_hex, nonce_hex, str_at(5).unwrap_or("")) {
-        return err(id, ErrorCode::DuplicateShare, "duplicate share");
-    }
     let Some(entry) = session.find_job(job_id) else {
-        return err(id, ErrorCode::JobNotFoundOrStale, format!("job {job_id:?} is not current"));
+        return err(id, ErrorCode::JobNotFoundOrStale, "job is not current");
     };
     let job = &entry.job;
 
@@ -124,38 +129,69 @@ fn submit_inner(session: &Arc<Session>, req: &StratumRequest, accept_block: &Acc
         }
     };
 
+    // The header first (cheap: coinbase txid and branch, no block): the
+    // limiter below must never cost a block.
     let extranonce = session.extranonce(&en2);
-    let solved = match job.solve(&extranonce, version, ntime, nonce) {
+    let share = match job.share(&extranonce, version, ntime, nonce) {
         Ok(s) => s,
         Err(e @ SolveError::BitsChanged { .. }) => return err(id, ErrorCode::JobNotFoundOrStale, e.to_string()),
         Err(e @ SolveError::Internal(_)) => {
-            warn!("stratum: session {} share on job {job_id} not reconstructible: {e}", session.id);
+            if let Some(n) = session.log_allow() {
+                warn!("stratum: session {} share on job {} not reconstructible: {e}{}", session.id,
+                      peer_str(job_id), super::suppressed_note(n));
+            }
             return err(id, ErrorCode::Other, e.to_string());
         }
         Err(e) => return err(id, ErrorCode::Other, e.to_string()),
     };
+    // Duplicates are keyed on the header id (canonical whatever the hex
+    // spelling or job id), checked here and remembered only once credited.
+    if session.is_duplicate(&share.id) {
+        return err(id, ErrorCode::DuplicateShare, "duplicate share");
+    }
 
-    // Share target: the session's difficulty, capped at the block's (a
-    // share is never harder than a block, also after rounding).
     let block_target = job.block_target();
     let net_diff = difficulty_from_bits(job.bits);
-    let share_target = difficulty::easier(&target_from_difficulty(session.share_difficulty().min(net_diff)), &block_target);
-    if !sha256d::meets_target(&solved.id, &share_target) {
-        return err(id, ErrorCode::LowDifficulty, "share above target");
+    let is_block = sha256d::meets_target(&share.id, &block_target);
+    if !is_block {
+        if rate == SubmitRate::Excess {
+            if let Some(d) = session.raise_for_rate(net_diff) {
+                session.announce_difficulty(d);
+            }
+            return err(id, ErrorCode::Other, format!("submit rate exceeded ({SUBMIT_RATE_PER_MIN}/min): difficulty raised"));
+        }
+        // Share target: the session's difficulty (or the one before a raise,
+        // in its grace), capped at the block's (a share is never harder than
+        // a block, also after rounding).
+        let share_target = difficulty::easier(&target_from_difficulty(session.judged_difficulty().min(net_diff)),
+                                              &block_target);
+        if !sha256d::meets_target(&share.id, &share_target) {
+            return err(id, ErrorCode::LowDifficulty, "share above target");
+        }
     }
+    session.remember_share(share.id);
+    session.note_accepted_share();
     if let Some(d) = session.record_share_and_maybe_retarget(net_diff) {
         let _ = session.send_set_difficulty(d);
     }
-    if !sha256d::meets_target(&solved.id, &block_target) {
+    if !is_block {
         return StratumResponse::ok(id, Value::from(true));
     }
 
-    let height = solved.block.height;
-    match accept_block(solved.block) {
+    // A block: only now is the block assembled (whatever the submit rate).
+    let block = match job.block_for(&extranonce, &share) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("stratum: session {} block share on job {} could not be assembled: {e}", session.id, peer_str(job_id));
+            return err(id, ErrorCode::Other, e.to_string());
+        }
+    };
+    let height = block.height;
+    match accept_block(block) {
         Ok(hash) => {
             crate::metrics::stratum_block_found("v1");
             info!("stratum: session {} BLOCK FOUND h={height} id={hash} (by {}, version {version:08x} ntime {ntime})",
-                  session.id, session.authorized_name().unwrap_or_default());
+                  session.id, peer_str(&session.authorized_name().unwrap_or_default()));
             StratumResponse::ok(id, Value::from(true))
         }
         Err(reason) => {
@@ -215,12 +251,26 @@ mod tests {
     }
 
     #[test]
-    fn duplicates_return_22_and_rolled_fields_are_distinct() {
+    fn the_rate_limiter_never_refuses_before_the_share_is_hashed() {
+        // Over the per-minute rate, a submit is still parsed and looked up
+        // (the job lookup answers 21 here, not a blanket rate refusal); a
+        // block share would be judged and submitted.
         let s = mk_session();
-        let _ = handle_submit(&s, &submit_req("j", "cafebabe", "00000001", "00000000"), &*cb());
-        assert_eq!(code(&handle_submit(&s, &submit_req("j", "cafebabe", "00000001", "00000000"), &*cb())), 22);
-        // Another ntime is another solution (not 22; 21 for the unknown job).
-        assert_eq!(code(&handle_submit(&s, &submit_req("j", "cafebabe", "00000002", "00000000"), &*cb())), 21);
+        for _ in 0..(SUBMIT_RATE_PER_MIN + 5) {
+            assert_eq!(code(&handle_submit(&s, &submit_req("j", "cafebabe", "00000001", "00000000"), &*cb())), 21);
+        }
+        assert!(!s.is_dead());
+    }
+
+    #[test]
+    fn a_submit_flood_closes_the_session() {
+        let s = mk_session();
+        for _ in 0..SUBMIT_FLOOD_PER_MIN {
+            let _ = handle_submit(&s, &submit_req("j", "cafebabe", "00000001", "00000000"), &*cb());
+        }
+        assert!(!s.is_dead());
+        assert_eq!(code(&handle_submit(&s, &submit_req("j", "cafebabe", "00000001", "00000000"), &*cb())), 20);
+        assert!(s.is_dead(), "closed at the flood cap");
     }
 
     #[test]

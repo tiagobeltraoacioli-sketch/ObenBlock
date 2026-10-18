@@ -52,7 +52,7 @@ pub const MERKLE_RULE: &str = "bitcoin-sha256d";
 
 /// The rule a pool applies to compute the header Merkle root from the
 /// coinbase txid, or why this template has none a pool can use.
-fn merkle_rule(tmpl: &BlockTemplate) -> Result<&'static str, String> {
+pub fn merkle_rule(tmpl: &BlockTemplate) -> Result<&'static str, String> {
     if !core::block_rules::rules_apply(tmpl.height, tmpl.activation_height) || !tmpl.hardened {
         return Err("header jobs need the hardening block rules at the template height \
                     (ObenBlock applies them from genesis)".into());
@@ -257,22 +257,31 @@ impl HeaderJob {
     /// the pool splits into `extranonce1` (`mining.subscribe`) and
     /// `extranonce2_size`.
     pub fn stratum_json(&self) -> Value {
-        let mut prev = [0u8; 32];
-        prev.copy_from_slice(&self.header[4..36]);
-        json!({
-            "prevhash": stratum_prevhash(&prev),
-            "coinb1": hex::encode(&self.coinb1),
-            "coinb2": hex::encode(&self.coinb2),
-            "merkle_branch": self.merkle_branch.iter().map(hex::encode).collect::<Vec<_>>(),
-            "version": format!("{:08x}", self.block.header.version),
-            "nbits": format!("{:08x}", self.block.header.bits),
-            "ntime": format!("{:08x}", self.block.header.timestamp),
-            "extranonce_size": EXTRANONCE_LEN,
-            "ntime_min": self.window.mintime,
-            "ntime_max": self.window.maxtime,
-            "version_rolling_mask": format!("{:08x}", sha256d::BIP320_VERSION_MASK),
-        })
+        stratum_object(&self.header, &self.coinb1, &self.coinb2, &self.merkle_branch, &self.window)
     }
+}
+
+/// The `stratum` object of a header job from its parts: the nonce-0 header
+/// (its version, parents commitment, time and bits), the coinbase split, the
+/// branch and the time window ([`HeaderJob::stratum_json`]).
+pub fn stratum_object(header: &[u8; sha256d::POW_HEADER_LEN], coinb1: &[u8], coinb2: &[u8], branch: &[[u8; 32]],
+                      window: &TimeWindow) -> Value {
+    let mut prev = [0u8; 32];
+    prev.copy_from_slice(&header[4..36]);
+    let word = |at: usize| u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]]);
+    json!({
+        "prevhash": stratum_prevhash(&prev),
+        "coinb1": hex::encode(coinb1),
+        "coinb2": hex::encode(coinb2),
+        "merkle_branch": branch.iter().map(hex::encode).collect::<Vec<_>>(),
+        "version": format!("{:08x}", word(0)),
+        "nbits": format!("{:08x}", word(72)),
+        "ntime": format!("{:08x}", word(68)),
+        "extranonce_size": EXTRANONCE_LEN,
+        "ntime_min": window.mintime,
+        "ntime_max": window.maxtime,
+        "version_rolling_mask": format!("{:08x}", sha256d::BIP320_VERSION_MASK),
+    })
 }
 
 /// Build the [`HeaderJob`] of `tmpl` paying `script_pubkey` (an output kind
@@ -329,7 +338,7 @@ pub fn header_job(
 /// the extranonce) around the extranonce: the bytes that change when only
 /// the extranonce changes must be one run of exactly [`EXTRANONCE_LEN`]
 /// bytes.
-fn split_coinbase(cb: &Transaction) -> Result<(Vec<u8>, Vec<u8>), String> {
+pub fn split_coinbase(cb: &Transaction) -> Result<(Vec<u8>, Vec<u8>), String> {
     let a = cb.to_wire_bytes(true);
     let mut alt = cb.clone();
     let ss = &mut alt.inputs.first_mut().ok_or("coinbase has no input")?.script_sig;
