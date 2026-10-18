@@ -285,7 +285,8 @@ jobs:
 
   # WAL-5: the committed browser wallet core must be reproducible from source.
   # Rebuild it with the pinned toolchain (rust-toolchain.toml, 1.94.1) and the
-  # pinned wasi-sdk 25 (download checked against its SHA-256) through
+  # pinned wasi-sdk 34 (download checked against its SHA-256, the digest
+  # GitHub publishes for the release asset) through
   # scripts/build-wallet-wasm.sh, and fail if the binary's SHA-256 differs from
   # the pin in site/wallet/app.js (which loadCore enforces in the browser) or
   # from the committed site/wallet/gnb_wallet.wasm. Any source change that
@@ -294,15 +295,15 @@ jobs:
   wasm-reproducible:
     runs-on: ubuntu-latest
     env:
-      WASI_SDK_VERSION: "25"
-      WASI_SDK_SHA256: "52640dde13599bf127a95499e61d6d640256119456d1af8897ab6725bcf3d89c"
+      WASI_SDK_VERSION: "34"
+      WASI_SDK_SHA256: "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
     steps:
       - uses: actions/checkout@v4
       - name: Rust 1.94.1 with the wasm32-wasip1 target
         run: |
           rustup toolchain install 1.94.1 --profile minimal --target wasm32-wasip1
           test "$(rustc --version | cut -d' ' -f2)" = "1.94.1"
-      - name: wasi-sdk 25 (pinned download and checksum)
+      - name: wasi-sdk 34 (pinned download and checksum)
         run: |
           curl -fsSL -o "$RUNNER_TEMP/wasi-sdk.tar.gz" \
             "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-${WASI_SDK_VERSION}/wasi-sdk-${WASI_SDK_VERSION}.0-x86_64-linux.tar.gz"
@@ -389,6 +390,8 @@ jobs:
         run: python3 deploy/explorer-api/test_gnb_explorer_api.py -v
       - name: Address-v2 explorer aliases and carryover identity
         run: python3 deploy/explorer-api/test_address_v2.py -v
+      - name: ObenBlock explorer API (obb1, SHA-256d, PoWit finality)
+        run: python3 deploy/explorer-api/test_obenblock_explorer_api.py -v
       - name: release tool unit tests (minimum chain work)
         run: python3 tools/release/test_min_chain_work.py -v
 

@@ -1,0 +1,90 @@
+# Read-only explorer API for obenblock.xyz, in front of the local ObenBlock
+# node (obenblock-node.service, JSON-RPC on 127.0.0.1:18210).
+#
+# Default (WAL-2/WAL-4): loopback only on 127.0.0.1:2086, for a Cloudflare
+# Tunnel. The ObenBlock launch publishes it directly instead: TLS on
+# 0.0.0.0:2087 with a Let's Encrypt certificate for the host's
+# <ip-with-dashes>.sslip.io name (Workers cannot fetch a bare IP), and the
+# port open to Cloudflare's ranges only (firewall-cloudflare.sh 2087). That
+# layout is the drop-in obenblock-explorer-api.tls.conf.example. See
+# README.md ("ObenBlock mainnet").
+#
+# Audit OPS-3: the API faces the internet (through the Worker), so it runs
+# as its OWN system user, not as the node's `obenblock` user: a compromise of
+# the API process cannot read or write the node's data dir
+# (/var/lib/obenblock) or its keys. Create the user once:
+#   useradd --system --no-create-home --home-dir /nonexistent \
+#           --shell /usr/sbin/nologin obenblock-api
+# and give it the secret: install -m 0640 -o root -g obenblock-api ... (README.md).
+# Check the sandbox with `systemd-analyze security obenblock-explorer-api`;
+# deploy/test_deploy_files.py keeps the directives below in place.
+[Unit]
+Description=ObenBlock explorer API (read-only)
+After=obenblock-node.service
+Wants=obenblock-node.service
+
+[Service]
+User=obenblock-api
+Group=obenblock-api
+Environment=OBB_CHAIN=obenblock
+Environment=OBB_RPC_URL=http://127.0.0.1:18210/
+Environment=OBB_API_BIND=127.0.0.1
+Environment=OBB_API_PORT=2086
+Environment=OBB_API_KEY_FILE=/etc/obenblock/explorer-api.key
+# The Bloch Genesis-3 carryover snapshot, uncompressed
+# (gunzip -c genesis/bloch-g3-carryover.tsv.gz); optional.
+Environment=OBB_CARRYOVER=/opt/obenblock/carryover.tsv
+Environment=OBB_API_MAX_CONNECTIONS=64
+Environment=OBB_API_TIMEOUT=10
+Environment=OBB_API_DEADLINE=30
+# Direct-TLS mode: obenblock-explorer-api.tls.conf.example as a drop-in.
+ExecStart=/usr/bin/python3 -I /opt/obenblock/bin/gnb_explorer_api.py
+Restart=always
+RestartSec=3
+MemoryMax=1G
+TasksMax=128
+UMask=0077
+
+# ── Sandboxing (audit OPS-3) ────────────────────────────────────────────────
+# The API reads its key, its TLS files and the carryover snapshot, talks to
+# the node's loopback RPC and serves HTTP(S). It writes nothing.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateUsers=true
+PrivateIPC=true
+RemoveIPC=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+# No capabilities: it listens on an unprivileged port.
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+# Tunnel layout: only loopback peers (cloudflared, the node). The direct-TLS
+# drop-in resets both (the firewall then restricts the port).
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+# CPython without its experimental JIT and without ctypes callbacks: no
+# writable-executable mappings.
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+DevicePolicy=closed
+KeyringMode=private
+
+[Install]
+WantedBy=multi-user.target

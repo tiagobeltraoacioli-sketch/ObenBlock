@@ -1,4 +1,4 @@
-//! GnB browser wallet core, built for `wasm32-wasip1`.
+//! ObenBlock browser wallet core, built for `wasm32-wasip1`.
 //!
 //! One entry point, JSON in and JSON out:
 //!
@@ -7,49 +7,72 @@
 //! gnb_call(ptr, len) -> u64        (result_ptr << 32) | result_len; free with gnb_free
 //! ```
 //!
+//! The core is an ObenBlock wallet (docs/DESIGN-obenblock.md §2, §3): every
+//! request first fixes the process chain to ObenBlock (`ensure_obenblock`), so
+//! every signature commits to the ObenBlock chain id (mainnet `0x4F420001`,
+//! regtest `0x4F420002`) and every transaction is version 3 / sighash v3,
+//! which ObenBlock requires from height 0. Addresses are shown as `obb1…`;
+//! `gnb1…` and `bloch1…` strings are accepted as the same script (aliases).
+//! A network is `"mainnet"` (the default) or `"regtest"` (`"testnet"` is
+//! accepted as its old name: regtest uses the `Testnet` address network).
+//!
 //! Requests: `{"op": ...}` with
 //!
 //! ```text
+//! chain {network?}            the chain this core signs for: name, chain id,
+//!                             address prefix, `tx_version` (3) and the height
+//!                             from which version 3 applies (0)
 //! open {json, password, network?}
-//!                             unlock a keystore (v3/v2, `bloch1q…` accepted for v2; then v1)
-//!                             of `network` ("mainnet", the default, or "testnet"):
-//!                             v3 and v1 must authenticate that network, a v2 file
-//!                             (which authenticates none) must record an address of it
+//!                             unlock a keystore (v3/v2, `gnb1q…`/`bloch1q…`
+//!                             accepted for v2; then v1) of `network`: v3 and v1
+//!                             must authenticate that network, a v2 file (which
+//!                             authenticates none) must record an address of it
 //!                             (CRY-7)
-//! create {mnemonic?}          new mainnet key from the WASI CSPRNG (browser crypto).
-//!                             By default (`mnemonic` absent or true) the key is
-//!                             derived from a fresh 24-word phrase, returned ONCE as
-//!                             `words` for the user to write down (WAL-7);
-//!                             `mnemonic: false` makes a random key with no phrase.
-//! restore {words}             unlock the key of a 24-word phrase
+//! create {mnemonic?, network?}
+//!                             new key from the WASI CSPRNG (browser crypto).
+//!                             Mainnet, by default (`mnemonic` absent or true), is
+//!                             derived from a fresh 24-word phrase, returned ONCE
+//!                             as `words` for the user to write down (WAL-7);
+//!                             `mnemonic: false` or regtest (`network:
+//!                             "regtest"`, or the older `testnet: true`) makes a
+//!                             random key with no phrase.
+//! restore {words}             unlock the mainnet key of a 24-word phrase
+//! setnetwork {network} | {testnet}
+//!                             use the unlocked key on mainnet or regtest
 //! export {password}           encrypted keystore v3 JSON of the unlocked key
 //! (`utxos` are the node's getutxos rows; a coinbase output, `coinbase_height`
 //! in its row, is never selected before it is mature at `next_height`.)
 //! plan {utxos, to, amount, fee, next_height}
 //!                             the transaction `version` a payment targeting block
 //!                             `next_height` (the node's getdaginfo next_block_height)
-//!                             gets, and, for version 1 only, the txids whose creating
-//!                             transactions the page should fetch (WAL-1). A version-3
-//!                             signature commits to every spent value and script, so
-//!                             `prev_txids` is empty from the hardening activation on.
+//!                             gets: 3 on ObenBlock at every height. A version-3
+//!                             signature commits to every spent value and script,
+//!                             so `prev_txids` (the transactions a version-1
+//!                             payment had to fetch, WAL-1) is always empty.
 //! pay {utxos, to, amount, fee, next_height, prevtxs?, max_fee?, require_verified?}
-//!                             build and sign a payment (amounts in base units) as
-//!                             version 3 / sighash v3 at/after the activation, version
-//!                             1 / sighash v2 below it. `prevtxs` maps txid -> raw
-//!                             transaction hex; each is hashed against its txid and
-//!                             the claimed UTXO values are checked against it before
+//!                             build and sign a payment (amounts in base units),
+//!                             version 3 / sighash v3 under the ObenBlock chain id.
+//!                             `prevtxs` (txid -> raw transaction hex) is still
+//!                             accepted: each is hashed against its txid and the
+//!                             claimed UTXO values are checked against it before
 //!                             anything is signed. The response reports the ACTUAL
 //!                             fee, dust added to the fee, change, verified/unverified
 //!                             inputs, `version` and `amounts_committed`.
-//! address {} · wipe {} · normalize {address} · minfee {size}
+//! address {} · wipe {} · normalize {address, format?} · minfee {size}
 //! ```
 //!
 //! The secret key never crosses the boundary: responses carry addresses,
 //! public keys, signed transactions, encrypted keystores and — only from
 //! `create` — the new recovery phrase. Request buffers are wiped by the
 //! loader (`core.js`) and the password copies made here are wiped on drop.
+//!
+//! Keystores keep the address string they always stored (the `gnb1…` form,
+//! which the v3 associated data binds), so a keystore exported here opens in
+//! the GnB tools and the ObenBlock CLI alike; only what this core shows is
+//! the `obb1…` form (`address::display_address`).
 
-use gnb_crypto::address::{Address, Network};
+use gnb_crypto::address::{display_address, Address, AddressFamily, Network};
+use gnb_crypto::core::chain::{set_process_chain, Chain};
 use gnb_crypto::core::{tokenomics, ChainId, TxOutput};
 use gnb_crypto::wallet::payment::amounts_committed_at;
 use gnb_crypto::wallet::send::{all_immature_message, utxo_row_spendable_at};
@@ -62,6 +85,31 @@ use std::sync::Mutex;
 use zeroize::{Zeroize, Zeroizing};
 
 static SESSION: Mutex<Option<Keypair>> = Mutex::new(None);
+
+/// The address family this core parses and shows (`obb1…`, GnB and Bloch
+/// forms accepted as aliases).
+const FAMILY: AddressFamily = AddressFamily::ObenBlock;
+
+/// Fix the process chain to ObenBlock before anything is parsed, derived or
+/// signed: `ChainId::for_network` then maps a key's network to the ObenBlock
+/// chain id (folded into every sighash), the activation schedule is
+/// ObenBlock's (version 3 from height 0) and `address::process_family` is
+/// `obb`. Idempotent; it can only fail if something fixed the GnB chain
+/// first, and then nothing is signed.
+fn ensure_obenblock() -> Result<(), String> {
+    set_process_chain(Chain::ObenBlock)
+        .map_err(|other| format!("this wallet core signs for ObenBlock only (the process chain is {})", other.name()))
+}
+
+/// An address string as this core shows it: `obb1…`.
+fn shown(address: &str) -> String {
+    display_address(address)
+}
+
+/// The key `kp` as a response: its `obb1…` address and its public key.
+fn identity(kp: &Keypair) -> Value {
+    json!({ "address": shown(&kp.address), "public_key": hex::encode(&kp.public_key) })
+}
 
 fn set_session(kp: Keypair) {
     let mut s = SESSION.lock().unwrap_or_else(|e| e.into_inner());
@@ -195,13 +243,63 @@ fn observe_wiped(req: Option<&Value>, out: &Value) {
     });
 }
 
+/// The public formats (descriptors, PQ-PSBT) name ObenBlock regtest by the
+/// address network it uses, "testnet"; accept "regtest" there too.
+fn public_format_request(req: &Value) -> std::borrow::Cow<'_, Value> {
+    if req.get("network").and_then(Value::as_str) == Some("regtest") {
+        let mut owned = req.clone();
+        owned["network"] = json!("testnet");
+        std::borrow::Cow::Owned(owned)
+    } else {
+        std::borrow::Cow::Borrowed(req)
+    }
+}
+
+/// Show every `address` / `bech32m` string field of a public-format answer
+/// (recursively) in the ObenBlock form; descriptor strings and scripts are
+/// unchanged.
+fn show_addresses(v: &mut Value) {
+    match v {
+        Value::Object(map) => {
+            for (key, value) in map.iter_mut() {
+                match value {
+                    Value::String(text) if key == "address" || key == "bech32m" => *text = shown(text),
+                    other => show_addresses(other),
+                }
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(show_addresses),
+        _ => {}
+    }
+}
+
 /// Dispatch one request. Pure Rust, testable on the host.
 pub fn handle(req: &Value) -> Result<Value, String> {
+    ensure_obenblock()?;
     match s(req, "op")? {
-        "descriptor" => gnb_crypto::wallet::descriptor::public_request(req),
-        "pqpsbt" => gnb_crypto::wallet::pqpsbt::public_request(req),
+        "chain" => {
+            let network = parse_network(req)?;
+            let id = ChainId::for_chain(Chain::ObenBlock, network);
+            let version = PaymentOptions { next_block_height: Some(0), ..PaymentOptions::default() }.tx_version(id)?;
+            Ok(json!({
+                "chain": Chain::ObenBlock.name(),
+                "network": network_name(network),
+                "chain_id": format!("{:#010x}", id.to_u32()),
+                "address_prefix": FAMILY.key_prefix(network),
+                "policy_prefix": FAMILY.policy_prefix(network),
+                "tx_version": version,
+                "tx_version_3_from_height":
+                    gnb_crypto::core::activation::hardening_activation_height_for_chain(id),
+            }))
+        }
+        "descriptor" => gnb_crypto::wallet::descriptor::public_request(&public_format_request(req)).map(|mut v| {
+            show_addresses(&mut v);
+            v
+        }),
+        "pqpsbt" => gnb_crypto::wallet::pqpsbt::public_request(&public_format_request(req)),
         "pqpsbt_sign" => {
             use gnb_crypto::wallet::pqpsbt::{self, PqPsbt};
+            let req = &*public_format_request(req);
             pqpsbt::check_request_fields(req, &["op", "hex", "network", "next_height", "max_fee"])?;
             let context = pqpsbt::context_from_request(req)?;
             let mut document = PqPsbt::from_bytes(&pqpsbt::decode_hex(s(req, "hex")?, pqpsbt::MAX_BYTES)?)?;
@@ -214,27 +312,33 @@ pub fn handle(req: &Value) -> Result<Value, String> {
         }
         "open" => {
             let kp = open_keypair(req)?;
-            let out = json!({ "address": kp.address, "public_key": hex::encode(&kp.public_key) });
+            let out = identity(&kp);
             set_session(kp);
             Ok(out)
         }
         "create" => {
-            // `testnet: true` makes a random testnet key (no phrase: the
-            // phrase derivation is mainnet).
-            let testnet = req.get("testnet").and_then(Value::as_bool).unwrap_or(false);
+            // Regtest (`network: "regtest"`, or the older `testnet: true`)
+            // makes a random key with no phrase: the phrase derivation is
+            // mainnet's.
+            let network = if req.get("network").is_some() {
+                parse_network(req)?
+            } else if req.get("testnet").and_then(Value::as_bool).unwrap_or(false) {
+                Network::Testnet
+            } else {
+                Network::Mainnet
+            };
+            let testnet = network == Network::Testnet;
             let with_phrase = !testnet && req.get("mnemonic").and_then(Value::as_bool).unwrap_or(true);
             if with_phrase {
                 let (kp, phrase) = generate_mnemonic_keypair(Network::Mainnet).map_err(|e| e.to_string())?;
                 let words = Zeroizing::new(phrase.words().join(" "));
-                let out = json!({
-                    "address": kp.address, "public_key": hex::encode(&kp.public_key),
-                    "words": words.as_str(),
-                });
+                let mut out = identity(&kp);
+                out["words"] = json!(words.as_str());
                 set_session(kp);
                 Ok(out)
             } else {
                 let kp = generate_keypair(testnet);
-                let out = json!({ "address": kp.address, "public_key": hex::encode(&kp.public_key) });
+                let out = identity(&kp);
                 set_session(kp);
                 Ok(out)
             }
@@ -242,33 +346,29 @@ pub fn handle(req: &Value) -> Result<Value, String> {
         "restore" => {
             let words = secret(req, "words")?;
             let kp = keypair_from_mnemonic(&words, Network::Mainnet).map_err(|e| e.to_string())?;
-            let out = json!({ "address": kp.address, "public_key": hex::encode(&kp.public_key) });
+            let out = identity(&kp);
             set_session(kp);
             Ok(out)
         }
-        "address" => with_session(|kp| Ok(json!({ "address": kp.address }))),
-        // Use the unlocked key on mainnet or testnet: the address prefix
-        // picks the chain id every signature commits to.
+        "address" => with_session(|kp| Ok(json!({ "address": shown(&kp.address), "network": network_name(kp.network()?) }))),
+        // Use the unlocked key on mainnet or regtest: the address network
+        // picks the chain id every signature commits to. `{network}` or the
+        // older `{testnet: bool}`.
         "setnetwork" => {
-            let testnet = req.get("testnet").and_then(Value::as_bool).ok_or("missing bool `testnet`")?;
+            let testnet = match (req.get("network"), req.get("testnet")) {
+                (Some(_), _) => parse_network(req)? == Network::Testnet,
+                (None, Some(Value::Bool(t))) => *t,
+                _ => return Err("missing `network` (\"mainnet\" or \"regtest\")".into()),
+            };
             let mut s = SESSION.lock().unwrap_or_else(|e| e.into_inner());
             let kp = s.as_mut().ok_or("wallet is locked")?;
             kp.address = gnb_crypto::crypto::address_from_pubkey(&kp.public_key, testnet);
-            Ok(json!({ "address": kp.address }))
+            Ok(json!({ "address": shown(&kp.address), "network": network_name(kp.network()?) }))
         }
-        // Lock GNB in the Bloch bridge vault for an L2 (0x…) address: vault
-        // in output 0, the 20-byte destination marker in output 1, change
-        // last. Version and sighash follow `next_height` as for `pay`.
-        "bridgelock" => {
-            let next_height = parse_height(req)?;
-            let utxos = parse_spendable_utxos(req.get("utxos").ok_or("missing `utxos`")?, next_height)?;
-            let amount = parse_amount(req, "amount")?;
-            let fee = parse_amount(req, "fee")?;
-            let vault = hex::decode(s(req, "vault_script")?).map_err(|_| "vault_script must be hex")?;
-            let l2: [u8; 20] = hex::decode(s(req, "l2")?.trim().trim_start_matches("0x")).ok()
-                .and_then(|v| v.try_into().ok()).ok_or("L2 address must be 0x + 40 hex digits")?;
-            with_session(|kp| bridge_lock(kp, &utxos, &vault, amount, l2, fee, next_height))
-        }
+        // The GnB build locked GNB in the Bloch bridge vault here. ObenBlock
+        // has no bridge: refuse, so no page can lock OBB into a vault that no
+        // signer watches.
+        "bridgelock" => Err("ObenBlock has no Bloch bridge: bridgelock is not available".into()),
         "export" => {
             let pw = secret(req, "password")?;
             with_session(|kp| kp.to_encrypted_json(&pw).map(|j| json!({ "keystore": j })))
@@ -326,17 +426,19 @@ pub fn handle(req: &Value) -> Result<Value, String> {
             Ok(json!({ "locked": true }))
         }
         "normalize" => {
-            let address = Address::parse(s(req, "address")?.trim())
+            // Any accepted form (obb1, gnb1, bloch1, v2 Bech32m) of a
+            // single-key address, shown as the ObenBlock form. Formatting is
+            // opt-in: "legacy" (the default, `obb1q…`/`obb1t…`) or "bech32m"
+            // (`obb1z…`/`tobb1z…`, BIP350, which binds the network).
+            let address = Address::parse_in(s(req, "address")?.trim(), FAMILY)
                 .map_err(|e| format!("invalid address: {e:?}"))?;
-            // Formatting is opt-in. Default output keeps existing wallet and
-            // carryover identities stable; BIP350 HRPs bind v2 to the network.
             let formatted = match req.get("format") {
-                None => address.to_string(),
-                Some(Value::String(format)) if format == "legacy" => address.to_string(),
-                Some(Value::String(format)) if format == "bech32m" => address.to_bech32m(),
+                None => address.to_string_in(FAMILY),
+                Some(Value::String(format)) if format == "legacy" => address.to_string_in(FAMILY),
+                Some(Value::String(format)) if format == "bech32m" => address.to_bech32m_in(FAMILY),
                 _ => return Err("unsupported address format; expected legacy or bech32m".into()),
             };
-            Ok(json!({ "address": formatted }))
+            Ok(json!({ "address": formatted, "network": network_name(address.network()) }))
         }
         "minfee" => {
             let size = req.get("size").and_then(Value::as_u64).ok_or("missing `size`")?;
@@ -349,41 +451,6 @@ pub fn handle(req: &Value) -> Result<Value, String> {
     }
 }
 
-fn bridge_lock(kp: &Keypair, utxos: &[Utxo], vault: &[u8], amount: u64, l2: [u8; 20],
-               mut fee: u64, next_height: u64) -> Result<Value, String> {
-    if gnb_crypto::core::policy::output_kind(vault) != Some(gnb_crypto::core::policy::OutputKind::Policy) {
-        return Err("the vault must be a policy address".into());
-    }
-    let rows: Vec<(Vec<u8>, u32, TxOutput)> = utxos.iter()
-        .map(|u| (u.txid.to_vec(), u.index, u.output.clone()))
-        .collect();
-    let outputs = gnb_crypto::bridge::lock_outputs(vault, amount, l2);
-    // Falcon signatures vary in length: the fee only ever rises, to the
-    // largest minimum seen, so this settles within a few builds.
-    let mut tx = None;
-    for _ in 0..16 {
-        let built = TxBuilder::build_outputs(kp, &rows, outputs.clone(), fee, next_height)?;
-        let min = tokenomics::min_tx_fee_sat(built.to_wire_bytes(true).len());
-        if fee >= min {
-            tx = Some(built);
-            break;
-        }
-        fee = fee.max(min);
-    }
-    let tx = tx.ok_or("could not settle the fee")?;
-    // Never hand back something the signers would not recognise as a lock.
-    let lock = gnb_crypto::bridge::parse_lock(&tx.outputs, vault, 0)?;
-    let raw = tx.to_wire_bytes(true);
-    if raw.len() > gnb_crypto::wallet::payment::MAX_STANDARD_TX_BYTES {
-        return Err("this lock needs too many inputs; lock a smaller amount".into());
-    }
-    Ok(json!({
-        "raw": hex::encode(&raw), "txid": hex::encode(tx.txid()), "size": raw.len(), "fee": fee.to_string(),
-        "inputs": tx.inputs.len(), "amount": lock.amount.to_string(), "version": tx.version,
-        "l2_recipient": format!("0x{}", hex::encode(lock.l2_recipient)), "lock_vout": 0,
-    }))
-}
-
 /// The key of an `open` request (CRY-7): the page states the network it
 /// serves (the web wallet is a mainnet wallet; default "mainnet"). A keystore
 /// v3 or keyfile v1 authenticates its own network, which must be this one; a
@@ -391,6 +458,7 @@ fn bridge_lock(kp: &Keypair, utxos: &[Utxo], vault: &[u8], amount: u64, l2: [u8;
 /// (`Keypair::from_encrypted_bytes_on`). `pay` then trusts the session key's
 /// network.
 fn open_keypair(req: &Value) -> Result<Keypair, String> {
+    ensure_obenblock()?;
     let raw = s(req, "json")?.as_bytes();
     let pw = secret(req, "password")?;
     let network = parse_network(req)?;
@@ -404,17 +472,21 @@ fn open_keypair(req: &Value) -> Result<Keypair, String> {
     }
 }
 
-/// `network` of an `open` request: "mainnet" (the default) or "testnet".
+/// `network` of a request: "mainnet" (the default) or "regtest". "testnet"
+/// is accepted as regtest's older name (ObenBlock has no public testnet;
+/// its regtest uses the `Testnet` address network).
 fn parse_network(req: &Value) -> Result<Network, String> {
-    match req.get("network").and_then(Value::as_str).unwrap_or("mainnet") {
-        "mainnet" => Ok(Network::Mainnet),
-        "testnet" => Ok(Network::Testnet),
-        other => Err(format!("unknown network `{other}`")),
+    match req.get("network") {
+        None => Ok(Network::Mainnet),
+        Some(Value::String(n)) if n == "mainnet" => Ok(Network::Mainnet),
+        Some(Value::String(n)) if n == "regtest" || n == "testnet" => Ok(Network::Testnet),
+        Some(other) => Err(format!("unknown network `{}` (expected mainnet or regtest)",
+            other.as_str().map_or_else(|| other.to_string(), str::to_owned))),
     }
 }
 
 fn network_name(n: Network) -> &'static str {
-    if n == Network::Testnet { "testnet" } else { "mainnet" }
+    if n == Network::Testnet { "regtest" } else { "mainnet" }
 }
 
 fn parse_amount(req: &Value, k: &str) -> Result<u64, String> {
@@ -436,7 +508,8 @@ fn pay(kp: &Keypair, utxos: &[Utxo], to: &str, amount: u64, opts: &PaymentOption
     if amount == 0 {
         return Err("amount must be positive".into());
     }
-    let dest = Address::parse(to.trim()).map_err(|e| format!("invalid destination: {e:?}"))?;
+    // obb1 (and the gnb1 / bloch1 / v2 aliases of the same script).
+    let dest = Address::parse_in(to.trim(), FAMILY).map_err(|e| format!("invalid destination: {e:?}"))?;
     let mine = Address::parse(&kp.address).map_err(|e| format!("{e:?}"))?;
     if dest.network() != mine.network() {
         return Err("destination is on another network".into());
@@ -548,6 +621,9 @@ mod tests {
         use gnb_crypto::core::policy::SpendPolicy;
         use gnb_crypto::wallet::{policy_spend::PolicySpend, pqpsbt::PqPsbt};
         let _session = SESSION_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        // The policy spend below is built before any request: fix the chain
+        // first, as every request does.
+        ensure_obenblock().unwrap();
         let mut keys = (0..3).map(|_| generate_keypair(false)).collect::<Vec<_>>();
         let policy = SpendPolicy::new(2, keys.iter().map(|k| k.public_key.clone()).collect(), 0, 0).unwrap();
         let mut spend = PolicySpend::new(Network::Mainnet, policy, &[([7;32],0,5_000_000)], vec![9;20], 1_000_000,0,0).unwrap();
@@ -561,8 +637,10 @@ mod tests {
         handle(&json!({"op":"wipe"})).unwrap();
         assert!(handle(&sign).unwrap_err().contains("locked"));
         set_session(keys.remove(0));
-        for (field,value) in [("max_fee","0"),("network","testnet"),("next_height","17499")] {
-            let mut bad=sign.clone(); bad[field]=value.into(); assert!(handle(&bad).is_err());
+        // ObenBlock signs version 3 at every height, so an earlier height is
+        // no longer a version mismatch; a malformed one is still refused.
+        for (field,value) in [("max_fee","0"),("network","testnet"),("network","regtest"),("next_height","17x")] {
+            let mut bad=sign.clone(); bad[field]=value.into(); assert!(handle(&bad).is_err(), "{field}={value}");
         }
         handle(&json!({"op":"setnetwork","testnet":true})).unwrap();
         assert!(handle(&sign).is_err(),"session network must be independently checked");
@@ -579,6 +657,58 @@ mod tests {
         handle(&json!({"op":"wipe"})).unwrap();
     }
 
+    /// The ObenBlock mainnet form of a 20-byte key hash.
+    fn obb(hash: [u8; 20], network: Network) -> String {
+        Address::from_hash(hash, network).to_string_in(FAMILY)
+    }
+
+    /// The 20-byte script of an `obb1q…`/`obb1t…` address the core showed.
+    fn spk_of(address: &str) -> Vec<u8> {
+        Address::parse_in(address, FAMILY).unwrap().hash().to_vec()
+    }
+
+    #[test]
+    fn chain_reports_the_obenblock_identity() {
+        let main = handle(&json!({"op": "chain"})).unwrap();
+        assert_eq!(main["chain"], "obenblock");
+        assert_eq!(main["network"], "mainnet");
+        assert_eq!(main["chain_id"], "0x4f420001");
+        assert_eq!(main["address_prefix"], "obb1q");
+        assert_eq!(main["policy_prefix"], "obb1m");
+        assert_eq!(main["tx_version"], 3);
+        assert_eq!(main["tx_version_3_from_height"], 0);
+        let reg = handle(&json!({"op": "chain", "network": "regtest"})).unwrap();
+        assert_eq!((reg["chain_id"].as_str(), reg["address_prefix"].as_str()), (Some("0x4f420002"), Some("obb1t")));
+        assert_eq!(handle(&json!({"op": "chain", "network": "testnet"})).unwrap()["chain_id"], "0x4f420002",
+            "testnet is regtest's older name");
+        assert!(handle(&json!({"op": "chain", "network": "gnb"})).unwrap_err().contains("unknown network"));
+        assert_eq!(gnb_crypto::core::chain::process_chain(), Chain::ObenBlock);
+        assert_eq!(gnb_crypto::address::process_family(), AddressFamily::ObenBlock);
+    }
+
+    #[test]
+    fn normalize_shows_obb_and_accepts_gnb_and_bloch_aliases() {
+        let hash = [0x5a; 20];
+        let main = obb(hash, Network::Mainnet);
+        assert!(main.starts_with("obb1q"), "{main}");
+        let gnb = Address::from_hash(hash, Network::Mainnet).to_string();
+        let bloch = format!("bloch1q{}", &gnb[5..]);
+        for form in [main.clone(), gnb.clone(), bloch, Address::from_hash(hash, Network::Mainnet).to_bech32m(),
+                     Address::from_hash(hash, Network::Mainnet).to_bech32m_in(FAMILY)] {
+            let r = handle(&json!({"op": "normalize", "address": form})).unwrap();
+            assert_eq!(r["address"], main, "{form}");
+            assert_eq!(r["network"], "mainnet");
+        }
+        let v2 = handle(&json!({"op": "normalize", "address": gnb, "format": "bech32m"})).unwrap();
+        assert!(v2["address"].as_str().unwrap().starts_with("obb1z"), "{v2}");
+        let reg = handle(&json!({"op": "normalize", "address": Address::from_hash(hash, Network::Testnet).to_string()})).unwrap();
+        assert_eq!(reg["address"], obb(hash, Network::Testnet));
+        assert_eq!(reg["network"], "regtest");
+        let mut bad = main.clone();
+        bad.replace_range(10..11, if &main[10..11] == "0" { "1" } else { "0" });
+        assert!(handle(&json!({"op": "normalize", "address": bad})).is_err(), "checksum is checked");
+    }
+
     // The session is process-global: keep every flow in one test.
     #[test]
     #[cfg_attr(miri, ignore = "key generation, signing and verification run the PQClean ML-DSA-65 and Falcon-1024 C code, which Miri cannot execute")]
@@ -586,12 +716,16 @@ mod tests {
         let _session = SESSION_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let created = handle(&json!({"op": "create"})).unwrap();
         let addr = created["address"].as_str().unwrap().to_string();
+        assert!(addr.starts_with("obb1q") && addr.len() == 53, "{addr}");
         // WAL-7: phrase-backed by default, and the phrase restores the key.
         let words = created["words"].as_str().unwrap().to_string();
         assert_eq!(words.split_whitespace().count(), 24);
         let ks = handle(&json!({"op": "export", "password": "Correct-Horse-9-battery"})).unwrap();
         let ks = ks["keystore"].as_str().unwrap().to_string();
         assert!(ks.contains("\"version\": 3"), "exports keystore v3");
+        // The keystore keeps the address string it always bound (gnb1q…),
+        // so the GnB tools and the ObenBlock CLI open it alike.
+        assert!(ks.contains(&format!("gnb1q{}", &addr[5..])), "{ks}");
         handle(&json!({"op": "wipe"})).unwrap();
         assert!(handle(&json!({"op": "address"})).is_err());
         let restored = handle(&json!({"op": "restore", "words": words})).unwrap();
@@ -599,22 +733,29 @@ mod tests {
         handle(&json!({"op": "wipe"})).unwrap();
         let opened = handle(&json!({"op": "open", "json": ks, "password": "Correct-Horse-9-battery"})).unwrap();
         assert_eq!(opened["address"], addr);
+        assert_eq!(handle(&json!({"op": "address"})).unwrap(), json!({"address": addr, "network": "mainnet"}));
 
-        // Pay 3 GNB from two 2 GNB outputs owned by this key.
-        let spk = Address::parse(&addr).unwrap().hash().to_vec();
+        // Pay 3 OBB from two 2 OBB outputs owned by this key.
+        let spk = spk_of(&addr);
         let utxos = json!([
             {"txid": "11".repeat(32), "index": 0, "value": "200000000", "script_pubkey": hex::encode(&spk)},
             {"txid": "22".repeat(32), "index": 1, "value": "200000000", "script_pubkey": hex::encode(&spk)},
         ]);
-        let to = Address::from_hash([7u8; 20], Network::Mainnet).to_string();
+        let to = obb([7u8; 20], Network::Mainnet);
         // Without the next block's height the core refuses to sign.
         let err = handle(&json!({"op": "pay", "utxos": utxos, "to": to, "amount": "300000000", "fee": "0"})).unwrap_err();
         assert!(err.contains("next_height"), "{err}");
-        // Mainnet, far below the activation height: version 1 / sighash v2.
+        // ObenBlock: version 3 / sighash v3 from height 0, at every height.
+        for next in [0u64, 1, 11, 17_499, 17_500, 1_000_000] {
+            let plan = handle(&json!({"op": "plan", "utxos": utxos, "to": to, "amount": "300000000", "fee": "0",
+                "next_height": next})).unwrap();
+            assert_eq!(plan, json!({"prev_txids": [], "version": 3}), "next_height {next}");
+        }
         let r = handle(&json!({"op": "pay", "utxos": utxos, "to": to, "amount": "300000000", "fee": "0",
             "next_height": "11"})).unwrap();
-        assert_eq!(r["version"], 1);
-        assert_eq!(r["amounts_committed"], false);
+        assert_eq!(r["version"], 3);
+        assert_eq!(r["amounts_committed"], true);
+        assert_eq!(r["unverified_inputs"], 0);
         let size = r["size"].as_u64().unwrap() as usize;
         assert_eq!(r["inputs"], 2);
         let fee: u64 = r["fee"].as_str().unwrap().parse().unwrap();
@@ -622,64 +763,62 @@ mod tests {
         // The reported fee is the actual one: inputs − amount − change.
         let change: u64 = r["change"].as_str().unwrap().parse().unwrap();
         assert_eq!(400_000_000 - 300_000_000 - change, fee);
-        assert_eq!(r["unverified_inputs"], 2);
         let raw = hex::decode(r["raw"].as_str().unwrap()).unwrap();
+        assert_eq!(&raw[..4], &3u32.to_le_bytes(), "the wire transaction is version 3");
         let tx = Transaction::from_wire_bytes(&raw).unwrap();
         assert_eq!(hex::encode(tx.txid()), r["txid"].as_str().unwrap());
-        // Every input carries a signature that verifies under the GnB sighash.
-        for (i, inp) in tx.inputs.iter().enumerate() {
-            let (sig, pk) = Transaction::parse_script_sig(&inp.script_sig).unwrap();
-            let h = tx.sighash(i, gnb_crypto::core::ChainId::Mainnet);
-            assert!(gnb_crypto::crypto::verify(&pk, &h, &sig));
+        assert_eq!(tx.outputs[0].script_pubkey, vec![7u8; 20]);
+        // Every input verifies under the ObenBlock mainnet chain id, and
+        // under no GnB chain id (the chain id keeps the chains apart).
+        let spent: Vec<TxOutput> = (0..2).map(|_| TxOutput { value: 200_000_000, script_pubkey: spk.clone() }).collect();
+        let verify = |chain: ChainId| gnb_crypto::core::sighash::verify_tx_scripts(&tx, &spent, chain, 11, 0);
+        assert!(verify(ChainId::ObenBlockMainnet).is_ok());
+        for other in [ChainId::Mainnet, ChainId::Testnet, ChainId::ObenBlockRegtest] {
+            assert!(verify(other).is_err(), "{other:?}");
         }
-        // Bloch-prefixed destinations are the same owner.
-        let bloch = format!("bloch1q{}", &to[5..]);
-        assert_eq!(handle(&json!({"op": "normalize", "address": bloch})).unwrap()["address"], to);
+        // gnb1q… and bloch1q… destinations are the same script.
+        let gnb_to = Address::from_hash([7u8; 20], Network::Mainnet).to_string();
+        for alias in [gnb_to.clone(), format!("bloch1q{}", &gnb_to[5..])] {
+            let r = handle(&json!({"op": "pay", "utxos": utxos, "to": alias, "amount": "300000000", "fee": "0",
+                "next_height": 11})).unwrap();
+            let tx = Transaction::from_wire_bytes(&hex::decode(r["raw"].as_str().unwrap()).unwrap()).unwrap();
+            assert_eq!(tx.outputs[0].script_pubkey, vec![7u8; 20], "{alias}");
+        }
+        // A regtest destination is another network.
+        let err = handle(&json!({"op": "pay", "utxos": utxos, "to": obb([7u8; 20], Network::Testnet),
+            "amount": "300000000", "fee": "0", "next_height": 11})).unwrap_err();
+        assert!(err.contains("another network"), "{err}");
 
-        // ── WAL-1: a lied UTXO value is detected through `prevtxs` ─────────
+        // ── WAL-1: a lied UTXO value cannot be spent: the v3 signature
+        // commits to the value the page claimed ───────────────────────────
         let prev = Transaction {
-            version: 1,
+            version: 3,
             inputs: vec![TxInput { prev_txid: [9; 32], prev_index: 0, script_sig: vec![], sequence: u32::MAX }],
             outputs: vec![TxOutput { value: 10_000_000_000, script_pubkey: spk.clone() }],
             locktime: 0,
         };
         let txid = hex::encode(prev.txid());
         let lied = json!([{"txid": txid, "index": 0, "value": "100050000", "script_pubkey": hex::encode(&spk)}]);
-        let plan = handle(&json!({"op": "plan", "utxos": lied, "to": to, "amount": "100000000", "fee": "0",
-            "next_height": 11})).unwrap();
-        assert_eq!(plan["prev_txids"], json!([txid]));
-        assert_eq!(plan["version"], 1);
+        // A supplied previous transaction is still checked before signing.
         let prevtxs = json!({ txid.clone(): hex::encode(prev.to_wire_bytes(true)) });
         let err = handle(&json!({"op": "pay", "utxos": lied, "to": to, "amount": "100000000", "fee": "0",
             "next_height": "11", "prevtxs": prevtxs})).unwrap_err();
         assert!(err.contains("refusing to sign"), "{err}");
-        let honest = json!([{"txid": txid, "index": 0, "value": "10000000000", "script_pubkey": hex::encode(&spk)}]);
-        let r = handle(&json!({"op": "pay", "utxos": honest, "to": to, "amount": "100000000", "fee": "0",
-            "next_height": "11", "prevtxs": prevtxs, "require_verified": true})).unwrap();
-        assert_eq!(r["verified_inputs"], 1);
-        // The maximum-fee guard cannot be bypassed through `fee`.
-        let err = handle(&json!({"op": "pay", "utxos": honest, "to": to, "amount": "1", "fee": "9900000000",
-            "next_height": "11"})).unwrap_err();
-        assert!(err.contains("guard"), "{err}");
-
-        // ── WAL-1 full fix: from the mainnet activation height, version 3 ──
-        let act = gnb_crypto::core::activation::MAINNET_HARDENING_ACTIVATION_HEIGHT;
-        let plan = handle(&json!({"op": "plan", "utxos": lied, "to": to, "amount": "100000000", "fee": "0",
-            "next_height": act.to_string()})).unwrap();
-        assert_eq!(plan["prev_txids"], json!([]), "nothing to fetch: the signature commits the values");
-        assert_eq!(plan["version"], 3);
         let r = handle(&json!({"op": "pay", "utxos": lied, "to": to, "amount": "100000000", "fee": "0",
-            "next_height": act.to_string(), "require_verified": true})).unwrap();
-        assert_eq!(r["version"], 3);
+            "next_height": "11", "require_verified": true})).unwrap();
         assert_eq!(r["amounts_committed"], true);
-        assert_eq!(r["unverified_inputs"], 0);
         let tx = Transaction::from_wire_bytes(&hex::decode(r["raw"].as_str().unwrap()).unwrap()).unwrap();
         let claimed = TxOutput { value: 100_050_000, script_pubkey: spk.clone() };
         let real = prev.outputs[0].clone();
         let verify = |spent: &TxOutput| gnb_crypto::core::sighash::verify_tx_scripts(
-            &tx, std::slice::from_ref(spent), gnb_crypto::core::ChainId::Mainnet, act, act);
+            &tx, std::slice::from_ref(spent), ChainId::ObenBlockMainnet, 11, 0);
         assert!(verify(&claimed).is_ok(), "valid for the value it was signed over");
         assert!(verify(&real).is_err(), "the lie invalidates it against the real coin");
+        // The maximum-fee guard cannot be bypassed through `fee`.
+        let honest = json!([{"txid": txid, "index": 0, "value": "10000000000", "script_pubkey": hex::encode(&spk)}]);
+        let err = handle(&json!({"op": "pay", "utxos": honest, "to": to, "amount": "1", "fee": "9900000000",
+            "next_height": "11"})).unwrap_err();
+        assert!(err.contains("guard"), "{err}");
 
         // ── Coinbase maturity: an immature coinbase output is never selected ─
         // (it used to be, largest-first, and every node refused the payment).
@@ -690,7 +829,7 @@ mod tests {
             r
         };
         let coins = json!([
-            row("33", "10000000000", Some(1_000)),       // 100 GNB, immature at 1_001
+            row("33", "10000000000", Some(1_000)),       // 100 OBB, immature at 1_001
             row("44", "200000000", Some(1_001 - m)),     // mature at 1_001 exactly
             row("55", "200000000", None),                // not a coinbase output
         ]);
@@ -703,9 +842,6 @@ mod tests {
         let r = pay_at(&coins, 1_001).unwrap();
         assert_eq!(r["inputs"], 2);
         assert!(!spent(&r).contains(&[0x33; 32]), "the immature coinbase output was selected");
-        let plan = handle(&json!({"op": "plan", "utxos": coins, "to": to, "amount": "300000000", "fee": "0",
-            "next_height": 1_001})).unwrap();
-        assert!(!plan["prev_txids"].as_array().unwrap().contains(&json!("33".repeat(32))), "{plan}");
         // At coinbase_height + COINBASE_MATURITY it is spendable (and, the
         // largest coin, chosen alone).
         assert_eq!(spent(&pay_at(&coins, 1_000 + m).unwrap()), vec![[0x33; 32]]);
@@ -715,6 +851,34 @@ mod tests {
         let mut bad = coins.clone();
         bad[0]["coinbase_height"] = json!("1000");
         assert!(pay_at(&bad, 1_001).is_err(), "a malformed coinbase_height is refused");
+
+        // ── Network selector: the same key on regtest signs for 0x4F420002 ─
+        let reg = handle(&json!({"op": "setnetwork", "network": "regtest"})).unwrap();
+        let reg_addr = reg["address"].as_str().unwrap().to_string();
+        assert_eq!(reg_addr, format!("obb1t{}", &addr[5..]));
+        assert_eq!(reg["network"], "regtest");
+        let reg_to = obb([7u8; 20], Network::Testnet);
+        let r = handle(&json!({"op": "pay", "utxos": utxos, "to": reg_to, "amount": "300000000", "fee": "0",
+            "next_height": 1})).unwrap();
+        let tx = Transaction::from_wire_bytes(&hex::decode(r["raw"].as_str().unwrap()).unwrap()).unwrap();
+        let spent2: Vec<TxOutput> = (0..2).map(|_| TxOutput { value: 200_000_000, script_pubkey: spk.clone() }).collect();
+        assert!(gnb_crypto::core::sighash::verify_tx_scripts(&tx, &spent2, ChainId::ObenBlockRegtest, 1, 0).is_ok());
+        assert!(gnb_crypto::core::sighash::verify_tx_scripts(&tx, &spent2, ChainId::ObenBlockMainnet, 1, 0).is_err());
+        assert!(handle(&json!({"op": "setnetwork", "network": "signet"})).is_err());
+        assert_eq!(handle(&json!({"op": "setnetwork", "testnet": false})).unwrap()["address"], addr);
+        handle(&json!({"op": "wipe"})).unwrap();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "key generation runs the PQClean keygen")]
+    fn regtest_create_makes_a_random_regtest_key() {
+        let _session = SESSION_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        for req in [json!({"op": "create", "network": "regtest"}), json!({"op": "create", "testnet": true})] {
+            let created = handle(&req).unwrap();
+            assert!(created["address"].as_str().unwrap().starts_with("obb1t"), "{created}");
+            assert!(created.get("words").is_none(), "no phrase on regtest");
+        }
+        assert!(handle(&json!({"op": "create", "network": "testnet3"})).is_err());
         handle(&json!({"op": "wipe"})).unwrap();
     }
 
@@ -766,7 +930,8 @@ mod tests {
         assert_eq!(call(json!({"op": "minfee", "size": 1u64 << 32})), json!({"error": "`size` too large"}));
         let to = Address::from_hash([7u8; 20], Network::Mainnet).to_string();
         let bloch = format!("bloch1q{}", &to[5..]);
-        assert_eq!(call(json!({"op": "normalize", "address": bloch})), json!({"ok": {"address": to}}));
+        assert_eq!(call(json!({"op": "normalize", "address": bloch})),
+            json!({"ok": {"address": format!("obb1q{}", &to[5..]), "network": "mainnet"}}));
         assert_eq!(call(json!({"op": "nope"})), json!({"error": "unknown op `nope`"}));
         let bad = call_through_abi(b"{not json");
         assert!(bad["error"].as_str().unwrap().starts_with("bad request: "), "{bad}");
@@ -799,10 +964,14 @@ mod tests {
         let ks = testnet_key.to_encrypted_json("Correct-Horse-9-battery").unwrap();
         let err = open_keypair(&json!({"json": ks, "password": "Correct-Horse-9-battery"})).unwrap_err();
         assert!(err.contains("mainnet was requested"), "{err}");
-        let opened = open_keypair(&json!({"json": ks, "password": "Correct-Horse-9-battery",
-            "network": "testnet"})).unwrap();
-        assert_eq!(opened.address, testnet_key.address);
-        assert!(open_keypair(&json!({"json": ks, "password": "x", "network": "regtest"}))
+        // ObenBlock regtest uses the Testnet address network: "regtest", or
+        // "testnet" as its older name.
+        for network in ["regtest", "testnet"] {
+            let opened = open_keypair(&json!({"json": ks, "password": "Correct-Horse-9-battery",
+                "network": network})).unwrap();
+            assert_eq!(opened.address, testnet_key.address);
+        }
+        assert!(open_keypair(&json!({"json": ks, "password": "x", "network": "signet"}))
             .unwrap_err().contains("unknown network"));
     }
 
@@ -877,27 +1046,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg_attr(miri, ignore = "bridgelock runs PQClean keygen and signing via unsupported C FFI")]
-    fn bridgelock_signs_the_version_of_the_target_height() {
-        let _session = SESSION_TESTS.lock().unwrap_or_else(|e| e.into_inner());
-        let created = handle(&json!({"op": "create", "mnemonic": false})).unwrap();
-        let addr = created["address"].as_str().unwrap().to_string();
-        let spk = Address::parse(&addr).unwrap().hash().to_vec();
-        let keys = vec![gnb_crypto::crypto::generate_keypair().0];
-        let vault = gnb_crypto::core::policy::SpendPolicy::new(1, keys, 0, 0).unwrap().script_pubkey();
-        let act = gnb_crypto::core::activation::MAINNET_HARDENING_ACTIVATION_HEIGHT;
-        for (next, version) in [(act - 1, 1u32), (act, 3)] {
-            let utxos = json!([{"txid": "44".repeat(32), "index": 0, "value": "500000000", "script_pubkey": hex::encode(&spk)}]);
-            let r = handle(&json!({"op": "bridgelock", "utxos": utxos, "vault_script": hex::encode(&vault),
-                "amount": "100000000", "l2": format!("0x{}", "ab".repeat(20)), "fee": "0", "next_height": next})).unwrap();
-            assert_eq!(r["version"], version, "next_height {next}");
-            let tx = gnb_crypto::core::Transaction::from_wire_bytes(&hex::decode(r["raw"].as_str().unwrap()).unwrap()).unwrap();
-            assert_eq!(tx.outputs[0].script_pubkey, vault);
-            assert_eq!(r["l2_recipient"], format!("0x{}", "ab".repeat(20)));
-        }
-        assert!(handle(&json!({"op": "bridgelock", "utxos": [], "vault_script": hex::encode(&vault),
-            "amount": "1", "l2": "0x00", "fee": "0"})).unwrap_err().contains("next_height"));
-        handle(&json!({"op": "wipe"})).unwrap();
+    fn bridgelock_is_refused_on_obenblock() {
+        let err = handle(&json!({"op": "bridgelock", "utxos": [], "vault_script": "", "amount": "1",
+            "l2": "0x00", "fee": "0", "next_height": 1})).unwrap_err();
+        assert!(err.contains("no Bloch bridge"), "{err}");
     }
 
 }

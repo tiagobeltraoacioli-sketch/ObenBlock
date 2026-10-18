@@ -1,5 +1,8 @@
-// gnb-smh.com explorer: data fetching, routing and DOM wiring. All markup is
-// built by /assets/explorer-views.js (escaped `html` templates, WAL-3).
+// obenblock.xyz explorer: data fetching, routing and DOM wiring. All markup is
+// built by /assets/explorer-views.js (escaped `html` templates, WAL-3). The
+// explorer API (deploy/explorer-api) shows ObenBlock's forms: obb1 addresses,
+// SHA-256d difficulty and block ids, and PoWit `finality` per block,
+// transaction and address movement.
 import { html, isAddress, canonicalAddress } from "/assets/safe.js";
 import * as V from "/assets/explorer-views.js";
 
@@ -59,11 +62,12 @@ function scrollDagEnd(root) { root.querySelectorAll(".dag").forEach((d) => (d.sc
 let lastSeen = new Set();
 async function viewHome(refresh = false) {
   if (!refresh) show(app, V.homeHead());
-  const [dag, supply, stats, pct, chain, dagWindow, hist, mem] = await Promise.all([
+  const [dag, supply, stats, pct, chain, dagWindow, hist, mem, pw] = await Promise.all([
     api("getdaginfo"), api("getsupplyinfo"), api("getchainstats"), api("getblocktimepercentiles"),
     api("getselectedchain", [0, 12]), api("getdagwindow", [90]), api("getdifficultyhistory", [100]), api("getmempoolstats"),
+    api("getpowitinfo").catch(() => null),
   ]);
-  show(document.getElementById("h-stats"), V.homeStats({ dag, supply, stats, pct, chain, mem }));
+  show(document.getElementById("h-stats"), V.homeStats({ dag, supply, stats, pct, chain, mem, pw }));
   const blocks = Array.isArray(chain.blocks) ? chain.blocks : [];
   const fresh = new Set(blocks.filter((b) => refresh && !lastSeen.has(b.hash)).map((b) => b.hash));
   lastSeen = new Set(blocks.map((b) => b.hash));
@@ -88,7 +92,19 @@ async function viewDag() {
 
 async function viewBlock(hash) {
   show(app, V.loading("Loading block"));
-  show(app, V.blockPage(await api("getblockdag", [hash])));
+  // getblock adds the block's PoWit body (witness shares, attestations).
+  const [b, full] = await Promise.all([api("getblockdag", [hash]), api("getblock", [hash, false]).catch(() => null)]);
+  show(app, V.blockPage(b, full));
+}
+
+async function viewFinality() {
+  show(app, V.finalityHead());
+  const [pw, info, chain] = await Promise.all([
+    api("getpowitinfo"), api("getfinalityinfo").catch(() => null), api("getselectedchain", [0, 10]).catch(() => ({ blocks: [] })),
+  ]);
+  const hashes = (Array.isArray(chain.blocks) ? chain.blocks : []).map((b) => b?.hash).filter((h) => /^[0-9a-f]{64}$/.test(h));
+  const blocks = (await Promise.all(hashes.map((h) => api("getblock", [h, false]).catch(() => null)))).filter(Boolean);
+  show(document.getElementById("fi"), V.finalityPage(pw, info, blocks));
 }
 
 async function viewTx(txid) {
@@ -100,7 +116,7 @@ async function viewTx(txid) {
 // (`next_cursor`); the node and the API refuse offsets above 10,000.
 async function viewAddress(addr, page = 0, cursor = null) {
   addr = await canonicalAddress(addr, api);
-  if (/^gnb1[mn]/.test(addr)) {
+  if (/^(?:obb|gnb)1[mn]/.test(addr)) {
     // The history index is single-key only; a valid policy alias must not
     // be sent to it or presented as an invalid address/empty history.
     show(app, html`<div class="pagehead"><h1>Policy address</h1><div class="hash">${addr}</div></div>
@@ -125,10 +141,12 @@ document.getElementById("search").addEventListener("submit", async (ev) => {
   ev.preventDefault();
   const input = document.getElementById("q").value.trim();
   // Preserve legacy/hex search casing without normalizing mixed-case Bech32m.
-  const q = /^(?:[0-9a-f]{64}|(?:gnb|bloch)1[qt][0-9a-f]{48}|gnb1[mn][0-9a-f]{72})$/i.test(input) ? input.toLowerCase() : input;
+  const q = /^(?:[0-9a-f]{64}|(?:obb|gnb|bloch)1[qt][0-9a-f]{48}|(?:obb|gnb)1[mn][0-9a-f]{72})$/i.test(input) ? input.toLowerCase() : input;
   if (!q) return;
   if (isAddress(q)) return go(`#/address/${q}`);
-  if (/^bloch1q[0-9a-f]{48}$/.test(q)) return go(`#/address/gnb1q${q.slice(7)}`);
+  // A Bloch key-hash address is the same owner: its checksum covers the hash
+  // only, so the obb1 form keeps it.
+  if (/^bloch1[qt][0-9a-f]{48}$/.test(q)) return go(`#/address/obb1${q[6]}${q.slice(7)}`);
   if (/^\d{1,12}$/.test(q)) {
     try {
       const dag = await api("getdaginfo");
@@ -143,7 +161,7 @@ document.getElementById("search").addEventListener("submit", async (ev) => {
     try { await api("getblockdag", [q]); return go(`#/block/${q}`); } catch {}
     return go(`#/tx/${q}`);
   }
-  show(app, html`<div class="err">Not a block hash, transaction id, gnb1q… address or height.</div>`);
+  show(app, html`<div class="err">Not a block hash, transaction id, obb1q… address or height.</div>`);
 });
 function go(h) { if (location.hash === h) route(); else location.hash = h; }
 
@@ -152,7 +170,7 @@ async function route() {
   const parts = location.hash.replace(/^#\/?/, "").split("/").filter(Boolean);
   const [v, a, b, c] = parts;
   document.querySelectorAll("[data-nav]").forEach((n) => n.removeAttribute("aria-current"));
-  const nav = { "": "home", blocks: "blocks", dag: "dag", holders: "holders" }[v || ""];
+  const nav = { "": "home", blocks: "blocks", dag: "dag", finality: "finality", holders: "holders" }[v || ""];
   if (nav) document.querySelector(`[data-nav="${nav}"]`)?.setAttribute("aria-current", "page");
   window.scrollTo(0, 0);
   const pageNo = (s) => (/^\d{1,6}$/.test(s || "") ? Number(s) : 0);
@@ -161,6 +179,7 @@ async function route() {
     else if (v === "blocks") await viewBlocks(pageNo(a));
     else if (v === "dag") { await viewDag(); timer = setInterval(() => viewDag().catch(() => {}), 15000); }
     else if (v === "holders") await viewHolders();
+    else if (v === "finality") { await viewFinality(); timer = setInterval(() => viewFinality().catch(() => {}), 15000); }
     else if (v === "block" && /^[0-9a-f]{64}$/.test(a)) await viewBlock(a);
     else if (v === "tx" && /^[0-9a-f]{64}$/.test(a)) await viewTx(a);
     else if (v === "address" && isAddress(a)) await viewAddress(a, pageNo(b), /^[0-9a-f]{32}$/.test(c || "") ? c : null);

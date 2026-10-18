@@ -1,6 +1,10 @@
-// GnB wallet core loader: runs gnb-wallet-wasm (wasm32-wasip1) in the browser.
-// The secret key stays inside the WebAssembly memory; this file only moves
-// JSON requests and responses. Randomness comes from crypto.getRandomValues.
+// ObenBlock wallet core loader: runs gnb-wallet-wasm (wasm32-wasip1) in the
+// browser. The secret key stays inside the WebAssembly memory; this file only
+// moves JSON requests and responses. Randomness comes from
+// crypto.getRandomValues. The core signs for ObenBlock only (chain id
+// 0x4F420001 on mainnet, 0x4F420002 on regtest; version-3 transactions from
+// height 0) and shows obb1 addresses; gnb1 and bloch1 strings are accepted
+// as aliases of the same script.
 const WASI_EBADF = 8, WASI_ESUCCESS = 0;
 
 // A number may already have lost integer precision before JSON serialization.
@@ -13,6 +17,26 @@ function exactContextInteger(value, name) {
     throw new Error(`${name} must be an unsigned decimal integer`);
   }
   return String(value);
+}
+
+/** The wallet networks: ObenBlock mainnet and the local regtest ("testnet" is
+ *  accepted as regtest's older name, the address network it uses). */
+export const NETWORKS = ["mainnet", "regtest"];
+export function walletNetwork(value) {
+  if (value === "mainnet" || value === "regtest") return value;
+  if (value === "testnet") return "regtest";
+  throw new Error("unknown wallet network (expected mainnet or regtest)");
+}
+
+/** The network of the node an API answers for, from getnetworkinfo's
+ *  chain_id: "mainnet" (0x4f420001) or "regtest" (0x4f420002). Anything else
+ *  (a GnB node, a missing field) is refused: the page must never sign for a
+ *  chain it does not know. */
+export function networkOfChainId(chainId) {
+  const id = typeof chainId === "string" ? chainId.toLowerCase() : "";
+  if (id === "0x4f420001") return "mainnet";
+  if (id === "0x4f420002") return "regtest";
+  throw new Error(`the node is not an ObenBlock node (chain id ${typeof chainId === "string" ? chainId : "unknown"})`);
 }
 
 // WAL-5: the SHA-256 of the binary is mandatory; app.js passes the hash that
@@ -72,29 +96,35 @@ export async function loadCore(url, sha256Hex) {
     return out.ok;
   }
   return {
-    open: (json, password, network = "mainnet") => {
-      if (network !== "mainnet" && network !== "testnet") throw new Error("unknown wallet network");
-      return call({ op: "open", json, password, network });
+    // The chain this core signs for (name, chain id, prefixes, version 3).
+    chain: (network = "mainnet") => call({ op: "chain", network: walletNetwork(network) }),
+    open: (json, password, network = "mainnet") => call({ op: "open", json, password, network: walletNetwork(network) }),
+    // WAL-7: mainnet keys are phrase-backed. A regtest key is random and
+    // backed up by its encrypted keystore. `network` is "mainnet" or
+    // "regtest"; a boolean (true = regtest) is accepted for older callers.
+    create: (network = "mainnet") => {
+      if (typeof network === "boolean") network = network ? "regtest" : "mainnet";
+      const net = walletNetwork(network);
+      return call({ op: "create", mnemonic: true, network: net });
     },
-    // WAL-7: mainnet remains phrase-backed by default. The existing Rust
-    // testnet path returns a random key backed up by its encrypted keystore.
-    create: (testnet = false) => {
-      if (typeof testnet !== "boolean") throw new Error("testnet must be a boolean");
-      return call({ op: "create", mnemonic: true, testnet });
-    },
+    setNetwork: (network) => call({ op: "setnetwork", network: walletNetwork(network) }),
     restore: (words) => call({ op: "restore", words }),
     exportKeystore: (password) => call({ op: "export", password }).keystore,
-    // WAL-1: `nextHeight` is the node's getdaginfo next_block_height; it selects
-    // the transaction version (3 / sighash v3 from the hardening activation
-    // height, 1 below it). Version 1 only: the outpoints whose previous
-    // transactions should be fetched...
+    // WAL-1: `nextHeight` is the node's getdaginfo next_block_height. On
+    // ObenBlock every payment is version 3 / sighash v3, whose signature
+    // commits to every spent value, so `prev_txids` is always empty...
     plan: (utxos, to, amount, fee, nextHeight) => call({ op: "plan", utxos, to, amount: String(amount), fee: String(fee), next_height: String(nextHeight) }),
-    // ...and the payment, with those transactions (txid -> raw hex) so the
-    // core can check the claimed UTXO values before it signs. A version-3
-    // signature commits to every spent value, so nothing needs fetching.
+    // ...and the payment; supplied previous transactions (txid -> raw hex)
+    // are still checked against the claimed UTXO values before signing.
     pay: (utxos, to, amount, fee, nextHeight, prevtxs = {}) => call({ op: "pay", utxos, to, amount: String(amount), fee: String(fee), next_height: String(nextHeight), prevtxs }),
     address: () => call({ op: "address" }).address,
     normalize: (address, format = "legacy") => call({ op: "normalize", address, format }).address,
+    // The obb1 form of any accepted address string and its network
+    // ("mainnet" or "regtest"); throws on a bad checksum.
+    classify: (address) => {
+      const r = call({ op: "normalize", address: String(address ?? "").trim() });
+      return { address: r.address, network: r.network };
+    },
     minFee: (size) => call({ op: "minfee", size }).fee,
     // BIP174-style public roles; the document remains a string so duplicate
     // JSON fields reach the strict shared parser. Caller-supplied `op` cannot

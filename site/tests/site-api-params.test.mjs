@@ -68,8 +68,11 @@ print(json.dumps(bad))
 
 test("every literal argument a page sends passes the explorer API's validation", () => {
   const args = literalArguments();
-  assert.ok(args.some(([, m]) => m === "getutxos"), "the scan must see the wallets' getutxos calls");
-  assert.ok(args.length >= 15, `only ${args.length} literal arguments found`);
+  // The wallet's getutxos limits are constants (core.js UTXO_WINDOW /
+  // UTXO_WIDE_WINDOW), checked against the API by wallet-api-window.test.mjs.
+  assert.ok(args.some(([, m]) => m === "getdifficultyhistory"), "the scan must see the explorer's calls");
+  assert.ok(args.some(([, m]) => m === "getaddresshistory"), "the scan must see the wallet's history call");
+  assert.ok(args.length >= 10, `only ${args.length} literal arguments found`);
   const bad = JSON.parse(execFileSync("python3", ["-I", "-c", CHECK, API_PY, JSON.stringify(args)], { encoding: "utf8" }));
   assert.deepEqual(bad, []);
 });

@@ -327,7 +327,7 @@ class ExplorerApiTests(unittest.TestCase):
             m = re.search(r"export const [^;]*\bUTXO_WIDE_WINDOW = (\d+)[,;]", fh.read())
         self.assertIsNotNone(m, "core.js exports UTXO_WIDE_WINDOW")
         wide = int(m.group(1))
-        addr = "gnb1q" + "00" * 24
+        addr = "obb1q" + "00" * 24
         status, doc = self.server.get(f'/v1/getutxos?p=["{addr}",{wide}]')
         self.assertEqual(status, 200, doc)
         self.assertEqual(doc["result"]["params"], [addr, wide])
@@ -338,7 +338,7 @@ class ExplorerApiTests(unittest.TestCase):
         with open(os.path.join(root, "node", "src", "storage", "indexer.rs"), encoding="utf-8") as fh:
             m = re.search(r"pub const MAX_HISTORY_OFFSET: usize = ([0-9_]+);", fh.read())
         node_max = int(m.group(1).replace("_", ""))
-        addr = "gnb1q" + "00" * 24
+        addr = "obb1q" + "00" * 24
         cursor = "0" * 31 + "1"
         status, doc = self.server.get(f'/v1/getaddresshistory?p=["{addr}",25,{node_max},"{cursor}"]')
         self.assertEqual(status, 200, doc)

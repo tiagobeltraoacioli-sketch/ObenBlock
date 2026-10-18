@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Read-only HTTP API in front of a GnB node, for the gnb-smh.com explorer.
+"""Read-only HTTP API in front of an ObenBlock (or GnB) node, for the
+obenblock.xyz explorer and web wallet.
 
     GET /v1/<method>?p=<JSON array of params>     -> {"result": ...} | {"error": ...}
     GET /v1/carryover/<address>                    -> carryover share of one address
@@ -10,6 +11,25 @@ Only methods in ALLOWED are forwarded, with validated parameters, to the
 node's localhost JSON-RPC. Responses are cached briefly. Every request must
 carry the shared secret in X-GnB-Key (set by the Cloudflare Worker), so the
 origin is not an open public API. Standard library only.
+
+ObenBlock (OBB_CHAIN=obenblock, the default; docs/DESIGN-obenblock.md):
+  * the node's RPC is on port 18210 (GnB: 17210);
+  * addresses: obb1q/obb1t (key hash), obb1m/obb1n (policy) and the v2
+    obb/tobb forms are accepted, and so are the GnB (gnb1…) and Bloch
+    (bloch1q/bloch1t) forms of the same script; any legacy gnb1… string
+    left in an answer is shown as its obb1… form (a policy address gets the
+    checksum over the obb1m/obb1n prefix);
+  * proof of work is SHA-256d over the 80-byte header: answers that carry
+    compact `bits` get `difficulty` on Bitcoin's scale (difficulty 1 = bits
+    0x1d00ffff, the ObenBlock pow limit), `pow: "sha256d"`, and block answers
+    get `pow_hash`, the block id in the byte order Bitcoin tools display
+    (reversed; the explorer keeps `hash` for lookups);
+  * PoWit finality: block, chain, transaction and address-history answers
+    get `finality` ("finalized" at or below the finalized checkpoint the
+    node's getpowitinfo reports, else "pending"; "off-chain" for a block
+    that is not merged), and getdaginfo gets `finalized_height`,
+    `finalized_hash` and `justified_height`; getnetworkinfo reports the chain
+    from its chain id. getfinalityinfo is served as well.
 
 Hardening (audit WAL-2, WAL-4, NET-12, B1-T10, B2-T4):
   * binds 127.0.0.1 by default: expose it through a Cloudflare Tunnel, or
@@ -48,8 +68,10 @@ Hardening (audit WAL-2, WAL-4, NET-12, B1-T10, B2-T4):
     number of client addresses (the node also applies its own budget to
     anonymous sendrawtransaction calls, docs/RUNNING.md).
 
-Environment:
-    GNB_RPC_URL              node JSON-RPC (default http://127.0.0.1:17210/)
+Environment (each GNB_* name may also be given as OBB_*, which wins):
+    OBB_CHAIN                "obenblock" (default) or "gnb"
+    GNB_RPC_URL              node JSON-RPC (default http://127.0.0.1:18210/ on
+                             ObenBlock, http://127.0.0.1:17210/ on GnB)
     GNB_API_BIND             bind address   (default 127.0.0.1)
     GNB_API_PORT             bind port      (default 2086)
     GNB_API_KEY_FILE         file holding the shared secret (required, mode 0600/0640)
@@ -85,11 +107,29 @@ import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-RPC_URL = os.environ.get("GNB_RPC_URL", "http://127.0.0.1:17210/")
+def env(name, default=None):
+    """`OBB_<name>`, else `GNB_<name>`, else `default`."""
+    for prefix in ("OBB_", "GNB_"):
+        value = os.environ.get(prefix + name)
+        if value is not None:
+            return value
+    return default
+
+
+CHAIN = env("CHAIN", "obenblock").strip().lower()
+if CHAIN not in ("obenblock", "gnb"):
+    raise SystemExit(f"OBB_CHAIN must be obenblock or gnb, not {CHAIN!r}")
+OBENBLOCK = CHAIN == "obenblock"
+# docs/DESIGN-obenblock.md §2: ObenBlock's default RPC port is 18210.
+DEFAULT_RPC_PORT = 18210 if OBENBLOCK else 17210
+RPC_URL = env("RPC_URL", f"http://127.0.0.1:{DEFAULT_RPC_PORT}/")
 API_KEY = b""
 
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
-ADDR = re.compile(r"^(gnb1[qt][0-9a-f]{48}|gnb1[mn][0-9a-f]{72})$")
+# Legacy forms: ObenBlock's own, GnB's (the same scripts) and, for a key
+# hash, Bloch's. Only the GnB forms on a GnB API.
+ADDR = re.compile(r"^((?:obb|gnb)1[qt][0-9a-f]{48}|(?:obb|gnb)1[mn][0-9a-f]{72}|bloch1[qt][0-9a-f]{48})$"
+                  if OBENBLOCK else r"^(gnb1[qt][0-9a-f]{48}|gnb1[mn][0-9a-f]{72})$")
 IP_TEXT = re.compile(r"^[0-9a-fA-F:.]{2,45}$")
 
 
@@ -124,7 +164,8 @@ def _re(rx, what):
 HASH = _re(HEX64, "64-char lowercase hex")
 # Routing is syntax-only. BIP350 checksum/network validation is performed by
 # the RPC; carryover is local and therefore uses _carryover_address below.
-V2_ADDR = re.compile(r"(?:t?gnb1zq[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{38}|t?gnb1zp[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{58})")
+V2_HRPS = "(?:obb|gnb)" if OBENBLOCK else "gnb"
+V2_ADDR = re.compile(rf"(?:t?{V2_HRPS}1zq[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{{38}}|t?{V2_HRPS}1zp[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{{58}})")
 
 
 def ADDRESS(value):
@@ -133,7 +174,7 @@ def ADDRESS(value):
             return value
         if (value == value.lower() or value == value.upper()) and V2_ADDR.fullmatch(value.lower()):
             return value
-    raise ValueError("GnB address expected")
+    raise ValueError("ObenBlock address expected" if OBENBLOCK else "GnB address expected")
 
 
 U32 = _int(0, 2**32 - 1)
@@ -182,10 +223,13 @@ ALLOWED = {
     "getaddresshistory":       ([ADDRESS, PAGE, HISTORY_OFFSET, CURSOR], 5),
     # B1-T11: O(1) on the node (holder aggregate).
     "getbalance":              ([ADDRESS], 5),
-    # B2-T3: up to the web wallet's wide window (the sidechain wallet,
-    # site/wallet/main.js, asks for 500 rows; the explorer for 100 and 200).
+    # B2-T3: up to the web wallet's wide window (site/wallet/core.js
+    # UTXO_WIDE_WINDOW); the explorer asks for 100 and 200.
     "getutxos":                ([ADDRESS, _int(1, GETUTXOS_MAX)], 2),
     "getpowitinfo":            ([], 3),
+    # The finality pin, its origin, the Bloch anchor and the finalized
+    # checkpoints it counts (bounded output on the node).
+    "getfinalityinfo":         ([], 5),
     "getblock":                ([HASH, BOOL], 10),
     "getblockhash":            ([U32], 5),
     "gettransaction":          ([HASH], 5),
@@ -235,6 +279,229 @@ def cached(key, ttl, fn):
     return value
 
 
+# ── ObenBlock presentation (docs/DESIGN-obenblock.md §2, §4, §6) ─────────────
+#
+# The node rates `difficulty` against the GnB-SMH pow limit and names the
+# GnB-SMH generation in `pow`, and nodes before the address-family binding
+# (integration 19c1d65) wrote addresses with the GnB prefixes; the explorer
+# and the wallet show ObenBlock's forms. Applied to every answer on an
+# ObenBlock API (never on a GnB one), after the cache, so a cached raw answer
+# is shown the same way each time; idempotent on answers that already carry
+# obb1 strings. Pure functions of the answer plus two cached reads
+# (getpowitinfo, and getblockdag for the chain block that merged a block).
+
+GNB_KEY = re.compile(r"^gnb1([qt])([0-9a-f]{48})$")
+GNB_POLICY = re.compile(r"^gnb1([mn])([0-9a-f]{64})([0-9a-f]{8})$")
+BITS = re.compile(r"^(?:0x)?[0-9a-f]{8}$")
+# Bitcoin's difficulty 1: the target of compact bits 0x1d00ffff, which is
+# ObenBlock's pow limit (docs/DESIGN-obenblock.md §4.2).
+DIFF1_TARGET = 0xFFFF << 208
+
+
+def _sha3d4(data):
+    return hashlib.sha3_256(hashlib.sha3_256(data).digest()).digest()[:4]
+
+
+def obb_address(text):
+    """The obb1… form of a legacy gnb1… string (anything else unchanged). A
+    key-hash checksum covers the hash only, so only the prefix changes; a
+    policy checksum covers the prefix, so it is recomputed, after checking
+    the gnb1 one (a string with a bad checksum is left as it is)."""
+    m = GNB_KEY.match(text)
+    if m:
+        return f"obb1{m.group(1)}{m.group(2)}"
+    m = GNB_POLICY.match(text)
+    if m:
+        kind, h = m.group(1), bytes.fromhex(m.group(2))
+        if _sha3d4(f"gnb1{kind}".encode() + h).hex() != m.group(3):
+            return text
+        return f"obb1{kind}{h.hex()}{_sha3d4(f'obb1{kind}'.encode() + h).hex()}"
+    return text
+
+
+def gnb_address(text):
+    """The gnb1… form of a legacy obb1… or bloch1… string (for the carryover
+    table, keyed by GnB strings); anything else unchanged."""
+    m = re.match(r"^(?:obb|bloch)1([qt])([0-9a-f]{48})$", text)
+    if m:
+        return f"gnb1{m.group(1)}{m.group(2)}"
+    m = re.match(r"^obb1([mn])([0-9a-f]{64})([0-9a-f]{8})$", text)
+    if m:
+        kind, h = m.group(1), bytes.fromhex(m.group(2))
+        if _sha3d4(f"obb1{kind}".encode() + h).hex() == m.group(3):
+            return f"gnb1{kind}{h.hex()}{_sha3d4(f'gnb1{kind}'.encode() + h).hex()}"
+    return text
+
+
+def bits_target(bits):
+    """The target of compact `bits` (int or "0x…" hex), as Bitcoin decodes it."""
+    if isinstance(bits, str):
+        if not BITS.match(bits):
+            return None
+        bits = int(bits, 16)
+    if not isinstance(bits, int) or isinstance(bits, bool) or not 0 <= bits < 2**32:
+        return None
+    exponent, mantissa = bits >> 24, bits & 0x007FFFFF
+    if bits & 0x00800000:
+        return None  # negative: never valid
+    return mantissa >> (8 * (3 - exponent)) if exponent <= 3 else mantissa << (8 * (exponent - 3))
+
+
+def sha256d_difficulty(bits):
+    """Difficulty on Bitcoin's scale: DIFF1_TARGET / target (None if invalid)."""
+    target = bits_target(bits)
+    if not target:
+        return None
+    return DIFF1_TARGET / target
+
+
+def pow_hash(block_hash):
+    """The block id in the byte order Bitcoin tools display (reversed)."""
+    if isinstance(block_hash, str) and HEX64.match(block_hash):
+        return bytes.fromhex(block_hash)[::-1].hex()
+    return None
+
+
+def _addresses(value):
+    """Every string of `value` that is a legacy gnb1… address, shown as obb1…."""
+    if isinstance(value, str):
+        return obb_address(value)
+    if isinstance(value, list):
+        return [_addresses(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _addresses(v) for k, v in value.items()}
+    return value
+
+
+def _cached_rpc(name, params, ttl):
+    return cached(name + json.dumps(params), ttl, lambda: rpc(name, params))
+
+
+def finality_heights():
+    """(finalized block height, finalized hash, justified block height) from
+    the node's getpowitinfo, or Nones when it has none (yet)."""
+    try:
+        info = _cached_rpc("getpowitinfo", [], ALLOWED["getpowitinfo"][1]).get("result")
+    except Exception:
+        return None, None, None
+    if not isinstance(info, dict):
+        return None, None, None
+
+    def height(cp):
+        h = cp.get("block_height") if isinstance(cp, dict) else None
+        return h if isinstance(h, int) and not isinstance(h, bool) and h >= 0 else None
+
+    fin = info.get("finalized")
+    fin_hash = fin.get("hash") if isinstance(fin, dict) and HEX64.match(str(fin.get("hash", ""))) else None
+    return height(fin), fin_hash, height(info.get("justified"))
+
+
+def chain_finality(height, finalized):
+    """Finality of a selected-chain block (or of what it applied) at `height`."""
+    if finalized is None or not isinstance(height, int) or isinstance(height, bool):
+        return None
+    return "finalized" if height <= finalized else "pending"
+
+
+def merged_finality(colour, height, merged_by, finalized):
+    """Finality of a block of `colour`: a chain block by its own height, a
+    merged (blue/red) one by the height of the chain block that merged it, a
+    block nothing merged yet is "off-chain"."""
+    if finalized is None:
+        return None
+    if colour == "chain":
+        return chain_finality(height, finalized)
+    if colour in ("blue", "red") and isinstance(merged_by, str) and HEX64.match(merged_by):
+        try:
+            merger = _cached_rpc("getblockdag", [merged_by], ALLOWED["getblockdag"][1]).get("result")
+        except Exception:
+            return None
+        if isinstance(merger, dict) and merger.get("colour") == "chain":
+            return chain_finality(merger.get("height"), finalized)
+        return None
+    return "off-chain"
+
+
+def _block_fields(block, finalized):
+    """SHA-256d and finality fields of one block object (in place)."""
+    if not isinstance(block, dict):
+        return
+    if "bits" in block:
+        block["difficulty"] = sha256d_difficulty(block.get("bits"))
+    if "hash" in block and pow_hash(block.get("hash")):
+        block["pow"] = "sha256d"
+        block["pow_hash"] = pow_hash(block["hash"])
+
+
+CHAIN_IDS = {"0x4f420001": ("obenblock", "mainnet"), "0x4f420002": ("obenblock", "regtest"),
+             "0x474e0001": ("gnb", "mainnet"), "0x474e0002": ("gnb", "testnet")}
+
+
+def present(name, params, doc):
+    """An ObenBlock API's view of the node's answer `doc` to `name`."""
+    if not OBENBLOCK or "result" not in doc:
+        return doc
+    res = _addresses(doc["result"])
+    finalized, fin_hash, justified = (None, None, None)
+    if name in ("getblockdag", "getblock", "getselectedchain", "gettransactionfull", "gettxstatus",
+                "getaddresshistory", "getdaginfo"):
+        # One cached getpowitinfo read (3 s) serves every annotation.
+        finalized, fin_hash, justified = finality_heights()
+    if name == "getnetworkinfo" and isinstance(res, dict):
+        # The chain and network from the chain id (nodes before integration
+        # 9032726 reported the literal "gnb").
+        known = CHAIN_IDS.get(str(res.get("chain_id", "")).lower())
+        if known:
+            res["chain"], res["network"] = known
+    elif name == "getpowitinfo" and isinstance(res, dict):
+        res["pow"] = "sha256d"
+    elif name in ("getblockdag", "getblock") and isinstance(res, dict):
+        # getblock's "pow" named the GnB-SMH generation of the height.
+        _block_fields(res, finalized)
+        res["pow"] = "sha256d"
+        if name == "getblockdag":
+            res["finality"] = merged_finality(res.get("colour"), res.get("height"), res.get("merged_by"), finalized)
+        res["finalized_height"] = finalized
+    elif name == "getselectedchain" and isinstance(res, dict) and isinstance(res.get("blocks"), list):
+        for b in res["blocks"]:
+            _block_fields(b, finalized)
+            if isinstance(b, dict):
+                b["finality"] = chain_finality(b.get("height"), finalized)
+        res["finalized_height"] = finalized
+    elif name in ("gettransactionfull", "gettxstatus") and isinstance(res, dict):
+        if res.get("status") == "confirmed":
+            colour = res.get("block_colour")
+            if colour == "chain":
+                res["finality"] = chain_finality(res.get("block_height"), finalized)
+            elif colour in ("blue", "red"):
+                try:
+                    blk = _cached_rpc("getblockdag", [res.get("block_hash")], ALLOWED["getblockdag"][1]).get("result")
+                except Exception:
+                    blk = None
+                res["finality"] = (merged_finality(colour, None, blk.get("merged_by"), finalized)
+                                   if isinstance(blk, dict) else None)
+            else:
+                res["finality"] = "off-chain" if finalized is not None else None
+        elif res.get("status") == "mempool":
+            res["finality"] = "pending"
+        res["finalized_height"] = finalized
+    elif name == "getaddresshistory" and isinstance(res, dict) and isinstance(res.get("items"), list):
+        for item in res["items"]:
+            if isinstance(item, dict):
+                item["finality"] = chain_finality(item.get("height"), finalized)
+        res["finalized_height"] = finalized
+    elif name == "getdaginfo" and isinstance(res, dict):
+        res["finalized_height"] = finalized
+        res["finalized_hash"] = fin_hash
+        res["justified_height"] = justified
+        res["pow"] = "sha256d"
+    elif name == "getdifficultyhistory" and isinstance(res, dict) and isinstance(res.get("points"), list):
+        for p in res["points"]:
+            if isinstance(p, dict):
+                p["difficulty"] = sha256d_difficulty(p.get("bits", p.get("bits_hex")))
+    return {"result": res}
+
+
 # ── per-client rate limiting (WAL-4, B1-T10, B2-T4) ─────────────────────────
 
 def client_key(text):
@@ -267,7 +534,7 @@ class RateLimiter:
 
     def __init__(self, per_min, max_clients=None):
         self.per_min = per_min
-        self.max_clients = max_clients or int(os.environ.get("GNB_API_MAX_CLIENTS", "50000"))
+        self.max_clients = max_clients or int(env("API_MAX_CLIENTS", "50000"))
         self.windows = collections.OrderedDict()
         self.evictions = 0
         self.lock = threading.Lock()
@@ -318,11 +585,11 @@ class ByteBudget:
             return True
 
 
-GET_LIMIT = RateLimiter(int(os.environ.get("GNB_API_RATE_PER_MIN", "240")))
-POST_LIMIT = RateLimiter(int(os.environ.get("GNB_API_POST_PER_MIN", "6")))
-POST_BYTES = ByteBudget(int(os.environ.get("GNB_API_POST_BYTES_PER_MIN", "2000000")))
+GET_LIMIT = RateLimiter(int(env("API_RATE_PER_MIN", "240")))
+POST_LIMIT = RateLimiter(int(env("API_POST_PER_MIN", "6")))
+POST_BYTES = ByteBudget(int(env("API_POST_BYTES_PER_MIN", "2000000")))
 # Re-audit B2-R2-2 (reads): one window shared by every cross-site read.
-CROSS_SITE_LIMIT = RateLimiter(int(os.environ.get("GNB_API_CROSS_SITE_PER_MIN", "240")), max_clients=1)
+CROSS_SITE_LIMIT = RateLimiter(int(env("API_CROSS_SITE_PER_MIN", "240")), max_clients=1)
 CROSS_SITE_KEY = "cross-site"
 
 RATE_LIMITED = {"error": "rate limit exceeded; retry in a minute"}
@@ -336,6 +603,7 @@ _carry = {}
 
 
 def _address(h20: bytes, testnet=False) -> str:
+    """The GnB string of a key hash: the carryover table is keyed by it."""
     c = hashlib.sha3_256(hashlib.sha3_256(h20).digest()).digest()[:4]
     return ("gnb1t" if testnet else "gnb1q") + (h20 + c).hex()
 
@@ -369,7 +637,9 @@ def _carryover_address(value):
     """
     ADDRESS(value)
     if ADDR.fullmatch(value):
-        return value  # Existing legacy behavior and table keys are unchanged.
+        # Existing legacy behavior and table keys (gnb1…) are unchanged; an
+        # obb1…/bloch1… string is the same key hash.
+        return gnb_address(value)
     lower = value.lower()
     hrp, data = lower.rsplit("1", 1)
     alphabet = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
@@ -396,7 +666,8 @@ def _carryover_address(value):
             payload.append((acc >> bits) & 0xff)
     if bits >= 5 or (acc & ((1 << bits) - 1)) or len(payload) != (20 if kind == 0 else 32):
         raise ValueError("invalid address padding or length")
-    prefix = ("gnb1t" if hrp == "tgnb" else "gnb1q") if kind == 0 else ("gnb1n" if hrp == "tgnb" else "gnb1m")
+    test = hrp in ("tgnb", "tobb")
+    prefix = ("gnb1t" if test else "gnb1q") if kind == 0 else ("gnb1n" if test else "gnb1m")
     checksum_input = (prefix.encode("ascii") if kind == 1 else b"") + payload
     legacy_checksum = hashlib.sha3_256(hashlib.sha3_256(checksum_input).digest()).digest()[:4]
     return prefix + (payload + legacy_checksum).hex()
@@ -405,21 +676,22 @@ def _carryover_address(value):
 def carryover_of(address):
     address = _carryover_address(address)
     v = _carry.get(address)
+    shown = obb_address(address) if OBENBLOCK else address
     if not v:
-        return {"result": {"address": address, "in_carryover": False}}
-    return {"result": {"address": address, "in_carryover": True, "amount": str(v[0]),
+        return {"result": {"address": shown, "in_carryover": False}}
+    return {"result": {"address": shown, "in_carryover": True, "amount": str(v[0]),
                        "utxos": v[1], "bloch_amount": str(v[2])}}
 
 
 # ── HTTP ─────────────────────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "gnb-explorer-api"
+    server_version = "obenblock-explorer-api" if OBENBLOCK else "gnb-explorer-api"
     sys_version = ""
     # Per-read socket timeout (BaseHTTPRequestHandler applies it in setup()).
-    timeout = float(os.environ.get("GNB_API_TIMEOUT", "10"))
+    timeout = float(env("API_TIMEOUT", "10"))
     # Absolute deadline for a whole connection, whatever the client sends.
-    deadline = float(os.environ.get("GNB_API_DEADLINE", "30"))
+    deadline = float(env("API_DEADLINE", "30"))
 
     def setup(self):
         super().setup()
@@ -522,7 +794,7 @@ class Handler(BaseHTTPRequestHandler):
             if self.over_read_limit():
                 return self.send(429, RATE_LIMITED)
             ck = name + json.dumps(params)
-            result = cached(ck, ttl, lambda: rpc(name, params))
+            result = present(name, params, cached(ck, ttl, lambda: rpc(name, params)))
             return self.send(200 if "result" in result else 404, result, ttl)
         except (ValueError, json.JSONDecodeError) as e:
             return self.send(400, {"error": str(e)})
@@ -645,15 +917,18 @@ def make_server(bind, port, max_connections, cert=None, key=None):
 
 def main():
     global API_KEY
-    API_KEY = load_api_key(os.environ["GNB_API_KEY_FILE"])
-    bind = os.environ.get("GNB_API_BIND", "127.0.0.1")
-    port = int(os.environ.get("GNB_API_PORT", "2086"))
-    cert, key = os.environ.get("GNB_API_TLS_CERT"), os.environ.get("GNB_API_TLS_KEY")
+    key_file = env("API_KEY_FILE")
+    if not key_file:
+        raise SystemExit("set OBB_API_KEY_FILE (or GNB_API_KEY_FILE): the shared secret file")
+    API_KEY = load_api_key(key_file)
+    bind = env("API_BIND", "127.0.0.1")
+    port = int(env("API_PORT", "2086"))
+    cert, key = env("API_TLS_CERT"), env("API_TLS_KEY")
     if bind not in ("127.0.0.1", "::1", "localhost") and not cert:
         raise SystemExit("refusing to serve plain HTTP on a non-loopback address; set "
                          "GNB_API_TLS_CERT/GNB_API_TLS_KEY or use a Cloudflare Tunnel (README.md)")
-    threading.Thread(target=load_carryover, args=(os.environ.get("GNB_CARRYOVER"),), daemon=True).start()
-    httpd = make_server(bind, port, int(os.environ.get("GNB_API_MAX_CONNECTIONS", "64")), cert, key)
+    threading.Thread(target=load_carryover, args=(env("CARRYOVER"),), daemon=True).start()
+    httpd = make_server(bind, port, int(env("API_MAX_CONNECTIONS", "64")), cert, key)
     httpd.serve_forever()
 
 

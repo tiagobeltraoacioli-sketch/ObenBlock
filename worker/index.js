@@ -1,16 +1,26 @@
 import { isAddress } from "../site/assets/safe.js";
 
-// gnb-smh.com: static site plus a read-only explorer API proxy.
+// obenblock.xyz: static site plus a read-only explorer API proxy.
 //
 //   /api/<method>?p=<JSON params>  -> origin /v1/<method>  (edge-cached briefly)
+//   POST /api/sendrawtransaction   -> origin /v1/sendrawtransaction (broadcast)
 //   everything else                -> static assets in ./site
 //
-// The origin is the explorer API on a GnB node. It accepts only requests that
-// carry the shared secret (Worker secret GNB_API_KEY), so the node is reached
-// exclusively through this Worker.
+// The origin is the explorer API (deploy/explorer-api) on an ObenBlock node.
+// It accepts only requests that carry the shared secret (Worker secret
+// OBB_API_KEY, or GNB_API_KEY), so the node is reached exclusively through
+// this Worker. The origins are the variable OBB_ORIGINS (or GNB_ORIGINS).
+// Cloudflare Workers cannot fetch a bare IP address, so each origin is a host
+// name (for the launch hosts, wildcard-DNS names that embed the address; the
+// list is configuration, worker/README.md, never code).
+//
+// Redirects (GET/HEAD of pages only, never /api/*):
+// - www.<CANONICAL_HOST> -> CANONICAL_HOST (variable; unset: no redirect);
+// - the retired GnB pages /wallet/ and /explorer/ -> /wallet and /explorer
+//   (the fragment, e.g. #/tx/<id>, is kept by the browser).
 //
 // Audit fixes:
-// - WAL-2: origins come from the GNB_ORIGINS variable (comma- or space-
+// - WAL-2: origins come from the OBB_ORIGINS / GNB_ORIGINS variable (comma- or space-
 //   separated) and must be https:// URLs (TLS on the origin or a Cloudflare
 //   Tunnel hostname, see deploy/explorer-api/README.md); plain http:// origins
 //   are refused, so the shared secret, UTXO values and broadcast transactions
@@ -42,6 +52,7 @@ const TTL = {
   getblockcount: 3, getdaginfo: 3, getselectedchain: 3, getdagwindow: 3,
   getchainstats: 30, gethashrate: 30, getdifficultyhistory: 30, getblocktimepercentiles: 30,
   getrichlist: 60, getsupplydistribution: 60, getrawtransaction: 60, carryover: 300,
+  getpowitinfo: 3, getfinalityinfo: 5, getnetworkinfo: 5,
 };
 export const ttlFor = (path) => TTL[path.split("/")[0]] ?? DEFAULT_TTL;
 
@@ -53,11 +64,42 @@ export function parseOrigins(value) {
   });
 }
 
+/** The explorer origins and the shared key: the OBB_* names, else GNB_*. */
+export const originsOf = (env) => parseOrigins(env.OBB_ORIGINS ?? env.GNB_ORIGINS);
+const apiKeyOf = (env) => env.OBB_API_KEY ?? env.GNB_API_KEY;
+
+// Pages of the GnB site that ObenBlock does not serve: its sidechain wallet
+// and its older explorer.
+const RETIRED = new Map([
+  ["/wallet/", "/wallet"], ["/wallet/index.html", "/wallet"],
+  ["/explorer/", "/explorer"], ["/explorer/index.html", "/explorer"],
+]);
+
+/** A 301 for a page request that has a canonical location, or null. */
+export function redirectFor(request, url, env) {
+  if (request.method !== "GET" && request.method !== "HEAD") return null;
+  if (url.pathname.startsWith("/api/")) return null;
+  const canonical = typeof env.CANONICAL_HOST === "string" ? env.CANONICAL_HOST.trim().toLowerCase() : "";
+  let target = null;
+  if (canonical && url.hostname === `www.${canonical}`) {
+    target = new URL(url);
+    target.hostname = canonical;
+  }
+  if (RETIRED.has(url.pathname)) {
+    target = target || new URL(url);
+    target.pathname = RETIRED.get(url.pathname);
+  }
+  if (!target) return null;
+  return withSecurityHeaders(url, new Response(null, { status: 301, headers: { location: target.toString() } }));
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    if (!url.pathname.startsWith("/api/")) return withSecurityHeaders(url, await env.ASSETS.fetch(request));
-    const origins = parseOrigins(env.GNB_ORIGINS);
+    if (!url.pathname.startsWith("/api/")) {
+      return redirectFor(request, url, env) || withSecurityHeaders(url, await env.ASSETS.fetch(request));
+    }
+    const origins = originsOf(env);
     if (!origins.length) return json({ error: "explorer backend not configured" }, 503);
     if (url.pathname === "/api/sendrawtransaction") return broadcast(request, env, origins);
     if (request.method !== "GET") return json({ error: "method not allowed" }, 405);
@@ -69,7 +111,7 @@ export default {
     if (p.length > 512) return json({ error: "params too long" }, 400);
     const path = rest.join("/");
     const ttl = ttlFor(path);
-    const cacheKey = new Request(`https://cache.gnb-smh.com/${path}?p=${encodeURIComponent(p)}`);
+    const cacheKey = new Request(`https://cache.obenblock.xyz/${path}?p=${encodeURIComponent(p)}`);
     const cache = caches.default;
     const hit = await cache.match(cacheKey);
     if (hit) return hit;
@@ -101,7 +143,8 @@ export default {
 
 function originHeaders(request, env, extra = {}) {
   return {
-    "x-gnb-key": env.GNB_API_KEY,
+    // The header keeps its GnB name: the explorer API reads X-GnB-Key.
+    "x-gnb-key": apiKeyOf(env),
     "x-gnb-client-ip": request.headers.get("cf-connecting-ip") || "",
     ...extra,
   };
@@ -139,8 +182,8 @@ export function isCrossSite(request, url) {
  * without CORS headers, so the browser never sends the POST. Independently,
  * a request a browser marks as coming from another origin (Sec-Fetch-Site
  * other than same-origin / none, or an Origin header that is not this
- * host's) is refused: only the site's own pages (site/wallet/app.js,
- * site/shared/gnb.js, both same-origin JSON fetches) and non-browser
+ * host's) is refused: only the site's own pages (site/wallet/app.js, a
+ * same-origin JSON fetch) and non-browser
  * clients (CLI wallets, scripts: no Origin, no Sec-Fetch-Site) broadcast.
  *
  * Bitcoin Core's RPC has the same property by construction: it sends no
