@@ -121,6 +121,8 @@ fn activation_source(chain: ChainId, activation: u64) -> &'static str {
     let schedule = match chain {
         ChainId::Mainnet => MAINNET_ACT,
         ChainId::Testnet => TESTNET_ACT,
+        // The vectors cover GnB's two networks only.
+        ChainId::ObenBlockMainnet | ChainId::ObenBlockRegtest => unreachable!("GnB vectors only"),
     };
     if activation == schedule { "schedule" } else { "explicit" }
 }
@@ -521,6 +523,7 @@ fn net_name(c: ChainId) -> &'static str {
     match c {
         ChainId::Mainnet => "mainnet",
         ChainId::Testnet => "testnet",
+        ChainId::ObenBlockMainnet | ChainId::ObenBlockRegtest => unreachable!("GnB vectors only"),
     }
 }
 

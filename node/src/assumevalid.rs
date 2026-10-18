@@ -166,6 +166,8 @@ pub const MAINNET_ASSUME_VALID: Option<AssumedValidBlock> = None;
 pub const TESTNET_ASSUME_VALID: Option<AssumedValidBlock> = None;
 /// Regtest: none (Core's regtest has none either).
 pub const REGTEST_ASSUME_VALID: Option<AssumedValidBlock> = None;
+/// ObenBlock mainnet: none at launch (docs/DESIGN-obenblock.md §3).
+pub const OBENBLOCK_ASSUME_VALID: Option<AssumedValidBlock> = None;
 
 /// The default assumed-valid block of a network.
 pub const fn default_assume_valid(net: core::activation::ActivationNetwork) -> Option<AssumedValidBlock> {
@@ -173,6 +175,7 @@ pub const fn default_assume_valid(net: core::activation::ActivationNetwork) -> O
         core::activation::ActivationNetwork::Mainnet => MAINNET_ASSUME_VALID,
         core::activation::ActivationNetwork::Testnet => TESTNET_ASSUME_VALID,
         core::activation::ActivationNetwork::Regtest => REGTEST_ASSUME_VALID,
+        core::activation::ActivationNetwork::ObenBlockMainnet => OBENBLOCK_ASSUME_VALID,
     }
 }
 

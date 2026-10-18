@@ -291,6 +291,9 @@ pub const MAINNET_MINIMUM_CHAIN_WORK: u128 = core::MIN_CHAIN_WORK;
 pub const TESTNET_MINIMUM_CHAIN_WORK: u128 = 0;
 /// Regtest: 0 (Bitcoin Core's regtest value).
 pub const REGTEST_MINIMUM_CHAIN_WORK: u128 = 0;
+/// ObenBlock mainnet: 0 at launch (docs/DESIGN-obenblock.md §3); each
+/// release sets it from independent nodes (`tools/release/min_chain_work.py`).
+pub const OBENBLOCK_MINIMUM_CHAIN_WORK: u128 = 0;
 
 /// The default minimum chain work of a network.
 pub const fn default_minimum_chain_work(net: core::activation::ActivationNetwork) -> u128 {
@@ -298,6 +301,7 @@ pub const fn default_minimum_chain_work(net: core::activation::ActivationNetwork
         core::activation::ActivationNetwork::Mainnet => MAINNET_MINIMUM_CHAIN_WORK,
         core::activation::ActivationNetwork::Testnet => TESTNET_MINIMUM_CHAIN_WORK,
         core::activation::ActivationNetwork::Regtest => REGTEST_MINIMUM_CHAIN_WORK,
+        core::activation::ActivationNetwork::ObenBlockMainnet => OBENBLOCK_MINIMUM_CHAIN_WORK,
     }
 }
 

@@ -65,7 +65,9 @@ use crate::transport::{stream::KyberStream, RxStream, TxStream, STREAM_KEY_SIZE}
 
 // ── Protocol constants ──────────────────────────────────────────────────────
 
-/// multistream-select protocol id.
+/// multistream-select protocol id of GnB (mainnet and testnet). Another
+/// chain negotiates its own ([`PqConfig::with_protocol_id`];
+/// `core::chain::ChainParams::transport_protocol`).
 pub const PQ_PROTOCOL_ID: &str = "/gnb/pq/2.0.0";
 
 /// Handshake version carried in `Init`.
@@ -126,11 +128,21 @@ pub struct PqConfig {
     keypair: identity::Keypair,
     pq: Arc<PqIdentity>,
     pins: Arc<PeerPins>,
+    protocol_id: &'static str,
 }
 
 impl PqConfig {
     pub fn new(keypair: &identity::Keypair, pq: Arc<PqIdentity>, pins: Arc<PeerPins>) -> Self {
-        Self { keypair: keypair.clone(), pq, pins }
+        Self { keypair: keypair.clone(), pq, pins, protocol_id: PQ_PROTOCOL_ID }
+    }
+
+    /// Negotiate `protocol_id` instead of [`PQ_PROTOCOL_ID`] (the node's
+    /// chain, `network::chain_separation::ChainProtocols::transport`). Peers
+    /// offering another id fail multistream-select before any handshake
+    /// byte is read.
+    pub fn with_protocol_id(mut self, protocol_id: &'static str) -> Self {
+        self.protocol_id = protocol_id;
+        self
     }
 }
 
@@ -139,7 +151,7 @@ impl UpgradeInfo for PqConfig {
     type InfoIter = iter::Once<Self::Info>;
 
     fn protocol_info(&self) -> Self::InfoIter {
-        iter::once(PQ_PROTOCOL_ID)
+        iter::once(self.protocol_id)
     }
 }
 

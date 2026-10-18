@@ -119,10 +119,13 @@ pub const TESTNET_PARAMS: PowitParams = PowitParams {
     ban_epochs: 3,
 };
 
+/// The PoWit parameters of `chain`. ObenBlock mainnet uses the mainnet
+/// clock and its regtest the testnet one; ObenBlock's own window and leak
+/// (docs/DESIGN-obenblock.md §5.2, §6.2) are set by those packages.
 pub fn params_for(chain: ChainId) -> PowitParams {
     match chain {
-        ChainId::Mainnet => MAINNET_PARAMS,
-        ChainId::Testnet => TESTNET_PARAMS,
+        ChainId::Mainnet | ChainId::ObenBlockMainnet => MAINNET_PARAMS,
+        ChainId::Testnet | ChainId::ObenBlockRegtest => TESTNET_PARAMS,
     }
 }
 

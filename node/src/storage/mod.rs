@@ -2124,14 +2124,14 @@ impl Storage {
                             hex::encode(&block[..8]), height,
                             match found {
                                 crate::core::ChainId::Mainnet => "pre-activation (legacy)",
-                                crate::core::ChainId::Testnet => "hardened",
+                                _ => "hardened",
                             },
                             found.to_u32(),
                             match found {
                                 crate::core::ChainId::Mainnet => " (or to a testnet started before testnet's \
                                     hardening, whose blocks the testnet rules reject anyway: start testnet with \
                                     a new --data-dir)",
-                                crate::core::ChainId::Testnet => "",
+                                _ => "",
                             },
                             chain_id,
                         ));

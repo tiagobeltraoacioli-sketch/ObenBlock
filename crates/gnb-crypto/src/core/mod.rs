@@ -55,36 +55,47 @@ pub const NETWORK_MAGIC:         u32   = 0x474E_4231;
 pub const SIGHASH_DOMAIN:  [u8; 16] = *b"GNB-SIGHASH-v1\0\0";
 pub const SIGHASH_VERSION: u8       = 0x02;
 
-/// Chain-ID registry (u32, serialized little-endian). 0x474E = "GN".
+/// Chain-ID registry (u32, serialized little-endian). 0x474E = "GN" (GnB),
+/// 0x4F42 = "OB" (ObenBlock, docs/DESIGN-obenblock.md §2).
 /// An explicit consensus input derived from the node's network, never from a
 /// transaction and never from a compile-time flag. New networks get a new
-/// discriminant; never reuse one.
+/// discriminant; never reuse one. The chain each id belongs to, its address
+/// network and its network parameters are in [`chain`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum ChainId {
+    /// GnB mainnet.
     Mainnet = 0x474E_0001,
+    /// GnB testnet.
     Testnet = 0x474E_0002,
+    /// ObenBlock mainnet.
+    ObenBlockMainnet = 0x4F42_0001,
+    /// ObenBlock regtest (local development; ObenBlock has no public testnet).
+    ObenBlockRegtest = 0x4F42_0002,
 }
 
 impl ChainId {
     #[inline] pub const fn to_u32(self) -> u32 { self as u32 }
     #[inline] pub fn to_le_bytes(self) -> [u8; 4] { (self as u32).to_le_bytes() }
-
-    pub const fn for_network(net: crate::address::Network) -> ChainId {
-        match net {
-            crate::address::Network::Mainnet => ChainId::Mainnet,
-            crate::address::Network::Testnet => ChainId::Testnet,
-        }
-    }
 }
 
+/// Chain identity and network parameters: GnB or ObenBlock, and each one's
+/// networks (ports, DNS seeds, protocol ids).
+pub mod chain;
+
 // Process-wide chain-id used by consensus validation. Set once at node startup
-// from the network selection; defaults to Mainnet if never set.
+// from the network selection; defaults to the process chain's mainnet (GnB
+// mainnet unless `chain::set_process_chain` chose ObenBlock) if never set.
 static NODE_CHAIN_ID: std::sync::OnceLock<ChainId> = std::sync::OnceLock::new();
 
-/// Set the process-wide node chain-id (idempotent for the same value). Returns
-/// `Err(existing)` if already set to a different value.
+/// Set the process-wide node chain-id (idempotent for the same value). Also
+/// fixes the process chain (`chain::set_process_chain`) to the id's chain.
+/// Returns `Err(existing)` if already set to a different value, or if the
+/// process chain was already fixed to the other chain.
 pub fn set_node_chain_id(id: ChainId) -> Result<(), ChainId> {
+    if chain::set_process_chain(id.chain()).is_err() {
+        return Err(node_chain_id());
+    }
     match NODE_CHAIN_ID.set(id) {
         Ok(()) => Ok(()),
         Err(_) => {
@@ -94,9 +105,11 @@ pub fn set_node_chain_id(id: ChainId) -> Result<(), ChainId> {
     }
 }
 
-/// The node-level chain-id. Defaults to Mainnet until `set_node_chain_id`.
+/// The node-level chain-id. Until `set_node_chain_id`, the mainnet of the
+/// process chain: GnB mainnet unless the process selected ObenBlock.
 pub fn node_chain_id() -> ChainId {
-    *NODE_CHAIN_ID.get().unwrap_or(&ChainId::Mainnet)
+    NODE_CHAIN_ID.get().copied()
+        .unwrap_or_else(|| ChainId::for_chain(chain::process_chain(), crate::address::Network::Mainnet))
 }
 
 // ── PoW + PoWit activation ───────────────────────────────────────────────────
@@ -112,6 +125,11 @@ pub const POWIT_HEIGHT_MAINNET: u64 = 10_000;
 
 /// Testnet default when no `--powit-height` is given: off.
 pub const POWIT_HEIGHT_TESTNET: u64 = u64::MAX;
+
+/// ObenBlock (mainnet and regtest): PoWit from genesis
+/// (docs/DESIGN-obenblock.md §3; the witness set is empty for the first two
+/// epochs).
+pub const POWIT_HEIGHT_OBENBLOCK: u64 = 0;
 
 static POWIT_HEIGHT_OVERRIDE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
 
@@ -132,6 +150,7 @@ pub fn powit_height() -> u64 {
     POWIT_HEIGHT_OVERRIDE.get().copied().unwrap_or(match node_chain_id() {
         ChainId::Mainnet => POWIT_HEIGHT_MAINNET,
         ChainId::Testnet => POWIT_HEIGHT_TESTNET,
+        ChainId::ObenBlockMainnet | ChainId::ObenBlockRegtest => POWIT_HEIGHT_OBENBLOCK,
     })
 }
 
@@ -2718,6 +2737,47 @@ mod chain_id_tests {
         let h_test = tx.sighash(0, ChainId::Testnet);
         assert!(!crate::crypto::verify(&pk, &h_test, &sig),
                 "cross-chain-id replay MUST be rejected");
+    }
+
+    /// docs/DESIGN-obenblock.md §2: the chain id separates GnB and ObenBlock
+    /// in every signed digest (sighash v2 and v3, signed messages, PoWit
+    /// attestations v1 and v2), so nothing signed for one of the four
+    /// networks is valid on another.
+    #[test]
+    fn every_signed_digest_is_separated_across_the_four_chain_ids() {
+        use std::collections::HashSet;
+        let tx = two_input_tx();
+        let spent = vec![TxOutput { value: 7, script_pubkey: vec![1u8; 20] },
+                         TxOutput { value: 8, script_pubkey: vec![2u8; 20] }];
+        let (src, tgt) = (powit::Checkpoint { height: 0, hash: [1; 32] },
+                          powit::Checkpoint { height: 720, hash: [2; 32] });
+        let witness = kes::KesSigner::generate(1, [9u8; 32], |_| {}).unwrap().public();
+        let digests = |c: ChainId| [
+            tx.sighash(0, c),
+            tx.sighash_v3(&spent, 0, 3, c).unwrap(),
+            crate::crypto::signed_message_digest_v2(c, b"message"),
+            powit::attestation_message(c, &src, &tgt),
+            powit::attestation_message_v2(c, &witness, &src, &tgt),
+        ];
+        for kind in 0..5 {
+            let set: HashSet<[u8; 32]> = ChainId::ALL.iter().map(|&c| digests(c)[kind]).collect();
+            assert_eq!(set.len(), ChainId::ALL.len(), "digest kind {kind}");
+        }
+        // A GnB mainnet signature does not verify on ObenBlock mainnet.
+        let (pk, sk) = crate::crypto::generate_keypair();
+        let sig = crate::crypto::sign(&sk, &tx.sighash(0, ChainId::Mainnet)).unwrap();
+        assert!(crate::crypto::verify(&pk, &tx.sighash(0, ChainId::Mainnet), &sig));
+        assert!(!crate::crypto::verify(&pk, &tx.sighash(0, ChainId::ObenBlockMainnet), &sig));
+    }
+
+    /// GnB keeps its digests: the ObenBlock ids add networks, they change
+    /// nothing for GnB (`node_chain_id` and `ChainId::for_network` still
+    /// answer GnB in a process that selected no chain).
+    #[test]
+    fn unset_process_keeps_gnb_ids() {
+        assert_eq!(node_chain_id(), ChainId::Mainnet);
+        assert_eq!(powit_height(), POWIT_HEIGHT_MAINNET);
+        assert_eq!(chain::params(ChainId::ObenBlockMainnet).chain_id, ChainId::ObenBlockMainnet);
     }
 }
 
