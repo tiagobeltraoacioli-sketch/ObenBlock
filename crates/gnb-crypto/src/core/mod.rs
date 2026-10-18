@@ -335,7 +335,7 @@ pub fn expected_bits(parent_timestamp: u64, height: u64) -> Result<u32, String> 
     #[cfg(feature = "test-pow-limit")]
     if pow_limit_pinned_on_this_thread() {
         let _ = (parent_timestamp, height);
-        return Ok(target_to_bits(&bits_to_target(POW_LIMIT_BITS)));
+        return Ok(target_to_bits(&bits_to_target(pow_scheme::node_sha256d_params().map_or(POW_LIMIT_BITS, |p| p.pow_limit_bits))));
     }
     #[allow(unreachable_code)]
     expected_bits_at(parent_timestamp, height, activation::hardening_activation_height())
@@ -344,7 +344,7 @@ pub fn expected_bits(parent_timestamp: u64, height: u64) -> Result<u32, String> 
 /// The real ASERT rule with an explicit activation height. Never pinned by
 /// the `test-pow-limit` feature, so the pow-limit boundary can be tested in
 /// any build.
-pub fn expected_bits_at(parent_timestamp: u64, height: u64, activation_height: u64) -> Result<u32, String> {
+pub fn expected_bits_at(parent_timestamp: u64, height: u64, activation_height: u64) -> Result<u32, String> { if let Some(p) = pow_scheme::node_sha256d_params() { return p.expected_bits(parent_timestamp, height); } // ObenBlock
     let parent_time = i64::try_from(parent_timestamp)
         .map_err(|_| format!("parent timestamp {parent_timestamp} out of range"))?;
     let bits = gnb_smh::difficulty::asert_next_bits(
@@ -1168,7 +1168,7 @@ fn pow_cache() -> &'static std::sync::Mutex<PowCache> {
 impl Block {
     /// Block identity: SHA3-256 over a domain label, the PoW preimage and the
     /// nonce. Cheap, and distinct from the (expensive) PoW output.
-    pub fn block_hash(&self) -> [u8; 32] {
+    pub fn block_hash(&self) -> [u8; 32] { if pow_scheme::node_sha256d_params().is_some() { return self.header.sha256d_block_id(); } // ObenBlock
         let mut h = Sha3_256::new();
         h.update(b"GNB-BLOCK-ID-v1");
         h.update(self.header.pow_preimage());
@@ -1348,7 +1348,7 @@ impl Block {
     /// checks the proof against the header's own `bits`; that `bits` equals
     /// the consensus-expected value is checked by the caller (`expected_bits`,
     /// always canonical) — first, since it is cheap and this is not.
-    pub fn validate_pow(&self) -> bool {
+    pub fn validate_pow(&self) -> bool { if let Some(p) = pow_scheme::node_sha256d_params() { return pow_scheme::validate_pow_sha256d(self, &p); } // ObenBlock
         let target = match gnb_smh::difficulty::try_canonical_bits_to_target(self.header.bits) {
             Some(t) => t,
             None => return false,
@@ -1413,7 +1413,7 @@ impl Block {
     /// `POW_LIMIT_BITS`, so the limit stays `POW_LIMIT_BITS` there too (a
     /// node binary with that feature refuses mainnet; POW-9 / POW-3 are
     /// therefore not reachable in the functional tests).
-    pub fn pow_limit_target_for_height(height: u64) -> [u8; 32] {
+    pub fn pow_limit_target_for_height(height: u64) -> [u8; 32] { if let Some(p) = pow_scheme::node_sha256d_params() { return p.pow_limit().0; } // ObenBlock: every height, every build
         if TEST_POW_LIMIT {
             return bits_to_target(POW_LIMIT_BITS);
         }
@@ -2415,7 +2415,7 @@ pub fn bits_to_work(bits: u32) -> u128 {
 /// Chain-work contribution of a block at `height` with `bits`: v3 blocks are
 /// normalised by `POW_V3_DIFFICULTY_SHIFT` so cumulative work is continuous
 /// across the switch. Every place that adds a block's work must call this.
-pub fn block_work(bits: u32, height: u64) -> u128 {
+pub fn block_work(bits: u32, height: u64) -> u128 { if pow_scheme::node_sha256d_params().is_some() { return pow_scheme::sha256d_block_work(bits); } // ObenBlock
     match pow_algo(height) {
         gnb_smh::Algo::V1 => bits_to_work(bits),
         gnb_smh::Algo::V3 => bits_to_work(bits) >> POW_V3_DIFFICULTY_SHIFT,
@@ -3117,3 +3117,8 @@ impl Block {
         }
     }
 }
+
+/// Proof-of-work scheme selector: GnB-SMH (default, GnB) or SHA-256d
+/// (ObenBlock, docs/DESIGN-obenblock.md §4). Declared at the end of the file
+/// (audit WAL-5).
+pub mod pow_scheme;
