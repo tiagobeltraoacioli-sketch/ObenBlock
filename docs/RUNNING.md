@@ -811,6 +811,38 @@ metric `gnb_finality_anchor_unknown` = 1. Check the hash and height you
 gave, and that your peers serve that chain; `setfinalitycheckpoint
 default` or `none` removes the setting.
 
+Replacing a wrong anchor. Because the node holds its last pin whatever its
+origin, a wrong anchor the node holds is replaced by a correct one directly
+only if the node can still store the correct block: when the correct chain
+is within the anti-DoS window of the node's tip (less than 360 blocks of
+work lighter, docs/CONSENSUS.md, "Anti-DoS work rule"), its blocks arrive
+as usual, the new anchor becomes known and the pin moves to it. When the
+correct chain is lighter than that, setting the new anchor first leaves the
+node stuck: it holds the wrong pin, the correct chain does not extend it,
+so the node pulls none of its blocks on a finality claim, and the work rule
+drops them all. The new anchor never arrives. Recover in this order:
+
+```sh
+# 1. Remove the wrong anchor (it persists; it overrides --finalitycheckpoint and the release's).
+GNB_RPC_API_KEY=<key> gnb-cli setfinalitycheckpoint none
+# 2. If `gnb-cli finality` still shows a pin on the wrong chain (its own
+#    finality there), set aside the wrong chain's lowest finalized checkpoint
+#    above the fork, and every one above it:
+GNB_RPC_API_KEY=<key> gnb-cli ignorefinalized <wrong-chain-checkpoint-above-the-fork>
+# 3. Let the node fetch the correct chain: with the pin at or below the fork
+#    it pulls that chain's blocks below the work threshold when they claim a
+#    newer finality than its pin. If they do not, feed it the blocks from the
+#    fork point up with `submitblock` (it skips the anti-DoS work rule), read
+#    from a node on that chain.
+# 4. Once the correct block is stored (`gnb-cli getblock <correct-hash>`), anchor it:
+GNB_RPC_API_KEY=<key> gnb-cli setfinalitycheckpoint <correct-hash> [dag-height]
+```
+
+After step 4 every finalized checkpoint that conflicts with the new anchor
+stops counting, so the checkpoints set aside in step 2 need no
+`reconsiderfinalized`. Until then the node has no anchor: run the sequence
+with peers you trust.
+
 ## Chain-state check at start-up
 
 Before anything else the node verifies the integrity chain over its stored
