@@ -1,0 +1,591 @@
+{
+ "cpu_miner": null,
+ "elapsed_ms": 412,
+ "host": "obb-mainnet-136",
+ "metrics": {
+  "node": null,
+  "stratum": {
+   "obb_stratum_blocks_accepted_total": 37.0,
+   "obb_stratum_blocks_found_total": 37.0,
+   "obb_stratum_blocks_rejected_total": 0.0,
+   "obb_stratum_rpc_failures_total": 0.0,
+   "obb_stratum_share_work_total": 1900000000.0,
+   "obb_stratum_shares_accepted_total": 4410.0,
+   "obb_stratum_shares_duplicate_total": 0.0,
+   "obb_stratum_shares_low_difficulty_total": 3.0,
+   "obb_stratum_shares_rejected_total": 12.0,
+   "obb_stratum_shares_stale_total": 9.0,
+   "obb_stratum_template_bits": 386000000.0,
+   "obb_stratum_template_height": 1001.0,
+   "obb_stratum_template_parent_count": 1.0,
+   "obb_stratum_templates_total": 2100.0,
+   "obb_stratum_workers_active": 2.0,
+   "obb_stratum_workers_authorized": 2.0,
+   "obb_stratum_workers_total": 5.0
+  }
+ },
+ "probe_version": 1,
+ "proc_name": "obenblock",
+ "processes": [
+  {
+   "args": "/opt/obenblock/current/obenblock --chain obenblock --data-dir /var/lib/obenblock --carryover-snapshot /etc/obenblock/carryover.bin --listen /ip4/0.0.0.0/tcp/18110 --rpc-port 18210 --archive --mine --miner-address LAUNCH-PLACEHOLDER-obb1-address --mine-threads 27 --no-default-dns-seed --peer /ip4/209.250.236.240/tcp/18110",
+   "etime": "1-02:03:04",
+   "etimes": 93784,
+   "pcpu": 187.5,
+   "pid": 41237,
+   "rss_kb": 1843200
+  }
+ ],
+ "rpc": {
+  "genesis": "9e000000000000009e000000000000009e000000000000009e00000000000000",
+  "getdaginfo": {
+   "below_minimum_chain_work": false,
+   "block_count": 1340,
+   "chain_length": 1001,
+   "hardening_activation_height": 0,
+   "hardening_active": true,
+   "k": 18,
+   "minimum_chain_work": "0",
+   "next_block_height": 1001,
+   "no_verdict": [],
+   "stopped": null,
+   "tip": "c0000000000003e8c0000000000003e8c0000000000003e8c0000000000003e8",
+   "tip_blue_score": 1200,
+   "tip_blue_work": "123456789012345",
+   "tip_count": 1,
+   "tip_height": 1000,
+   "tips": [
+    "c0000000000003e8c0000000000003e8c0000000000003e8c0000000000003e8"
+   ],
+   "warnings": []
+  },
+  "getfinalityinfo": {
+   "against_anchor": false,
+   "anchor": null,
+   "anchor_overdue": false,
+   "anchor_source": "none",
+   "anchor_status": "none",
+   "bloch_anchor": {
+    "advisory": true,
+    "alert": false,
+    "anchor": {
+     "block_id": "c000000000000384c000000000000384c000000000000384c000000000000384",
+     "chain_id": 1329725441,
+     "finalized_at": 1792996000,
+     "record": "0000000000000000abababababababababababababababababababababababababababababababababababababababab",
+     "record_id": "e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1e1",
+     "slot": 15,
+     "w_digest": "7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d7d"
+    },
+    "corroborated_slot": 15,
+    "detail": null,
+    "enabled": true,
+    "last_error": null,
+    "last_poll": 1792999700,
+    "registry_alarm": null,
+    "source": "http://127.0.0.1:8545",
+    "status": "consistent"
+   },
+   "conflict": null,
+   "conflict_resolution": null,
+   "conflicting_finalized": 0,
+   "finalized": [
+    {
+     "block_height": 960,
+     "hash": "c0000000000003c0c0000000000003c0c0000000000003c0c0000000000003c0",
+     "slot": 30
+    },
+    {
+     "block_height": 928,
+     "hash": "c0000000000003a0c0000000000003a0c0000000000003a0c0000000000003a0",
+     "slot": 29
+    }
+   ],
+   "finalized_count": 2,
+   "ignored": [],
+   "ignored_finalized": 0,
+   "minimum_chain_work": "0",
+   "origin": "finalized",
+   "own_finality": {
+    "block_height": 960,
+    "hash": "c0000000000003c0c0000000000003c0c0000000000003c0c0000000000003c0"
+   },
+   "pin": {
+    "block_height": 960,
+    "hash": "c0000000000003c0c0000000000003c0c0000000000003c0c0000000000003c0"
+   },
+   "poci": {
+    "absent_weight": [
+     {
+      "epoch": 30,
+      "keys": 0,
+      "over_a_third": false,
+      "weight": "0"
+     },
+     {
+      "epoch": 31,
+      "keys": 1,
+      "over_a_third": false,
+      "weight": "11342745564031282115445820247725607"
+     }
+    ],
+    "active": true,
+    "bans": [],
+    "config_epoch": 30,
+    "config_id": "5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+    "configurations": 2,
+    "entries": 3,
+    "finalized": {
+     "hash": "c0000000000003c0c0000000000003c0c0000000000003c0c0000000000003c0",
+     "slot": 30
+    },
+    "finalized_certificate": {
+     "available": true,
+     "chain_id": 1329725441,
+     "checkpoint": {
+      "block_height": 960,
+      "hash": "c0000000000003c0c0000000000003c0c0000000000003c0c0000000000003c0",
+      "slot": 30
+     },
+     "config_entries": 3,
+     "config_epoch": 30,
+     "config_id": "5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+     "config_total": "340282366920938463463374607431768211",
+     "finalized_at": 995,
+     "finalized_by": "c0000000000003e3c0000000000003e3c0000000000003e3c0000000000003e3",
+     "hands_off_to": null,
+     "signed_weight": "340282366920938463463374607431768211",
+     "size": 2140,
+     "target": {
+      "block_height": 992,
+      "hash": "c0000000000003e0c0000000000003e0c0000000000003e0c0000000000003e0",
+      "slot": 31
+     },
+     "version": 1,
+     "votes": 3
+    },
+    "growth_cap": {
+     "credited_epochs": 8,
+     "last_step": null,
+     "ledger_epoch": 31
+    },
+    "params_digest": "9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a",
+    "previous_config_id": "4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b",
+    "prune_after_epochs": 4,
+    "pruned": [],
+    "total": "340282366920938463463374607431768211"
+   },
+   "recorded_checkpoints": 31,
+   "recorded_sources": 3
+  },
+  "gethashrate": {
+   "avg_block_time_secs": 30.4,
+   "avg_dag_block_interval_secs": 27.1,
+   "current_difficulty": 838000.0,
+   "hashrate_hs": 120000000000000.0,
+   "hashrate_human": "120.00 TH/s",
+   "note": "hashrate_hs counts every DAG block"
+  },
+  "getmempoolinfo": {
+   "bytes": 2210,
+   "policy": {
+    "min_relay_fee_rate_sat_per_byte": 1
+   },
+   "rolling_min_fee_rate_sat_per_byte": 1,
+   "size": 3
+  },
+  "getnetworkinfo": {
+   "behind_by": 0,
+   "best_announced": 1200,
+   "blocks": 1201,
+   "blue_score": 1200,
+   "chain": "obenblock",
+   "chain_id": "0x4f420001",
+   "hardening_activation_height": 0,
+   "mempool": 3,
+   "net_protocol": 2,
+   "network": "mainnet",
+   "peers": 2,
+   "protocol": 3,
+   "pruned_height": 0,
+   "syncing": false,
+   "version": "0.2.0",
+   "warnings": []
+  },
+  "getpeers": {
+   "peer_count": 2,
+   "peers": [
+    {
+     "address": "/ip4/209.250.236.240/tcp/18110/p2p/12D3KooWSyntheticPeerB",
+     "ip": "209.250.236.240",
+     "peer_id": "12D3KooWSyntheticPeerB"
+    },
+    {
+     "address": "/ip4/152.236.5.112/tcp/18110/p2p/12D3KooWSyntheticPeerC",
+     "ip": "152.236.5.112",
+     "peer_id": "12D3KooWSyntheticPeerC"
+    }
+   ]
+  },
+  "getpowitinfo": {
+   "activation_height": 0,
+   "active": true,
+   "barred_keys": 0,
+   "epoch": 31,
+   "exited_keys": 0,
+   "finality_conflict": false,
+   "finalized": {
+    "block_height": 960,
+    "hash": "c0000000000003c0c0000000000003c0c0000000000003c0c0000000000003c0",
+    "slot": 30
+   },
+   "hardening2_activation_height": 0,
+   "inactivity_leak": "none (PoCI)",
+   "justified": {
+    "block_height": 992,
+    "hash": "c0000000000003e0c0000000000003e0c0000000000003e0c0000000000003e0",
+    "slot": 31
+   },
+   "liveness_active": true,
+   "params": {
+    "checkpoint_interval": 32,
+    "epoch_len": 32,
+    "max_witnesses": 64,
+    "window_epochs": 4
+   },
+   "pin": {
+    "block_height": 960,
+    "hash": "c0000000000003c0c0000000000003c0c0000000000003c0c0000000000003c0",
+    "origin": "finalized"
+   },
+   "poci": {
+    "absent_weight": [
+     {
+      "epoch": 30,
+      "keys": 0,
+      "over_a_third": false,
+      "weight": "0"
+     },
+     {
+      "epoch": 31,
+      "keys": 1,
+      "over_a_third": false,
+      "weight": "11342745564031282115445820247725607"
+     }
+    ],
+    "active": true,
+    "bans": [],
+    "config_epoch": 30,
+    "config_id": "5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+    "configurations": 2,
+    "entries": 3,
+    "finalized": {
+     "hash": "c0000000000003c0c0000000000003c0c0000000000003c0c0000000000003c0",
+     "slot": 30
+    },
+    "finalized_certificate": {
+     "available": true,
+     "chain_id": 1329725441,
+     "checkpoint": {
+      "block_height": 960,
+      "hash": "c0000000000003c0c0000000000003c0c0000000000003c0c0000000000003c0",
+      "slot": 30
+     },
+     "config_entries": 3,
+     "config_epoch": 30,
+     "config_id": "5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c5c",
+     "config_total": "340282366920938463463374607431768211",
+     "finalized_at": 995,
+     "finalized_by": "c0000000000003e3c0000000000003e3c0000000000003e3c0000000000003e3",
+     "hands_off_to": null,
+     "signed_weight": "340282366920938463463374607431768211",
+     "size": 2140,
+     "target": {
+      "block_height": 992,
+      "hash": "c0000000000003e0c0000000000003e0c0000000000003e0c0000000000003e0",
+      "slot": 31
+     },
+     "version": 1,
+     "votes": 3
+    },
+    "growth_cap": {
+     "credited_epochs": 8,
+     "last_step": null,
+     "ledger_epoch": 31
+    },
+    "params_digest": "9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a",
+    "previous_config_id": "4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b",
+    "prune_after_epochs": 4,
+    "pruned": [],
+    "total": "340282366920938463463374607431768211"
+   },
+   "pool": {
+    "attestations": 2,
+    "evidence": 0,
+    "exits": 0,
+    "rejoins": 0,
+    "shares": 4
+   },
+   "pow": "sha256d",
+   "rules": "hardening2",
+   "signer_halted": false,
+   "signers": [
+    {
+     "alert": null,
+     "halted": false,
+     "highwater": {
+      "source": 30,
+      "target": 31
+     },
+     "instance": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+     "key": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+     "record": "/var/lib/obenblock/powit/a1.rec",
+     "votes_recorded": 62
+    }
+   ],
+   "tip_height": 1000,
+   "witness_set": {
+    "size": 3,
+    "top": [
+     {
+      "key": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+      "weight": "113427455640312821154458202477256070"
+     }
+    ],
+    "total_weight": "340282366920938463463374607431768211"
+   },
+   "witness_set_from_finalized_history": true
+  },
+  "getselectedchain": {
+   "blocks": [
+    {
+     "blue_score": 1200,
+     "hash": "c0000000000003e8c0000000000003e8c0000000000003e8c0000000000003e8",
+     "height": 1000,
+     "timestamp": 1792999980
+    },
+    {
+     "blue_score": 1199,
+     "hash": "c0000000000003e7c0000000000003e7c0000000000003e7c0000000000003e7",
+     "height": 999,
+     "timestamp": 1792999950
+    },
+    {
+     "blue_score": 1198,
+     "hash": "c0000000000003e6c0000000000003e6c0000000000003e6c0000000000003e6",
+     "height": 998,
+     "timestamp": 1792999920
+    },
+    {
+     "blue_score": 1197,
+     "hash": "c0000000000003e5c0000000000003e5c0000000000003e5c0000000000003e5",
+     "height": 997,
+     "timestamp": 1792999890
+    },
+    {
+     "blue_score": 1196,
+     "hash": "c0000000000003e4c0000000000003e4c0000000000003e4c0000000000003e4",
+     "height": 996,
+     "timestamp": 1792999860
+    },
+    {
+     "blue_score": 1195,
+     "hash": "c0000000000003e3c0000000000003e3c0000000000003e3c0000000000003e3",
+     "height": 995,
+     "timestamp": 1792999830
+    },
+    {
+     "blue_score": 1194,
+     "hash": "c0000000000003e2c0000000000003e2c0000000000003e2c0000000000003e2",
+     "height": 994,
+     "timestamp": 1792999800
+    },
+    {
+     "blue_score": 1193,
+     "hash": "c0000000000003e1c0000000000003e1c0000000000003e1c0000000000003e1",
+     "height": 993,
+     "timestamp": 1792999770
+    },
+    {
+     "blue_score": 1192,
+     "hash": "c0000000000003e0c0000000000003e0c0000000000003e0c0000000000003e0",
+     "height": 992,
+     "timestamp": 1792999740
+    },
+    {
+     "blue_score": 1191,
+     "hash": "c0000000000003dfc0000000000003dfc0000000000003dfc0000000000003df",
+     "height": 991,
+     "timestamp": 1792999710
+    },
+    {
+     "blue_score": 1190,
+     "hash": "c0000000000003dec0000000000003dec0000000000003dec0000000000003de",
+     "height": 990,
+     "timestamp": 1792999680
+    },
+    {
+     "blue_score": 1189,
+     "hash": "c0000000000003ddc0000000000003ddc0000000000003ddc0000000000003dd",
+     "height": 989,
+     "timestamp": 1792999650
+    },
+    {
+     "blue_score": 1188,
+     "hash": "c0000000000003dcc0000000000003dcc0000000000003dcc0000000000003dc",
+     "height": 988,
+     "timestamp": 1792999620
+    },
+    {
+     "blue_score": 1187,
+     "hash": "c0000000000003dbc0000000000003dbc0000000000003dbc0000000000003db",
+     "height": 987,
+     "timestamp": 1792999590
+    },
+    {
+     "blue_score": 1186,
+     "hash": "c0000000000003dac0000000000003dac0000000000003dac0000000000003da",
+     "height": 986,
+     "timestamp": 1792999560
+    },
+    {
+     "blue_score": 1185,
+     "hash": "c0000000000003d9c0000000000003d9c0000000000003d9c0000000000003d9",
+     "height": 985,
+     "timestamp": 1792999530
+    },
+    {
+     "blue_score": 1184,
+     "hash": "c0000000000003d8c0000000000003d8c0000000000003d8c0000000000003d8",
+     "height": 984,
+     "timestamp": 1792999500
+    },
+    {
+     "blue_score": 1183,
+     "hash": "c0000000000003d7c0000000000003d7c0000000000003d7c0000000000003d7",
+     "height": 983,
+     "timestamp": 1792999470
+    },
+    {
+     "blue_score": 1182,
+     "hash": "c0000000000003d6c0000000000003d6c0000000000003d6c0000000000003d6",
+     "height": 982,
+     "timestamp": 1792999440
+    },
+    {
+     "blue_score": 1181,
+     "hash": "c0000000000003d5c0000000000003d5c0000000000003d5c0000000000003d5",
+     "height": 981,
+     "timestamp": 1792999410
+    },
+    {
+     "blue_score": 1180,
+     "hash": "c0000000000003d4c0000000000003d4c0000000000003d4c0000000000003d4",
+     "height": 980,
+     "timestamp": 1792999380
+    },
+    {
+     "blue_score": 1179,
+     "hash": "c0000000000003d3c0000000000003d3c0000000000003d3c0000000000003d3",
+     "height": 979,
+     "timestamp": 1792999350
+    },
+    {
+     "blue_score": 1178,
+     "hash": "c0000000000003d2c0000000000003d2c0000000000003d2c0000000000003d2",
+     "height": 978,
+     "timestamp": 1792999320
+    },
+    {
+     "blue_score": 1177,
+     "hash": "c0000000000003d1c0000000000003d1c0000000000003d1c0000000000003d1",
+     "height": 977,
+     "timestamp": 1792999290
+    },
+    {
+     "blue_score": 1176,
+     "hash": "c0000000000003d0c0000000000003d0c0000000000003d0c0000000000003d0",
+     "height": 976,
+     "timestamp": 1792999260
+    },
+    {
+     "blue_score": 1175,
+     "hash": "c0000000000003cfc0000000000003cfc0000000000003cfc0000000000003cf",
+     "height": 975,
+     "timestamp": 1792999230
+    },
+    {
+     "blue_score": 1174,
+     "hash": "c0000000000003cec0000000000003cec0000000000003cec0000000000003ce",
+     "height": 974,
+     "timestamp": 1792999200
+    },
+    {
+     "blue_score": 1173,
+     "hash": "c0000000000003cdc0000000000003cdc0000000000003cdc0000000000003cd",
+     "height": 973,
+     "timestamp": 1792999170
+    },
+    {
+     "blue_score": 1172,
+     "hash": "c0000000000003ccc0000000000003ccc0000000000003ccc0000000000003cc",
+     "height": 972,
+     "timestamp": 1792999140
+    },
+    {
+     "blue_score": 1171,
+     "hash": "c0000000000003cbc0000000000003cbc0000000000003cbc0000000000003cb",
+     "height": 971,
+     "timestamp": 1792999110
+    },
+    {
+     "blue_score": 1170,
+     "hash": "c0000000000003cac0000000000003cac0000000000003cac0000000000003ca",
+     "height": 970,
+     "timestamp": 1792999080
+    },
+    {
+     "blue_score": 1169,
+     "hash": "c0000000000003c9c0000000000003c9c0000000000003c9c0000000000003c9",
+     "height": 969,
+     "timestamp": 1792999050
+    }
+   ],
+   "chain_length": 1001
+  }
+ },
+ "rpc_port": 18210,
+ "system": {
+  "disk": [
+   {
+    "free": 700000000000,
+    "path": "/",
+    "total": 1000000000000
+   },
+   {
+    "free": 700000000000,
+    "path": "/var/lib/obenblock",
+    "total": 1000000000000
+   }
+  ],
+  "load": [
+   21.3,
+   20.9,
+   20.1
+  ],
+  "mem": {
+   "MemAvailable": 98304000000,
+   "MemTotal": 137438953472,
+   "SwapFree": 0,
+   "SwapTotal": 0
+  },
+  "nproc": 28
+ },
+ "time": 1793000000,
+ "units": {
+  "obenblock-cpu-miner": "inactive",
+  "obenblock-explorer-api": "active",
+  "obenblock-node": "active",
+  "obenblock-stratum": "active"
+ }
+}

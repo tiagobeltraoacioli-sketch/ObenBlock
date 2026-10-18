@@ -1,0 +1,5 @@
+1792999000.100001 obb-mainnet-209 systemd[1]: Started obenblock-cpu-miner.service - ObenBlock SHA-256d CPU miner (through stratum).
+1792999001.200002 obb-mainnet-209 obenblock-cpu-miner[7001]: [miner] kernels (MH/s, one thread): sha2 1.69, avx2 6.34; using avx2
+1792999001.500003 obb-mainnet-209 obenblock-cpu-miner[7001]: [miner] 31 threads (avx2), about 196.5 MH/s, suggesting difficulty 0.457500
+1792999031.500004 obb-mainnet-209 obenblock-cpu-miner[7001]: [miner] 201.3 MH/s, shares accepted 3 rejected 0
+1792999061.500005 obb-mainnet-209 obenblock-cpu-miner[7001]: [miner] 203.9 MH/s, shares accepted 7 rejected 1

@@ -1,0 +1,55 @@
+# ObenBlock monitor: one read-only probe of this host, its summary written
+# to /var/lib/obenblock-monitor/status.json (deploy/obenblock-monitor).
+# NOT installed by any script. To install by hand on a host:
+#   /opt/obenblock-monitor/{obbmon.py,probe.py}, this unit and the timer in
+#   /etc/systemd/system/, then: systemctl enable --now obenblock-monitor.timer
+#
+# The probe reads ps, /proc, statvfs, `systemctl is-active`, the CPU miner's
+# journal and the node's loopback RPC/metrics; it writes only the status file.
+[Unit]
+Description=ObenBlock monitor (read-only status snapshot)
+After=network-online.target obenblock-node.service
+
+[Service]
+Type=oneshot
+DynamicUser=yes
+# The CPU miner's MH/s lines are read from the journal.
+SupplementaryGroups=systemd-journal
+StateDirectory=obenblock-monitor
+StateDirectoryMode=0755
+ExecStart=/usr/bin/python3 -I /opt/obenblock-monitor/obbmon.py local --out /var/lib/obenblock-monitor/status.json
+# Exit 1 (warnings) and 2 (critical) are statuses written to the file, not failures.
+SuccessExitStatus=1 2
+TimeoutStartSec=90
+Nice=10
+UMask=0022
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+# Not ProtectProc=invisible: the probe must see the node's process (user
+# obenblock) to report its pid, uptime and arguments.
+ProcSubset=all
+CapabilityBoundingSet=
+AmbientCapabilities=
+# AF_UNIX: systemctl and journalctl talk to systemd; AF_INET(6): loopback RPC.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+MemoryMax=256M
