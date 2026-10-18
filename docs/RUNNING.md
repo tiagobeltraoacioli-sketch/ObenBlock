@@ -853,6 +853,49 @@ stops counting, so the checkpoints set aside in step 2 need no
 `reconsiderfinalized`. Until then the node has no anchor: run the sequence
 with peers you trust.
 
+## Witness signer protection
+
+A witness key must never sign two conflicting links (a double or surround
+vote is evidence and bars the key). The witness duty (`--witness-key`) and
+`gnb-cli powitattest` share one protection (`powit_signer`,
+docs/DESIGN-obenblock-poci.md §8):
+
+- Every vote is written and fsynced to the vote record
+  (`<data-dir>/powit-votes-<key id>.json`, format
+  `gnb-powit-vote-record/2`) and to the high-water file beside the key
+  (`<key>.votes-highwater.json`) before its signature leaves the process. A
+  repeated request returns the stored attestation; after a crash the restart
+  releases the stored vote once. A v1 record (a plain list of links) is
+  migrated at the first start; older releases then refuse the v2 file as
+  corrupt (they never sign against an unreadable record).
+- One signer per key: the node and the CLI take an exclusive lock on
+  `<key>.signer.lock` and on `powit-votes-<key id>.lock`, and write a fresh
+  instance id into the record. A second instance (another node, or
+  `powitattest` while the node runs) refuses to start. Before every vote the
+  signer re-reads the record and the high-water file; if another instance
+  wrote them (shared storage where locks do not hold) it halts.
+- Rollback guard: at start and before every vote the signer looks for votes
+  of its key, in the selected tip's PoWit state and the pool, that its record
+  does not hold at or above its highest signed heights, and for an
+  equivocation proof against the key. Finding one means the record is stale
+  (a restored backup) or another instance signs with a copy of the key: the
+  signer stops signing (the node keeps running), adopts those votes into the
+  record, and alerts: an error log line ("PoWit signer ... HALTED"),
+  `signer_halted: true` and `signers[].alert` in `getpowitinfo`, and the
+  metric `gnb_powit_signer_halted`. The alert is persisted in the record.
+  Stop every other instance of the key, then, with the node stopped:
+
+```sh
+gnb-cli powitsignerclear <witness-key.json> <data-dir>
+```
+
+- `gnb-cli powitattest <key> <net> <src_slot> <src_hash> <tgt_slot>
+  <tgt_hash> [activation] [record-dir] [--offline]` keeps its record in
+  `record-dir` (default: the key's directory; give the node's data
+  directory to share the duty's record) and reads the key's votes from the
+  node (`getpowitkeyvotes`, `--rpc-url`/`--rpc-port`) for the rollback
+  guard; without a node it refuses unless `--offline` is given.
+
 ## Chain-state check at start-up
 
 Before anything else the node verifies the integrity chain over its stored

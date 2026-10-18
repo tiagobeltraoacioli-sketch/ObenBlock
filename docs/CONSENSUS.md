@@ -1730,6 +1730,11 @@ activation it votes for the justified checkpoint's direct child while a
 block can still include that vote, else for the newest slot (below the
 activation, always the newest slot). `gnb-cli powitattest` signs on the
 schedule of the chain it names (`hardening2_activation_height_for_signer`).
+Both sign only through the node-local signer protection
+(`powit_signer::VoteGuard`: persist before release, double and surround
+votes refused against the record and the high-water mark, rollback guard,
+one signer per key; docs/RUNNING.md, "Witness signer protection"); it is not
+a consensus rule.
 The pool (gossip and the `submitpowititem` RPC, `powit::admit_item`) admits
 an attestation by the rules of a block at `max(target, next height)` and a
 proof by the next block's, and templates re-check every item with

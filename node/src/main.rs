@@ -48,6 +48,8 @@ mod anchoring;    // ObenBlock checkpoints anchored in Bloch: records + --bloch-
 mod blockval;     // this chain's tx rules on top of the audit set (locktime, policy, BIP30)
 mod powit;        // PoW + PoWit: witness shares, attestations, finality (node side)
 mod genesis_init; // first-boot genesis and the data-dir genesis check (both chains)
+#[allow(dead_code)] // the CLI and tests use the rest of its API
+mod powit_signer; // PoWit signer protection (vote record, locks, rollback guard)
 
 // The acceptance pipeline lives in `accept.rs` (shared with the library so
 // integration tests drive the real path); same names and signatures as the
@@ -2195,8 +2197,15 @@ async fn main() {
             Ok(d) => Arc::new(d),
             Err(e) => { eprintln!("witness: {}", e); std::process::exit(2); }
         };
-        info!("🛡  PoWit witness key {} (activation {})", hex::encode(duty.key_id),
-              match core::powit_height() { u64::MAX => "off".to_string(), h => h.to_string() });
+        info!("🛡  PoWit witness key {} (activation {}, signer instance {})", hex::encode(duty.key_id),
+              match core::powit_height() { u64::MAX => "off".to_string(), h => h.to_string() },
+              hex::encode(duty.guard().instance()));
+        // Signer protection: the rollback guard at start (and again before
+        // every vote). A halted signer keeps the node running and reports
+        // the alert (log, gnb_powit_signer_halted, getpowitinfo.signers).
+        if let Some(alert) = duty.scan_for_rollback(&dag.read(), &store) {
+            error!("🛡  PoWit witness signing halted: {alert}");
+        }
 
         // Duty loop: follow the tip, sign the newest checkpoint once, gossip
         // equivocation proofs.

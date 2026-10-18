@@ -271,6 +271,28 @@ against their own key:
    instance id in it; a second instance refuses to start.
 5. KES erasure as today (past epochs cannot be signed again from backups).
 
+Implementation (node-local, so it applies to GnB as well):
+`node/src/powit_signer.rs` (`VoteGuard`), used by the witness duty
+(`powit::WitnessDuty`) and `gnb-cli powitattest`; operator side in
+docs/RUNNING.md, "Witness signer protection"; tests in
+`node/tests/fix_powit_signer_protection.rs` (the §10 crash and
+restored-record rows, in process and by aborting the CLI). Choices:
+
+- The entry is written once, after signing and before release, with the
+  signed attestation in it (record, then the high-water file beside the
+  key). A crash before that write released nothing; a crash after it
+  releases the stored attestation on restart. No intent entry is needed.
+- The guard compares links whatever `config_id` they name, a stricter rule
+  than the evidence of §5 (same `config_id`): a key never needs a vote that
+  double-votes or surrounds one of its own votes under another
+  configuration, so refusing it costs nothing.
+- "Newer than the record" is a vote the record does not hold whose target is
+  at or above the record's highest signed target, or whose source is above
+  its highest source. Lower unknown votes (from before a failover onto a
+  fresh data directory) are already covered by the high-water mark.
+- The halt is persisted (the record's `alert`) and the votes found are
+  adopted into the record; only an operator clears the alert.
+
 ## 9. Launch
 
 `C` needs a finalized history, which does not exist at genesis. The first

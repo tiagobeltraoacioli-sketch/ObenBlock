@@ -338,7 +338,7 @@ const KNOWN_RPC_METHODS: &[&str] = &[
     "getblockbyheight", "getrecentblocks", "gettransaction", "getrawtransaction", "getbalance",
     "getaddresscount", "getutxos", "sendrawtransaction", "validateaddress", "estimatefee",
     "getrawmempool", "decoderawtransaction", "getblocktemplate", "submitblock", "getdaginfo",
-    "submitpowititem", "getpowitinfo", "pqpsbt", "getdescriptorinfo", "deriveaddresses",
+    "submitpowititem", "getpowitinfo", "getpowitkeyvotes", "pqpsbt", "getdescriptorinfo", "deriveaddresses",
     "listtransactions", "getpeerinfo", "getpeers", "getsupplyinfo", "getchainstats",
     "getsupplydistribution", "getselectedchain", "getblockdag", "gettransactionfull",
     "getdagwindow", "getaddresshistory", "getrichlist", "gethashrate", "getdifficultyhistory",
@@ -2219,6 +2219,21 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         // The Bloch weak-subjectivity anchor (`--bloch-rpc`) and what the
         // node made of it.
         "getblochanchor" => crate::anchoring::status_json(),
+
+        // getpowitkeyvotes [key id hex]: one witness key's votes in the
+        // selected tip's state and the pool (signer rollback guard).
+        "getpowitkeyvotes" => {
+            let key = params.and_then(|p| p.get(0)).and_then(|v| v.as_str())
+                .and_then(|h| hex::decode(h).ok())
+                .and_then(|b| <[u8; 20]>::try_from(b.as_slice()).ok());
+            match key {
+                Some(k) => {
+                    let dag = state.dag.read();
+                    crate::powit::key_votes_json(&dag, &state.store, &k)
+                }
+                None => json!({ "error": "usage: getpowitkeyvotes [key id, 20 bytes hex]" }),
+            }
+        }
 
         "getdaginfo" => {
             let dag = state.dag.read();
