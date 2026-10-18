@@ -2164,8 +2164,11 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             let dag = state.dag.read();
             let mut out = crate::powit::finality_info_json(&dag, 32);
             // PoCI (ObenBlock): the configuration in force and the latest
-            // finalized checkpoint's certificate (`null` on GnB).
-            out["poci"] = crate::powit::poci_finality_json(&dag, &state.store);
+            // finalized checkpoint's certificate (GnB's answer is unchanged).
+            let poci = crate::powit::poci_finality_json(&dag, &state.store);
+            if !poci.is_null() {
+                out["poci"] = poci;
+            }
             out
         }
 

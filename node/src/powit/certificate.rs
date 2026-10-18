@@ -116,15 +116,25 @@ pub fn build(dag: &GhostDAG, store: &Storage, fin: &Hash, fin_state: &PowitState
         return Err("finalizing link is not source -> direct child".into());
     }
     let config = pst.poci_config().cloned().ok_or("no PoCI configuration in force at the finalizing block's parent")?;
+    // The keys counted before this block (the parent's tally for `t`); the
+    // walk stops once it has found them and this block's own, so it reads
+    // only the blocks since the first counted vote, not `vote_ttl` of them.
+    let mut expected: usize = pst.votes.get(&t).map_or(0, |v| v.len());
     let mut votes: BTreeMap<KeyId, (KesPublic, KesSignature)> = BTreeMap::new();
-    for (h, _) in selected_chain_since(dag, Some(*fin), t.height) {
+    for (i, (h, _)) in selected_chain_since(dag, Some(*fin), t.height).into_iter().enumerate() {
         let b = store.get_block(&h).map_err(|e| format!("storage: {e}"))?
             .ok_or_else(|| format!("block body {} not stored (pruned?)", hex::encode(&h[..8])))?;
         for a in &b.powit.attestations {
             let k = a.key_id();
-            if a.source == f && a.target == t && config.weight(&k).is_some() {
-                votes.entry(k).or_insert_with(|| (a.witness, a.sig.clone()));
+            if a.source == f && a.target == t && config.weight(&k).is_some() && !votes.contains_key(&k) {
+                votes.insert(k, (a.witness, a.sig.clone()));
+                if i == 0 {
+                    expected += 1;
+                }
             }
+        }
+        if votes.len() >= expected {
+            break;
         }
     }
     let cert = Certificate::<Kes>::new(pp.chain_id, config.id(), f, t, votes.into_values().collect());
