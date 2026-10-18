@@ -1438,10 +1438,20 @@ fn anchor_in_force(setting: AnchorSetting) -> Option<Anchor> {
     }
 }
 
+/// How many epochs past that of the node's next block the target of a
+/// finality claim may lie (review round 4, item 6). The lighter side of a
+/// partition mines its heights at its own pace and the clocks drift, so an
+/// honest vote can be a few epochs ahead of the node; one further away is
+/// ignored. The first rule's witness sets a claim builds stay bounded by
+/// the `max_checks` of [`authenticated_finality_claim`]
+/// (`ingress::MAX_CLAIM_SIGNATURE_CHECKS`).
+pub const MAX_CLAIM_EPOCHS_AHEAD: u64 = 3;
+
 /// Review round 2 of the PoWit finality pin, H1 (and round 3, LOW 2-3): the
 /// target (block, checkpoint slot) of a vote of `block` that authentically
 /// claims a finality newer than the node's: its source lies above `floor`
-/// (`ingress::finality_claim_floor`), its target is not in a future epoch,
+/// (`ingress::finality_claim_floor`), its target's epoch is at most
+/// [`MAX_CLAIM_EPOCHS_AHEAD`] epochs after that of the node's next block,
 /// and it is signed by a key with weight in the witness set `state` (the
 /// node's selected tip's PoWit state) derives for the vote's target epoch,
 /// not barred at the node's current epoch. The rules are those of a block
@@ -1474,7 +1484,7 @@ pub fn authenticated_finality_claim(block: &Block, floor: u64, state: &PowitStat
         }
         let te = p.epoch(act, a.target.height);
         let key = a.key_id();
-        if te > now_epoch + 1 || state.is_banned(&key, now_epoch) {
+        if te > now_epoch + MAX_CLAIM_EPOCHS_AHEAD || state.is_banned(&key, now_epoch) {
             continue;
         }
         let member = match regime {
@@ -1949,6 +1959,34 @@ mod tests {
             st.banned.clear();
             let r = authenticated_finality_claim(&claim_block(target.height, vote), act, &st, next, 2);
             assert_eq!(r, Some((target.hash, target.height)), "the same vote once the bar is lifted");
+        }
+    }
+
+    /// Review round 4, item 6: the lighter side of a partition can be a few
+    /// epochs ahead of the node by height (both sides mine at the same rate,
+    /// the clocks drift): votes for targets up to three epochs ahead are
+    /// judged, beyond that they are ignored.
+    #[test]
+    fn a_claim_may_target_up_to_three_epochs_ahead() {
+        let p = powit::params();
+        let act = 1_000u64;
+        let e = p.epoch_len;
+        let _g = activation::scoped_override_v2(activation::NEVER);
+        let next = act + 1;
+        let vote = |seed: u8, ahead: u64| {
+            let target = Checkpoint { height: act + ahead * e, hash: [3; 32] };
+            let source = Checkpoint { height: target.height - p.checkpoint_interval, hash: [2; 32] };
+            let mut signer = gnb_crypto::core::kes::KesSigner::generate(3, [seed; 32], |_| {}).unwrap();
+            signer.evolve_to(ahead).unwrap();
+            let a = Attestation::sign_at(core::node_chain_id(), activation::NEVER, source, target, &signer).unwrap();
+            (a.key_id(), a)
+        };
+        for (ahead, judged) in [(2u64, true), (3, true), (4, false)] {
+            let (k, v) = vote(50 + ahead as u8, ahead);
+            let mut st = PowitState::genesis(act, [1; 32]);
+            st.epoch_work.entry(0).or_default().insert(k, 1_000);
+            let r = authenticated_finality_claim(&claim_block(act + ahead * e, v), act, &st, next, 2);
+            assert_eq!(r.is_some(), judged, "{ahead} epochs ahead");
         }
     }
 

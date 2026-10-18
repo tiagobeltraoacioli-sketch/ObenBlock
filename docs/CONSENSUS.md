@@ -1170,8 +1170,9 @@ bound of B's blue work:
      selected-tip state derives for the attestation's target epoch, under the
      rules of a block at the orphan's wire height or the node's next height,
      whichever is higher (the wire height is the sender's choice), the key
-     not barred at the node's current epoch and the target not in a future
-     epoch (at most two signatures are checked per orphan, membership first,
+     not barred at the node's current epoch and the target at most three
+     epochs past the epoch of the node's next block (the lighter side of a
+     partition can be a few epochs ahead by height; at most two signatures are checked per orphan, membership first,
      and at most two first-rule witness sets built). From the second
      hardening activation a chain that shares the node's finality reads the
      same frozen finalized window ("Witness set from finalized history");

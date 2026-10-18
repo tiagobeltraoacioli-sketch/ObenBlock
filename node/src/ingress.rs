@@ -1931,7 +1931,9 @@ pub fn work_admission(lb: u128, threshold: u128, chain_above: u128, merge_lb: u1
 //   tip's) derives for the vote's target epoch, under the rules of a block
 //   at the orphan's wire height or the node's next height, whichever is
 //   higher, the key not barred at the node's current epoch and the target
-//   not in a future epoch (`powit::authenticated_finality_claim`: at most
+//   at most `powit::MAX_CLAIM_EPOCHS_AHEAD` (three) epochs past that of the
+//   node's next block (round 4, item 6: the lighter side of a partition can
+//   be ahead by height; `powit::authenticated_finality_claim`: at most
 //   `MAX_CLAIM_SIGNATURE_CHECKS` signatures, and as many first-rule witness
 //   sets, per orphan). From the second hardening activation a chain that
 //   shares the node's finality reads the same frozen window; before it, the
