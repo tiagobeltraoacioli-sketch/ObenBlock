@@ -32,9 +32,9 @@
 //!
 //! Plus exits and bans during a stall (40 % offline): the same configuration
 //! and denominators on every node through the stall, the exit and the
-//! evidence take effect at the one handoff that ends it (`ban_start` = that
-//! epoch, 100 epochs), and the certificate kept before the stall still
-//! verifies.
+//! evidence take effect at the one handoff that ends it (stepped through
+//! every epoch boundary: `ban_start` = the first step above the evidence,
+//! 100 epochs), and the certificate kept before the stall still verifies.
 //!
 //! The chain id is process-wide: this binary runs ObenBlock regtest only.
 
@@ -444,9 +444,10 @@ fn split_70_30_beyond_the_window() {
 /// §10 "exit, ban and expiry during a stall": 40 % of the weight goes
 /// offline for 6 epochs. During the stall key 0 exits and key 1's
 /// equivocation is included; nothing in force changes on either node. When
-/// the weight returns, one handoff ends the stall: key 0 is out, key 1 is
-/// banned from that epoch for 100 epochs, and the certificate kept before
-/// the stall still verifies. (Expiry of weight cannot be shown here: the
+/// the weight returns, one handoff ends the stall, stepping through every
+/// epoch boundary (§4): key 0 is out, key 1 is banned for 100 epochs from
+/// the first step whose opening lies above its evidence, and the
+/// certificate kept before the stall still verifies. (Expiry of weight cannot be shown here: the
 /// window is 112 epochs on regtest too, part of `params_digest`.)
 #[test]
 fn exit_and_ban_during_a_stall() {
@@ -528,15 +529,25 @@ fn exit_and_ban_during_a_stall() {
     });
     let (hh, st) = handoff.expect("finality resumes and hands off");
     let ps = st.poci.as_ref().unwrap();
-    assert_eq!(ps.history().count(), configs_before + 1, "one handoff");
-    assert_eq!(ps.previous().unwrap().id(), c0.id());
     let e = ps.config().epoch();
     assert_eq!(e, PP.epoch_of(st.finalized.height));
+    // §4: one handoff, one step per epoch boundary (C_{e0+1} ..= C_e).
+    let steps = (e - c0.epoch()) as usize;
+    assert!(steps > 1, "the stall spans several epochs");
+    assert_eq!(ps.history().count(), configs_before + steps, "one configuration per epoch");
+    assert_eq!(ps.history().nth(steps).unwrap().id(), c0.id());
+    assert!(ps.history().take(steps).map(|c| c.epoch()).eq((c0.epoch() + 1..=e).rev()));
     assert!(ps.config().weight(&ws[0].id).is_none(), "the exited key left at the handoff");
     assert!(ps.config().weight(&ws[1].id).is_none(), "the banned key left at the handoff");
+    // The ban starts at the first step whose opening is at or above the
+    // evidence (included at its block's height + 1), inside the stall.
     let ban = &ps.bans[&ws[1].id][0];
-    assert_eq!((ban.config_id, ban.start, ban.end(PP.ban_epochs)), (c0.id(), Some(e), Some(e + 100)));
-    assert!(ps.banned_at(&PP, &ws[1].id, e) && ps.banned_at(&PP, &ws[1].id, e + 99) && !ps.banned_at(&PP, &ws[1].id, e + 100));
+    let start = (c0.epoch() + 1..=e).find(|y| PP.opening(*y) > evidence_at.unwrap()).unwrap();
+    assert!(start < e);
+    assert_eq!((ban.config_id, ban.start, ban.end(PP.ban_epochs)), (c0.id(), Some(start), Some(start + 100)));
+    assert!(ps.banned_at(&PP, &ws[1].id, start) && ps.banned_at(&PP, &ws[1].id, start + 99)
+            && !ps.banned_at(&PP, &ws[1].id, start + 100));
+    assert!(ps.history().take_while(|c| c.epoch() >= start).all(|c| c.weight(&ws[1].id).is_none()));
     // The finalization that ended the stall is certified by C0 (exited and
     // banned keys still count in it: nothing is retroactive).
     let resume = state(&na, &blocks.iter().find(|b| b.height == hh).unwrap().block_hash()).finalized;

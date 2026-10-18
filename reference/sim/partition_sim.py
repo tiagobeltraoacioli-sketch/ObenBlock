@@ -23,21 +23,22 @@ Rule sets (docs/DESIGN-obenblock-poci.md, docs/DESIGN-obenblock.md §5.2 and
           exit message (an exiting key just stops voting).
   PoCI    strict quorum (3 got > 2 total) over the frozen configuration C_e
           named by the vote; C_{x} enters into force only when C_e finalizes a
-          checkpoint of epoch x > e (handoff, may skip epochs); weights from
+          checkpoint of epoch x > e (handoff: one step per epoch boundary,
+          C_{e+1} .. C_x in order, each from the one before); weights from
           the finalized history with the §6.3 growth cap; exits, bans and
           expiry only at a handoff; no leak; evidence = double or surround vote
           by one key under one config_id; ban for 100 epochs from the first
           configuration computed after the evidence is finalized; C_x reads
           the history up to opening(x) only (evidence, exits and rejoins at
           slots <= opening(x), DESIGN-obenblock-poci.md §4); absence
-          pruning (§4.1): at a handoff to C_x, if the keys of C_e with a vote
-          included in slots [opening(x-4), opening(x)) hold a strict quorum
-          of C_e, a key that has been an entry of every configuration since
+          pruning (§4.1): at each step C_{x-1} -> C_x, if the keys of C_{x-1}
+          with a vote included in slots [opening(x-4), opening(x)) hold a
+          strict quorum of C_{x-1}, a key that has been an entry of every configuration since
           epoch x - 4 or earlier and has no such vote is left out until a
           rejoin is finalized (an honest online key that is pruned publishes
           one at the next epoch start, as its operator would); without that
-          quorum nobody is pruned; C_x is never empty (it then carries C_e's
-          entries).
+          quorum nobody is pruned; C_x is never empty (it then carries
+          C_{x-1}'s entries).
 
 Model:
 
@@ -501,12 +502,15 @@ class Sim:
         if self.rules.poci:
             x = epoch_of(src)
             if x > b.config.epoch:
+                # §4: one step per epoch boundary, C_{e+1} .. C_x in order,
+                # each from the one before and the history up to its opening.
                 old = b.config
-                self.prune(b, x, src)
-                cfg = self.poci_config(b, x, x * SLOTS_PER_EPOCH)
-                b.config = cfg
-                b.cfg_hist.append(cfg)
-                b.seen = {k: v for k, v in b.seen.items() if cfg.weight(k) > 0}
+                for y in range(old.epoch + 1, x + 1):
+                    self.prune(b, y, src)
+                    cfg = self.poci_config(b, y, y * SLOTS_PER_EPOCH)
+                    b.config = cfg
+                    b.cfg_hist.append(cfg)
+                    b.seen = {k: v for k, v in b.seen.items() if cfg.weight(k) > 0}
                 b.handoffs.append({"at_slot": at, "from_epoch": old.epoch, "to_epoch": x, "config_id": cfg.id,
                                    "total": cfg.total, "entries": [k for k, _ in cfg.entries]})
         self.check_conflict(at)

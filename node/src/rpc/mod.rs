@@ -2034,11 +2034,11 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             let cur_bits = crate::core::liveness::relieve_at(tmpl.bits, tmpl.parent_timestamp, tmpl.height,
                                                              now.max(tmpl.parent_timestamp), tmpl.activation_height,
                                                              crate::core::liveness::liveness_activation_height());
-            let powit_hex = {
-                let mut v = Vec::new();
-                tmpl.powit.write_wire_with(&mut v, crate::core::liveness::liveness_active_at(tmpl.height));
-                hex::encode(v)
-            };
+            // The section in the block's own wire format (`BodyFormat::at`:
+            // on ObenBlock the PoCI evidence list and the tagged membership
+            // list of exits and rejoins), the bytes `submitblock` decodes and
+            // the coinbase body commitment hashes.
+            let powit_hex = hex::encode(tmpl.powit_wire());
             // SHA-256d (ObenBlock): the 80-byte header fields, the Merkle-root
             // inputs and an optional header job (`mining::sha256d`,
             // docs/OBENBLOCK-MINING.md); `null` under GnB-SMH.

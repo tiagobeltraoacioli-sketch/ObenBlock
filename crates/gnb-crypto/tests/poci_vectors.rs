@@ -376,8 +376,10 @@ fn cph(height: u64) -> Checkpoint {
 }
 
 impl Chain {
-    fn weights(&self, e: u64, finalized: &Checkpoint) -> BTreeMap<KeyId, u128> {
-        let (f, w) = self.provider.get(&e).unwrap_or_else(|| panic!("provider call for epoch {e}"));
+    fn weights_of(provider: &BTreeMap<u64, (Checkpoint, BTreeMap<KeyId, u128>)>, e: u64, finalized: &Checkpoint)
+        -> BTreeMap<KeyId, u128>
+    {
+        let (f, w) = provider.get(&e).unwrap_or_else(|| panic!("provider call for epoch {e}"));
         assert_eq!(f, finalized, "provider called for epoch {e} with the finalized checkpoint");
         w.clone()
     }
@@ -409,12 +411,12 @@ impl Chain {
         let mut handoff = false;
         if let Some(f) = step.finalized {
             self.finalized = f;
-            let w = self.state.handoff_epoch(&self.p, &f).map(|e| self.weights(e, &f));
-            let (p, cap) = (self.p, &mut self.cap);
+            let (p, cap, provider) = (self.p, &mut self.cap, &self.provider);
+            // §4: one provider call per handoff step, C_{e+1} ..= C_epoch(f).
             handoff = self.state.finalized(&p, &f, |st, x| {
-                let w = w.unwrap();
+                let w = Chain::weights_of(provider, x, &f);
                 if let Some(g) = cap.as_mut() {
-                    // Mid-handoff: this handoff's bans and prunings are recorded.
+                    // Mid-step: this step's bans and prunings are recorded.
                     assert_eq!(g.step(&p, x, &|k, y| st.excluded_at(&p, k, y)), w, "growth cap provider at {x}");
                 }
                 w
@@ -454,7 +456,7 @@ impl Chain {
 fn sequences() {
     let d = doc();
     let seqs = d["sequences"].as_array().unwrap();
-    assert_eq!(seqs.len(), 16);
+    assert_eq!(seqs.len(), 19);
     for sq in seqs {
         let name = sq["name"].as_str().unwrap();
         let p = params(sq["params"].as_str().unwrap());

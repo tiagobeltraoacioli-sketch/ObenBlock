@@ -1722,17 +1722,24 @@ fn poci_info_json(dag: &GhostDAG, store: &Storage, st: Option<&PowitState>) -> s
                                    "launch_height": pp.launch_height() });
     };
     let c = ps.config();
-    // The weight of C_e with no vote included in a block of each recent
-    // epoch (not final: blocks above the finalized checkpoint count), so
-    // operators see it grow long before it reaches a third.
+    // §4.1: for each recent handoff step epoch x (up to the tip's epoch + 1,
+    // whose window holds the tip's blocks), the weight of C_e with no vote
+    // included in (opening(x - 4), opening(x)], and whether the present keys
+    // hold a strict quorum of C_e (the gate; not final: blocks above the
+    // finalized checkpoint count), so operators see absence grow long
+    // before it reaches a third. Informational: the later steps of a
+    // handoff gate on their own C_{x-1}.
     let now = s.epoch;
-    let absent: Vec<serde_json::Value> = (now.saturating_sub(poci::POCI_PRUNE_AFTER_EPOCHS)..=now)
-        .filter(|e| *e >= c.epoch())
-        .map(|e| {
-            let w = ps.absent_weight(e);
-            let keys = c.entries().iter().filter(|(k, _)| !ps.seen.get(k).is_some_and(|m| m.contains_key(&e))).count();
-            serde_json::json!({ "epoch": e, "weight": w.to_string(), "keys": keys,
-                                "over_a_third": w.checked_mul(3).is_none_or(|x| x > c.total()) })
+    let lo = c.epoch().saturating_add(1).max(now.saturating_sub(2));
+    let absent: Vec<serde_json::Value> = (lo..=now.saturating_add(1))
+        .map(|x| {
+            let w = ps.absent_weight(&pp, x);
+            let keys = c.entries().iter().filter(|(k, _)| !ps.present(&pp, k, x)).count();
+            serde_json::json!({ "epoch": x,
+                                "window": [pp.opening(x.saturating_sub(poci::POCI_PRUNE_AFTER_EPOCHS)), pp.opening(x)],
+                                "weight": w.to_string(), "keys": keys,
+                                "over_a_third": w.checked_mul(3).is_none_or(|v| v > c.total()),
+                                "present_quorum": c.quorum(c.total().saturating_sub(w)) })
         }).collect();
     let f = s.finalized;
     let certificate = if certificate::final_by_definition(&pp, &f) {

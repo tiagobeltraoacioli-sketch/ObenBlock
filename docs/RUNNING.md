@@ -925,15 +925,23 @@ epochs (24 hours) is left out of the next configuration. A key that has been
 in the configuration for less than 4 epochs is not pruned. Pruning is not a
 punishment: the key keeps its share rewards and may come back.
 
-- `getpowitinfo` → `poci.absent_weight` lists, per recent epoch, the weight
-  (`weight`) and the number of keys (`keys`) of the configuration in force
-  with no vote included in a block of that
-  epoch, and `over_a_third` when it exceeds a third (finality then halts
-  until that weight returns). `poci.pruned` lists the pruned keys, the epoch
-  their pruning started, and where a pending rejoin was included.
-- Keys whose votes only return after a halt longer than 4 epochs are pruned
-  at the handoff their own votes enable (those votes are in blocks above the
-  finalized checkpoint); they rejoin like any other pruned key.
+- `getpowitinfo` → `poci.absent_weight` lists, per recent handoff epoch `x`
+  (up to the tip's epoch + 1), the weight (`weight`) and the number of keys
+  (`keys`) of the configuration in force with no vote included in the
+  window of a handoff to `x` (`window`: ledger heights
+  `(opening(x - 4), opening(x)]`, unfinalized blocks included),
+  `present_quorum` when the other keys hold more than two thirds (only then
+  is anybody pruned), and `over_a_third` when it exceeds a third (finality
+  then halts until that weight returns). `poci.pruned` lists the pruned
+  keys, the epoch their pruning started, and where a pending rejoin was
+  included.
+- A finality halt is not absence: when the keys present in the window hold
+  no two-thirds quorum, nobody is pruned. But a key that comes back later
+  than the others (after they already hold a quorum in the window) is pruned
+  at the next handoff even if it voted in the link that finalized it: votes
+  above the opening of the new epoch are not read. It is never banned for
+  this; the node publishes its rejoin by itself and the key is back one
+  handoff later.
 - A node running the witness duty (`--witness-key`) publishes the rejoin
   itself when it finds its key pruned at the tip (log line "witness key
   pruned for absence: rejoin ... published"). Once the block that includes

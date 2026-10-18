@@ -1503,16 +1503,19 @@ impl PowitState {
     ///   recorded for absence pruning (`included_at = b.height + 1`).
     /// - **Strict quorum** of the configuration's frozen total ([`poci::quorum`],
     ///   `3 got > 2 total`); Casper FFG otherwise ([`poci::ffg_step`]).
-    /// - **Handoff** (§4, §4.1): finalizing `F` with `epoch(F) = x` above the
-    ///   configuration's epoch starts the pending bans and ends the prunings
-    ///   of the pending rejoins included at or below `opening(x)`, prunes the
-    ///   keys of the configuration absent from the blocks of epochs
+    /// - **Handoff** (§4, §4.1): finalizing `F` with `epoch(F)` above the
+    ///   configuration's epoch `e` steps through every epoch boundary in
+    ///   order ([`PociState::handoff_steps`]). The step to `x = e + 1, ...,
+    ///   epoch(F)` starts the pending bans and ends the prunings of the
+    ///   pending rejoins included at or below `opening(x)`, prunes the keys
+    ///   of `C_{x-1}` absent from the blocks of epochs
     ///   `x - PRUNE_AFTER ..= x - 1` when the present ones hold a strict
-    ///   quorum ([`PociState::begin_handoff`]), and puts `C_x` in force from
-    ///   `weights`, without the keys banned, pruned or exited at `x`, never
-    ///   empty ([`PociState::enter`]). Everything `C_x` reads lies at or
-    ///   below `opening(x)`, so it does not depend on which checkpoint of
-    ///   epoch `x` was finalized first.
+    ///   quorum of `C_{x-1}` ([`PociState::begin_step`]), and puts `C_x` in
+    ///   force from `weights` (one growth-cap step), without the keys banned,
+    ///   pruned or exited at `x`, never empty ([`PociState::enter`]).
+    ///   Everything `C_x` reads lies at or below `opening(x)`, so it is a
+    ///   function of the history only, whatever checkpoints were finalized
+    ///   on the way.
     /// - **Proof of Corruption** (§5): `poci.evidence` ([`PociState::admit_evidence`],
     ///   included at `b.height + 1` in the ledger's convention); GnB's
     ///   `evidence` is refused. Nothing in force changes.
@@ -1720,7 +1723,9 @@ impl PowitState {
             if let Some(f) = step.finalized {
                 s.finalized = f;
                 s.finalized_at = b.height;
-                if let Some(x) = s.poci.as_mut().expect("in force").begin_handoff(pp, &f) {
+                // §4: one step per epoch boundary, C_{e+1} ..= C_epoch(f).
+                for x in s.poci.as_ref().expect("in force").handoff_steps(pp, &f) {
+                    s.poci.as_mut().expect("in force").begin_step(pp, x);
                     let candidates = weights.weights(&mut s, pp, x, &f)?;
                     let exited: BTreeSet<KeyId> =
                         candidates.keys().filter(|k| s.has_exited(k, x)).copied().collect();
@@ -1741,14 +1746,13 @@ impl PowitState {
 ///
 /// Contract (B2, DESIGN-obenblock-poci.md §4 and §4.1):
 ///
-/// - `state.poci` is the ledger in the middle of the handoff: `config()` is
-///   still `C_e`, the configuration being replaced (the growth cap's
-///   `W = total(C_{x-1})` when no epoch is skipped), and the bans started,
-///   rejoins ended and keys pruned by this handoff are already recorded, so
-///   [`PowitState::poci_excluded_at`] answers for every epoch `e < y <= epoch`
-///   the handoff covers (the growth cap runs one step per such epoch and
-///   gives an excluded key no new credit there). At the launch `state.poci`
-///   is `None`.
+/// - `state.poci` is the ledger in the middle of one handoff step (§4: a
+///   handoff runs one step per epoch boundary, so `epoch = e + 1`):
+///   `config()` is still `C_e = C_{epoch-1}`, the configuration being
+///   replaced, and the bans started, rejoins ended and keys pruned by this
+///   step are already recorded, so [`PowitState::poci_excluded_at`] answers
+///   for `epoch` (the growth cap runs one step and gives an excluded key no
+///   new credit there). At the launch `state.poci` is `None`.
 /// - Only finalized history at or below `opening(epoch)` may be read (share
 ///   work of epochs `< epoch`; the growth cap reads epochs `<= epoch - 2`),
 ///   never the blocks between `opening(epoch)` and `finalized`: `C_epoch`
@@ -1759,8 +1763,8 @@ impl PowitState {
 ///   pruned key the provider gives no weight.
 /// - The provider may update the part of `state` it derives the weights
 ///   from (the growth cap's credit ledger, [`GrowthCapWeights`]): it runs
-///   exactly once per launch or handoff, on the state of the block that
-///   performs it.
+///   exactly once per launch or handoff step, on the state of the block
+///   that performs it.
 pub trait ConfigWeights {
     fn weights(&mut self, state: &mut PowitState, params: &PociParams, epoch: u64, finalized: &Checkpoint)
         -> Result<BTreeMap<KeyId, u128>, String>;
