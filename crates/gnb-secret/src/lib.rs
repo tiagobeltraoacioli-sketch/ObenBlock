@@ -282,8 +282,11 @@ pub fn locked_memory() -> LockedMemoryStats {
 /// Bytes of stack [`scrub_stack`] overwrites. PQClean's Falcon-1024 signer
 /// keeps a 72 KiB temporary plus its expanded key on the stack, its key
 /// generator 28 KiB, ML-DSA-65's signer about 60 KiB of polynomial vectors
-/// derived from the secret key: 128 KiB covers each of them.
-pub const STACK_SCRUB_BYTES: usize = 128 * 1024;
+/// derived from the secret key. The SLH-DSA-SHAKE-128s signer of the
+/// conservative suite (`fips205`) reaches about 150 KB below its caller, so
+/// 128 KiB left a copy of the key's `SK.seed` just past the scrubbed range
+/// (`secret_hygiene`, one run in ten): 256 KiB covers each of them.
+pub const STACK_SCRUB_BYTES: usize = 256 * 1024;
 
 /// Overwrite the [`STACK_SCRUB_BYTES`] of stack below the caller's frame
 /// with zeros (volatile writes).
