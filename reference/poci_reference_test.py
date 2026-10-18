@@ -322,6 +322,151 @@ class Corruption(unittest.TestCase):
         self.assertEqual(self.ch.evidence(j + 1, *old), "already_banned_for_config")
 
 
+class Pruning(unittest.TestCase):
+    """Section 4.1: absence pruning by the old committee, and rejoin."""
+
+    def handoff(self, ch, ks, x, last=None, included_at=None):
+        for h, voters in ((x * L, ks), (x * L + I, last or ks)):
+            t = ch.cp(h)
+            out = ch.votes(t, votes(ch, voters, t), included_at)
+        self.assertTrue(out["handoff"], x)
+        self.assertEqual(ch.config.epoch, x)
+
+    def test_message_layout(self):
+        k = keys(1)[0]
+        pre = r.rejoin_preimage(r.CHAIN_OBB_MAINNET, k, 9)
+        self.assertEqual(len(pre), 67)
+        self.assertEqual(pre[:4], (18).to_bytes(4, "little"))
+        self.assertEqual(pre[4:22], b"OBB-POCI-v1/rejoin")
+        self.assertEqual(pre[22:26], r.CHAIN_OBB_MAINNET.to_bytes(4, "little"))
+        self.assertEqual(pre[26], k.depth)
+        self.assertEqual(pre[27:59], k.root)
+        self.assertEqual(pre[59:], (9).to_bytes(8, "little"))
+        # Not an exit, not a vote: its own domain.
+        self.assertNotEqual(r.rejoin_message(r.CHAIN_OBB_MAINNET, k, 9), r.rejoin_message(r.CHAIN_OBB_REGTEST, k, 9))
+        self.assertNotEqual(r.rejoin_message(r.CHAIN_OBB_MAINNET, k, 9), r.rejoin_message(r.CHAIN_OBB_MAINNET, k, 10))
+
+    def test_grace_and_the_exact_window(self):
+        ks = keys(6, "pr")
+        ch = chain(lambda e: {k.key_id: 100 for k in ks})
+        core, quiet = ks[:5], ks[5]
+        for x in (5, 6, 7):
+            self.handoff(ch, core, x)
+            self.assertIsNotNone(ch.config.weight(quiet.key_id), f"grace at {x}")
+        self.handoff(ch, core, 8)
+        self.assertIsNone(ch.config.weight(quiet.key_id), "an entry since 4 with nothing included")
+        self.assertEqual(ch.pruned[quiet.key_id].start, 8)
+
+    def test_only_finalized_inclusions_count(self):
+        ks = keys(6, "fin")
+        ch = chain(lambda e: {k.key_id: 100 for k in ks})
+        k5 = ks[5].key_id
+        # Included exactly at opening(x - 4) is outside (lo, F]; one above is inside.
+        for h, pruned in ((5 * L, True), (5 * L + 1, False)):
+            c = chain(lambda e: {k.key_id: 100 for k in ks})
+            c.include(h, [k5])
+            self.handoff(c, ks[:5], 9)
+            self.assertEqual(c.config.weight(k5) is None, pruned, h)
+        # A vote included above F (the finalizing link) does not count.
+        self.handoff(ch, ks[:5], 9, last=ks)
+        self.assertIsNone(ch.config.weight(k5))
+
+    def test_a_key_that_entered_later_has_its_grace(self):
+        ks = keys(6, "late")
+        ch = chain(lambda e: {k.key_id: 100 for k in (ks if e >= 6 else ks[:5])})
+        for x in (5, 6, 7, 8, 9):
+            self.handoff(ch, ks[:5], x)
+        self.assertIsNotNone(ch.config.weight(ks[5].key_id), "an entry since 6: grace until 10")
+        self.handoff(ch, ks[:5], 10)
+        self.assertIsNone(ch.config.weight(ks[5].key_id))
+
+    def test_rejoin_returns_from_the_handoff_that_finalizes_it(self):
+        ks = keys(6, "rj")
+        ch = chain(lambda e: {k.key_id: 100 for k in ks})
+        for x in (5, 6, 7, 8):
+            self.handoff(ch, ks[:5], x)
+        k = ks[5]
+        self.assertTrue(ch.pruned_at(k.key_id, 8))
+        rj = r.sign_rejoin(r.CHAIN_OBB_MAINNET, k, 8)
+        self.assertEqual(ch.rejoin(8 * L + I + 1, 8, rj), "ok")
+        self.assertEqual(ch.rejoin(8 * L + I + 2, 8, rj), "pending")
+        # Finalizing a checkpoint below the rejoin's block does not end it.
+        t = ch.cp(8 * L + 2 * I)
+        ch.votes(t, votes(ch, ks[:5], t))
+        self.assertEqual(ch.finalized[0], 8 * L + I)
+        self.assertIn(k.key_id, ch.rejoins)
+        self.handoff(ch, ks[:5], 9)
+        self.assertEqual(ch.config.weight(k.key_id), 100)
+        self.assertNotIn(k.key_id, ch.pruned)
+        self.assertEqual(ch.rejoins, {})
+        # Grace again: pruned at 13 if it stays silent.
+        for x in (10, 11, 12):
+            self.handoff(ch, ks[:5], x)
+            self.assertIsNotNone(ch.config.weight(k.key_id))
+        self.handoff(ch, ks[:5], 13)
+        self.assertIsNone(ch.config.weight(k.key_id))
+
+    def test_rejoin_verdicts(self):
+        ks = keys(6, "rv")
+        ch = chain(lambda e: {k.key_id: 100 for k in ks})
+        for x in (5, 6, 7, 8):
+            self.handoff(ch, ks[:5], x)
+        h = ch.finalized[0] + 1
+        k = ks[5]
+        self.assertEqual(ch.rejoin(h, 8, r.sign_rejoin(r.CHAIN_OBB_MAINNET, ks[0], 8)), "not_pruned")
+        self.assertEqual(ch.rejoin(h, 8, r.sign_rejoin(r.CHAIN_OBB_MAINNET, k, 6)), "epoch")
+        self.assertEqual(ch.rejoin(h, 8, r.sign_rejoin(r.CHAIN_OBB_MAINNET, k, 9)), "epoch")
+        self.assertEqual(ch.rejoin(h, 8, r.sign_rejoin(r.CHAIN_OBB_REGTEST, k, 8)), "signature")
+        self.assertEqual(ch.rejoin(h - 1, 8, r.sign_rejoin(r.CHAIN_OBB_MAINNET, k, 8)), "below_finality")
+        self.assertEqual(ch.rejoin(h, 9, r.sign_rejoin(r.CHAIN_OBB_MAINNET, k, 8)), "ok", "the next epoch too")
+
+    def test_forgotten_without_share_work(self):
+        ks = keys(6, "fg")
+        ch = chain(lambda e: {k.key_id: 100 for k in (ks if e < 9 or e > 9 else ks[:5])})
+        for x in (5, 6, 7, 8):
+            self.handoff(ch, ks[:5], x)
+        k = ks[5].key_id
+        self.assertIn(k, ch.pruned)
+        self.handoff(ch, ks[:5], 9)
+        self.assertNotIn(k, ch.pruned, "no candidate weight: forgotten")
+        self.handoff(ch, ks[:5], 10)
+        self.assertEqual(ch.config.weight(k), 100, "back as a new key")
+
+    def test_mass_absence_halts_and_nobody_prunes(self):
+        ks = keys(5, "mass")
+        ch = chain(lambda e: {k.key_id: 100 for k in ks})
+        for h in range(4 * L + I, 40 * L, I):
+            t = ch.cp(h)
+            self.assertFalse(ch.votes(t, votes(ch, ks[:3], t))["quorum"])
+        self.assertEqual((ch.config.epoch, ch.config.total, ch.pruned), (4, 500, {}))
+
+    def test_fading_weight_never_halts_finality(self):
+        # One key in ten goes offline every day (4 epochs), 40 % in all: a key
+        # is pruned about five epochs after its last included vote, so at most
+        # two are absent from C_x at once, the online weight stays above two
+        # thirds and every handoff happens.
+        ks = keys(10, "fade")
+        ch = chain(lambda e: {k.key_id: 100 for k in ks})
+        off = {ks[9].key_id: 5, ks[8].key_id: 9, ks[7].key_id: 13, ks[6].key_id: 17}
+        for x in range(5, 30):
+            online = [k for k in ks if off.get(k.key_id, 10**9) > x]
+            self.handoff(ch, online, x)
+            absent = sum(w for kk, w in ch.config.entries if off.get(kk, 10**9) <= x)
+            self.assertLess(3 * absent, ch.config.total, x)
+        self.assertEqual(ch.config.total, 600)
+        self.assertEqual(sorted(ch.pruned), sorted(off))
+
+    def test_a_partition_side_cannot_prune_its_way_to_a_quorum(self):
+        # 50/50: neither side finalizes, so neither side prunes the other.
+        ks = keys(10, "split")
+        for side in (ks[:5], ks[5:]):
+            ch = chain(lambda e: {k.key_id: 100 for k in ks})
+            for h in range(4 * L + I, 30 * L, I):
+                t = ch.cp(h)
+                ch.votes(t, votes(ch, side, t))
+            self.assertEqual((ch.config.epoch, ch.pruned, ch.finalized[0]), (4, {}, 4 * L))
+
+
 class Certificates(unittest.TestCase):
     def setUp(self):
         self.ks = keys(4)

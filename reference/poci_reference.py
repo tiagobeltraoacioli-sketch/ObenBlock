@@ -85,6 +85,38 @@ counts: its configuration is computed from a history that holds the
 evidence). The key is not an entry of C_x for ban_start <= x < ban_start +
 ban_epochs (100). Configurations already in force or past never change.
 
+Absence pruning by the old committee (section 4.1, PRUNE_AFTER = 4 epochs).
+A vote is "included at" ledger height h (the node passes block height + 1,
+the convention of the evidence height above: h <= F.height means the block is
+in the history finalized by F). At the handoff to C_x triggered by F, after
+the ban starts:
+
+  1. rejoins: every pending rejoin included at h <= F.height ends its key's
+     pruning; the key is no longer excluded from x on.
+  2. pruning: a key k of the configuration in force C_e is pruned (excluded
+     from x on, until a rejoin) iff
+       - it has been an entry of every configuration in force since epoch
+         x - PRUNE_AFTER or earlier (walking the configurations newest first,
+         k is an entry of each one until one whose epoch is <= x - PRUNE_AFTER;
+         a key that entered later is in its grace period), and
+       - no vote of k was included at a height h with
+         opening(x - PRUNE_AFTER) < h <= F.height.
+  3. C_x = the provider's candidate weights minus the keys banned at x and
+     the pruned keys. A pruned key absent from the candidate weights (no
+     share work left in its window) is forgotten: its later share work counts
+     as a new key's. Included votes are kept only for the keys of C_x.
+
+Rejoin (section 4.1): a pruned key returns by publishing, signed with the KES
+leaf of `epoch`,
+
+    rejoin_msg = SHA3-256( u32le(18) || "OBB-POCI-v1/rejoin" || u32le(chain_id)
+                           || u8(depth) || root[32] || u64le(epoch) )          67-byte preimage
+
+A block of epoch E may carry it iff epoch in {E-1, E}, the key is pruned and
+has no rejoin pending, and the signature is valid (checked last). Its share
+work counts again from the handoff that the finalization of the rejoin's
+block triggers (or the next one), as new weight under the growth cap.
+
 Finality certificate (section 6), wire encoding:
 
     u8(version = 1) || u32le(chain_id) || config_id[32]
@@ -141,8 +173,12 @@ DS_LEAF = b"OBB-POCI-v1/leaf"
 DS_NODE = b"OBB-POCI-v1/node"
 DS_ROOT = b"OBB-POCI-v1/root"
 DS_ATTEST_V3 = b"OBB-POCI-v1/attest"
+DS_REJOIN = b"OBB-POCI-v1/rejoin"
 DS_TEST_SIG = b"OBB-POCI-test/sig"
 CERT_VERSION = 1
+# Absence pruning (section 4.1): a rule constant, like the domain tags (not
+# part of params_digest, so the configuration ids of section 2 are unchanged).
+PRUNE_AFTER_EPOCHS = 4
 
 # ObenBlock PoWit parameters under PoCI. Mainnet: 6-hour epochs of 720 blocks
 # (DESIGN-obenblock.md §6.2), slots every 60, the 112-epoch window, the
@@ -478,11 +514,12 @@ def sign_vote(chain: int, params: dict, config_id: bytes, key: KesKey, src, tgt,
     return Vote(config_id, key, src, tgt, test_sign(key, e, message_v3(chain, config_id, key, src, tgt)))
 
 
-def counted_weight(config: Config, votes, src, tgt) -> int:
-    """Weight of the distinct keys of `config` with a valid vote for src->tgt
-    naming config.id (a vote naming another configuration counts nowhere)."""
+def counted_keys(config: Config, votes, src, tgt) -> list:
+    """The distinct keys of `config` with a valid vote for src->tgt naming
+    config.id, in vote order (a vote naming another configuration counts
+    nowhere)."""
     seen: set[bytes] = set()
-    got = 0
+    out = []
     for v in votes:
         if v.config_id != config.id or v.source != src or v.target != tgt:
             continue
@@ -491,8 +528,44 @@ def counted_weight(config: Config, votes, src, tgt) -> int:
         if w is None or k in seen or not v.verify(config.chain, config.params):
             continue
         seen.add(k)
-        got += w
-    return got
+        out.append(k)
+    return out
+
+
+def counted_weight(config: Config, votes, src, tgt) -> int:
+    """Weight of the distinct keys of `config` with a valid vote for src->tgt
+    naming config.id (a vote naming another configuration counts nowhere)."""
+    return sum(config.weight(k) for k in counted_keys(config, votes, src, tgt))
+
+
+# ── Rejoin (section 4.1) ─────────────────────────────────────────────────────
+
+def rejoin_preimage(chain: int, key: KesKey, epoch: int) -> bytes:
+    assert len(key.root) == 32
+    return u32le(len(DS_REJOIN)) + DS_REJOIN + u32le(chain) + u8(key.depth) + key.root + u64le(epoch)
+
+
+def rejoin_message(chain: int, key: KesKey, epoch: int) -> bytes:
+    return sha3(rejoin_preimage(chain, key, epoch))
+
+
+@dataclass(frozen=True)
+class Rejoin:
+    """A pruned key's rejoin message, signed by the KES leaf of `epoch`."""
+    key: KesKey
+    epoch: int
+    sig: bytes
+
+    def verify(self, chain: int) -> bool:
+        return test_verify(self.key, self.epoch, rejoin_message(chain, self.key, self.epoch), self.sig)
+
+    def to_json(self) -> dict:
+        return {"depth": self.key.depth, "root": self.key.root.hex(), "key_id": self.key.key_id.hex(),
+                "epoch": self.epoch, "sig": self.sig.hex()}
+
+
+def sign_rejoin(chain: int, key: KesKey, epoch: int) -> Rejoin:
+    return Rejoin(key, epoch, test_sign(key, epoch, rejoin_message(chain, key, epoch)))
 
 
 # ── Proof of Corruption ──────────────────────────────────────────────────────
@@ -541,12 +614,25 @@ class Ban:
 
 
 @dataclass
+class Prune:
+    """Absence pruning (section 4.1): the key is excluded from epoch `start`
+    on; `until` is set (transiently, while the handoff that ends it computes
+    C_x) when a finalized rejoin ends it."""
+    start: int
+    until: int | None = None
+
+    def covers(self, epoch: int) -> bool:
+        return self.start <= epoch and (self.until is None or epoch < self.until)
+
+
+@dataclass
 class PociChain:
     """Linear model of one honest node's PoCI state. `provider(epoch,
     finalized)` returns the candidate weights {key_id: weight} of C_epoch
     computed from the finalized history up to `finalized` (the window and
-    growth cap of DESIGN-obenblock.md §6.3, package O10); bans are applied
-    here."""
+    growth cap of DESIGN-obenblock.md §6.3, package O10), including keys that
+    are excluded at that epoch (`excluded_at` says which, for every epoch the
+    handoff covers); bans and pruning are applied here."""
     params_name: str
     provider: object
     checkpoint_hash: object = None
@@ -556,6 +642,9 @@ class PociChain:
     configs: dict = field(default_factory=dict)
     history: list = field(default_factory=list)      # configs in order of entry into force
     bans: dict = field(default_factory=dict)         # key_id -> [Ban] (latest last)
+    pruned: dict = field(default_factory=dict)       # key_id -> Prune
+    rejoins: dict = field(default_factory=dict)      # key_id -> height of the block holding its rejoin
+    seen: dict = field(default_factory=dict)         # key_id -> [heights where a vote of it was included]
     log: list = field(default_factory=list)
 
     @property
@@ -576,16 +665,46 @@ class PociChain:
         n = self.params["ban_epochs"]
         return any(b.start is not None and b.start <= epoch < b.start + n for b in self.bans.get(key_id, []))
 
+    def pruned_at(self, key_id: bytes, epoch: int) -> bool:
+        p = self.pruned.get(key_id)
+        return p is not None and p.covers(epoch)
+
+    def excluded_at(self, key_id: bytes, epoch: int) -> bool:
+        """Banned or pruned at `epoch` (what a provider leaves out of the
+        epochs a handoff covers)."""
+        return self.banned_at(key_id, epoch) or self.pruned_at(key_id, epoch)
+
     def _enter(self, epoch: int) -> None:
-        weights = {k: w for k, w in self.provider(epoch, self.finalized).items() if not self.banned_at(k, epoch)}
+        candidates = self.provider(epoch, self.finalized)
+        # A pruned key without candidate weight (no share work left) is forgotten.
+        for k in [k for k, p in self.pruned.items() if p.until is None and candidates.get(k, 0) == 0]:
+            del self.pruned[k]
+            self.rejoins.pop(k, None)
+        weights = {k: w for k, w in candidates.items() if not self.excluded_at(k, epoch)}
         self.config = make_config(self.params_name, epoch, weights)
         self.configs[self.config.id] = self.config
         self.history.append(self.config)
+        self.pruned = {k: p for k, p in self.pruned.items() if p.until is None}
+        self.seen = {k: hs for k, hs in self.seen.items() if self.config.weight(k) is not None}
 
-    def votes(self, target: tuple, votes) -> dict:
-        """Count votes for justified -> target under the configuration in force."""
+    def include(self, height: int, key_ids) -> list:
+        """A block at ledger height `height` included votes of `key_ids`
+        under the configuration in force: only its entries can have one."""
+        out = []
+        for k in key_ids:
+            if self.config.weight(k) is not None:
+                self.seen.setdefault(k, []).append(height)
+                out.append(k)
+        return out
+
+    def votes(self, target: tuple, votes, included_at: int | None = None) -> dict:
+        """Count votes for justified -> target under the configuration in
+        force. The counted ones are included at `included_at` (default
+        target height + 1: the first block that may carry them)."""
         src = self.justified
-        got = counted_weight(self.config, votes, src, target)
+        keys = counted_keys(self.config, votes, src, target)
+        got = sum(self.config.weight(k) for k in keys)
+        self.include(target[0] + 1 if included_at is None else included_at, keys)
         q = quorum(got, self.config.total)
         out = {"weight": got, "total": self.config.total, "quorum": q, "justified": False,
                "finalized": False, "handoff": False}
@@ -597,6 +716,20 @@ class PociChain:
                 out["handoff"] = self._finalize(src)
         return out
 
+    def present(self, key_id: bytes, x: int, f: tuple) -> bool:
+        lo = checkpoint_opening(self.params, x - PRUNE_AFTER_EPOCHS)
+        return any(lo < h <= f[0] for h in self.seen.get(key_id, []))
+
+    def prune_eligible(self, key_id: bytes, x: int) -> bool:
+        """k has been an entry of every configuration in force since epoch
+        x - PRUNE_AFTER or earlier."""
+        for c in reversed(self.history):
+            if c.weight(key_id) is None:
+                return False
+            if c.epoch <= x - PRUNE_AFTER_EPOCHS:
+                return True
+        return False
+
     def _finalize(self, f: tuple) -> bool:
         self.finalized = f
         e = epoch_of(self.params, f[0])
@@ -606,6 +739,12 @@ class PociChain:
             for b in bans:
                 if b.start is None and b.height <= f[0]:
                     b.start = e
+        for k in [k for k, h in self.rejoins.items() if h <= f[0]]:
+            del self.rejoins[k]
+            self.pruned[k].until = e
+        for k, _ in self.config.entries:
+            if k not in self.pruned and self.prune_eligible(k, e) and not self.present(k, e, f):
+                self.pruned[k] = Prune(e)
         self._enter(e)
         return True
 
@@ -625,6 +764,25 @@ class PociChain:
             if ban.start is None or self.config.epoch < ban.start + n:
                 return "ban_pending_or_active"
         self.bans.setdefault(k, []).append(Ban(a.config_id, height))
+        return "ok"
+
+    def rejoin(self, height: int, block_epoch: int, rj: Rejoin) -> str:
+        """A block at ledger height `height` of PoWit epoch `block_epoch`
+        carries the rejoin; returns "ok" or the reason it is invalid (first
+        failure wins, the signature last)."""
+        if height <= self.finalized[0]:
+            return "below_finality"
+        if not (rj.epoch <= block_epoch <= rj.epoch + 1):
+            return "epoch"
+        k = rj.key.key_id
+        p = self.pruned.get(k)
+        if p is None or p.until is not None:
+            return "not_pruned"
+        if k in self.rejoins:
+            return "pending"
+        if not rj.verify(self.params["chain_id"]):
+            return "signature"
+        self.rejoins[k] = height
         return "ok"
 
 
@@ -861,6 +1019,18 @@ def gen_messages() -> list:
     return out
 
 
+def gen_rejoin_messages() -> list:
+    out = []
+    for chain in (CHAIN_OBB_MAINNET, CHAIN_OBB_REGTEST):
+        for key in (vkey("rejoin", 0), KesKey(16, ZERO32)):
+            for e in (0, 9, 2**64 - 1):
+                pre = rejoin_preimage(chain, key, e)
+                out.append({"chain_id": chain, "depth": key.depth, "root": key.root.hex(), "key_id": key.key_id.hex(),
+                            "epoch": e, "preimage": pre.hex(), "rejoin_msg": sha3(pre).hex(),
+                            "test_sig": test_sign(key, e, sha3(pre)).hex()})
+    return out
+
+
 def gen_quorum() -> list:
     pairs = [(0, 0), (0, 1), (1, 1), (2, 3), (3, 3), (1, 2), (2, 2), (200, 300), (201, 300),
              (6_666, 10_000), (6_667, 10_000), (6_666_666, 9_999_999), (6_666_667, 9_999_999),
@@ -908,7 +1078,7 @@ def gen_sequences() -> list:
     name ("current" or "previous"), and the expected outcome and state."""
     P = PARAMS["mainnet"]
     I, L = P["checkpoint_interval"], P["epoch_len"]
-    keys = [vkey("seq", i) for i in range(6)]
+    keys = [vkey("seq", i) for i in range(10)]
     kid = [k.key_id for k in keys]
     seqs = []
 
@@ -925,9 +1095,18 @@ def gen_sequences() -> list:
                 bad = [keys[i] for i in st.get("bad_sig", [])]
                 vs = _vote_set(ch, [keys[i] for i in st["voters"]], tgt, cfg, src, bad)
                 rec["named_config_id"] = cfg.id.hex()
-                rec["result"] = ch.votes(tgt, vs)
+                rec["result"] = ch.votes(tgt, vs, st.get("included_at"))
                 rec["result"]["weight"] = str(rec["result"]["weight"])
                 rec["result"]["total"] = str(rec["result"]["total"])
+            elif st["op"] == "include":
+                rec["result"] = [k.hex() for k in ch.include(st["height"], [kid[i] for i in st["voters"]])]
+            elif st["op"] == "rejoin":
+                k = keys[st["key"]]
+                rj = sign_rejoin(P["chain_id"] if not st.get("other_chain") else CHAIN_OBB_REGTEST, k, st["epoch"])
+                if st.get("bad_sig"):
+                    rj = Rejoin(rj.key, rj.epoch, bytes(32))
+                rec["rejoin"] = rj.to_json()
+                rec["result"] = ch.rejoin(st["height"], st["block_epoch"], rj)
             elif st["op"] == "evidence":
                 a, b = st["links"]
                 cfg = ch.history[-2] if st.get("config") == "previous" else ch.config
@@ -939,6 +1118,8 @@ def gen_sequences() -> list:
             rec["state"] = _state(ch)
             rec["bans"] = {k.hex(): [{"config_id": b.config_id.hex(), "height": b.height, "start": b.start,
                                       "end": b.end(P["ban_epochs"])} for b in bl] for k, bl in sorted(ch.bans.items())}
+            rec["pruned"] = {k.hex(): p.start for k, p in sorted(ch.pruned.items())}
+            rec["rejoins"] = {k.hex(): h for k, h in sorted(ch.rejoins.items())}
             out_steps.append(rec)
         seqs.append({"name": name, "params": "mainnet", "keys": [{"depth": k.depth, "root": k.root.hex(),
                                                                    "key_id": k.key_id.hex()} for k in keys],
@@ -1011,6 +1192,8 @@ def gen_sequences() -> list:
         {"op": "votes", "target": b4 + I, "voters": [0, 1, 2, 3, 4]},
         {"op": "votes", "target": 5 * L, "voters": [0, 1, 2, 3, 4]},
         {"op": "votes", "target": 5 * L + I, "voters": [0, 1, 2, 3, 4]},
+        # The voters kept voting during the jump (section 4.1: no pruning).
+        {"op": "include", "height": 104 * L - 30, "voters": [0, 1, 2, 3, 4, 5]},
         {"op": "votes", "target": 104 * L, "voters": [0, 1, 2, 3, 4]},
         {"op": "votes", "target": 104 * L + I, "voters": [0, 1, 2, 3, 4]},
         {"op": "votes", "target": 105 * L, "voters": [0, 1, 2, 3, 4]},
@@ -1030,6 +1213,67 @@ def gen_sequences() -> list:
         {"op": "evidence", "height": b4 + 2, "key": 0, "links": [[b4, b4 + I], [b4, b4 + I, 1]]},
     ]
     run("evidence_rejections", lambda e: {kid[i]: 100 for i in range(5)}, steps)
+
+    # 8. Absence pruning (section 4.1) and rejoin. Keys 0..4 vote at every
+    #    handoff; key 5 votes once in epoch 5 and fades out; key 6 never votes.
+    #    Key 5 has no share work in epoch 12's window (forgotten) and is back
+    #    as a new key from 13.
+    def fading(e):
+        w = {kid[i]: 100 for i in range(5)}
+        w[kid[6]] = 10
+        if e != 12:
+            w[kid[5]] = 100
+        return w
+
+    def handoff(x, voters, last=None):
+        return [{"op": "votes", "target": x * L, "voters": voters},
+                {"op": "votes", "target": x * L + I, "voters": last or voters}]
+    core = [0, 1, 2, 3, 4]
+    steps = [{"op": "votes", "target": 5 * L, "voters": core + [5]},
+             {"op": "votes", "target": 5 * L + I, "voters": core}]
+    for x in (6, 7):
+        steps += handoff(x, core)
+    steps += handoff(8, core)                      # key 6: an entry since 4, nothing included: pruned at 8
+    steps += handoff(9, core)                      # key 5: included at 5L+1 > opening(5): present at 9
+    steps += handoff(10, core, core + [5])         # key 5's vote for 10L+I is above F = 10L: pruned at 10
+    steps += [
+        {"op": "rejoin", "height": 10 * L + I + 1, "block_epoch": 10, "key": 6, "epoch": 9},
+        {"op": "rejoin", "height": 10 * L + I + 2, "block_epoch": 10, "key": 6, "epoch": 10},
+        {"op": "rejoin", "height": 10 * L + I + 2, "block_epoch": 10, "key": 6, "epoch": 10},
+        {"op": "rejoin", "height": 10 * L + I + 2, "block_epoch": 10, "key": 0, "epoch": 10},
+        {"op": "rejoin", "height": 10 * L + I + 2, "block_epoch": 10, "key": 5, "epoch": 8},
+        {"op": "rejoin", "height": 10 * L + I + 2, "block_epoch": 10, "key": 5, "epoch": 10, "bad_sig": True},
+        {"op": "rejoin", "height": 10 * L + I + 2, "block_epoch": 10, "key": 5, "epoch": 10, "other_chain": True},
+        {"op": "rejoin", "height": 10 * L, "block_epoch": 10, "key": 5, "epoch": 10},
+        {"op": "rejoin", "height": 10 * L + I + 3, "block_epoch": 11, "key": 7, "epoch": 10},
+    ]
+    steps += handoff(11, core)                     # key 6's rejoin is final: back in C_11 (grace to 15)
+    steps += handoff(12, core)                     # key 5 has no candidate weight: forgotten
+    steps += handoff(13, core)                     # key 5 is a new key again
+    steps += handoff(14, core)
+    steps += handoff(15, core)                     # key 6 (entry since 11) still silent: pruned again
+    run("absence_pruning_and_rejoin", fading, steps)
+
+    # 9. A stall jumps from epoch 4 to 9: votes included in blocks of the
+    #    finalized history count, the votes of the finalizing links do not.
+    #    Key 5 is also banned (pending evidence): both apply at 9.
+    steps = [
+        {"op": "evidence", "height": b4 + 10, "key": 5, "links": [[b4, b4 + I], [b4, b4 + I, 1]]},
+        {"op": "votes", "target": b4 + I, "voters": [0, 1, 2]},
+        {"op": "include", "height": 6 * L + 3, "voters": [0, 1, 2, 3]},
+        {"op": "include", "height": 5 * L, "voters": [4]},
+        {"op": "votes", "target": 9 * L, "voters": [0, 1, 2, 3, 4]},
+        {"op": "votes", "target": 9 * L + I, "voters": [0, 1, 2, 3, 4]},
+    ]
+    run("stall_prunes_from_finalized_history", flat, steps)
+
+    # 10. More than a third vanishes at once: no quorum, no handoff, so
+    #     nobody is pruned (no local timeout) and C_4 stays.
+    steps = [{"op": "votes", "target": b4 + k * I, "voters": [0, 1, 2]} for k in range(1, 4)]
+    steps += [{"op": "include", "height": 30 * L, "voters": [0, 1, 2]},
+              {"op": "votes", "target": 30 * L, "voters": [0, 1, 2]},
+              {"op": "votes", "target": 30 * L + I, "voters": [0, 1, 2]}]
+    run("mass_absence_halts_without_pruning", lambda e: {kid[i]: 100 for i in range(5)}, steps)
     return seqs
 
 
@@ -1163,6 +1407,8 @@ def generate() -> dict:
             "ds_params": DS_PARAMS.decode(), "ds_config": DS_CONFIG.decode(), "ds_leaf": DS_LEAF.decode(),
             "ds_node": DS_NODE.decode(), "ds_root": DS_ROOT.decode(), "ds_attest_v3": DS_ATTEST_V3.decode(),
             "ds_test_sig": DS_TEST_SIG.decode(), "certificate_version": CERT_VERSION,
+            "ds_rejoin": DS_REJOIN.decode(), "prune_after_epochs": PRUNE_AFTER_EPOCHS,
+            "rejoin_preimage_len": len(rejoin_preimage(CHAIN_OBB_MAINNET, KesKey(0, ZERO32), 0)),
             "v3_preimage_len": len(message_v3_preimage(CHAIN_OBB_MAINNET, ZERO32, KesKey(0, ZERO32),
                                                        (0, ZERO32), (1, ZERO32))),
             "config_preimage_len": len(config_preimage_parts(0, 0, 0, ZERO32, ZERO32)),
@@ -1180,7 +1426,13 @@ def generate() -> dict:
                          "under the named configuration ('current' = in force, 'previous' = the one before it); "
                          "voters in bad_sig carry 32 zero bytes instead. result.weight/total are the counted weight "
                          "and the total of the configuration in force when the votes were counted; state is after "
-                         "the step. An evidence step: the block at `height` carries attestations a and b.",
+                         "the step. An evidence step: the block at `height` carries attestations a and b. "
+                         "Absence pruning (section 4.1): the votes counted in a votes step are included at "
+                         "`included_at` (default target height + 1); an include step records votes of the listed "
+                         "keys included at `height` (only entries of the configuration in force; result = the keys "
+                         "recorded); a rejoin step: the block at `height` of epoch `block_epoch` carries the "
+                         "rejoin (signed for chain 0x4F420002 when other_chain, 32 zero bytes when bad_sig). "
+                         "pruned: key -> the epoch its pruning started; rejoins: key -> height of its pending rejoin.",
             "certificates": "verdict: verify_certificate against trusted_config's entries; verdict_with_proof: "
                             "verify_certificate_with_proof against trusted_config.config_id and registry_proof "
                             "(absent when the certificate does not decode or names a key outside the configuration)",
@@ -1188,6 +1440,7 @@ def generate() -> dict:
         "params": gen_params(),
         "configs": gen_configs(),
         "messages": gen_messages(),
+        "rejoin_messages": gen_rejoin_messages(),
         "quorum": gen_quorum(),
         "evidence": gen_evidence_items(),
         "sequences": gen_sequences(),

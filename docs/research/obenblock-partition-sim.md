@@ -151,6 +151,8 @@ kinds `exit`, `equivocate`, `stop_mining`), `offline` (`key: [from, to)`) and
 `original_total`, `evidence_keys`, `honest_evidence`, `refused_votes`,
 `certificates_verify`, optional `stall` (`finalized_during`, `resume_epoch`,
 `totals`), and for PoCI `handoffs[]` (`at_slot`, `from_epoch`, `to_epoch`,
-`config_id`, `total`, `entries`) and `bans` (`key: [start, end)`). A node-level
+`config_id`, `total`, `entries`), `bans` (`key: [start, end)`) and `pruned`
+(`key: start epoch`, absence pruning of DESIGN-obenblock-poci.md §4.1, added
+with package B2; scenarios `fade-10pct-daily` and `vanish-40pct`). A node-level
 partition test can replay a scenario's witnesses and events and compare these
 outcomes (slots are checkpoint indices: height = slot x 60).

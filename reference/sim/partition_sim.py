@@ -27,7 +27,12 @@ Rule sets (docs/DESIGN-obenblock-poci.md, docs/DESIGN-obenblock.md §5.2 and
           the finalized history with the §6.3 growth cap; exits, bans and
           expiry only at a handoff; no leak; evidence = double or surround vote
           by one key under one config_id; ban for 100 epochs from the first
-          configuration computed after the evidence is finalized.
+          configuration computed after the evidence is finalized; absence
+          pruning (§4.1): at a handoff to C_x, a key that has been an entry of
+          every configuration since epoch x - 4 or earlier and has no vote
+          included in the finalized history of slots [opening(x-4), F) is left
+          out until a rejoin is finalized (an honest online key that is pruned
+          publishes one at the next epoch start, as its operator would).
 
 Model:
 
@@ -77,6 +82,7 @@ CHAIN_ID = 0x4F42_0001  # sim-local
 MAX_DECAY_STEPS = 64
 POCI_BAN_EPOCHS = 100
 GROWTH_DIV = 64
+PRUNE_AFTER_EPOCHS = 4
 
 
 # ── Rules ────────────────────────────────────────────────────────────────────
@@ -246,6 +252,10 @@ class Branch:
     total_by_epoch: dict[int, int] = field(default_factory=dict)
     fin_log: list[dict] = field(default_factory=list)
     certs: list[dict] = field(default_factory=list)
+    seen: dict[str, list[int]] = field(default_factory=dict)  # key -> slots whose votes were included
+    pruned: dict[str, list] = field(default_factory=dict)  # key -> [start, until or None] (§4.1)
+    rejoins: list[tuple[int, str]] = field(default_factory=list)  # (slot included, key)
+    cfg_hist: list = field(default_factory=list)  # configurations in force, oldest first
 
     def fork(self, label: str, members: set[str], slot: int) -> "Branch":
         b = Branch(label, list(self.chain), set(members),
@@ -255,7 +265,9 @@ class Branch:
                    dict(self.win_cache), self.config, {e: dict(m) for e, m in self.admitted.items()},
                    list(self.exits), list(self.evidence), set(self.used_evidence), dict(self.bans),
                    set(self.excluded), list(self.handoffs), dict(self.config_by_epoch),
-                   dict(self.total_by_epoch), list(self.fin_log), list(self.certs))
+                   dict(self.total_by_epoch), list(self.fin_log), list(self.certs),
+                   {k: list(v) for k, v in self.seen.items()}, {k: list(v) for k, v in self.pruned.items()},
+                   list(self.rejoins), list(self.cfg_hist))
         return b
 
     def has(self, slot: int, cp: str) -> bool:
@@ -292,6 +304,7 @@ class Sim:
             main.admitted = {e: dict(m) for e, m in work.items()}
             cfg = self.poci_config(main, 0, 0)
             main.config = cfg
+            main.cfg_hist.append(cfg)
             main.config_by_epoch[0] = cfg.id
             main.total_by_epoch[0] = cfg.total
         self.branches = [main]
@@ -332,6 +345,31 @@ class Sim:
         s = b.bans.get(k)
         return s is not None and s[0] <= e < s[1]
 
+    def pruned_at(self, b: Branch, k: str, e: int) -> bool:
+        p = b.pruned.get(k)
+        return p is not None and p[0] <= e and (p[1] is None or e < p[1])
+
+    def prune(self, b: Branch, x: int, f_slot: int) -> None:
+        """§4.1 at the handoff to C_x triggered by finalizing slot f_slot."""
+        for slot, k in list(b.rejoins):
+            if slot <= f_slot:
+                b.rejoins.remove((slot, k))
+                if k in b.pruned:
+                    b.pruned[k][1] = x
+        lo = (x - PRUNE_AFTER_EPOCHS) * SLOTS_PER_EPOCH
+        for k, _ in b.config.entries:
+            if k in b.pruned:
+                continue
+            eligible = False
+            for c in reversed(b.cfg_hist):
+                if c.weight(k) == 0:
+                    break
+                if c.epoch <= x - PRUNE_AFTER_EPOCHS:
+                    eligible = True
+                    break
+            if eligible and not any(lo <= s < f_slot for s in b.seen.get(k, [])):
+                b.pruned[k] = [x, None]
+
     def ledger(self, b: Branch, upto: int) -> None:
         """Growth-capped admitted work (§6.3) for every epoch < upto."""
         win = self.rules.window
@@ -339,7 +377,8 @@ class Sim:
         while e < upto:
             w_e = sum(sum(b.admitted.get(i, {}).values()) for i in range(e - win, e))
             leaving = b.admitted.get(e - win, {})
-            new = {k: (0 if self.banned_at(b, k, e) else n) for k, n in b.work.get(e, {}).items()}
+            new = {k: (0 if self.banned_at(b, k, e) or self.pruned_at(b, k, e) else n)
+                   for k, n in b.work.get(e, {}).items()}
             renew = {k: min(n, leaving.get(k, 0)) for k, n in new.items()}
             extra = {k: new[k] - renew[k] for k in new}
             g = max(w_e // GROWTH_DIV, self.g_min)
@@ -367,7 +406,12 @@ class Sim:
         for e in range(x - self.rules.window, x):
             for k, w in b.admitted.get(e, {}).items():
                 weights[k] = weights.get(k, 0) + w
-        weights = {k: w for k, w in weights.items() if k not in b.excluded and not self.banned_at(b, k, x)}
+        for k in [k for k, v in b.pruned.items() if v[1] is None and weights.get(k, 0) == 0]:
+            del b.pruned[k]  # no weight left: forgotten (§4.1)
+            b.rejoins = [(s, k2) for s, k2 in b.rejoins if k2 != k]
+        weights = {k: w for k, w in weights.items()
+                   if k not in b.excluded and not self.banned_at(b, k, x) and not self.pruned_at(b, k, x)}
+        b.pruned = {k: v for k, v in b.pruned.items() if v[1] is None}
         cfg = make_config(self.rules, x, weights)
         self.registry[cfg.id] = cfg
         return cfg
@@ -423,6 +467,8 @@ class Sim:
             got += w
             signed.append(k)
             b.active.add(k)
+            if self.rules.poci:
+                b.seen.setdefault(k, []).append(slot)
         if quorum(self.rules, got, total):
             if slot == b.justified + 1:
                 self.finalize(b, src, slot, signed, scope, got, total)
@@ -439,8 +485,11 @@ class Sim:
             x = epoch_of(src)
             if x > b.config.epoch:
                 old = b.config
+                self.prune(b, x, src)
                 cfg = self.poci_config(b, x, src)
                 b.config = cfg
+                b.cfg_hist.append(cfg)
+                b.seen = {k: v for k, v in b.seen.items() if cfg.weight(k) > 0}
                 b.handoffs.append({"at_slot": at, "from_epoch": old.epoch, "to_epoch": x, "config_id": cfg.id,
                                    "total": cfg.total, "entries": [k for k, _ in cfg.entries]})
         self.check_conflict(at)
@@ -569,6 +618,16 @@ class Sim:
         else:
             raise ValueError(kind)
 
+    def rejoin_pruned(self, e: int) -> None:
+        """Operators of honest online keys that were pruned publish a rejoin."""
+        slot = e * SLOTS_PER_EPOCH
+        for b in self.branches:
+            for k, v in sorted(b.pruned.items()):
+                off = self.sc.offline.get(k)
+                online = not (off and off[0] <= e < off[1]) and k not in self.exited and k in b.members
+                if v[1] is None and online and self.w[k].role == "honest" and all(k != k2 for _, k2 in b.rejoins):
+                    b.rejoins.append((slot, k))
+
     def mine(self, e: int) -> None:
         for b in self.branches:
             m = b.work.setdefault(e, {})
@@ -589,6 +648,8 @@ class Sim:
             for (ee, kind, k, where) in self.sc.events:
                 if ee == e:
                     self.apply_event(e, kind, k, where)
+            if self.rules.poci:
+                self.rejoin_pruned(e)
             self.mine(e)
             for slot in range(max(1, e * SLOTS_PER_EPOCH), (e + 1) * SLOTS_PER_EPOCH):
                 for b in self.branches:
@@ -668,6 +729,7 @@ class Sim:
             b = self.branches[0]
             out["handoffs"] = b.handoffs
             out["bans"] = {k: list(v) for k, v in sorted(b.bans.items())}
+            out["pruned"] = {k: v[0] for k, v in sorted(b.pruned.items())}
         return out
 
 
@@ -741,6 +803,15 @@ def scenarios() -> list[Scenario]:
         "p50-exit-ban", "50/50 epochs 2-12; side A includes an exit and an evidence",
         ws, 0, {"A": [w.key for w in ws[:5]], "B": [w.key for w in ws[5:]]}, 2, 12,
         events=[(3, "exit", "a00", "A"), (4, "equivocate", "a01", "A")]))
+    # §10 / §4.1: weight that fades out (one key in ten goes for good every
+    # day, 40 % in all) against 40 % vanishing at once (single chain).
+    ws = keyed(10, 10, "k")
+    out.append(Scenario(
+        "fade-10pct-daily", "one key in ten offline for good every 4 epochs from epoch 3 (40 % in all)",
+        ws, 40, offline={f"k{9 - i:02d}": (3 + 4 * i, 1 << 30) for i in range(4)}, stall=(3, 40)))
+    out.append(Scenario(
+        "vanish-40pct", "40 % offline for good at epoch 3", keyed(10, 10, "k"), 40,
+        offline={f"k{i:02d}": (3, 1 << 30) for i in range(6, 10)}, stall=(3, 40)))
     return out
 
 

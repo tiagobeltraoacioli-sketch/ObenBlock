@@ -191,6 +191,47 @@ class StallExitBanExpiry(unittest.TestCase):
         self.assertEqual(cfg.weight("a01"), 0)
 
 
+class AbsencePruning(unittest.TestCase):
+    """§4.1 and §10: weight that fades out is pruned at handoffs and finality
+    never halts; more than a third vanishing at once halts finality and no
+    node prunes locally; keys that come back after a halt rejoin."""
+
+    def test_fading_weight_is_pruned_and_finality_never_halts(self):
+        sim = run("fade-10pct-daily", p.POCI)
+        b = sim.branches[0]
+        r = sim.result()
+        epochs = {e for e in range(4, 40) if any(epoch_ok(f["at"], e) for f in b.fin_log)}
+        self.assertEqual(epochs, set(range(4, 40)), "a finalization in every epoch")
+        self.assertEqual(sorted(r["pruned"]), ["k06", "k07", "k08", "k09"])
+        last = sim.registry[b.handoffs[-1]["config_id"]]
+        self.assertEqual(sorted(k for k, _ in last.entries), [f"k{i:02d}" for i in range(6)])
+
+    def test_forty_percent_at_once_halts_and_nobody_is_pruned(self):
+        sim = run("vanish-40pct", p.POCI)
+        r = sim.result()
+        self.assertFalse(r["stall"]["finalized_during"])
+        self.assertIsNone(r["stall"]["resume_epoch"])
+        self.assertEqual(r["pruned"], {})
+        self.assertEqual(len(set(r["stall"]["totals"])), 1, "the same C and denominator throughout")
+        # Rule set 1 resumes through the leak (and would on both sides of a partition).
+        self.assertTrue(res("vanish-40pct", p.R1_OBB)["stall"]["finalized_during"])
+
+    def test_keys_back_after_a_halt_are_pruned_then_rejoin(self):
+        sim = run("stall-exit-ban-expiry", p.POCI)
+        b = sim.branches[0]
+        h15 = next(h for h in b.handoffs if h["to_epoch"] == 15)
+        back = ("k06", "k07", "k08", "k09")
+        # Their votes that ended the halt are above the finalized checkpoint.
+        self.assertTrue(all(k not in h15["entries"] for k in back))
+        later = next(h for h in b.handoffs if h["to_epoch"] > 16)
+        self.assertTrue(all(k in later["entries"] for k in back), later)
+        self.assertEqual(b.pruned, {})
+
+
+def epoch_ok(at_slot: int, e: int) -> bool:
+    return at_slot // S == e
+
+
 class Certificates(unittest.TestCase):
     def setUp(self):
         self.sim = run("p70-long", p.POCI)
