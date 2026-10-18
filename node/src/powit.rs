@@ -29,6 +29,8 @@ use gnb_crypto::core::{self, activation, Block};
 
 type Hash = [u8; 32];
 
+mod store;
+
 /// The second hardening activation height the PoWit rules switch at
 /// (`core::powit::Regime`; process-wide, the node's chain schedule):
 /// consensus (`block_state`), the pool, templates and the witness duty all
@@ -83,38 +85,43 @@ pub fn selected_chain_since(dag: &GhostDAG, start: Option<Hash>, min_height: u64
 
 // ── Per-block state storage ──────────────────────────────────────────────────
 
-fn state_key(hash: &Hash) -> String {
-    format!("powit/state/{}", hex::encode(hash))
-}
+#[allow(unused_imports)] // docs and tests; the node binary compiles this module too
+pub use store::ANCHOR_EVERY;
 
+/// `hash`'s stored PoWit state (`store`: per-epoch segments plus per-block
+/// diffs, package A3; data dirs of earlier releases are read as written).
 pub fn load_state(store: &Storage, hash: &Hash) -> Option<PowitState> {
-    let bytes = store.get_meta(&state_key(hash)).ok().flatten()?;
-    bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).ok().map(|(s, _)| s)
+    store::load(store, hash)
 }
 
-fn encode_state(state: &PowitState) -> Result<Vec<u8>, String> {
-    bincode::serde::encode_to_vec(state, bincode::config::standard())
-        .map_err(|e| format!("powit state encode: {e}"))
-}
-
-/// Write `hash`'s PoWit state on its own. The acceptance pipeline uses
-/// [`stage_state`] (committed with the block's DAG record); this is for tools
-/// and tests.
+/// Write `hash`'s PoWit state on its own, as an anchor record. The
+/// acceptance pipeline uses [`stage_state`] (committed with the block's DAG
+/// record); this is for tools and tests. Overwriting the state of a block
+/// that already has children stored as diffs of it changes theirs too.
 #[allow(dead_code)] // tools and tests; the node binary compiles this module too
 pub fn save_state(store: &Storage, hash: &Hash, state: &PowitState) -> Result<(), String> {
-    let bytes = encode_state(state)?;
-    store.put_meta(&state_key(hash), &bytes).map_err(|e| format!("storage: powit state: {e}"))
+    let mut batch = rocksdb::WriteBatch::default();
+    store::stage(store, &mut batch, hash, None, state)?;
+    store.write_batch(batch).map_err(|e| format!("storage: powit state: {e}"))
 }
 
 /// [`save_state`] into a caller-owned batch: the acceptance pipeline commits
 /// a block's PoWit state in the same batch as its DAG record (the first chunk
 /// of the chain move it triggers, or its fork-loser record), so a block is
 /// never recorded without its state and a refused block leaves none behind.
-pub fn stage_state(store: &Storage, batch: &mut rocksdb::WriteBatch, hash: &Hash, state: &PowitState)
-    -> Result<(), String>
+/// `parent` is the block's selected parent: when its state is stored in the
+/// same epoch, this block's record is a diff of it (`store`).
+pub fn stage_state(store: &Storage, batch: &mut rocksdb::WriteBatch, hash: &Hash, parent: Option<&Hash>,
+                   state: &PowitState) -> Result<(), String>
 {
-    let bytes = encode_state(state)?;
-    store.stage_meta(batch, &state_key(hash), &bytes).map_err(|e| format!("storage: powit state: {e}"))
+    store::stage(store, batch, hash, parent, state)
+}
+
+/// Whether `hash`'s state is stored as an anchor (`Some(true)`) or a diff
+/// (`Some(false)`) in the per-epoch layout; `None` if not in that layout.
+#[allow(dead_code)] // tests; the node binary compiles this module too
+pub fn state_record_is_anchor(store: &Storage, hash: &Hash) -> Option<bool> {
+    store::record_kind(store, hash)
 }
 
 /// State a child of `parent` builds on: the parent's stored state, or the
