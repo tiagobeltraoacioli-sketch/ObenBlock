@@ -60,3 +60,15 @@
 .gradient-bar{height:90px;border-radius:4px;background:var(--grad);margin-top:24px}
 @media(max-width:1100px){.network-grid{gap:55px}}
 @media(max-width:800px){.network-grid{grid-template-columns:1fr;gap:40px}.page-head{padding:48px 0 40px}.dl-grid,.brand-grid,.swatches{grid-template-columns:1fr}}
+
+/* Home additions (site-launch): status labels, the finality section with
+   PoCI, the launch table actions and the OBIP roadmap. */
+.status{display:inline-block;font:10px/1.6 var(--mono);letter-spacing:.08em;text-transform:uppercase;border:1px solid currentColor;border-radius:2px;padding:0 6px;margin-left:8px;white-space:nowrap;vertical-align:1px}.status.live{color:var(--lime)}.status.spec{color:var(--yellow)}.status.fork{color:var(--orange)}td>.status:first-child{margin-left:0}
+.finality-grid{display:grid;grid-template-columns:.95fr 1.25fr;gap:64px;align-items:start}.finality-grid .spec-table th{width:34%}
+.poci{border:1px solid #5a2a0c;border-radius:4px;background:linear-gradient(145deg,#170f08,#080a06 70%);padding:24px 27px 26px}.poci-head{display:flex;justify-content:space-between;align-items:center;gap:16px;flex-wrap:wrap}.poci-head .eyebrow{color:#c9a58f}.poci-head .status{margin-left:0}.poci-lead{font-size:15px;line-height:1.8;margin-top:16px;max-width:640px}
+.poci-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:1px;background:var(--line);border:1px solid var(--line);margin-top:24px}.poci-card{background:#0a0b08;padding:18px 18px 20px}.poci-card h3{font-size:16px;letter-spacing:-.02em;margin:8px 0 8px;color:var(--ink)}.poci-card p{font-size:13px;line-height:1.7}.poci-card code{font-size:.9em;color:#e1e8d7}.poci-card.corruption h3{color:#ffd2bd}
+.launch-actions{display:flex;align-items:center;gap:24px;flex-wrap:wrap;margin-top:30px}.network-grid .intro .launch-actions .button{margin-top:0}#network{margin-top:48px}
+.roadmap-table thead th{font:9px/1.7 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:#88947a;width:auto}.roadmap-table td.obip{width:70px;font-family:var(--mono);color:var(--lime)}.roadmap-table td:last-child{color:#9aa28f;font-size:12px}.roadmap-table tbody tr:hover td{color:var(--ink)}
+@media(max-width:1100px){.finality-grid{gap:40px}.poci-grid{grid-template-columns:1fr 1fr}}
+@media(max-width:800px){.finality-grid{grid-template-columns:1fr}.poci{padding:20px}.poci-grid{grid-template-columns:1fr}.roadmap-table td:last-child{display:none}.roadmap-table thead th:last-child{display:none}}
+.launch-value{font-family:var(--mono);font-size:.92em;color:#e1e8d7;overflow-wrap:anywhere}
