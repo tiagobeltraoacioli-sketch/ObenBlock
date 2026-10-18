@@ -89,6 +89,10 @@ pub struct MetricsState {
     /// The configured weak-subjectivity anchor is unknown while the applied
     /// tip is above its height (review round 2, M3): 1, else 0.
     pub finality_anchor_unknown:         IntGauge,
+    /// PoWit signer protection (DESIGN-obenblock-poci.md §8): witness
+    /// signers of this process halted by the rollback guard or the
+    /// one-signer check; 0 when none.
+    pub powit_signer_halted:             IntGauge,
 
     // ── Histograms (Phase 2) ────────────────────────────────────
     pub block_validation_seconds:        Histogram,
@@ -242,6 +246,13 @@ impl MetricsState {
             registry
         ).expect("register finality_anchor_unknown");
 
+        let powit_signer_halted = register_int_gauge_with_registry!(
+            opts!("gnb_powit_signer_halted",
+                  "PoWit witness signers of this node halted by signer protection (a vote of the key the record \
+                   does not hold, or a second instance): alert while > 0; getpowitinfo.signers has the reason"),
+            registry
+        ).expect("register powit_signer_halted");
+
         // ── Histograms ───────────────────────────────────────────
         // Block validation buckets tuned for expected range: 1ms..10s
         let block_validation_seconds = register_histogram_with_registry!(
@@ -287,6 +298,7 @@ impl MetricsState {
             deep_reorgs_total,
             finality_conflicts,
             finality_anchor_unknown,
+            powit_signer_halted,
             block_validation_seconds,
             rpc_latency_seconds,
         }
@@ -437,6 +449,12 @@ pub fn set_finality_conflicts(n: i64) {
 #[inline]
 pub fn set_finality_anchor_unknown(overdue: bool) {
     if let Some(m) = METRICS.get() { m.finality_anchor_unknown.set(i64::from(overdue)); }
+}
+
+/// PoWit signer protection: halted witness signers (`powit_signer`).
+#[inline]
+pub fn set_powit_signer_halted(n: i64) {
+    if let Some(m) = METRICS.get() { m.powit_signer_halted.set(n); }
 }
 
 #[inline]

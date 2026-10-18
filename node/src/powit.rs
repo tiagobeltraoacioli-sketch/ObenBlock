@@ -583,6 +583,16 @@ impl PowitPool {
         (g.shares.len(), g.attestations.len(), g.evidence.len())
     }
 
+    /// Every link of `key` the pool holds (pending and seen in gossip), and
+    /// whether it holds an equivocation proof against it: the signer's
+    /// rollback guard (`WitnessDuty::scan_for_rollback`).
+    pub fn votes_of(&self, key: &KeyId) -> (Vec<Attestation>, bool) {
+        let g = self.inner.lock();
+        let mut out: Vec<Attestation> = g.seen_links.of(key).cloned().collect();
+        out.extend(g.attestations.values().filter(|x| x.key == *key).map(|x| x.att.clone()));
+        (out, g.evidence.contains_key(key))
+    }
+
     /// Links remembered for equivocation detection (tests, metrics).
     #[allow(dead_code)] // tests only; the node binary compiles this module too
     pub fn seen_links_len(&self) -> usize {
@@ -834,80 +844,15 @@ pub fn template_body(pool: &PowitPool, dag: &GhostDAG, store: &Storage, tip: Has
 
 // ── Witness duty ─────────────────────────────────────────────────────────────
 
-/// Write `bytes` to `path` so that it survives a crash or a power loss:
-/// a temp file in the same directory, fsync'd, renamed over `path`, then the
-/// directory fsync'd (the rename itself is durable only then). Owner-only
-/// permissions (the KES key file holds the encrypted seed).
-fn write_durable(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write;
-    let name = path.file_name().ok_or_else(|| format!("{}: not a file path", path.display()))?;
-    let mut tmp_name = name.to_os_string();
-    tmp_name.push(".tmp");
-    let tmp = path.with_file_name(tmp_name);
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let io = |what: &str, e: std::io::Error| format!("{what} {}: {e}", tmp.display());
-    let mut f = opts.open(&tmp).map_err(|e| io("create", e))?;
-    f.write_all(bytes).map_err(|e| io("write", e))?;
-    f.sync_all().map_err(|e| io("fsync", e))?;
-    drop(f);
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {e}", path.display()))?;
-    let dir = match path.parent() {
-        Some(d) if !d.as_os_str().is_empty() => d,
-        _ => Path::new("."),
-    };
-    std::fs::File::open(dir).and_then(|d| d.sync_all())
-        .map_err(|e| format!("fsync directory {}: {e}", dir.display()))
-}
+use crate::powit_signer::{write_durable, CrashPoint, ObservedVote, Signed, VoteGuard};
 
-/// Read a JSON file that may be absent (`None`), refusing one that exists but
-/// cannot be read or parsed: an unreadable vote record must never read as
-/// "no votes" (that re-opens every link the key signed).
-fn read_json_if_present<T: serde::de::DeserializeOwned>(path: &Path, what: &str) -> Result<Option<T>, String> {
-    match std::fs::read(path) {
-        Ok(b) => serde_json::from_slice(&b).map(Some).map_err(|e| format!(
-            "{what} {} is corrupt ({e}); refusing to sign: restore it from a backup (deleting it can make \
-             this key sign a double vote and be barred)", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("{what} {} is unreadable ({e}); refusing to sign", path.display())),
-    }
-}
-
-/// The highest source and target heights a key ever signed (EIP-3076's
-/// minimal slashing protection): a link with a lower source or a target not
-/// above it is never signed, so no double or surround vote is possible even
-/// if the full record is lost. Kept in the record and, so that it moves with
-/// the key on a failover onto a fresh data directory, beside the key file.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct HighWater {
-    source: u64,
-    target: u64,
-}
-
-impl HighWater {
-    fn of(signed: &[(Checkpoint, Checkpoint)]) -> Self {
-        signed.iter().fold(HighWater::default(), |h, (s, t)| h.max(&HighWater { source: s.height, target: t.height }))
-    }
-    fn max(self, o: &HighWater) -> Self {
-        HighWater { source: self.source.max(o.source), target: self.target.max(o.target) }
-    }
-    fn allows(&self, source: &Checkpoint, target: &Checkpoint) -> bool {
-        source.height >= self.source && target.height > self.target
-    }
-}
-
-/// A witness's forward-secure KES key, its payout script and its persistent
-/// vote record. The KES state evolves to each target's epoch (erasing every
-/// earlier seed, on disk first) before signing, and the record makes a double
-/// or surround vote impossible even across restarts and reorgs. Both files
-/// are written durably (`write_durable`) before a signature is released; a
-/// record that exists but cannot be read refuses to load; the highest
-/// signed heights (`HighWater`) are enforced and kept beside the key too.
+/// A witness's forward-secure KES key, its payout script and its signer
+/// protection (`powit_signer::VoteGuard`, DESIGN-obenblock-poci.md §8). The
+/// KES state evolves to each target's epoch (erasing every earlier seed, on
+/// disk first) before signing; the guard persists every vote before its
+/// signature is released, refuses double and surround votes, holds the
+/// key's exclusive signer lock, and stops signing on a vote of this key in
+/// the chain or the pool that its record does not hold (rollback guard).
 pub struct WitnessDuty {
     pub key_id: KeyId,
     pub payout_script: Vec<u8>,
@@ -919,9 +864,7 @@ pub struct WitnessDuty {
     /// secure-allocator memory, for the same reason).
     password: gnb_crypto::crypto::SecretBytes,
     signer: Mutex<gnb_crypto::core::kes::KesSigner>,
-    record_path: PathBuf,
-    highwater_path: PathBuf,
-    signed: Mutex<(Vec<(Checkpoint, Checkpoint)>, HighWater)>,
+    guard: VoteGuard,
 }
 
 /// The witness password held in secret memory, as the `&str` the key file
@@ -931,11 +874,24 @@ fn password_str(password: &gnb_crypto::crypto::SecretBytes) -> &str {
     std::str::from_utf8(password).expect("the witness password was read as UTF-8")
 }
 
+/// Votes of `key` the next block's view knows: the tip state's included
+/// links (source height, target) and the pool's links and held evidence.
+fn observed_votes(st: &PowitState, key: &KeyId) -> (Vec<ObservedVote>, bool) {
+    let mut seen: Vec<ObservedVote> = st.links.get(key).into_iter().flatten()
+        .map(|&(sh, th, thash)| ObservedVote { source_height: sh, source_hash: None,
+                                              target: Checkpoint { height: th, hash: thash } })
+        .collect();
+    let (pooled, evidence) = pool().votes_of(key);
+    seen.extend(pooled.iter().map(ObservedVote::of));
+    (seen, evidence)
+}
+
 impl WitnessDuty {
     /// Load a KES witness key (`gnb-cli witnesskeygen`); the password is read
     /// from `password_file` (first line), never from the command line.
-    /// Refuses a vote record or high-water file that exists but cannot be
-    /// read (it would otherwise read as "never signed").
+    /// Opens the key's signer guard: refuses a second signer of the key, and
+    /// a vote record or high-water file that exists but cannot be read (it
+    /// would otherwise read as "never signed").
     pub fn load(key: &Path, password_file: &Path, payout_script: Vec<u8>, data_dir: &Path) -> Result<Self, String> {
         // CRY-4: the file's contents are wiped once the first line is copied.
         let pw = zeroize::Zeroizing::new(
@@ -945,45 +901,62 @@ impl WitnessDuty {
         let file = gnb_crypto::core::kes::KesKeyFile::load(key)?;
         let signer = file.open(password_str(&password))?;
         let key_id = signer.public().witness_id();
-        let record_path = data_dir.join(format!("powit-votes-{}.json", hex::encode(key_id)));
-        let mut hw_name = key.file_name().ok_or("witness key path has no file name")?.to_os_string();
-        hw_name.push(".votes-highwater.json");
-        let highwater_path = key.with_file_name(hw_name);
-        let signed: Vec<(Checkpoint, Checkpoint)> =
-            read_json_if_present(&record_path, "witness vote record")?.unwrap_or_default();
-        let beside_key: HighWater =
-            read_json_if_present(&highwater_path, "witness vote high-water file")?.unwrap_or_default();
-        let hw = HighWater::of(&signed).max(&beside_key);
+        let guard = VoteGuard::open(key_id, key, &crate::powit_signer::record_path(data_dir, &key_id))?;
         Ok(WitnessDuty {
             key_id,
             payout_script,
             key_path: key.to_path_buf(),
             password,
             signer: Mutex::new(signer),
-            record_path,
-            highwater_path,
-            signed: Mutex::new((signed, hw)),
+            guard,
         })
     }
 
-    fn conflicts(&self, source: &Checkpoint, target: &Checkpoint) -> bool {
-        let g = self.signed.lock();
-        !g.1.allows(source, target) || g.0.iter().any(|(s, t)| {
-            (t.height == target.height && t != target)
-                || (s.height < source.height && target.height < t.height)
-                || (source.height < s.height && t.height < target.height)
-        })
+    /// The signer guard (status, alert, record).
+    pub fn guard(&self) -> &VoteGuard {
+        &self.guard
+    }
+
+    /// Tests: make the next signature stop at `p` as a crash would.
+    #[doc(hidden)]
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
+    pub fn set_crash_point(&self, p: Option<CrashPoint>) {
+        self.guard.set_crash_point(p, false);
+    }
+
+    /// Rollback guard against the selected tip's state and the pool: at
+    /// start (main) and before every vote (`maybe_attest`). Returns the
+    /// alert if the signer is (now) halted.
+    pub fn scan_for_rollback(&self, dag: &GhostDAG, store: &Storage) -> Option<String> {
+        let st = tip_context(dag).and_then(|(tip, _)| load_state(store, &tip));
+        let (seen, evidence) = match &st {
+            Some(st) => observed_votes(st, &self.key_id),
+            None => {
+                let (pooled, evidence) = pool().votes_of(&self.key_id);
+                (pooled.iter().map(ObservedVote::of).collect(), evidence)
+            }
+        };
+        self.guard.observe(&seen, evidence, "chain or pool")
     }
 
     /// If this key is a witness for the checkpoint to vote for above the
     /// tip's justified one, sign that link once (the message of the target's
-    /// height). Returns the new attestation. The checkpoint is the newest slot
-    /// at or below the next block's height; from the second hardening
-    /// activation, the justified checkpoint's direct child while a vote for
-    /// it can still be included.
+    /// height). Returns the new attestation (or, once per process, one
+    /// persisted but maybe never released before a crash). The checkpoint is
+    /// the newest slot at or below the next block's height; from the second
+    /// hardening activation, the justified checkpoint's direct child while a
+    /// vote for it can still be included.
     pub fn maybe_attest(&self, dag: &GhostDAG, store: &Storage) -> Result<Option<Attestation>, String> {
+        if self.guard.alert().is_some() {
+            return Ok(None);
+        }
         let Some((tip, tip_h)) = tip_context(dag) else { return Ok(None) };
         let Some(st) = load_state(store, &tip) else { return Ok(None) };
+        // Rollback guard before every vote.
+        let (seen, evidence) = observed_votes(&st, &self.key_id);
+        if let Some(alert) = self.guard.observe(&seen, evidence, "chain or pool") {
+            return Err(format!("PoWit signer halted: {alert}"));
+        }
         let p: PowitParams = powit::params();
         let act = st.activation;
         if tip_h < act {
@@ -1035,41 +1008,42 @@ impl WitnessDuty {
             }
             let Some(hash) = view.selected_at(slot) else { continue };
             let target = Checkpoint { height: slot, hash };
-            if self.signed.lock().0.iter().any(|(s, t)| *s == source && *t == target) {
-                return Ok(None); // signed: waiting for it to be included
+            if self.guard.holds(&source, &target) {
+                // Signed: the guard returns the stored attestation once per
+                // process (persisted, maybe not released before a restart),
+                // then nothing while it waits to be included.
+                return match self.guard.sign_link(source, target, None, || Err("already signed".into()))? {
+                    Signed::Stored { att, first_release: true } => Ok(Some(att)),
+                    _ => Ok(None),
+                };
             }
-            if self.conflicts(&source, &target) || te < signer.epoch() {
+            if !self.guard.permits(&source, &target) || te < signer.epoch() {
                 continue;
             }
             chosen = Some((target, te));
             break;
         }
         let Some((target, te)) = chosen else { return Ok(None) };
-        if te > signer.epoch() {
-            // Erase every earlier seed, ON DISK FIRST (durably), then in memory.
-            let password = password_str(&self.password);
-            let mut next_state = gnb_crypto::core::kes::KesKeyFile::load(&self.key_path)?.open(password)?;
-            next_state.evolve_to(te)?;
-            let sealed = gnb_crypto::core::kes::KesKeyFile::seal(&next_state, password)?;
-            let json = serde_json::to_vec_pretty(&sealed).map_err(|e| format!("kes save: {e}"))?;
-            write_durable(&self.key_path, &json).map_err(|e| format!("kes save: {e}"))?;
-            *signer = next_state;
+        let signed = self.guard.sign_link(source, target, None, || {
+            if te > signer.epoch() {
+                // Erase every earlier seed, ON DISK FIRST (durably), then in memory.
+                let password = password_str(&self.password);
+                let mut next_state = gnb_crypto::core::kes::KesKeyFile::load(&self.key_path)?.open(password)?;
+                next_state.evolve_to(te)?;
+                let sealed = gnb_crypto::core::kes::KesKeyFile::seal(&next_state, password)?;
+                let json = serde_json::to_vec_pretty(&sealed).map_err(|e| format!("kes save: {e}"))?;
+                write_durable(&self.key_path, &json).map_err(|e| format!("kes save: {e}"))?;
+                *signer = next_state;
+            }
+            // The message of the target's height (v2, committing this key,
+            // from the second hardening activation). PoCI (ObenBlock) signs
+            // the v3 message naming `config_id` here.
+            Attestation::sign_at(core::node_chain_id(), h2, source, target, &signer)
+        })?;
+        match signed {
+            Signed::Fresh(att) | Signed::Stored { att, first_release: true } => Ok(Some(att)),
+            _ => Ok(None),
         }
-        // The message of the target's height (v2, committing this key, from
-        // the second hardening activation).
-        let att = Attestation::sign_at(core::node_chain_id(), h2, source, target, &signer)?;
-        {
-            let mut g = self.signed.lock();
-            g.0.push((source, target));
-            g.1 = g.1.max(&HighWater { source: source.height, target: target.height });
-            // Persist BEFORE releasing the signature: the record, then the
-            // high-water mark beside the key.
-            let bytes = serde_json::to_vec(&g.0).map_err(|e| e.to_string())?;
-            write_durable(&self.record_path, &bytes).map_err(|e| format!("witness vote record: {e}"))?;
-            let hw = serde_json::to_vec(&g.1).map_err(|e| e.to_string())?;
-            write_durable(&self.highwater_path, &hw).map_err(|e| format!("witness vote high-water file: {e}"))?;
-        }
-        Ok(Some(att))
     }
 }
 
@@ -1159,7 +1133,52 @@ pub fn info_json(dag: &GhostDAG, store: &Storage) -> serde_json::Value {
             "hash": hex::encode(h), "block_height": height,
             "origin": dag.finality_outcome().origin.as_str() })),
         "finality_conflict": dag.finality_outcome().conflict.is_some(),
+        // Signer protection (DESIGN-obenblock-poci.md §8): this node's
+        // witness signers; `signer_halted` is the alert.
+        "signer_halted": crate::powit_signer::any_halted(),
+        "signers": crate::powit_signer::statuses(),
     })
+}
+
+/// JSON for `getpowitkeyvotes <key id hex>`: the votes of one witness key
+/// the selected tip's PoWit state includes (source height, target) and the
+/// pool holds, and whether the pool holds an equivocation proof against it.
+/// Read by `gnb-cli powitattest`'s rollback guard (signer protection).
+pub fn key_votes_json(dag: &GhostDAG, store: &Storage, key: &KeyId) -> serde_json::Value {
+    let st = tip_context(dag).and_then(|(tip, _)| load_state(store, &tip));
+    let chain: Vec<serde_json::Value> = st.as_ref().and_then(|s| s.links.get(key)).into_iter().flatten()
+        .map(|(sh, th, thash)| serde_json::json!({
+            "source_height": sh, "target_height": th, "target_hash": hex::encode(thash) }))
+        .collect();
+    let (pooled, evidence) = pool().votes_of(key);
+    let pool_votes: Vec<serde_json::Value> = pooled.iter().map(|a| serde_json::json!({
+        "source_height": a.source.height, "source_hash": hex::encode(a.source.hash),
+        "target_height": a.target.height, "target_hash": hex::encode(a.target.hash) })).collect();
+    serde_json::json!({ "key": hex::encode(key), "chain": chain, "pool": pool_votes, "evidence": evidence })
+}
+
+/// Parse `getpowitkeyvotes`'s answer into observed votes (`gnb-cli`).
+#[allow(dead_code)] // gnb-cli only; the node binary compiles this module too
+pub fn parse_key_votes(v: &serde_json::Value) -> Result<(Vec<crate::powit_signer::ObservedVote>, bool), String> {
+    if let Some(e) = v.get("error") {
+        return Err(format!("getpowitkeyvotes: {e}"));
+    }
+    let h32 = |x: &serde_json::Value| -> Result<[u8; 32], String> {
+        let b = hex::decode(x.as_str().ok_or("hash is not a string")?).map_err(|e| e.to_string())?;
+        b.try_into().map_err(|_| "hash is not 32 bytes".to_string())
+    };
+    let u = |x: &serde_json::Value| x.as_u64().ok_or_else(|| "height is not a number".to_string());
+    let mut out = Vec::new();
+    for (list, with_source) in [("chain", false), ("pool", true)] {
+        for x in v.get(list).and_then(|l| l.as_array()).ok_or(format!("getpowitkeyvotes: no {list}"))? {
+            out.push(crate::powit_signer::ObservedVote {
+                source_height: u(&x["source_height"])?,
+                source_hash: if with_source { Some(h32(&x["source_hash"])?) } else { None },
+                target: Checkpoint { height: u(&x["target_height"])?, hash: h32(&x["target_hash"])? },
+            });
+        }
+    }
+    Ok((out, v.get("evidence").and_then(|e| e.as_bool()).unwrap_or(false)))
 }
 
 // ── Gossip ingress ───────────────────────────────────────────────────────────

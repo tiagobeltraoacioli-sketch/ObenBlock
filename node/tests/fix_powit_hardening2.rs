@@ -283,7 +283,7 @@ fn powitattest_signs_on_its_chains_schedule() {
     let run = |net: &str, key: &std::path::Path, src: u64, tgt: u64| -> Attestation {
         let out = std::process::Command::new(env!("CARGO_BIN_EXE_gnb-cli"))
             .args(["powitattest", key.to_str().unwrap(), net, &src.to_string(), &hex::encode([1u8; 32]),
-                   &tgt.to_string(), &hex::encode([2u8; 32]), &ACT.to_string()])
+                   &tgt.to_string(), &hex::encode([2u8; 32]), &ACT.to_string(), "--offline"])
             .env("GNB_WALLET_PASSWORD", PASSWORD)
             .output()
             .unwrap();

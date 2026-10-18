@@ -110,7 +110,10 @@ a separate, optional sighash flag and is not part of this change.
   exists but cannot be read makes the witness refuse to start instead of
   reading as "no votes". Losing the record AND the high-water file together
   with an old backup can still produce a double vote, and the key would be
-  barred.
+  barred, unless the rollback guard (`node/src/powit_signer.rs`,
+  DESIGN-obenblock-poci.md §8) sees the lost vote in the chain or the pool
+  first: it then stops signing and alerts. The same protection, with the
+  key's exclusive signer lock, covers `gnb-cli powitattest`.
 - **A key compromised in the current epoch** can still sign the current and
   future epochs until the operator rotates. That is unchanged from today.
 

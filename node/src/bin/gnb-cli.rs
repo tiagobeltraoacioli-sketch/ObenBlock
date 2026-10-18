@@ -182,11 +182,21 @@ fn main() {
             return;
         }
         // Sign a PoWit link with a KES witness key and print the attestation
-        // hex (kind 2). For operators and tests: unlike the node's witness duty
-        // this does not consult a vote record, and it evolves the key file.
+        // hex (kind 2). Signer protection (DESIGN-obenblock-poci.md §8): the
+        // key's vote record (in [record-dir], default the key's directory;
+        // pass the node's data directory to share the duty's record) and the
+        // high-water file beside the key refuse double and surround votes,
+        // the vote is persisted before it is printed, a repeated request
+        // prints the stored attestation, the key's signer lock refuses a
+        // second signer (a running node with this key), and the rollback
+        // guard reads the key's votes from the node (`getpowitkeyvotes`;
+        // `--offline` skips it explicitly).
         "powitattest" => {
-            require_params(params, 6,
-                "powitattest <witness-key.json> <mainnet|testnet> <src_slot> <src_hash> <tgt_slot> <tgt_hash> [activation]");
+            let offline = params.contains(&"--offline");
+            let params: Vec<&str> = params.iter().copied().filter(|p| *p != "--offline").collect();
+            require_params(&params, 6,
+                "powitattest <witness-key.json> <mainnet|testnet> <src_slot> <src_hash> <tgt_slot> <tgt_hash> \
+                 [activation] [record-dir] [--offline]");
             // CRY-4: wiping storage, as for witnesskeygen.
             let pw = match std::env::var("GNB_WALLET_PASSWORD") {
                 Ok(p) => zeroize::Zeroizing::new(p),
@@ -207,23 +217,85 @@ fn main() {
             let act: u64 = params.get(6).and_then(|a| a.parse().ok()).unwrap_or(0);
             let p = gnb::core::powit::params_for(chain);
             if tgt.height < act { eprintln!("target below activation"); process::exit(1); }
-            let e = p.epoch(act, tgt.height);
-            if e > signer.epoch() {
-                signer.evolve_to(e).unwrap_or_else(|er| { eprintln!("{}", er); process::exit(1) });
-                gnb::core::kes::KesKeyFile::seal(&signer, &pw).and_then(|f| f.save(path))
-                    .unwrap_or_else(|er| { eprintln!("{}", er); process::exit(1) });
-            } else if e < signer.epoch() {
-                eprintln!("epoch {} already erased (key is at {}): forward security", e, signer.epoch());
-                process::exit(1);
+            let key_id = signer.public().witness_id();
+            let record_dir = match params.get(7) {
+                Some(d) => std::path::PathBuf::from(d),
+                None => match path.parent() {
+                    Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+                    _ => std::path::PathBuf::from("."),
+                },
+            };
+            let guard = gnb::powit_signer::VoteGuard::open(key_id, path,
+                &gnb::powit_signer::record_path(&record_dir, &key_id))
+                .unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
+            if let Ok(at) = std::env::var(gnb::powit_signer::CRASH_ENV) {
+                guard.set_crash_point(gnb::powit_signer::CrashPoint::parse(&at), true);
+            }
+            if offline {
+                eprintln!("--offline: the rollback guard (votes of this key in the chain and the pool) is skipped");
+            } else {
+                let answer = rpc_call(&rpc_target, "getpowitkeyvotes", &serde_json::json!([hex::encode(key_id)]))
+                    .and_then(|v| gnb::powit::parse_key_votes(&v))
+                    .unwrap_or_else(|e| {
+                        eprintln!("rollback guard: cannot read this key's votes from the node ({e}); refusing to \
+                                   sign (pass --offline to skip the check explicitly)");
+                        process::exit(1)
+                    });
+                if let Some(alert) = guard.observe(&answer.0, answer.1, "node's chain or pool") {
+                    eprintln!("PoWit signer halted: {alert}");
+                    process::exit(1);
+                }
             }
             // The message of the target's height on `chain`'s schedule: from
             // the second hardening activation it commits the witness key
             // (PoWit audit finding 1). A signer has no node chain id, so the
-            // schedule comes from the chain named here.
+            // schedule comes from the chain named here. PoCI (ObenBlock)
+            // passes its config_id and signs the v3 message here.
             let h2 = gnb::core::activation::hardening2_activation_height_for_signer(chain);
-            let att = gnb::core::powit::Attestation::sign_at(chain, h2, src, tgt, &signer)
-                .unwrap_or_else(|er| { eprintln!("{}", er); process::exit(1) });
+            let signed = guard.sign_link(src, tgt, None, || {
+                let e = p.epoch(act, tgt.height);
+                if e > signer.epoch() {
+                    // Erase earlier seeds on disk first (durably).
+                    signer.evolve_to(e)?;
+                    let sealed = gnb::core::kes::KesKeyFile::seal(&signer, &pw)?;
+                    let json = serde_json::to_vec_pretty(&sealed).map_err(|e| format!("kes save: {e}"))?;
+                    gnb::powit_signer::write_durable(path, &json).map_err(|e| format!("kes save: {e}"))?;
+                } else if e < signer.epoch() {
+                    return Err(format!("epoch {} already erased (key is at {}): forward security", e, signer.epoch()));
+                }
+                gnb::core::powit::Attestation::sign_at(chain, h2, src, tgt, &signer)
+            }).unwrap_or_else(|er| { eprintln!("{}", er); process::exit(1) });
+            let att = match signed {
+                gnb::powit_signer::Signed::Fresh(a) => a,
+                gnb::powit_signer::Signed::Stored { att, .. } => {
+                    eprintln!("this link was signed before: printing the stored attestation");
+                    att
+                }
+                gnb::powit_signer::Signed::RecordedWithoutSignature => {
+                    eprintln!("this link was signed before (a v1 vote record keeps no signature)");
+                    process::exit(1)
+                }
+            };
             println!("{}", hex::encode(att.to_wire_bytes()));
+            return;
+        }
+        // Clear a persisted signer-protection alert (the rollback guard
+        // halted the signer). Stop every other instance of the key first; the
+        // lock refuses while one runs. Votes adopted from the chain stay in
+        // the record and keep being refused against.
+        "powitsignerclear" => {
+            require_params(params, 2, "powitsignerclear <witness-key.json> <record-dir>");
+            let path = std::path::Path::new(params[0]);
+            let file = gnb::core::kes::KesKeyFile::load(path).unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
+            let key_id = file.public.witness_id();
+            let guard = gnb::powit_signer::VoteGuard::open(key_id, path,
+                &gnb::powit_signer::record_path(std::path::Path::new(params[1]), &key_id))
+                .unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
+            match guard.clear_alert() {
+                Ok(Some(a)) => println!("cleared: {a}"),
+                Ok(None) => println!("no alert"),
+                Err(e) => { eprintln!("{}", e); process::exit(1) }
+            }
             return;
         }
         "getpowitinfo" | "powit" => {
