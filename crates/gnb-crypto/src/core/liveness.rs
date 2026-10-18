@@ -121,36 +121,65 @@ pub fn expected_block_bits_at(parent_timestamp: u64, height: u64, time: u64, har
     Ok(relieve_at(base, parent_timestamp, height, time, hardening_height, liveness_height))
 }
 
+/// The easiest target of a block at `height` under the process's proof-of-work
+/// scheme: the SHA-256d pow limit of the chain on ObenBlock (`0x1d00ffff`
+/// mainnet, `0x207fffff` regtest, at every height), else GnB's ASERT pow
+/// limit of `height` (`asert_params_at`). The stall relief is clamped to it,
+/// so a relaxed block never carries bits the PoW check refuses.
+pub fn scheme_pow_limit_at(height: u64, hardening_height: u64) -> gnb_smh::difficulty::Target {
+    match super::pow_scheme::node_sha256d_params() {
+        Some(p) => p.pow_limit(),
+        None => super::asert_params_at(height, hardening_height).pow_limit,
+    }
+}
+
 /// `base` (a block's ASERT bits) relaxed for a block stamped `time` (no
-/// change below the liveness activation). The relief is clamped to the ASERT
-/// pow limit of `height`. For producers that hold a template's base bits.
+/// change below the liveness activation). The relief is clamped to the pow
+/// limit of the process's scheme at `height` ([`scheme_pow_limit_at`]). For
+/// producers that hold a template's base bits.
 pub fn relieve_at(base: u32, parent_timestamp: u64, height: u64, time: u64, hardening_height: u64,
               liveness_height: u64) -> u32 {
     if !activation::is_active_at(height, liveness_height) {
         return base;
     }
+    relieve_with_limit(base, parent_timestamp, time, &scheme_pow_limit_at(height, hardening_height))
+}
+
+/// The stall relief of `base` for a block stamped `time` over parents stamped
+/// `parent_timestamp`, clamped to `pow_limit` (the liveness rules apply).
+/// Pure; [`relieve_at`] supplies the limit of the process's scheme.
+pub fn relieve_with_limit(base: u32, parent_timestamp: u64, time: u64, pow_limit: &gnb_smh::difficulty::Target)
+    -> u32
+{
     // Saturate to i64: the relief only compares the two times.
     let as_i64 = |t: u64| i64::try_from(t).unwrap_or(i64::MAX);
-    let limit = super::asert_params_at(height, hardening_height).pow_limit;
     gnb_smh::stall_relief::relieved_bits(&OBENBLOCK_STALL_RELIEF, base, as_i64(parent_timestamp), as_i64(time),
-                                         &limit)
+                                         pow_limit)
 }
 
 /// The easiest target an honest block at `height` stamped no later than
 /// `latest_time` can carry over a parent stamped `parent_timestamp`, given
 /// its ASERT target `reference` (anti-DoS references; never consensus).
-/// Below the liveness activation: `reference`.
+/// Below the liveness activation: `reference`. Clamped to the pow limit of
+/// the process's scheme ([`scheme_pow_limit_at`]).
 pub fn relieved_reference(reference: &[u8; 32], parent_timestamp: u64, height: u64, latest_time: u64)
     -> [u8; 32]
 {
     if !liveness_active_at(height) {
         return *reference;
     }
+    let limit = scheme_pow_limit_at(height, activation::hardening_activation_height());
+    relieved_reference_with_limit(reference, parent_timestamp, latest_time, &limit)
+}
+
+/// [`relieved_reference`] with an explicit pow limit (the liveness rules apply).
+pub fn relieved_reference_with_limit(reference: &[u8; 32], parent_timestamp: u64, latest_time: u64,
+                                     pow_limit: &gnb_smh::difficulty::Target) -> [u8; 32]
+{
     let as_i64 = |t: u64| i64::try_from(t).unwrap_or(i64::MAX);
-    let limit = super::asert_params_at(height, activation::hardening_activation_height()).pow_limit;
     let base = gnb_smh::difficulty::Target(*reference);
     gnb_smh::stall_relief::relieved_target(&OBENBLOCK_STALL_RELIEF, &base, as_i64(parent_timestamp),
-                                           as_i64(latest_time), &limit.max(base)).0
+                                           as_i64(latest_time), &(*pow_limit).max(base)).0
 }
 
 // ── Witness exit message ─────────────────────────────────────────────────────
@@ -232,6 +261,58 @@ mod tests {
         let late = expected_block_bits_at(g, 1, g + 180 + 1_800, NEVER, 0).unwrap();
         let (b, l) = (gnb_smh::difficulty::bits_to_target(base), gnb_smh::difficulty::bits_to_target(late));
         assert!(l > b);
+    }
+
+    /// Regression (review, mainnet launch blocker): the stall relief of an
+    /// ObenBlock block is clamped to the SHA-256d pow limit, never to GnB's.
+    /// From the 1 EH/s launch bits the relief reaches `0x1d00ffff` after
+    /// about 16 h of lateness; at 20 h and 100 h it is exactly the limit, and
+    /// the SHA-256d PoW check accepts those bits (no `AbovePowLimit`).
+    #[test]
+    fn sha256d_relief_is_clamped_to_the_scheme_pow_limit() {
+        use super::super::pow_scheme::{check_sha256d_pow, Sha256dHeaderError, Sha256dParams, OBB_BLOCK_VERSION,
+                                       OBB_LAUNCH_BITS, OBB_POW_LIMIT_BITS, OBB_REGTEST_POW_LIMIT_BITS};
+        use super::super::{BlockHeader, MerkleRoot};
+        use gnb_smh::difficulty::{bits_to_target, target_to_bits};
+        let g = 1_800_000_000u64;
+        let header = |bits: u32, nonce: u64, timestamp: u64| BlockHeader {
+            version: OBB_BLOCK_VERSION, parents: vec![[1; 32]], merkle_root: MerkleRoot([7; 32]), timestamp, bits, nonce,
+        };
+        let main = Sha256dParams::obenblock_mainnet(g);
+        let base = main.expected_bits(g, 1).unwrap();
+        assert_eq!(base, OBB_LAUNCH_BITS);
+        for late_h in [20u64, 100] {
+            let t = g + late_h * 3_600;
+            let bits = relieve_with_limit(base, g, t, &main.pow_limit());
+            assert_eq!(bits, OBB_POW_LIMIT_BITS, "{late_h} h late");
+            assert!(matches!(check_sha256d_pow(&header(bits, 0, t), &main),
+                             Ok(()) | Err(Sha256dHeaderError::InsufficientWork)), "{late_h} h late");
+            let reference = relieved_reference_with_limit(&bits_to_target(base).0, g, t, &main.pow_limit());
+            assert_eq!(target_to_bits(&gnb_smh::difficulty::Target(reference)), OBB_POW_LIMIT_BITS);
+            // The bug: GnB's (hardened) limit lets the relief run past the
+            // SHA-256d limit, into bits every ObenBlock node refuses.
+            let gnb_limit = super::super::asert_params_at(1, 0).pow_limit;
+            let wrong = relieve_with_limit(base, g, t, &gnb_limit);
+            assert_eq!(check_sha256d_pow(&header(wrong, 0, t), &main), Err(Sha256dHeaderError::AbovePowLimit));
+        }
+        // Not yet at the limit 15 h late (the relief still binds), at it by 17 h.
+        assert!(bits_to_target(relieve_with_limit(base, g, g + 15 * 3_600, &main.pow_limit())) < main.pow_limit());
+        assert_eq!(relieve_with_limit(base, g, g + 17 * 3_600, &main.pow_limit()), OBB_POW_LIMIT_BITS);
+
+        // Regtest: genesis bits are the limit; relief never exceeds it, and a
+        // late block at those bits is mined and accepted.
+        let reg = Sha256dParams::obenblock_regtest(g);
+        let base = reg.expected_bits(g, 1).unwrap();
+        for late_h in [20u64, 100] {
+            let t = g + late_h * 3_600;
+            let bits = relieve_with_limit(base, g, t, &reg.pow_limit());
+            assert_eq!(bits, OBB_REGTEST_POW_LIMIT_BITS);
+            let mut h = header(bits, 0, t);
+            while check_sha256d_pow(&h, &reg) == Err(Sha256dHeaderError::InsufficientWork) {
+                h.nonce += 1;
+            }
+            assert_eq!(check_sha256d_pow(&h, &reg), Ok(()));
+        }
     }
 
     #[test]

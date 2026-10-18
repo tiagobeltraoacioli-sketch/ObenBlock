@@ -2960,6 +2960,12 @@ bits     = base_bits                                         if steps = 0
            bits(max(target(base_bits), min(pow_limit, relaxed)))   otherwise
 ```
 
+`pow_limit` is the pow limit of the chain's proof-of-work scheme: on
+ObenBlock the SHA-256d limit (`0x1d00ffff` mainnet, `0x207fffff` regtest),
+never GnB's ASERT limit (`liveness::scheme_pow_limit_at`). From the 1 EH/s
+launch bits a block more than about 16.5 hours late therefore carries exactly
+`0x1d00ffff`, which the SHA-256d PoW check accepts.
+
 `2^x` uses ASERT's 16.16 fixed point and cubic, so 30 steps are exactly one
 doubling. The relief never makes a block harder, and with no step the bits
 are `base_bits` bit for bit. The validator checks `bits` against this
