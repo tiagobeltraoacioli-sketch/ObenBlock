@@ -11,7 +11,7 @@
 use std::sync::Arc;
 
 use crate::core::pow_scheme::Sha256dParams;
-use crate::stratum::jobs::{Job, EXTRANONCE_BYTES};
+use crate::stratum::jobs::{Job, JobPrep, EXTRANONCE_BYTES};
 use crate::template::BlockTemplate;
 
 /// The header Merkle root for a channel's extranonce: exactly what a V1
@@ -22,16 +22,26 @@ pub fn compute_merkle_root_for_channel(job: &Job, extranonce: &[u8; EXTRANONCE_B
 }
 
 /// The job of a channel: the header job of `template` paying the channel's
-/// script with the channel's extranonce, stamped `now`. Its candidate block
-/// already carries the channel's extranonce, so `job.header` is the header
-/// the channel mines (nonce 0).
+/// script with the channel's extranonce, stamped `now`. `job.header` is the
+/// header the channel mines (nonce 0). Computes the template's shared parts;
+/// the server uses [`build_channel_job_with`] and the work feed's.
 pub fn build_channel_job(
     template: Arc<BlockTemplate>, params: &Sha256dParams, script_pubkey: &[u8],
     extranonce: [u8; EXTRANONCE_BYTES], now: u64,
 ) -> Result<(Job, [u8; 32]), String> {
-    let job = Job::build(template, params, script_pubkey, extranonce, now)?;
+    let prep = Arc::new(JobPrep::new(&template, Some(params), now));
+    build_channel_job_with(template, prep, params, script_pubkey, extranonce, now)
+}
+
+/// [`build_channel_job`] with the template's shared parts ([`JobPrep`]):
+/// a light job, no block.
+pub fn build_channel_job_with(
+    template: Arc<BlockTemplate>, prep: Arc<JobPrep>, params: &Sha256dParams, script_pubkey: &[u8],
+    extranonce: [u8; EXTRANONCE_BYTES], now: u64,
+) -> Result<(Job, [u8; 32]), String> {
+    let job = Job::build_with(template, prep, params, script_pubkey, extranonce, now)?;
     let root = compute_merkle_root_for_channel(&job, &extranonce)?;
-    if root != job.block.header.merkle_root.0 {
+    if root[..] != job.header[36..68] {
         return Err("internal: channel root differs from the header job's root".into());
     }
     Ok((job, root))

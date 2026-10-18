@@ -6,7 +6,9 @@
 //! certificate of the static key signed by the authority key) and both sides
 //! switch to transport mode. The cryptography (ECDH over secp256k1, the
 //! certificate, ChaCha20-Poly1305, zeroization) is SRI's `noise_sv2::Responder`;
-//! this module feeds it the socket bytes under a timeout. Ported from the
+//! this module feeds it the socket bytes under a timeout and runs the
+//! responder on the blocking pool (the listener caps concurrent handshakes,
+//! `MAX_CONCURRENT_HANDSHAKES`). Ported from the
 //! legacy Bloch server (genesis3-node `src/stratum_v2/handshake.rs`).
 
 use std::time::Duration;
@@ -41,10 +43,18 @@ pub async fn perform_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     timeout(timeout_after, async {
         let mut act1 = [0u8; ACT1_SIZE];
         stream.read_exact(&mut act1).await?;
-        let mut responder = Responder::from_authority_kp(
-            &authority.public, authority.secret(), Duration::from_secs(cert_validity_secs as u64),
-        ).map_err(|e| Sv2Error::Keypair(format!("noise responder: {e:?}")))?;
-        let (act2, codec) = responder.step_1(act1).map_err(|e| Sv2Error::Keypair(format!("noise step 1: {e:?}")))?;
+        // The secp256k1 work (a static key, an ElligatorSwift ECDH, a BIP 340
+        // certificate signature) runs on the blocking pool, not on a runtime
+        // worker shared with P2P, RPC and finality.
+        let public = authority.public;
+        let secret = zeroize::Zeroizing::new(*authority.secret());
+        let (act2, codec) = tokio::task::spawn_blocking(move || {
+            let mut responder = Responder::from_authority_kp(&public, &secret, Duration::from_secs(cert_validity_secs as u64))
+                .map_err(|e| Sv2Error::Keypair(format!("noise responder: {e:?}")))?;
+            responder.step_1(act1).map_err(|e| Sv2Error::Keypair(format!("noise step 1: {e:?}")))
+        })
+        .await
+        .map_err(|e| Sv2Error::Keypair(format!("handshake task: {e}")))??;
         stream.write_all(&act2).await?;
         stream.flush().await?;
         Ok::<_, Sv2Error>(codec)
