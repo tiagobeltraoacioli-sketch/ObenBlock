@@ -4,12 +4,15 @@
 //!
 //! The node builds the complete candidate block (transactions, PoWit
 //! section, a coinbase paying the pool's script) with a fixed 8-byte
-//! extranonce. Each connection fills those 8 bytes with its own
-//! `extranonce1 ‖ extranonce2`, so all connections share one job and search
-//! disjoint spaces. For a winning share the server writes the share's
-//! extranonce and Merkle root into the job's block bytes, and the share's
-//! version, time and nonce travel as `submitblock`'s second parameter; the
-//! node then judges the block like any other.
+//! extranonce, and hands back a ready Stratum V1 `mining.notify` object
+//! (`header_job.stratum`, §4.1). Each connection fills those 8 bytes with
+//! its own `extranonce1 ‖ extranonce2`, so all connections share one job and
+//! search disjoint spaces. A share's header is rebuilt exactly as stock
+//! firmware builds it: coinbase `coinb1 ‖ en1 ‖ en2 ‖ coinb2`, its SHA-256d
+//! txid folded up `merkle_branch` with SHA-256d (Bitcoin's tree). A winning
+//! share is submitted as the job's block with `submitblock`'s second
+//! parameter `{version, time, nonce, extranonce}`; the node writes them in,
+//! recomputes the root and judges the block like any other.
 
 use std::time::Instant;
 
@@ -17,49 +20,12 @@ use serde_json::Value;
 
 use crate::types::{EXTRANONCE1_LEN, EXTRANONCE2_LEN};
 use crate::validator::{
-    bitcoin_merkle_root, bits_to_target, block_id, effective_version, header80, meets_target, merkle_root, sha256d,
-    RootRule, Target, POW_HEADER_LEN,
+    bits_to_target, block_id, effective_version, header80, merkle_root, sha256d, stratum_word_swap, RootRule, Target,
+    POW_HEADER_LEN,
 };
 
 /// Bytes of the node's header-job extranonce.
 pub const EXTRANONCE_LEN: usize = EXTRANONCE1_LEN + EXTRANONCE2_LEN;
-
-/// Stall relief of the template (DESIGN-obenblock.md §5.1): the header bits
-/// depend on the block's own time in steps; a share's time must stay in the
-/// step of its job, or its header's bits would be wrong for that time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Relief {
-    pub parent_time: u64,
-    pub grace_secs: u64,
-    pub step_secs: u64,
-}
-
-impl Relief {
-    /// Whole relief steps a block stamped `time` has earned
-    /// (`gnb_smh::stall_relief::relief_steps`).
-    pub fn steps(&self, time: u64) -> u64 {
-        gnb_smh::stall_relief::relief_steps(
-            &gnb_smh::stall_relief::StallReliefParams {
-                grace_secs: self.grace_secs as i64,
-                step_secs: self.step_secs as i64,
-                halflife_secs: 1, // unused by relief_steps
-            },
-            i64::try_from(self.parent_time).unwrap_or(i64::MAX),
-            i64::try_from(time).unwrap_or(i64::MAX),
-        )
-    }
-
-    /// The first time after `time` whose step differs (when a pool should
-    /// issue a new job with easier bits).
-    pub fn next_step_time(&self, time: u64) -> u64 {
-        let start = self.parent_time.saturating_add(self.grace_secs);
-        if time < start {
-            return start.saturating_add(self.step_secs);
-        }
-        let k = (time - start) / self.step_secs.max(1);
-        start.saturating_add((k + 1).saturating_mul(self.step_secs.max(1)))
-    }
-}
 
 /// One job, shared by every connection.
 #[derive(Clone, Debug)]
@@ -74,24 +40,44 @@ pub struct ObbJob {
     pub version_mask: u32,
     pub coinb1: Vec<u8>,
     pub coinb2: Vec<u8>,
+    /// Bitcoin merkle branch of the coinbase (hashing byte order, bottom-up).
     pub branch: Vec<[u8; 32]>,
     pub rule: RootRule,
-    pub shielded_root: [u8; 32],
-    pub powit_root: [u8; 32],
-    /// Header bits of this job (for `time`, stall relief included).
+    /// Header bits of this job (stall relief of `time` applied).
     pub bits: u32,
     pub target: Target,
     /// Header time of the job (the node's `curtime`).
     pub time: u32,
-    /// Earliest share time (the latest parent timestamp).
+    /// The `ntime` window that keeps `bits` (docs/OBENBLOCK-MINING.md §3.5):
+    /// every share time must be in `[mintime, maxtime]`.
     pub mintime: u64,
-    pub relief: Option<Relief>,
+    pub maxtime: u64,
+    /// The stall-relief step of the window (0: not late).
+    pub relief_step: u64,
+    /// First time with the next step's (easier) bits: fetch a new job then.
+    /// `None` without stall relief at this height.
+    pub next_bits_time: Option<u64>,
+    /// `mining.notify` fields as the node encoded them (`header_job.stratum`).
+    pub notify: NotifyFields,
     /// The node's candidate block (`submitblock` wire bytes, nonce 0).
     pub block: Vec<u8>,
     /// Offsets in `block`.
     pub merkle_offset: usize,
     pub extranonce_offset: usize,
     pub created: Instant,
+}
+
+/// The stratum encodings of a job (`header_job.stratum`): `prevhash`
+/// word-swapped, `version` / `nbits` / `ntime` big-endian hex.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NotifyFields {
+    pub prevhash: String,
+    pub coinb1: String,
+    pub coinb2: String,
+    pub merkle_branch: Vec<String>,
+    pub version: String,
+    pub nbits: String,
+    pub ntime: String,
 }
 
 /// The header of one share.
@@ -114,6 +100,21 @@ fn hexbytes(v: &Value, what: &str) -> Result<Vec<u8>, String> {
     hex::decode(s).map_err(|_| format!("{what}: not hex"))
 }
 
+fn hexstr(v: &Value, what: &str) -> Result<String, String> {
+    let s = v.as_str().ok_or_else(|| format!("{what}: not a string"))?;
+    hex::decode(s).map_err(|_| format!("{what}: not hex"))?;
+    Ok(s.to_ascii_lowercase())
+}
+
+fn branch_of(v: &Value, what: &str) -> Result<Vec<[u8; 32]>, String> {
+    v.as_array().ok_or_else(|| format!("{what}: not an array"))?
+        .iter().map(|b| hex32(b, what)).collect()
+}
+
+fn u64_of(v: &Value, what: &str) -> Result<u64, String> {
+    v.as_u64().ok_or_else(|| format!("{what}: not an unsigned integer"))
+}
+
 fn read_compact_size(b: &[u8], at: &mut usize) -> Result<u64, String> {
     let first = *b.get(*at).ok_or("block: truncated varint")?;
     *at += 1;
@@ -133,9 +134,11 @@ fn read_compact_size(b: &[u8], at: &mut usize) -> Result<u64, String> {
 impl ObbJob {
     /// Build a job from a `getblocktemplate` result that carries a header job
     /// requested with `extranonce` (all zeros by default). Every field is
-    /// checked against the others: the header job's header must equal the
-    /// one this server computes from the job fields, and the block bytes
-    /// must carry that header and the coinbase `coinb1 ‖ extranonce ‖ coinb2`.
+    /// checked against the others: the header job's header and root must
+    /// equal the ones this server computes with Bitcoin's coinbase / Merkle
+    /// math, the `stratum` object must encode the same job, and the block
+    /// bytes must carry that header and the coinbase `coinb1 ‖ extranonce ‖
+    /// coinb2`.
     pub fn from_template(gbt: &Value, extranonce: [u8; EXTRANONCE_LEN], job_id: String) -> Result<Self, String> {
         if let Some(e) = gbt.get("error").and_then(Value::as_str) {
             return Err(format!("getblocktemplate: {e}"));
@@ -146,45 +149,42 @@ impl ObbJob {
         let s = gbt.get("sha256d").filter(|v| v.is_object()).ok_or("getblocktemplate: no sha256d object")?;
         let rule_name = s.get("merkle_root_rule").and_then(Value::as_str).unwrap_or("");
         let rule = RootRule::parse(rule_name)
-            .ok_or_else(|| format!("getblocktemplate: unsupported merkle_root_rule {rule_name:?}"))?;
+            .ok_or_else(|| format!("getblocktemplate: unsupported merkle_root_rule {rule_name:?} \
+                                    (this server needs bitcoin-sha256d)"))?;
         let n_extra = s.get("extranonce_bytes").and_then(Value::as_u64).unwrap_or(0);
         if n_extra != EXTRANONCE_LEN as u64 {
             return Err(format!("getblocktemplate: extranonce_bytes {n_extra}, this server needs {EXTRANONCE_LEN}"));
         }
         let hj = s.get("header_job").filter(|v| v.is_object()).ok_or("getblocktemplate: no header_job (request one)")?;
+        let st = hj.get("stratum").filter(|v| v.is_object()).ok_or("header_job: no stratum object")?;
         let version = s.get("version").and_then(Value::as_u64).and_then(|v| u32::try_from(v).ok())
             .ok_or("sha256d.version")?;
         let version_mask = s.get("version_rolling_mask").and_then(Value::as_str)
             .and_then(crate::codec::parse_hex_u32).ok_or("sha256d.version_rolling_mask")?;
         let parents_commitment = hex32(&s["parents_commitment"], "sha256d.parents_commitment")?;
-        let shielded_root = hex32(&s["shielded_root"], "sha256d.shielded_root")?;
-        let powit_root = hex32(&s["powit_root"], "sha256d.powit_root")?;
-        let mintime = s.get("mintime").and_then(Value::as_u64).ok_or("sha256d.mintime")?;
-        let branch = gbt.get("coinbase_merkle_branch").and_then(Value::as_array).ok_or("coinbase_merkle_branch")?
-            .iter().map(|b| hex32(b, "coinbase_merkle_branch[]")).collect::<Result<Vec<_>, _>>()?;
         let parents = gbt.get("parents").and_then(Value::as_array).ok_or("parents")?
             .iter().map(|p| hex32(p, "parents[]")).collect::<Result<Vec<_>, _>>()?;
         if gnb_smh::sha256d::parents_commitment(&parents) != parents_commitment {
             return Err("getblocktemplate: parents do not hash to parents_commitment".into());
         }
         let height = gbt.get("height").and_then(Value::as_u64).ok_or("height")?;
-        let relief = match gbt.get("stall_relief") {
-            Some(r) if r.get("active").and_then(Value::as_bool) == Some(true) => Some(Relief {
-                parent_time: gbt.get("parent_time").and_then(Value::as_u64).ok_or("parent_time")?,
-                grace_secs: r.get("grace_secs").and_then(Value::as_u64).ok_or("stall_relief.grace_secs")?,
-                step_secs: r.get("step_secs").and_then(Value::as_u64).filter(|&s| s > 0).ok_or("stall_relief.step_secs")?,
-            }),
-            _ => None,
+        let relief_step = s.get("relief_step").and_then(Value::as_u64).unwrap_or(0);
+        let next_bits_time = match s.get("next_bits_time") {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(u64_of(v, "sha256d.next_bits_time")?),
         };
 
         let header: [u8; POW_HEADER_LEN] = hexbytes(&hj["header"], "header_job.header")?
             .try_into().map_err(|_| "header_job.header: not 80 bytes")?;
         let coinb1 = hexbytes(&hj["coinb1"], "header_job.coinb1")?;
         let coinb2 = hexbytes(&hj["coinb2"], "header_job.coinb2")?;
+        let branch = branch_of(&hj["merkle_branch"], "header_job.merkle_branch[]")?;
         let got_extranonce = hexbytes(&hj["extranonce"], "header_job.extranonce")?;
         if got_extranonce != extranonce {
             return Err("header_job: the node used another extranonce than requested".into());
         }
+        let mintime = u64_of(&hj["mintime"], "header_job.mintime")?;
+        let maxtime = u64_of(&hj["maxtime"], "header_job.maxtime")?;
         let block = hexbytes(&hj["block"], "header_job.block")?;
         let time = u32::from_le_bytes(header[68..72].try_into().unwrap());
         let bits = u32::from_le_bytes(header[72..76].try_into().unwrap());
@@ -192,17 +192,60 @@ impl ObbJob {
         if target.is_zero() {
             return Err(format!("header_job: malformed bits {bits:08x}"));
         }
+        if !(mintime <= time as u64 && time as u64 <= maxtime) {
+            return Err(format!("header_job: time {time} outside its window [{mintime}, {maxtime}]"));
+        }
+        if next_bits_time.is_some_and(|t| t <= maxtime) {
+            return Err("header_job: maxtime reaches the next relief step".into());
+        }
+
+        // The stratum object must be this job, in stratum's encodings.
+        let notify = NotifyFields {
+            prevhash: hexstr(&st["prevhash"], "stratum.prevhash")?,
+            coinb1: hexstr(&st["coinb1"], "stratum.coinb1")?,
+            coinb2: hexstr(&st["coinb2"], "stratum.coinb2")?,
+            merkle_branch: st["merkle_branch"].as_array().ok_or("stratum.merkle_branch")?
+                .iter().map(|b| hexstr(b, "stratum.merkle_branch[]")).collect::<Result<Vec<_>, _>>()?,
+            version: hexstr(&st["version"], "stratum.version")?,
+            nbits: hexstr(&st["nbits"], "stratum.nbits")?,
+            ntime: hexstr(&st["ntime"], "stratum.ntime")?,
+        };
+        let expect = NotifyFields {
+            prevhash: hex::encode(stratum_word_swap(&parents_commitment)),
+            coinb1: hex::encode(&coinb1),
+            coinb2: hex::encode(&coinb2),
+            merkle_branch: branch.iter().map(hex::encode).collect(),
+            version: format!("{version:08x}"),
+            nbits: format!("{bits:08x}"),
+            ntime: format!("{time:08x}"),
+        };
+        if notify != expect {
+            return Err(format!("header_job.stratum does not encode the header job: {notify:?} vs {expect:?}"));
+        }
+        if st.get("extranonce_size").and_then(Value::as_u64) != Some(EXTRANONCE_LEN as u64) {
+            return Err("header_job.stratum.extranonce_size is not 8".into());
+        }
+        if st.get("ntime_min").and_then(Value::as_u64) != Some(mintime)
+            || st.get("ntime_max").and_then(Value::as_u64) != Some(maxtime)
+        {
+            return Err("header_job.stratum ntime window differs from the job's".into());
+        }
 
         let mut job = ObbJob {
-            job_id, height, parents, parents_commitment, version, version_mask, coinb1, coinb2, branch, rule,
-            shielded_root, powit_root, bits, target, time, mintime, relief, block,
+            job_id, height, parents, parents_commitment, version, version_mask, coinb1, coinb2, branch, rule, bits,
+            target, time, mintime, maxtime, relief_step, next_bits_time, notify, block,
             merkle_offset: 0, extranonce_offset: 0, created: Instant::now(),
         };
         // Our own header for the requested extranonce must be the node's.
         let mine = job.share_header(&extranonce[..EXTRANONCE1_LEN], &extranonce[EXTRANONCE1_LEN..], time, 0, None)?;
         if mine.header[..76] != header[..76] {
-            return Err("header_job: the node's header differs from the one computed from the job fields \
-                        (merkle_root_rule, branch or roots)".into());
+            return Err("header_job: the node's header differs from the one computed from coinb1 / coinb2 / \
+                        merkle_branch with Bitcoin's coinbase and Merkle math".into());
+        }
+        if let Some(r) = hj.get("merkle_root").and_then(Value::as_str) {
+            if r != hex::encode(mine.merkle_root) {
+                return Err("header_job.merkle_root differs from the computed root".into());
+            }
         }
         if u32::from_le_bytes(header[0..4].try_into().unwrap()) != version {
             return Err("header_job: header version is not sha256d.version".into());
@@ -260,7 +303,7 @@ impl ObbJob {
         Ok(())
     }
 
-    /// The coinbase txid for an extranonce.
+    /// The coinbase txid for an extranonce: `SHA-256d(coinb1 ‖ en1 ‖ en2 ‖ coinb2)`.
     pub fn coinbase_txid(&self, en1: &[u8], en2: &[u8]) -> [u8; 32] {
         let mut cb = Vec::with_capacity(self.coinb1.len() + EXTRANONCE_LEN + self.coinb2.len());
         cb.extend_from_slice(&self.coinb1);
@@ -270,9 +313,9 @@ impl ObbJob {
         sha256d(&cb)
     }
 
-    /// The header root for an extranonce.
+    /// The header root for an extranonce (Bitcoin's fold of the branch).
     pub fn merkle_root_for(&self, en1: &[u8], en2: &[u8]) -> [u8; 32] {
-        merkle_root(self.rule, &self.coinbase_txid(en1, en2), &self.branch, &self.shielded_root, &self.powit_root)
+        merkle_root(self.rule, &self.coinbase_txid(en1, en2), &self.branch)
     }
 
     /// The header and id of a share.
@@ -288,91 +331,85 @@ impl ObbJob {
         Ok(ShareHeader { header, id: block_id(&header), version, merkle_root: root })
     }
 
-    /// Whether the header a Stratum V1 miner builds with Bitcoin's SHA-256d
-    /// tree meets `share_target` (diagnostics: unmodified firmware).
-    pub fn bitcoin_root_share_meets(&self, en1: &[u8], en2: &[u8], time: u32, nonce: u32, rolled: Option<u32>,
-                                    share_target: &Target) -> bool {
-        let root = bitcoin_merkle_root(&self.coinbase_txid(en1, en2), &self.branch);
-        let version = effective_version(self.version, self.version_mask, rolled);
-        meets_target(&block_id(&header80(version, &self.parents_commitment, &root, time, self.bits, nonce)), share_target)
-    }
-
-    /// Why a share time is not valid for this job, if it is not: before the
-    /// latest parent, more than `max_future` seconds past `now`, or (stall
-    /// relief) in another 60-second step than the job, whose bits it carries.
+    /// Why a share time is not valid for this job, if it is not: outside the
+    /// job's window `[mintime, maxtime]` (before the parents, or in another
+    /// stall-relief step, whose bits differ), or more than `max_future`
+    /// seconds past this server's clock.
     pub fn check_time(&self, time: u32, now: u64, max_future: u64) -> Result<(), &'static str> {
         let t = time as u64;
         if t < self.mintime {
-            return Err("ntime before the parents' time");
+            return Err("ntime before the job's window (parents' time or relief step)");
+        }
+        if t > self.maxtime {
+            return Err("ntime past the job's window (another difficulty step, or too far ahead); take the new job");
         }
         if t > now.saturating_add(max_future) {
             return Err("ntime too far in the future");
         }
-        if let Some(r) = self.relief {
-            if r.steps(t) != r.steps(self.time as u64) {
-                return Err("ntime in another difficulty step than the job (stall relief); take the new job");
-            }
-        }
         Ok(())
     }
 
+    /// Whether this job should be replaced at `now`: its window has ended or
+    /// the next relief step (easier bits) has begun.
+    pub fn window_over(&self, now: u64) -> bool {
+        now > self.maxtime || self.next_bits_time.is_some_and(|t| now >= t)
+    }
+
+    /// The extranonce of a share: `extranonce1 ‖ extranonce2`.
+    pub fn extranonce(en1: &[u8], en2: &[u8]) -> [u8; EXTRANONCE_LEN] {
+        let mut e = [0u8; EXTRANONCE_LEN];
+        e[..EXTRANONCE1_LEN].copy_from_slice(en1);
+        e[EXTRANONCE1_LEN..].copy_from_slice(en2);
+        e
+    }
+
     /// The block of a winning share: the job's block with the share's
-    /// extranonce and Merkle root written in. Its version, time and nonce
-    /// travel as `submitblock`'s second parameter (and are written here too,
-    /// so the bytes alone are the block). Self-checks that the result's header
-    /// fields are the share's.
+    /// extranonce, Merkle root, version, time and nonce written in, so the
+    /// bytes alone are the block (the same fields also travel as
+    /// `submitblock`'s second parameter, which the node applies). Self-checks
+    /// that the patched coinbase reproduces the share's root.
     pub fn block_for(&self, en1: &[u8], en2: &[u8], share: &ShareHeader, time: u32, nonce: u32) -> Result<Vec<u8>, String> {
         let mut b = self.block.clone();
-        b[self.extranonce_offset..self.extranonce_offset + EXTRANONCE1_LEN].copy_from_slice(en1);
-        b[self.extranonce_offset + EXTRANONCE1_LEN..self.extranonce_offset + EXTRANONCE_LEN].copy_from_slice(en2);
+        b[self.extranonce_offset..self.extranonce_offset + EXTRANONCE_LEN].copy_from_slice(&Self::extranonce(en1, en2));
         b[self.merkle_offset..self.merkle_offset + 32].copy_from_slice(&share.merkle_root);
         b[0..4].copy_from_slice(&share.version.to_le_bytes());
         let t = self.merkle_offset + 32;
         b[t..t + 8].copy_from_slice(&(time as u64).to_le_bytes());
         b[t + 12..t + 20].copy_from_slice(&(nonce as u64).to_le_bytes());
-        // Self-check: the coinbase hashes to the root's txid.
         let cb_start = self.extranonce_offset - self.coinb1.len();
         let cb_end = self.extranonce_offset + EXTRANONCE_LEN + self.coinb2.len();
         let txid = sha256d(&b[cb_start..cb_end]);
-        if merkle_root(self.rule, &txid, &self.branch, &self.shielded_root, &self.powit_root) != share.merkle_root {
+        if merkle_root(self.rule, &txid, &self.branch) != share.merkle_root {
             return Err("internal: patched block does not reproduce the share's root".into());
         }
         Ok(b)
     }
 
-    /// Mining-notify params for this job:
-    /// `[job_id, prevhash, coinb1, coinb2, merkle_branch, version, nbits, ntime, clean_jobs]`,
-    /// plus, for a connection that negotiated the `obenblock-root` extension,
-    /// a tenth element with the rest of the root rule.
-    pub fn notify_params(&self, clean_jobs: bool, obenblock_root: bool) -> Value {
-        let mut p = vec![
+    /// Standard Stratum V1 `mining.notify` params, straight from the node's
+    /// `stratum` object:
+    /// `[job_id, prevhash, coinb1, coinb2, merkle_branch, version, nbits, ntime, clean_jobs]`.
+    pub fn notify_params(&self, clean_jobs: bool) -> Value {
+        let n = &self.notify;
+        Value::from(vec![
             Value::from(self.job_id.clone()),
-            Value::from(hex::encode(crate::validator::stratum_word_swap(&self.parents_commitment))),
-            Value::from(hex::encode(&self.coinb1)),
-            Value::from(hex::encode(&self.coinb2)),
-            Value::from(self.branch.iter().map(hex::encode).collect::<Vec<_>>()),
-            Value::from(format!("{:08x}", self.version)),
-            Value::from(format!("{:08x}", self.bits)),
-            Value::from(format!("{:08x}", self.time)),
+            Value::from(n.prevhash.clone()),
+            Value::from(n.coinb1.clone()),
+            Value::from(n.coinb2.clone()),
+            Value::from(n.merkle_branch.clone()),
+            Value::from(n.version.clone()),
+            Value::from(n.nbits.clone()),
+            Value::from(n.ntime.clone()),
             Value::from(clean_jobs),
-        ];
-        if obenblock_root {
-            p.push(serde_json::json!({
-                "merkle_root_rule": self.rule.name(),
-                "shielded_root": hex::encode(self.shielded_root),
-                "powit_root": hex::encode(self.powit_root),
-            }));
-        }
-        Value::from(p)
+        ])
     }
 }
 
-/// What a miner receives in `mining.notify`, parsed back (the CPU miner, and
-/// tests). The tenth element is required: without it the root rule is
-/// unknown.
+/// What a miner receives in `mining.notify`, parsed back the way stock
+/// firmware reads it (the CPU miner, and tests).
 #[derive(Clone, Debug)]
 pub struct NotifiedJob {
     pub job_id: String,
+    /// Header bytes 4..36 (`prevhash` with its words swapped back).
     pub parents_commitment: [u8; 32],
     pub coinb1: Vec<u8>,
     pub coinb2: Vec<u8>,
@@ -381,44 +418,37 @@ pub struct NotifiedJob {
     pub bits: u32,
     pub time: u32,
     pub clean_jobs: bool,
-    pub rule: RootRule,
-    pub shielded_root: [u8; 32],
-    pub powit_root: [u8; 32],
 }
 
 impl NotifiedJob {
     pub fn parse(params: &Value) -> Result<Self, String> {
         let a = params.as_array().ok_or("notify params: not an array")?;
-        if a.len() < 10 {
-            return Err("notify without the obenblock-root element (negotiate the extension)".into());
+        if a.len() < 9 {
+            return Err(format!("notify with {} params, want 9", a.len()));
         }
         let u = |i: usize, w: &str| a[i].as_str().and_then(crate::codec::parse_hex_u32).ok_or_else(|| format!("notify {w}"));
-        let ext = &a[9];
-        let rule_name = ext.get("merkle_root_rule").and_then(Value::as_str).unwrap_or("");
         Ok(NotifiedJob {
             job_id: a[0].as_str().ok_or("notify job_id")?.to_string(),
-            parents_commitment: crate::validator::stratum_word_swap(&hex32(&a[1], "notify prevhash")?),
+            parents_commitment: stratum_word_swap(&hex32(&a[1], "notify prevhash")?),
             coinb1: hexbytes(&a[2], "notify coinb1")?,
             coinb2: hexbytes(&a[3], "notify coinb2")?,
-            branch: a[4].as_array().ok_or("notify branch")?.iter().map(|b| hex32(b, "notify branch[]"))
-                .collect::<Result<Vec<_>, _>>()?,
+            branch: branch_of(&a[4], "notify merkle_branch[]")?,
             version: u(5, "version")?,
             bits: u(6, "nbits")?,
             time: u(7, "ntime")?,
             clean_jobs: a[8].as_bool().unwrap_or(false),
-            rule: RootRule::parse(rule_name).ok_or_else(|| format!("notify: unknown root rule {rule_name:?}"))?,
-            shielded_root: hex32(&ext["shielded_root"], "notify shielded_root")?,
-            powit_root: hex32(&ext["powit_root"], "notify powit_root")?,
         })
     }
 
+    /// Bitcoin's root for an extranonce: the coinbase txid folded up the
+    /// branch with SHA-256d.
     pub fn merkle_root_for(&self, en1: &[u8], en2: &[u8]) -> [u8; 32] {
         let mut cb = Vec::with_capacity(self.coinb1.len() + en1.len() + en2.len() + self.coinb2.len());
         cb.extend_from_slice(&self.coinb1);
         cb.extend_from_slice(en1);
         cb.extend_from_slice(en2);
         cb.extend_from_slice(&self.coinb2);
-        merkle_root(self.rule, &sha256d(&cb), &self.branch, &self.shielded_root, &self.powit_root)
+        merkle_root(RootRule::BitcoinSha256d, &sha256d(&cb), &self.branch)
     }
 }
 
@@ -441,31 +471,38 @@ pub(crate) mod tests {
     fn inconsistent_templates_are_refused() {
         let t = template_from_vector(0);
         let en = vector_extranonce(0);
-        let mut bad = t.clone();
-        bad["sha256d"]["powit_root"] = json!("00".repeat(32));
-        assert!(ObbJob::from_template(&bad, en, "x".into()).unwrap_err().contains("differs"));
-        let mut bad = t.clone();
-        bad["sha256d"]["merkle_root_rule"] = json!("bitcoin");
-        assert!(ObbJob::from_template(&bad, en, "x".into()).unwrap_err().contains("merkle_root_rule"));
-        let mut bad = t.clone();
-        bad["sha256d"]["header_job"] = Value::Null;
-        assert!(ObbJob::from_template(&bad, en, "x".into()).is_err());
-        let mut bad = t.clone();
-        bad["pow"] = json!("gnb-smh-v3");
-        assert!(ObbJob::from_template(&bad, en, "x".into()).is_err());
-        let mut bad = t.clone();
-        bad["parents"] = json!(["22".repeat(32)]);
-        assert!(ObbJob::from_template(&bad, en, "x".into()).is_err());
-        let mut bad = t.clone();
-        bad["error"] = json!("busy");
-        assert!(ObbJob::from_template(&bad, en, "x".into()).unwrap_err().contains("busy"));
+        let refused = |f: &dyn Fn(&mut Value)| {
+            let mut bad = t.clone();
+            f(&mut bad);
+            ObbJob::from_template(&bad, en, "x".into()).unwrap_err()
+        };
+        // A branch that does not lead to the header's root (consistent in both places).
+        assert!(refused(&|b| {
+            b["sha256d"]["header_job"]["merkle_branch"] = json!(["11".repeat(32)]);
+            b["sha256d"]["header_job"]["stratum"]["merkle_branch"] = json!(["11".repeat(32)]);
+        }).contains("differs"));
+        assert!(refused(&|b| b["sha256d"]["header_job"]["merkle_branch"] = json!(["11".repeat(32)])).contains("stratum"));
+        assert!(refused(&|b| b["sha256d"]["merkle_root_rule"] = json!("gnb-body-v2")).contains("merkle_root_rule"));
+        assert!(refused(&|b| b["sha256d"]["merkle_root_rule"] = json!("gnb-tagged-v1")).contains("merkle_root_rule"));
+        assert!(refused(&|b| b["sha256d"]["header_job"]["stratum"]["prevhash"] = json!("00".repeat(32))).contains("stratum"));
+        assert!(refused(&|b| b["sha256d"]["header_job"]["stratum"]["nbits"] = json!("1d00ffff")).contains("stratum"));
+        assert!(refused(&|b| b["sha256d"]["header_job"]["stratum"]["ntime_max"] = json!(1)).contains("window"));
+        assert!(refused(&|b| b["sha256d"]["header_job"]["stratum"] = Value::Null).contains("stratum"));
+        assert!(refused(&|b| b["sha256d"]["header_job"]["merkle_root"] = json!("00".repeat(32))).contains("merkle_root"));
+        assert!(refused(&|b| b["sha256d"]["header_job"]["maxtime"] = json!(1)).contains("window"));
+        assert!(refused(&|b| b["sha256d"]["next_bits_time"] = json!(1)).contains("relief"));
+        assert!(refused(&|b| b["sha256d"]["header_job"] = Value::Null).contains("header_job"));
+        assert!(refused(&|b| b["pow"] = json!("gnb-smh-v3")).contains("SHA-256d"));
+        assert!(refused(&|b| b["parents"] = json!(["22".repeat(32)])).contains("parents"));
+        assert!(refused(&|b| b["error"] = json!("busy")).contains("busy"));
         // The block bytes must carry the job.
-        let mut bad = t.clone();
-        let mut blk = hex::decode(bad["sha256d"]["header_job"]["block"].as_str().unwrap()).unwrap();
-        let n = blk.len();
-        blk[n - 10] ^= 1; // inside coinb2
-        bad["sha256d"]["header_job"]["block"] = json!(hex::encode(blk));
-        assert!(ObbJob::from_template(&bad, en, "x".into()).unwrap_err().contains("coinbase"));
+        let e = refused(&|b| {
+            let mut blk = hex::decode(b["sha256d"]["header_job"]["block"].as_str().unwrap()).unwrap();
+            let n = blk.len();
+            blk[n - 10] ^= 1; // inside coinb2
+            b["sha256d"]["header_job"]["block"] = json!(hex::encode(blk));
+        });
+        assert!(e.contains("coinbase"), "{e}");
         assert!(ObbJob::from_template(&t, [9; 8], "x".into()).is_err(), "another extranonce than requested");
     }
 
@@ -485,6 +522,7 @@ pub(crate) mod tests {
         assert_eq!(u64::from_le_bytes(b[t + 12..t + 20].try_into().unwrap()), 77);
         assert_eq!(&b[job.extranonce_offset..job.extranonce_offset + 8], &[1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(b.len(), job.block.len());
+        assert_eq!(ObbJob::extranonce(&en1, &en2), [1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
@@ -492,28 +530,38 @@ pub(crate) mod tests {
         let job = ObbJob::from_template(&template_from_vector(0), vector_extranonce(0), "j".into()).unwrap();
         let now = job.time as u64;
         assert!(job.check_time(job.time, now, 600).is_ok());
+        assert!(job.check_time(job.mintime as u32, now, 600).is_ok());
         assert!(job.check_time(job.mintime as u32 - 1, now, 600).is_err());
-        assert!(job.check_time(job.time + 601, now, 600).is_err());
-        // The job is 30 s after its parent: relief starts at +240 s, so a
-        // share stamped there carries other bits.
-        let r = job.relief.unwrap();
-        assert_eq!(r.steps(job.time as u64), 0);
-        assert_eq!(r.next_step_time(job.time as u64), r.parent_time + 240);
-        assert!(job.check_time((r.parent_time + 239) as u32, now + 300, 600).is_ok());
-        assert!(job.check_time((r.parent_time + 240) as u32, now + 300, 600).is_err());
+        assert!(job.check_time(job.maxtime as u32, now + 300, 600).is_ok());
+        // Past maxtime is the next relief step: other bits.
+        assert!(job.check_time(job.maxtime as u32 + 1, now + 300, 600).is_err());
+        // Inside the window but too far past this server's clock.
+        assert!(job.check_time(job.maxtime as u32, now, 10).is_err());
+        // The job is 30 s after its parent: the next step starts at +240 s.
+        assert_eq!(job.next_bits_time, Some(job.mintime + 240));
+        assert_eq!(job.maxtime, job.mintime + 239);
+        assert!(!job.window_over(job.maxtime));
+        assert!(job.window_over(job.maxtime + 1));
     }
 
     #[test]
-    fn notify_round_trips_for_the_cpu_miner() {
-        let job = ObbJob::from_template(&template_from_vector(1.min(n_vectors() - 1)), vector_extranonce(1.min(n_vectors() - 1)), "j1".into()).unwrap();
-        let p = job.notify_params(true, true);
+    fn notify_is_the_node_stratum_object_and_round_trips() {
+        let i = 1.min(n_vectors() - 1);
+        let t = template_from_vector(i);
+        let job = ObbJob::from_template(&t, vector_extranonce(i), "j1".into()).unwrap();
+        let p = job.notify_params(true);
+        let a = p.as_array().unwrap();
+        assert_eq!(a.len(), 9, "plain Stratum V1 notify");
+        let st = &t["sha256d"]["header_job"]["stratum"];
+        for (k, name) in [(1, "prevhash"), (2, "coinb1"), (3, "coinb2"), (4, "merkle_branch"), (5, "version"),
+                          (6, "nbits"), (7, "ntime")] {
+            assert_eq!(a[k], st[name], "{name}");
+        }
         let n = NotifiedJob::parse(&p).unwrap();
         assert_eq!(n.parents_commitment, job.parents_commitment);
         assert_eq!((n.version, n.bits, n.time, n.clean_jobs), (job.version, job.bits, job.time, true));
         let (en1, en2) = ([9u8, 8, 7, 6], [1u8, 0, 0, 0]);
         assert_eq!(n.merkle_root_for(&en1, &en2), job.merkle_root_for(&en1, &en2));
-        // A plain notify (no extension) has exactly the nine standard fields.
-        assert_eq!(job.notify_params(false, false).as_array().unwrap().len(), 9);
-        assert!(NotifiedJob::parse(&job.notify_params(false, false)).is_err());
+        assert!(!job.branch.is_empty(), "the vector case has a branch to walk");
     }
 }

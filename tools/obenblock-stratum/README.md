@@ -14,60 +14,45 @@ through it.
 
 It is a port of the Bloch pool proxy (`bloch-pos/pool-proxy`). Merged mining
 is removed (owner decision). The Bloch proxy forwarded the node's own
-stratum; the ObenBlock node has none, so this server builds the jobs itself.
+stratum; this server builds its jobs from the node's RPC header jobs
+instead, so it runs next to any ObenBlock node and adds vardiff, PPLNS
+accounting and metrics (the node's own built-in solo V1/V2 servers live on
+branch `obenblock/stratum-node`, docs/STRATUM.md there).
 
-## 1. ASICs: read this first
+## 1. ASICs and rental services
 
-**Unmodified Stratum V1 firmware cannot mine ObenBlock blocks under the
-current consensus rules.** This covers stock Antminer and Whatsminer
-firmware, NiceHash, MiningRigRentals and every other V1 rental service.
+**Stock Stratum V1 firmware mines ObenBlock unmodified.** This covers stock
+Antminer and Whatsminer firmware, cgminer/bmminer-style drivers, V1 proxies
+and rental services such as MiningRigRentals (MRR) and NiceHash.
 
-The reason is the header's Merkle root:
+The reason is the header's Merkle root (docs/CONSENSUS.md "Header Merkle
+root and body commitment (ObenBlock)", docs/OBENBLOCK-MINING.md §3.3):
 
-- A Stratum V1 miner builds the root itself. It takes
-  `coinb1 ‖ extranonce1 ‖ extranonce2 ‖ coinb2` and the branch, and folds
-  them with **Bitcoin's SHA-256d tree**.
-- ObenBlock's header root is the **body root**
-  (docs/OBENBLOCK-MINING.md §3.3):
-  - the tagged-SHA-256 transaction tree;
-  - then `SHA3-256("gnb:block:body:v2" ‖ tx_root ‖ shielded_root ‖ powit_root)`.
-- So the header a V1 ASIC hashes is never the header of an ObenBlock block.
-  No choice of `coinb1`, `coinb2` or branch can fix that: the miner would
-  have to hit a chosen SHA-256d output.
+- A Stratum V1 miner builds the root itself: it hashes
+  `coinb1 ‖ extranonce1 ‖ extranonce2 ‖ coinb2` with SHA-256d and folds the
+  txid up the branch with **Bitcoin's SHA-256d tree**.
+- ObenBlock's header root is exactly that tree (`merkle_root_rule`
+  `bitcoin-sha256d`). The rest of the block body (witnesses, the shielded
+  and PoWit sections) is committed inside the coinbase, in `coinb1`, so it
+  never changes the branch.
+- The header layout is Bitcoin's too (80 bytes; the parents commitment
+  stands where Bitcoin has the previous block hash; BIP 320 version bits).
 
-The ASIC hashes the right header layout (80 bytes, nonce, BIP 320 version
-bits). Only the root inside it is wrong.
+So the server sends plain Stratum V1 jobs (§5.1) built from the node's
+`stratum` object, judges every share as the node judges the block, and
+submits blocks with their extranonce. Older nodes whose header root was the
+GnB body root (`gnb-body-v2`) are refused at the first template.
 
-What the server does about it:
+**MiningRigRentals**: create a pool entry with
+`stratum+tcp://<STRATUM_HOST>:3333`, the worker `<obb1 address>.<label>`
+(or set `OBB_STRATUM_ANY_USER=on`, since MRR may rewrite usernames) and
+password `x` (or `d=<difficulty>`). Set the starting difficulty to your
+rig's hashrate (§3); vardiff takes over after the first shares. MRR's own
+pool test connects, subscribes and authorizes like any V1 miner.
 
-- It judges every share exactly as the node judges a block (ObenBlock root),
-  so such work is rejected as low difficulty.
-- It recognizes that work and counts it in
-  `obb_stratum_shares_bitcoin_root_total`.
-- It logs once per connection: "shares are valid work over Bitcoin's
-  SHA-256d Merkle root".
-
-Pointing rented hashrate at this server costs the rent and finds nothing. The
-metric shows it within the first shares.
-
-What works today:
-
-- Miners that implement the `obenblock-root` stratum extension (§5.2), such
-  as `obenblock-cpu-miner`.
-- Stratum V2 standard channels (header-only mining, the pool sends the root)
-  would map directly (docs/OBENBLOCK-MINING.md §4). This server does not
-  implement SV2.
-
-What would make stock V1 ASICs work is a consensus change, to be decided
-before genesis:
-
-- the header root becomes Bitcoin's SHA-256d transaction tree;
-- the body roots move into a commitment inside the coinbase.
-
-This is the open point recorded by package O3b. It is the owner's decision;
-nothing in this tool depends on it. Once the node's `getblocktemplate`
-reports such a root rule, this server needs one more `RootRule` (see
-`src/validator.rs`). Its stratum side is already standard V1.
+Not measured here: real ASICs or MRR rigs against this server. The
+end-to-end test (§8) uses a regtest node, the CPU miner and a stock-firmware
+style client written from the protocol alone.
 
 ## 2. Quick start
 
@@ -127,27 +112,54 @@ The username does not change who is paid: every block pays
 must be valid for the network) so a typo shows at once. Set
 `OBB_STRATUM_ANY_USER=on` for a rental service that rewrites usernames.
 
-Remember §1: an ASIC on stock V1 firmware produces no ObenBlock blocks.
-
 ### obenblock-cpu-miner
 
 ```text
-obenblock-cpu-miner -o stratum+tcp://HOST:3333 -u <obb1 address>[.<worker>] [-p x] [-t THREADS]
+obenblock-cpu-miner -o stratum+tcp://HOST:3333 -u <obb1 address>[.<worker>] [-p x] [-t THREADS] [--kernel K]
+obenblock-cpu-miner --bench SECS [-t THREADS] [--kernel K]
 ```
+
+It speaks plain Stratum V1 like ASIC firmware, so it also mines through any
+other ObenBlock V1 server (the node's built-in one, a pool).
 
 - **Threads**: all logical CPUs by default. Each thread owns an
   `extranonce2` lane (thread i takes i, i + T, i + 2T, …). The server's
   unique `extranonce1` keeps machines apart.
-- **Hashing**: per lane, the coinbase txid, the ObenBlock root
-  (`obenblock-root` extension) and the SHA-256 midstate are computed once.
-  Each nonce costs the second block and the outer SHA-256 only.
-- **Difficulty**: a 0.5 s self-benchmark at start, then a
+- **Hashing** (`src/hasher.rs`): per lane, the coinbase txid, Bitcoin's
+  Merkle fold, the SHA-256 midstate and the first three rounds of the
+  second block (end of the root, time, bits) are computed once. Per nonce:
+  rounds 3..64 of the second block and the outer SHA-256 stopped after
+  round 60 (the id's top 32 bits are final there); only a nonce whose top
+  word is at or below the target's is checked in full.
+- **Kernels**: the rounds are written once over N lanes and compiled per
+  instruction set, chosen at run time: `avx512` (16 nonces at a time,
+  AVX-512F/VL), `avx2` (8), `lanes4` (4, baseline x86-64) and `sha2` (the
+  `sha2` crate per nonce, which uses the SHA-NI extensions when the CPU has
+  them, detected at run time by `cpufeatures`; no build flag needed). At
+  start every available kernel is measured for 0.2 s and the fastest is
+  used; `--kernel` forces one.
+- **Difficulty**: a self-benchmark at start, then a
   `mining.suggest_difficulty` of about one share per 10 s.
 - **Submissions**: every hash that meets the easier of the share target and
   the block target, so no block is dropped below the share difficulty.
   After a block, the lane waits for the next job: more blocks on the same
   parents would only be siblings.
 - **Connection**: reconnects every 5 s if it drops.
+
+Measured (`--bench`, 2026-10-18, on a 32-vCPU Intel Xeon Cascade Lake
+build host, no SHA-NI, load average about 1):
+
+| Kernel | 1 thread | 32 threads (total) |
+| --- | --- | --- |
+| `sha2` (the previous miner's path) | 1.69 MH/s | 53.5 MH/s (1.67 per thread) |
+| `avx2` | 6.34 MH/s | 205 MH/s (6.41 per thread) |
+| `avx512` | 14.3 MH/s | 442 MH/s (13.8 per thread) |
+| `lanes4` | 1.42 MH/s | |
+
+The previous miner reported 1.5 to 1.7 MH/s for one thread on the same host.
+CPUs with SHA-NI (AMD Zen, recent Intel) were not measured; run
+`obenblock-cpu-miner --bench 10` there and the miner picks the fastest
+kernel by itself.
 
 What CPU mining yields: about 2^32 × difficulty hashes per block. Against an
 ASIC-scale target, CPU hashrate finds blocks only after stall relief
@@ -191,7 +203,6 @@ but invalid one stops the server at startup.
   - `version-rolling`: granted with the mask `1fffe000` intersected with the
     miner's mask;
   - `minimum-difficulty`: honored as the starting difficulty;
-  - `obenblock-root`: granted (§5.2);
   - any other extension: declined (`false`).
 - **`mining.subscribe`**: the result is
   `[[["mining.set_difficulty", en1], ["mining.notify", en1]], en1, 4]`.
@@ -202,11 +213,18 @@ but invalid one stops the server at startup.
 - **`mining.authorize [user, password]`**: user as in §3. Work starts with
   `mining.set_difficulty` and a clean `mining.notify`.
 - **`mining.notify`**:
-  `[job_id, prevhash, coinb1, coinb2, branch, version, nbits, ntime, clean_jobs]`.
+  `[job_id, prevhash, coinb1, coinb2, merkle_branch, version, nbits, ntime, clean_jobs]`,
+  field for field the header job's `stratum` object
+  (docs/OBENBLOCK-MINING.md §4.1):
   - `prevhash` is the parents commitment (header bytes 4..36) in stratum's
-    word-swapped form.
-  - `coinb1 ‖ extranonce1 ‖ extranonce2 ‖ coinb2` is the node's coinbase.
-  - `branch` is the tagged-tree branch (`coinbase_merkle_branch`).
+    word-swapped form;
+  - `coinb1 ‖ extranonce1 ‖ extranonce2 ‖ coinb2` is the node's coinbase
+    (`coinb1` ends with `/obb/`; the 8-byte extranonce closes the
+    `script_sig`);
+  - `merkle_branch` is Bitcoin's branch of the coinbase (hashing byte
+    order, bottom-up);
+  - `version`, `nbits`, `ntime` are big-endian hex, as Bitcoin pools send
+    them.
 - **`mining.submit [user, job_id, extranonce2, ntime, nonce, version_bits?]`**:
   - checked against the job: `extranonce2` of 4 bytes, the time window,
     duplicates, the share target, the block target;
@@ -221,29 +239,19 @@ but invalid one stops the server at startup.
   - 24 unauthorized
   - 25 not subscribed
 
-### 5.2 The `obenblock-root` extension
-
-A miner that sends `mining.configure [["obenblock-root"], {}]` and gets
-`{"obenblock-root": true}` receives a tenth `mining.notify` element:
-
-```json
-{"merkle_root_rule": "gnb-body-v2", "shielded_root": "<hex>", "powit_root": "<hex>"}
-```
-
-With it, the miner computes the header root as the node does:
+### 5.2 The header a share hashes
 
 ```text
 coinbase_txid = SHA-256d(coinb1 ‖ extranonce1 ‖ extranonce2 ‖ coinb2)
-tx_root       = cur = leaf(coinbase_txid); cur = node(cur, s) for s in branch
-                leaf(x) = tagged("GnB/merkle/leaf", x), node(l, r) = tagged("GnB/merkle/node", l ‖ r)
-                tagged(t, m) = SHA-256(SHA-256(t) ‖ SHA-256(t) ‖ m)
-merkle_root   = SHA3-256("gnb:block:body:v2" ‖ tx_root ‖ shielded_root ‖ powit_root)   (gnb-body-v2)
-              = tx_root                                                              (gnb-tagged-v1)
+merkle_root   = cur = coinbase_txid; cur = SHA-256d(cur ‖ s) for s in merkle_branch   (bitcoin-sha256d)
 header        = u32le(version) ‖ parents_commitment ‖ merkle_root ‖ u32le(ntime) ‖ u32le(nbits) ‖ u32le(nonce)
+block_id      = SHA-256d(header);  a block  <=>  le256(block_id) <= target(nbits)
 ```
 
-`reference/obb_job.py` is the executable reference.
-`src/validator.rs` reproduces `reference/obb_job_vectors.json`.
+`reference/obb_job.py` is the executable reference (`stock_firmware_header`
+builds the header from `mining.notify` alone). `src/validator.rs`
+reproduces `reference/obb_job_vectors.json`. The `obenblock-root` extension
+of earlier versions is gone (declined if a miner asks for it).
 
 ### 5.3 Jobs and blocks
 
@@ -251,23 +259,30 @@ header        = u32le(version) ‖ parents_commitment ‖ merkle_root ‖ u32le(
   extranonce. Every connection fills those 8 bytes with its own
   `extranonce1 ‖ extranonce2`.
 - **Self-check**: each job is checked against itself before it is served.
-  The node's header must equal the one computed from the job fields, and the
-  node's block bytes must carry that header and the coinbase.
+  The node's header and root must equal the ones computed from `coinb1`,
+  `coinb2` and `merkle_branch` with Bitcoin's math, the `stratum` object
+  must encode the same job, and the node's block bytes must carry that
+  header and the coinbase.
 - **New jobs**:
   - on a new tip (clean: miners drop older work);
   - every `OBB_STRATUM_REFRESH_SECS` (fresh time and mempool);
-  - when the stall-relief step changes (DESIGN-obenblock.md §5.1: a late
-    block's bits ease every 60 s);
+  - when the job's `ntime` window ends: at the node's `next_bits_time`
+    (the next stall-relief step, DESIGN-obenblock.md §5.1: a late block's
+    bits ease every 60 s) or once `maxtime` has passed; not clean, since the
+    old job's shares inside its window are still blocks. A job that arrives
+    with its window already over (the node caches templates for 5 s) is not
+    published, and the next poll asks again;
   - right after a block is found.
-- **Share time**: inside the job's window:
-  - not before the parents' time;
-  - at most 570 s past the server's clock (the node allows 600 s);
-  - in the job's stall-relief step, because the header's bits are those of
-    that step.
+- **Share time**: inside the job's window `[mintime, maxtime]` (the header
+  job's, one stall-relief step, at or after the parents, at most 600 s past
+  the node's clock), and at most 570 s past the server's clock.
 - **Blocks**: a share that meets the block target becomes a block. The
-  server writes the share's extranonce and root into the job's block bytes.
-  It sends `submitblock [block, {"version", "time", "nonce"}]`. The node
-  judges it like any block, and the verdict is logged and counted.
+  server writes the share's extranonce, root, version, time and nonce into
+  the job's block bytes and sends
+  `submitblock [block, {"version", "time", "nonce", "extranonce"}]`
+  (`extranonce` = `extranonce1 ‖ extranonce2`, docs/OBENBLOCK-MINING.md
+  §3.4); the node writes the same fields, recomputes the root and judges
+  the block like any other. The verdict is logged and counted.
 
 ## 6. Metrics
 
@@ -278,7 +293,6 @@ credit as JSON (empty while accounting is off).
   `_workers_authorized`.
 - **Shares**: `obb_stratum_shares_accepted_total`, `_rejected_total`,
   `_stale_total`, `_duplicate_total`, `_low_difficulty_total`.
-- **Bitcoin-root work** (§1): `obb_stratum_shares_bitcoin_root_total`.
 - **Hashrate**: `obb_stratum_share_work_total`. Its rate times 2^32 is the
   hashrate in H/s.
 - **Blocks**: `obb_stratum_blocks_found_total`, `_blocks_accepted_total`,
@@ -326,13 +340,19 @@ cargo test --release --manifest-path tools/obenblock-stratum/Cargo.toml
   (the `obenblock` family of `reference/obb_address_vectors.json`), the job
   vectors, share validation, version rolling, the session state machine
   and the configuration.
+- **Kernels** (`src/hasher.rs`): every kernel the CPU supports must report
+  exactly the nonces whose id's top word is at or below a bound, against
+  the node's `block_id`.
 - **`tests/mock_node.rs`**: the real server and `obenblock-cpu-miner`
   against a mock node RPC. Submitted blocks must carry a header that meets
-  its bits.
+  its bits, and `submitblock`'s solution (with the extranonce) must match
+  the block.
 - **`tests/e2e_regtest.rs`** (`--ignored`): a real regtest node from a fresh
-  data directory, the server and the CPU miner. The node must accept every
-  block, its tip must grow and the coinbases must pay the address. It needs
-  the node binary:
+  data directory, the server, the CPU miner, then a stock-firmware-style
+  device written in the test from the Stratum V1 protocol alone (Bitcoin
+  coinbase and Merkle math, version rolling, a rolled `ntime`). The node
+  must accept every block, its block count must grow by them and the
+  coinbases must pay the address. It needs the node binary:
 
 ```text
 cargo build --release -p gnb --bin gnb
@@ -359,8 +379,8 @@ Changed:
 - jobs come from `getblocktemplate` header jobs, not from a node stratum;
 - the server assigns `extranonce1` values, which are disjoint by
   construction (the Bloch proxy could only detect collisions);
-- shares are validated with the node's own `gnb-smh` functions and the
-  ObenBlock root rule;
+- shares are validated with the node's own `gnb-smh` functions and
+  Bitcoin's Merkle math (ObenBlock's header root);
 - vardiff has an idle escape for miners that honor a difficulty they
   cannot reach.
 

@@ -229,10 +229,6 @@ pub struct Metrics {
     pub shares_stale: AtomicU64,
     pub shares_duplicate: AtomicU64,
     pub shares_low_difficulty: AtomicU64,
-    /// Shares whose hash meets the share target only when the header root is
-    /// Bitcoin's SHA-256d transaction tree: work from unmodified Stratum V1
-    /// firmware, which cannot produce ObenBlock blocks (README, "ASICs").
-    pub shares_bitcoin_root: AtomicU64,
     /// Accepted shares weighted by their difficulty (hashrate estimate).
     pub share_work_total: AtomicU64,
     pub blocks_found: AtomicU64,
@@ -302,7 +298,6 @@ impl Metrics {
             shares_stale: l(&self.shares_stale),
             shares_duplicate: l(&self.shares_duplicate),
             shares_low_difficulty: l(&self.shares_low_difficulty),
-            shares_bitcoin_root: l(&self.shares_bitcoin_root),
             share_work_total: l(&self.share_work_total),
             blocks_found: l(&self.blocks_found),
             blocks_accepted: l(&self.blocks_accepted),
@@ -329,7 +324,6 @@ pub struct MetricsSnapshot {
     pub shares_stale: u64,
     pub shares_duplicate: u64,
     pub shares_low_difficulty: u64,
-    pub shares_bitcoin_root: u64,
     pub share_work_total: u64,
     pub blocks_found: u64,
     pub blocks_accepted: u64,

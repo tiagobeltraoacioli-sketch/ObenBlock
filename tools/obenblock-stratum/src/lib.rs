@@ -7,6 +7,7 @@ pub mod codec;
 pub mod extranonce;
 #[doc(hidden)]
 pub mod fixtures;
+pub mod hasher;
 pub mod job;
 pub mod jobstore;
 pub mod metrics;

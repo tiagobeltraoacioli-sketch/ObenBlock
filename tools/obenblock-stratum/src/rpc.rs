@@ -148,10 +148,18 @@ impl RpcClient {
         Ok(v)
     }
 
-    /// `submitblock [block_hex, {version, time, nonce}]`: the accepted block
-    /// id (hex), or why the node refused it.
-    pub async fn submit_block(&self, block: &[u8], version: u32, time: u32, nonce: u32) -> Result<String, PoolError> {
-        let v = self.call("submitblock", json!([hex::encode(block), {"version": version, "time": time, "nonce": nonce}])).await?;
+    /// `submitblock [block_hex, {version, time, nonce[, extranonce]}]`
+    /// (docs/OBENBLOCK-MINING.md §3.4): the accepted block id (hex), or why
+    /// the node refused it. With `extranonce` the node writes it into the
+    /// coinbase `script_sig` and recomputes the header root.
+    pub async fn submit_block(&self, block: &[u8], version: u32, time: u32, nonce: u32, extranonce: Option<&[u8; 8]>)
+        -> Result<String, PoolError>
+    {
+        let mut sol = json!({"version": version, "time": time, "nonce": nonce});
+        if let Some(e) = extranonce {
+            sol["extranonce"] = json!(hex::encode(e));
+        }
+        let v = self.call("submitblock", json!([hex::encode(block), sol])).await?;
         node_error(&v, "submitblock")?;
         if v.get("accepted").and_then(Value::as_bool) != Some(true) {
             return Err(PoolError::Node(format!("submitblock: unexpected answer {v}")));
@@ -257,10 +265,10 @@ mod tests {
     #[tokio::test]
     async fn node_errors_inside_result_are_errors() {
         let addr = mock_node_ok(r#"{"result":{"error":"rejected: bad pow"}}"#).await;
-        let e = RpcClient::new(addr, None).submit_block(&[1, 2], 1, 2, 3).await.unwrap_err();
+        let e = RpcClient::new(addr, None).submit_block(&[1, 2], 1, 2, 3, None).await.unwrap_err();
         assert!(matches!(e, PoolError::Node(ref m) if m.contains("bad pow")), "{e}");
         let addr = mock_node_ok(r#"{"result":{"accepted":true,"hash":"00ff"}}"#).await;
-        assert_eq!(RpcClient::new(addr, None).submit_block(&[1], 1, 2, 3).await.unwrap(), "00ff");
+        assert_eq!(RpcClient::new(addr, None).submit_block(&[1], 1, 2, 3, Some(&[0; 8])).await.unwrap(), "00ff");
     }
 
     #[tokio::test]

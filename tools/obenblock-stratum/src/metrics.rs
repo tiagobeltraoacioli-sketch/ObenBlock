@@ -43,9 +43,6 @@ pub fn render_prometheus(snap: &MetricsSnapshot, pplns: &PplnsSnapshot) -> Strin
     counter(&mut out, "obb_stratum_shares_duplicate_total", "Shares submitted twice (error 22).", snap.shares_duplicate);
     counter(&mut out, "obb_stratum_shares_low_difficulty_total", "Shares below their share target (error 23).",
             snap.shares_low_difficulty);
-    counter(&mut out, "obb_stratum_shares_bitcoin_root_total",
-            "Rejected shares that are valid work only with Bitcoin's SHA-256d Merkle root in the header: unmodified Stratum V1 firmware, which cannot mine ObenBlock blocks.",
-            snap.shares_bitcoin_root);
     counter(&mut out, "obb_stratum_share_work_total",
             "Sum of the difficulties of accepted shares (rate x 2^32 = hashes per second).", snap.share_work_total);
     counter(&mut out, "obb_stratum_blocks_found_total", "Shares that met the block target and were submitted.",
@@ -337,7 +334,6 @@ mod tests {
             "obb_stratum_shares_stale_total",
             "obb_stratum_shares_duplicate_total",
             "obb_stratum_shares_low_difficulty_total",
-            "obb_stratum_shares_bitcoin_root_total",
             "obb_stratum_share_work_total",
             "obb_stratum_blocks_found_total",
             "obb_stratum_blocks_accepted_total",

@@ -61,12 +61,21 @@ pub fn template_from_vector_at(i: usize, time: Option<u32>) -> Value {
     block.extend(hex::decode(job["coinb2"].as_str().unwrap()).unwrap());
     block.push(0); // no shielded transactions
     block.extend_from_slice(&[0u8; 3]); // PoWit section stand-in
+    // The vector's window: the parent 30 s before the job, no relief yet
+    // (the next step starts 240 s after the parent).
+    let time = job["time"].as_u64().unwrap();
+    let parent_time = time - 30;
+    let (mintime, maxtime, next_bits_time) = (parent_time, parent_time + 239, parent_time + 240);
+    let mut stratum = case["stratum"].clone();
+    stratum["ntime"] = json!(format!("{time:08x}"));
+    stratum["ntime_min"] = json!(mintime);
+    stratum["ntime_max"] = json!(maxtime);
     json!({
         "pow": "sha256d",
         "height": case["height"],
         "parents": parents,
-        "parent_time": job["time"].as_u64().unwrap() - 30,
-        "coinbase_merkle_branch": job["coinbase_merkle_branch"],
+        "parent_time": parent_time,
+        "coinbase_merkle_branch": job["merkle_branch"],
         "stall_relief": {"active": true, "grace_secs": 180, "step_secs": 60, "halflife_secs": 1800},
         "sha256d": {
             "version": job["version"],
@@ -74,21 +83,28 @@ pub fn template_from_vector_at(i: usize, time: Option<u32>) -> Value {
             "parents_commitment": hex::encode(commitment),
             "previousblockhash": hex::encode(display),
             "bits": format!("{:08x}", job["bits"].as_u64().unwrap()),
-            "curtime": job["time"],
-            "mintime": job["time"].as_u64().unwrap() - 30,
+            "curtime": time,
+            "mintime": mintime,
+            "maxtime": maxtime,
+            "relief_step": 0,
+            "next_bits_time": next_bits_time,
             "merkle_root_rule": job["merkle_root_rule"],
-            "shielded_root": job["shielded_root"],
-            "powit_root": job["powit_root"],
+            "merkle_branch": job["merkle_branch"],
             "extranonce_bytes": 8,
             "header_job": {
                 "header": header,
                 "block": hex::encode(&block),
                 "merkle_root": case["expect"]["merkle_root"],
                 "coinbase_txid": case["expect"]["coinbase_txid"],
-                "time": job["time"],
+                "time": time,
+                "bits": format!("{:08x}", job["bits"].as_u64().unwrap()),
+                "mintime": mintime,
+                "maxtime": maxtime,
                 "coinb1": job["coinb1"],
                 "coinb2": job["coinb2"],
                 "extranonce": job["extranonce"],
+                "merkle_branch": job["merkle_branch"],
+                "stratum": stratum,
             }
         }
     })

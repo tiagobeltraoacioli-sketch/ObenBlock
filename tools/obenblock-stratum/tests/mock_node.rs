@@ -3,7 +3,8 @@
 //! the node's job vectors, at the current time) and records `submitblock`.
 //! `obenblock-cpu-miner` connects to the real server; the test checks that a
 //! submitted block's own bytes carry a header whose SHA-256d id meets its
-//! bits, and that `submitblock`'s solution matches that header.
+//! bits (Bitcoin's Merkle root over the patched coinbase), and that
+//! `submitblock`'s solution (version, time, nonce, extranonce) matches it.
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -123,6 +124,10 @@ async fn cpu_miner_blocks_reach_submitblock_with_valid_headers() {
         assert_eq!(sol["version"].as_u64().unwrap() as u32, u32::from_le_bytes(header[0..4].try_into().unwrap()));
         assert_eq!(sol["time"].as_u64().unwrap() as u32, u32::from_le_bytes(header[68..72].try_into().unwrap()));
         assert_eq!(sol["nonce"].as_u64().unwrap() as u32, u32::from_le_bytes(header[76..80].try_into().unwrap()));
+        // The share's extranonce travels too, and is the one in the block's coinbase.
+        let en = sol["extranonce"].as_str().expect("submitblock carries the extranonce");
+        assert_eq!(en.len(), 16);
+        assert!(hex::encode(&block).contains(&format!("2f6f62622f{en}")), "coinbase script_sig ends /obb/ ‖ extranonce");
     }
     // Distinct blocks (extranonce lanes and nonces never repeat).
     let mut ids: Vec<_> = submitted.iter().map(|p| block_id(&header_of_block(&hex::decode(p[0].as_str().unwrap()).unwrap()))).collect();
@@ -130,5 +135,5 @@ async fn cpu_miner_blocks_reach_submitblock_with_valid_headers() {
     ids.dedup();
     assert_eq!(ids.len(), submitted.len());
     let s = metrics.snapshot();
-    assert!(s.blocks_found >= 3 && s.shares_bitcoin_root == 0, "{s:?}");
+    assert!(s.blocks_found >= 3, "{s:?}");
 }

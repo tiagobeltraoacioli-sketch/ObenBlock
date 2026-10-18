@@ -7,8 +7,7 @@
 //!
 //! * `mining.configure` (BIP 310): `version-rolling` is granted with the
 //!   template's BIP 320 mask (`1fffe000`) intersected with the miner's;
-//!   `minimum-difficulty` is honored; `obenblock-root` (this server's
-//!   extension, see below) is granted; other extensions are declined.
+//!   `minimum-difficulty` is honored; other extensions are declined.
 //! * `mining.subscribe`: a unique 4-byte `extranonce1`, `extranonce2` of 4.
 //! * `mining.authorize [user, password]`: `user` is an ObenBlock address of
 //!   this network, optionally `<address>.<worker>`; `d=<difficulty>` in the
@@ -16,15 +15,15 @@
 //! * `mining.notify`, `mining.set_difficulty` with per-connection vardiff.
 //! * `mining.submit [user, job_id, extranonce2, ntime, nonce, version_bits?]`.
 //!
-//! ObenBlock's header root is not Bitcoin's SHA-256d tree
-//! (docs/OBENBLOCK-MINING.md §3.3, §4), so a miner must know the root rule.
-//! The `obenblock-root` extension adds a tenth `mining.notify` element,
-//! `{"merkle_root_rule", "shielded_root", "powit_root"}`, and the branch is
-//! the tagged-tree branch; `obenblock-cpu-miner` negotiates it. Every share is
-//! judged as the node judges the block (ObenBlock root), so work from
-//! firmware that builds Bitcoin's root never counts; it is recognized and
-//! counted (`obb_stratum_shares_bitcoin_root_total`) and logged once per
-//! connection.
+//! ObenBlock's header root is Bitcoin's SHA-256d transaction tree
+//! (docs/OBENBLOCK-MINING.md §3.3, §4.1), so every job is a plain Stratum V1
+//! job built from the node's `stratum` object, and stock ASIC firmware (or a
+//! rental service such as MiningRigRentals) mines it unmodified. Every share
+//! is judged as the node judges the block: the coinbase rebuilt from
+//! `coinb1 ‖ extranonce1 ‖ extranonce2 ‖ coinb2`, the branch walked with
+//! SHA-256d, the header's id against the share and block targets, and its
+//! `ntime` against the job's window (`mintime` / `maxtime`, one stall-relief
+//! step).
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::Ordering;
@@ -48,9 +47,6 @@ use crate::types::{
 use crate::validator::{difficulty_to_target, id_difficulty, meets_target};
 use crate::vardiff::Vardiff;
 
-/// The stratum extension that carries ObenBlock's root rule.
-pub const OBENBLOCK_ROOT_EXTENSION: &str = "obenblock-root";
-
 /// A share's time may be at most this far past the server's clock (the node
 /// allows 600 s past its own; 30 s margin).
 pub const MAX_FUTURE_SECS: u64 = 570;
@@ -68,6 +64,8 @@ pub struct BlockFound {
     pub version: u32,
     pub time: u32,
     pub nonce: u32,
+    /// `extranonce1 ‖ extranonce2` of the share (`submitblock`'s `extranonce`).
+    pub extranonce: [u8; crate::job::EXTRANONCE_LEN],
     pub id: [u8; 32],
     pub account: String,
 }
@@ -93,12 +91,10 @@ pub struct Session {
     worker_name: String,
     /// Version bits this miner may roll (negotiated, or the template's mask).
     version_mask: Option<u32>,
-    obenblock_root: bool,
     vardiff: Vardiff,
     jobs: JobStore,
     seen: HashSet<SeenKey>,
     seen_order: VecDeque<SeenKey>,
-    bitcoin_root_logged: bool,
     work_sent: bool,
 }
 
@@ -109,8 +105,8 @@ impl Session {
         let vardiff = Vardiff::from_cfg(&cfg);
         Self {
             id, en1, cfg, metrics, ledger, subscribed: false, account: None, worker_name: String::new(),
-            version_mask: None, obenblock_root: false, vardiff, jobs: JobStore::new(JOB_CACHE),
-            seen: HashSet::new(), seen_order: VecDeque::new(), bitcoin_root_logged: false, work_sent: false,
+            version_mask: None, vardiff, jobs: JobStore::new(JOB_CACHE),
+            seen: HashSet::new(), seen_order: VecDeque::new(), work_sent: false,
         }
     }
 
@@ -140,7 +136,7 @@ impl Session {
     }
 
     fn notify_line(&self, job: &ObbJob, clean: bool) -> String {
-        notification_line(methods::NOTIFY, job.notify_params(clean, self.obenblock_root))
+        notification_line(methods::NOTIFY, job.notify_params(clean))
     }
 
     /// Lines for a newly published job.
@@ -253,10 +249,6 @@ impl Session {
                     let _ = self.vardiff.suggest(v);
                     result.insert("minimum-difficulty".into(), json!(true));
                 }
-                OBENBLOCK_ROOT_EXTENSION => {
-                    self.obenblock_root = true;
-                    result.insert(OBENBLOCK_ROOT_EXTENSION.into(), json!(true));
-                }
                 other => {
                     result.insert(other.to_string(), json!(false));
                 }
@@ -367,16 +359,6 @@ impl Session {
         let meets_share = meets_target(&share.id, &difficulty_to_target(announced));
 
         if !meets_block && !meets_share {
-            let share_target = difficulty_to_target(announced);
-            if job.bitcoin_root_share_meets(&self.en1, &en2, s.ntime, s.nonce, rolled, &share_target) {
-                self.metrics.shares_bitcoin_root.fetch_add(1, Ordering::Relaxed);
-                if !self.bitcoin_root_logged {
-                    self.bitcoin_root_logged = true;
-                    log::warn!("{} ({}): shares are valid work over Bitcoin's SHA-256d Merkle root: this firmware \
-                                does not build ObenBlock's header root, so its work can never be a block here \
-                                (README, \"ASICs\")", self.id, self.worker_name);
-                }
-            }
             let mut r = self.reject(&req.id, ShareOutcome::LowDifficulty, "low difficulty share");
             if self.vardiff.note_low_share(id_difficulty(&share.id)).is_some() {
                 r.send.push(self.set_difficulty_line());
@@ -391,7 +373,7 @@ impl Session {
                 Ok(b) => {
                     block = Some(BlockFound {
                         job: job.clone(), block: b, version: share.version, time: s.ntime, nonce: s.nonce,
-                        id: share.id, account: account.clone(),
+                        extranonce: ObbJob::extranonce(&self.en1, &en2), id: share.id, account: account.clone(),
                     });
                     ShareOutcome::Block
                 }
@@ -428,7 +410,7 @@ pub struct Shared {
 pub async fn submit_found_block(rpc: &RpcClient, metrics: &Metrics, wake: &Notify, found: &BlockFound) {
     log::info!("BLOCK candidate at height {} id {} (worker {}): submitting", found.job.height, hex::encode(found.id),
                found.account);
-    match rpc.submit_block(&found.block, found.version, found.time, found.nonce).await {
+    match rpc.submit_block(&found.block, found.version, found.time, found.nonce, Some(&found.extranonce)).await {
         Ok(hash) => {
             metrics.blocks_accepted.fetch_add(1, Ordering::Relaxed);
             log::info!("BLOCK accepted by the node: {hash} (height {})", found.job.height);
@@ -533,7 +515,7 @@ mod tests {
     use super::*;
     use crate::job::tests::{template_from_vector, vector_extranonce};
     use crate::types::Network;
-    use crate::validator::{bitcoin_merkle_root, block_id, header80};
+    use crate::validator::{bitcoin_merkle_root, block_id, header80, sha256d, stratum_word_swap};
 
     const MAIN_ADDR: &str = "obb1q0000000000000000000000000000000000000000335d2ee7";
 
@@ -558,11 +540,11 @@ mod tests {
         (Session::new(WorkerId(1), [0xde, 0xad, 0xbe, 0xef], cfg, m.clone(), l.clone()), m, l)
     }
 
-    fn ready_session(ext: bool) -> (Session, Arc<Metrics>, Arc<PplnsLedger>, Published) {
+    fn ready_session(rolling: bool) -> (Session, Arc<Metrics>, Arc<PplnsLedger>, Published) {
         let (mut s, m, l) = session_with(cfg());
         let p = published(true);
-        if ext {
-            s.handle_line(r#"{"id":0,"method":"mining.configure","params":[["version-rolling","obenblock-root"],{"version-rolling.mask":"ffffffff"}]}"#, None, 0);
+        if rolling {
+            s.handle_line(r#"{"id":0,"method":"mining.configure","params":[["version-rolling"],{"version-rolling.mask":"ffffffff"}]}"#, None, 0);
         }
         s.handle_line(r#"{"id":1,"method":"mining.subscribe","params":["test"]}"#, Some(&p), 0);
         let r = s.handle_line(&format!(r#"{{"id":2,"method":"mining.authorize","params":["{MAIN_ADDR}.rig1","x"]}}"#), Some(&p), 0);
@@ -585,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn configure_grants_bip320_rolling_and_the_extension() {
+    fn configure_grants_bip320_rolling_and_declines_the_rest() {
         let (mut s, _, _) = session_with(cfg());
         let r = s.handle_line(r#"{"id":0,"method":"mining.configure","params":[["version-rolling","minimum-difficulty","subscribe-extranonce","obenblock-root"],{"version-rolling.mask":"ffffffff","version-rolling.min-bit-count":2,"minimum-difficulty.value":2048}]}"#, None, 0);
         let res = &v(&r.send[0])["result"];
@@ -593,7 +575,7 @@ mod tests {
         assert_eq!(res["version-rolling.mask"], json!("1fffe000"));
         assert_eq!(res["minimum-difficulty"], json!(true));
         assert_eq!(res["subscribe-extranonce"], json!(false));
-        assert_eq!(res["obenblock-root"], json!(true));
+        assert_eq!(res["obenblock-root"], json!(false), "the retired root extension is declined");
         assert_eq!(s.difficulty(), 2048.0);
         // A narrower miner mask is intersected.
         let (mut s2, _, _) = session_with(cfg());
@@ -632,11 +614,11 @@ mod tests {
         let n = v(&r.send[2]);
         assert_eq!(n["method"], json!("mining.notify"));
         assert_eq!(n["params"][8], json!(true));
-        assert_eq!(n["params"].as_array().unwrap().len(), 9, "plain V1 notify without the extension");
+        assert_eq!(n["params"].as_array().unwrap().len(), 9, "plain Stratum V1 notify");
     }
 
-    /// Mine a share against a session's current job the way the CPU miner
-    /// does (ObenBlock root), for a target.
+    /// Mine a share against a session's current job (Bitcoin's root), for a
+    /// target.
     fn mine(s: &Session, job: &ObbJob, en2: [u8; 4], target: &crate::validator::Target) -> (u32, [u8; 32]) {
         let root = job.merkle_root_for(&s.en1, &en2);
         for nonce in 0u32.. {
@@ -663,6 +645,7 @@ mod tests {
         let found = r.block.expect("meets the block target");
         assert_eq!(found.id, id);
         assert_eq!(found.nonce, nonce);
+        assert_eq!(found.extranonce, [0xde, 0xad, 0xbe, 0xef, 0, 0, 0, 1]);
         assert_eq!(m.snapshot().blocks_found, 1);
         assert_eq!(l.totals().blocks, 1);
         // The same share again is a duplicate.
@@ -672,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    fn shares_are_judged_on_the_obenblock_header() {
+    fn shares_are_judged_on_the_header() {
         let (mut s, m, _, p) = ready_session(true);
         let job = p.job.clone();
         let hard = Arc::new(StratumConfig { vardiff_initial: 1e6, vardiff_min: 1e6, ..(*cfg()).clone() });
@@ -690,9 +673,14 @@ mod tests {
         let r = s.handle_line(&format!(r#"{{"id":5,"method":"mining.submit","params":["a","{}","00","{:08x}","00000000"]}}"#,
                                        job.job_id, job.time), None, job.time as u64);
         assert_eq!(v(&r.send[0])["error"][0], json!(20));
-        // Time outside the job's window: stale.
+        // Time outside the job's window (before it, or in the next relief
+        // step): stale.
         let r = s.handle_line(&submit_line(6, &job.job_id, [0, 0, 0, 2], job.mintime as u32 - 1, miss), None, job.time as u64);
         assert_eq!(v(&r.send[0])["error"][0], json!(21));
+        let late = job.maxtime as u32 + 1;
+        let r = s.handle_line(&submit_line(7, &job.job_id, [0, 0, 0, 2], late, miss), None, late as u64);
+        assert_eq!(v(&r.send[0])["error"][0], json!(21));
+        assert!(r.send[0].contains("window"), "{:?}", r.send);
     }
 
     #[test]
@@ -713,26 +701,43 @@ mod tests {
         assert_eq!(&found.block[0..4], &version.to_le_bytes());
     }
 
+    /// A stock Stratum V1 device: it reads only the `mining.notify` params and
+    /// the subscribe result, builds the coinbase, walks the branch, swaps the
+    /// prevhash words back and rolls ntime and version bits, exactly as
+    /// Bitcoin firmware does. Its block share is a block.
     #[test]
-    fn bitcoin_root_work_is_recognized_and_never_a_block() {
-        let (mut s, m, _, p) = ready_session(false);
+    fn stock_firmware_work_from_notify_alone_is_a_block() {
+        let (mut s, _, _, p) = ready_session(true);
         let job = p.job.clone();
-        let hard = Arc::new(StratumConfig { vardiff_initial: 1e-6, vardiff_min: 1e-6, ..(*cfg()).clone() });
-        s.vardiff = Vardiff::from_cfg(&hard);
-        let share_target = difficulty_to_target(1e-6);
-        // What unmodified firmware hashes: Bitcoin's root from the same coinbase.
-        let en2 = [0, 0, 0, 4];
-        let btc_root = bitcoin_merkle_root(&job.coinbase_txid(&s.en1, &en2), &job.branch);
-        let obb_root = job.merkle_root_for(&s.en1, &en2);
-        let nonce = (0u32..).find(|&n| {
-            meets_target(&block_id(&header80(job.version, &job.parents_commitment, &btc_root, job.time, job.bits, n)), &share_target)
-                && !meets_target(&block_id(&header80(job.version, &job.parents_commitment, &obb_root, job.time, job.bits, n)), &share_target)
-                && !meets_target(&block_id(&header80(job.version, &job.parents_commitment, &obb_root, job.time, job.bits, n)), &job.target)
-        }).unwrap();
-        let r = s.handle_line(&submit_line(8, &job.job_id, en2, job.time, nonce), None, job.time as u64);
-        assert_eq!(v(&r.send[0])["error"][0], json!(23));
-        assert!(r.block.is_none());
-        assert_eq!(m.snapshot().shares_bitcoin_root, 1);
+        let n = job.notify_params(false);
+        let n = n.as_array().unwrap();
+        let hx = |i: usize| hex::decode(n[i].as_str().unwrap()).unwrap();
+        let be = |i: usize| u32::from_str_radix(n[i].as_str().unwrap(), 16).unwrap();
+        let en1 = s.extranonce1();
+        let en2 = [0xa0, 0, 0, 5];
+        let mut cb = hx(2);
+        cb.extend_from_slice(&en1);
+        cb.extend_from_slice(&en2);
+        cb.extend(hx(3));
+        let mut root = sha256d(&cb);
+        for b in n[4].as_array().unwrap() {
+            let mut pair = root.to_vec();
+            pair.extend(hex::decode(b.as_str().unwrap()).unwrap());
+            root = sha256d(&pair);
+        }
+        assert_eq!(root, bitcoin_merkle_root(&job.coinbase_txid(&en1, &en2), &job.branch));
+        let prev: [u8; 32] = hx(1).try_into().unwrap();
+        let rolled = 0x0001_e000u32;
+        let (version, bits, ntime) = (be(5) | rolled, be(6), be(7) + 3);
+        let nonce = (0u32..).find(|&k| meets_target(&block_id(&header80(version, &stratum_word_swap(&prev), &root, ntime,
+            bits, k)), &job.target)).unwrap();
+        let line = format!(r#"{{"id":8,"method":"mining.submit","params":["w","{}","{}","{ntime:08x}","{nonce:08x}","{rolled:08x}"]}}"#,
+                           n[0].as_str().unwrap(), hex::encode(en2));
+        let r = s.handle_line(&line, None, ntime as u64);
+        assert_eq!(v(&r.send[0])["result"], json!(true), "{:?}", r.send);
+        let found = r.block.expect("a stock-firmware block share is a block");
+        assert_eq!((found.version, found.time, found.nonce), (version, ntime, nonce));
+        assert_eq!(&found.block[job.merkle_offset..job.merkle_offset + 32], &root);
     }
 
     #[test]

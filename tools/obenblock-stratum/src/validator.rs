@@ -4,105 +4,66 @@
 //! ```text
 //! coinbase      = coinb1 ‖ extranonce1 ‖ extranonce2 ‖ coinb2      (8 extranonce bytes)
 //! coinbase_txid = SHA-256d(coinbase)
-//! tx_root       = cur = leaf(coinbase_txid); cur = node(cur, s) for s in branch
-//!                 leaf(x) = tagged("GnB/merkle/leaf", x), node(l, r) = tagged("GnB/merkle/node", l ‖ r)
-//!                 tagged(t, m) = SHA-256(SHA-256(t) ‖ SHA-256(t) ‖ m)
-//! merkle_root   = SHA3-256("gnb:block:body:v2" ‖ tx_root ‖ shielded_root ‖ powit_root)   (gnb-body-v2)
-//!               = tx_root                                                              (gnb-tagged-v1)
+//! merkle_root   = cur = coinbase_txid; cur = SHA-256d(cur ‖ s) for s in merkle_branch   (bitcoin-sha256d)
 //! header        = u32le(version) ‖ parents_commitment ‖ merkle_root ‖ u32le(time) ‖ u32le(bits) ‖ u32le(nonce)
 //! block_id      = SHA-256d(header);  valid  <=>  le256(block_id) <= target(bits)
 //! ```
 //!
-//! (docs/OBENBLOCK-MINING.md §1 and §3.3; `reference/obb_job.py` is the
-//! executable reference, and the tests below recompute its vectors,
-//! `reference/obb_job_vectors.json`.)
+//! The header root is Bitcoin's transaction Merkle root (docs/CONSENSUS.md
+//! "Header Merkle root and body commitment (ObenBlock)",
+//! docs/OBENBLOCK-MINING.md §3.3): exactly what stock Stratum V1 firmware
+//! computes from `mining.notify`. The rest of the block body is committed by
+//! the coinbase commitment inside `coinb1`, so it never changes the branch.
+//! `reference/obb_job.py` is the executable reference, and the tests below
+//! recompute its vectors (`reference/obb_job_vectors.json`).
 //!
 //! The header, id, target decoding and the comparison are the node's own
 //! functions (`gnb_smh::sha256d`, `gnb_smh::difficulty`), linked, not
-//! copied. Only the Merkle root rule, which lives in the node crate, is
-//! restated here, and the vector test pins it.
-//!
-//! The root is NOT Bitcoin's SHA-256d transaction tree. Unmodified Stratum V1
-//! firmware builds Bitcoin's tree from `coinb1 ‖ extranonce ‖ coinb2` and the
-//! branch, so its headers are never ObenBlock blocks;
-//! [`bitcoin_merkle_root`] exists only to recognize (and count) such work.
+//! copied. Only the Merkle fold, which lives in the node crate, is restated
+//! here, and the vector test pins it. (The node also rejects the
+//! CVE-2012-2459 duplicated-subtree mutation; a pool only folds the branch
+//! the node gave it, so that check never applies here.)
 
 use sha2::digest::generic_array::GenericArray;
-use sha2::{Digest, Sha256};
-use sha3::Sha3_256;
 
 pub use gnb_smh::difficulty::{bits_to_target, Target};
 pub use gnb_smh::sha256d::{block_id, meets_target, sha256d, BIP320_VERSION_MASK, POW_HEADER_LEN};
 
-const LEAF_TAG: &[u8] = b"GnB/merkle/leaf";
-const NODE_TAG: &[u8] = b"GnB/merkle/node";
-const BODY_V2_TAG: &[u8] = b"gnb:block:body:v2";
-
 /// How the header root is derived from the coinbase txid
-/// (`getblocktemplate` `sha256d.merkle_root_rule`).
+/// (`getblocktemplate` `sha256d.merkle_root_rule`). The node serves header
+/// jobs only under `bitcoin-sha256d`; any other name is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RootRule {
-    /// `gnb-body-v2` (ObenBlock: PoWit active from genesis).
-    BodyV2,
-    /// `gnb-tagged-v1`.
-    TaggedV1,
+    /// `bitcoin-sha256d`: Bitcoin's transaction tree (coinbase at position
+    /// 0, SHA-256d nodes).
+    BitcoinSha256d,
 }
 
 impl RootRule {
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "gnb-body-v2" => Some(RootRule::BodyV2),
-            "gnb-tagged-v1" => Some(RootRule::TaggedV1),
+            "bitcoin-sha256d" => Some(RootRule::BitcoinSha256d),
             _ => None,
         }
     }
 
     pub fn name(self) -> &'static str {
         match self {
-            RootRule::BodyV2 => "gnb-body-v2",
-            RootRule::TaggedV1 => "gnb-tagged-v1",
+            RootRule::BitcoinSha256d => "bitcoin-sha256d",
         }
     }
 }
 
-fn tagged(tag: &[u8], parts: &[&[u8]]) -> [u8; 32] {
-    let t = Sha256::digest(tag);
-    let mut h = Sha256::new();
-    h.update(t);
-    h.update(t);
-    for p in parts {
-        h.update(p);
-    }
-    h.finalize().into()
-}
-
-/// The header Merkle root of a block whose coinbase txid is `coinbase_txid`.
-pub fn merkle_root(
-    rule: RootRule,
-    coinbase_txid: &[u8; 32],
-    branch: &[[u8; 32]],
-    shielded_root: &[u8; 32],
-    powit_root: &[u8; 32],
-) -> [u8; 32] {
-    let mut cur = tagged(LEAF_TAG, &[coinbase_txid]);
-    for s in branch {
-        cur = tagged(NODE_TAG, &[&cur, s]);
-    }
+/// The header Merkle root of a block whose coinbase txid is `coinbase_txid`:
+/// Bitcoin's fold of the coinbase branch (bottom-up, hashing byte order).
+pub fn merkle_root(rule: RootRule, coinbase_txid: &[u8; 32], branch: &[[u8; 32]]) -> [u8; 32] {
     match rule {
-        RootRule::TaggedV1 => cur,
-        RootRule::BodyV2 => {
-            let mut h = Sha3_256::new();
-            h.update(BODY_V2_TAG);
-            h.update(cur);
-            h.update(shielded_root);
-            h.update(powit_root);
-            h.finalize().into()
-        }
+        RootRule::BitcoinSha256d => bitcoin_merkle_root(coinbase_txid, branch),
     }
 }
 
-/// Bitcoin's root (coinbase at position 0, SHA-256d nodes): what unmodified
-/// Stratum V1 firmware puts in the header. Diagnostics only.
+/// Bitcoin's root (coinbase at position 0, SHA-256d nodes): what stock
+/// Stratum V1 firmware puts in the header, and ObenBlock's header root.
 pub fn bitcoin_merkle_root(coinbase_txid: &[u8; 32], branch: &[[u8; 32]]) -> [u8; 32] {
     let mut h = *coinbase_txid;
     for s in branch {
@@ -243,12 +204,14 @@ mod tests {
     /// Every case and share of `reference/obb_job_vectors.json` (produced by
     /// the node's test `obb_sha256d_mining`, recomputed by
     /// `reference/obb_job_test.py`): coinbase txid, Merkle root, header,
-    /// block id and the target verdict.
+    /// block id and the target verdict, and the case's `stratum` object
+    /// read back the way stock firmware reads `mining.notify`.
     #[test]
     fn reproduces_the_node_job_vectors() {
         let v: Value = serde_json::from_str(VECTORS).unwrap();
         assert_eq!(v["extranonce_bytes"].as_u64(), Some(8));
         assert_eq!(v["bip320_mask"].as_u64(), Some(BIP320_VERSION_MASK as u64));
+        assert_eq!(v["merkle_root_rule"].as_str(), Some("bitcoin-sha256d"));
         let cases = v["cases"].as_array().unwrap();
         assert!(!cases.is_empty());
         let mut shares = 0;
@@ -262,15 +225,19 @@ mod tests {
             let txid = sha256d(&cb);
             assert_eq!(hex::encode(txid), case["expect"]["coinbase_txid"].as_str().unwrap(), "{}", case["name"]);
             let branch: Vec<[u8; 32]> =
-                job["coinbase_merkle_branch"].as_array().unwrap().iter().map(|b| h32(b.as_str().unwrap())).collect();
+                job["merkle_branch"].as_array().unwrap().iter().map(|b| h32(b.as_str().unwrap())).collect();
             let rule = RootRule::parse(job["merkle_root_rule"].as_str().unwrap()).unwrap();
-            let root = merkle_root(rule, &txid, &branch, &h32(job["shielded_root"].as_str().unwrap()),
-                                   &h32(job["powit_root"].as_str().unwrap()));
+            let root = merkle_root(rule, &txid, &branch);
             assert_eq!(hex::encode(root), case["expect"]["merkle_root"].as_str().unwrap(), "{}", case["name"]);
             let bits = job["bits"].as_u64().unwrap() as u32;
             let header = header80(job["version"].as_u64().unwrap() as u32, &commitment, &root,
                                   job["time"].as_u64().unwrap() as u32, bits, 0);
             assert_eq!(hex::encode(header), case["expect"]["header"].as_str().unwrap(), "{}", case["name"]);
+            // The stratum object: word-swapped prevhash, big-endian u32 fields.
+            let st = &case["stratum"];
+            assert_eq!(stratum_word_swap(&h32(st["prevhash"].as_str().unwrap())), commitment);
+            assert_eq!(st["nbits"].as_str().unwrap(), format!("{bits:08x}"));
+            assert_eq!(st["merkle_branch"], job["merkle_branch"]);
             for s in case["shares"].as_array().unwrap() {
                 let h = header80(s["version"].as_u64().unwrap() as u32, &commitment, &root,
                                  s["time"].as_u64().unwrap() as u32, bits, s["nonce"].as_u64().unwrap() as u32);
@@ -289,13 +256,18 @@ mod tests {
     }
 
     #[test]
-    fn bitcoin_root_differs_from_the_obenblock_root() {
+    fn root_rule_names() {
+        assert_eq!(RootRule::parse("bitcoin-sha256d"), Some(RootRule::BitcoinSha256d));
+        assert_eq!(RootRule::BitcoinSha256d.name(), "bitcoin-sha256d");
+        // The retired GnB roots are refused.
+        assert_eq!(RootRule::parse("gnb-body-v2"), None);
+        assert_eq!(RootRule::parse("gnb-tagged-v1"), None);
         let txid = [7u8; 32];
-        let branch = [[9u8; 32]];
-        let btc = bitcoin_merkle_root(&txid, &branch);
-        assert_ne!(btc, merkle_root(RootRule::BodyV2, &txid, &branch, &[0; 32], &[0; 32]));
-        assert_ne!(btc, merkle_root(RootRule::TaggedV1, &txid, &branch, &[0; 32], &[0; 32]));
         assert_eq!(bitcoin_merkle_root(&txid, &[]), txid, "empty branch: the root is the txid");
+        let mut pair = [0u8; 64];
+        pair[..32].copy_from_slice(&txid);
+        pair[32..].copy_from_slice(&[9u8; 32]);
+        assert_eq!(merkle_root(RootRule::BitcoinSha256d, &txid, &[[9u8; 32]]), sha256d(&pair));
     }
 
     #[test]

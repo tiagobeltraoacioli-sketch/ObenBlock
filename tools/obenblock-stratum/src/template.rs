@@ -4,8 +4,12 @@
 //! * It fetches a new header job (`getblocktemplate`) when the tips change
 //!   (a clean job: miners drop work on the old parents), when
 //!   `refresh_interval` has passed (fresh time and mempool, not clean), when
-//!   the stall-relief step of the time changes (easier bits for a late
-//!   block, not clean), and right after this server found a block.
+//!   the job's `ntime` window ends: its `maxtime` has passed or the node's
+//!   `next_bits_time` (the next stall-relief step, easier bits) has come
+//!   (not clean: the old job's shares inside its window are still blocks),
+//!   and right after this server found a block. A job whose window is
+//!   already over when it arrives (the node caches templates for 5 s) is
+//!   not published; the next poll asks again.
 //! * Jobs are published on a `watch` channel; every connection sees the
 //!   latest one. A failing node keeps the last good job published (miners
 //!   keep working on it) and is retried at the next poll.
@@ -66,8 +70,8 @@ impl TemplateSource {
         m.template_height.store(job.height as i64, Ordering::Relaxed);
         m.template_bits.store(job.bits as i64, Ordering::Relaxed);
         m.template_parent_count.store(job.parents.len() as i64, Ordering::Relaxed);
-        log::info!("job {} height {} bits {:08x} parents {} clean {}", job.job_id, job.height, job.bits,
-                   job.parents.len(), clean_jobs);
+        log::info!("job {} height {} bits {:08x} step {} ntime {}..={} parents {} clean {}", job.job_id, job.height,
+                   job.bits, job.relief_step, job.mintime, job.maxtime, job.parents.len(), clean_jobs);
         let _ = self.tx.send(Some(Published { job: Arc::new(job), clean_jobs }));
     }
 
@@ -96,14 +100,17 @@ impl TemplateSource {
             let due = match &last {
                 None => true,
                 Some((job, at)) => {
-                    at.elapsed() >= self.refresh_interval
-                        || job.relief.is_some_and(|r| r.steps(now_unix) != r.steps(job.time as u64))
+                    at.elapsed() >= self.refresh_interval || job.window_over(now_unix)
                 }
             };
             if !(force || tips_changed || due) {
                 continue;
             }
             match self.fetch_job().await {
+                Ok(job) if job.window_over(unix_now()) => {
+                    log::debug!("job {} arrived with its window over (maxtime {}); asking again", job.job_id,
+                                job.maxtime);
+                }
                 Ok(job) => {
                     let clean = match &last {
                         None => true,
