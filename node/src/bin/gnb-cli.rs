@@ -402,6 +402,17 @@ fn main() {
         "getfinalityinfo" | "finality" => {
             ("getfinalityinfo", serde_json::Value::Null)
         }
+        "getfinalitycertificate" | "finalitycertificate" => {
+            // [slot | checkpoint hash]; none: the latest finalized checkpoint.
+            let p = match params.first() {
+                Some(v) => match v.parse::<u64>() {
+                    Ok(n) => serde_json::json!([n]),
+                    Err(_) => serde_json::json!([v]),
+                },
+                None => serde_json::json!([]),
+            };
+            ("getfinalitycertificate", p)
+        }
         "ignorefinalized" => {
             ("ignorefinalized", serde_json::json!(params.iter().take(1).collect::<Vec<_>>()))
         }
@@ -2070,6 +2081,9 @@ fn print_usage() {
                                           selected-chain descendants invalid (persisted)
     gnb-cli reconsiderblock <hash>        Undo invalidateblock (and re-check the chain)
     gnb-cli finality                      PoWit finality pin, own finality, conflict alert
+    gnb-cli finalitycertificate [slot|hash]
+                                          PoCI certificate of a finalized checkpoint
+                                          (ObenBlock; default: the latest)
     gnb-cli ignorefinalized [hash]        Set the pinned (or given) finalized checkpoint aside
     gnb-cli reconsiderfinalized <hash>    Remove ignorefinalized (to move back after a
                                           conflict: setfinalitycheckpoint)

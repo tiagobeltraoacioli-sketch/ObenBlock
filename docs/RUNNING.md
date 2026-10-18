@@ -744,6 +744,22 @@ answer to its own request; it is checked like a new block (height implied by
 its parents, difficulty, timestamp, proof of work, the witness commitment
 rules) before it is stored.
 
+### PoCI finality certificates (ObenBlock)
+
+On ObenBlock every finalized checkpoint after the launch has a finality
+certificate (docs/DESIGN-obenblock-poci.md §6): the votes of more than two
+thirds of the configuration in force, which the node keeps when it accepts
+the block that finalized it. `gnb-cli finalitycertificate [slot | hash]`
+(RPC `getfinalitycertificate`) returns it with the registry proof of its
+voters; without an argument, the latest finalized checkpoint's. Anyone who
+trusts the `config_id` (from their own node, or reached through earlier
+certificates) checks it without the configuration's entries. `getpowitinfo`
+and `getfinalityinfo` show, under `poci`, the configuration in force (epoch,
+`config_id`, exact `total`), the bans, the latest finalized checkpoint with
+its certificate, and `absent`: per recent epoch, the weight and number of
+the configuration's keys with no vote included on the chain. Watch it: if
+it nears a third of `total`, finality is about to halt.
+
 ### PoWit finality: the pin, conflicts and the operator
 
 From the PoWit activation the node never leaves a finalized checkpoint it

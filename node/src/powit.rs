@@ -32,6 +32,7 @@ use gnb_crypto::core::{self, activation, Block};
 type Hash = [u8; 32];
 
 mod store;
+pub mod certificate;
 
 /// The second hardening activation height the PoWit rules switch at
 /// (`core::powit::Regime`; process-wide, the node's chain schedule):
@@ -113,10 +114,19 @@ fn encode_exited(state: &PowitState) -> Result<Option<Vec<u8>>, String> {
 }
 
 /// The state's PoCI ledger (`PowitState::poci`, ObenBlock), stored beside it
-/// like the exits: per block the id of the configuration in force and the
-/// bans (`powit/poci/<block>`); each configuration once, content-addressed,
-/// with the id of the one in force before it (`powit/pocicfg/<config id>`).
-/// GnB states have none, so nothing changes for them.
+/// like the exits: per block the id of its history (the configurations in
+/// force, newest first) and the bans (`powit/poci/<block>`); each history
+/// node once, `powit/pocihist/<history id>` = (configuration id, previous
+/// history id); each configuration once, content-addressed
+/// (`powit/pocicfg/<config id>`). GnB states have none, so nothing changes
+/// for them.
+///
+/// A history id commits to the whole sequence of configurations, not only
+/// the newest: two forks can reach the same configuration through different
+/// handoffs (one finalizes a checkpoint of every epoch, the other skips
+/// one), and evidence naming a past configuration is valid only on a chain
+/// that had it in force, so a block's ledger must never be read back with
+/// another fork's history.
 fn poci_key(hash: &Hash) -> String {
     format!("powit/poci/{}", hex::encode(hash))
 }
@@ -125,8 +135,13 @@ fn poci_config_key(id: &Hash) -> String {
     format!("powit/pocicfg/{}", hex::encode(id))
 }
 
+fn poci_hist_key(id: &Hash) -> String {
+    format!("powit/pocihist/{}", hex::encode(id))
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PociRecord {
+    /// History id ([`poci_history_id`]).
     head: Hash,
     bans: BTreeMap<KeyId, Vec<poci::Ban>>,
 }
@@ -134,11 +149,27 @@ struct PociRecord {
 #[derive(serde::Serialize, serde::Deserialize)]
 struct PociConfigRow {
     config: Configuration,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PociHistRow {
+    config: Hash,
     prev: Option<Hash>,
 }
 
-/// Histories by the id of their newest configuration (shared by every
-/// state of a chain; a handful are live at once).
+/// The id of a history whose newest configuration is `config_id`, on top of
+/// the history `prev` (node-local storage key, not consensus).
+fn poci_history_id(prev: Option<&Hash>, config_id: &Hash) -> Hash {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(b"OBB-POCI-node/history");
+    h.update(prev.unwrap_or(&[0; 32]));
+    h.update(config_id);
+    h.finalize().into()
+}
+
+/// Histories by history id (shared by every state of a chain; a handful are
+/// live at once).
 static POCI_HISTORIES: Mutex<Option<HashMap<Hash, PociState>>> = parking_lot::const_mutex(None);
 const POCI_HISTORY_CACHE_CAP: usize = 64;
 
@@ -158,13 +189,17 @@ fn load_poci(store: &Storage, hash: &Hash) -> Option<Option<PociState>> {
         None => {
             let mut history: Vec<Arc<Configuration>> = Vec::new();
             let mut cur = Some(rec.head);
-            while let Some(id) = cur {
-                let row: PociConfigRow = bincode_decode(&store.get_meta(&poci_config_key(&id)).ok()??)?;
-                if row.config.id() != id {
+            while let Some(hid) = cur {
+                let node: PociHistRow = bincode_decode(&store.get_meta(&poci_hist_key(&hid)).ok()??)?;
+                if poci_history_id(node.prev.as_ref(), &node.config) != hid {
+                    return None;
+                }
+                let row: PociConfigRow = bincode_decode(&store.get_meta(&poci_config_key(&node.config)).ok()??)?;
+                if row.config.id() != node.config {
                     return None;
                 }
                 history.push(Arc::new(row.config));
-                cur = row.prev;
+                cur = node.prev;
             }
             let st = PociState::from_history(history, BTreeMap::new())?;
             let mut g = POCI_HISTORIES.lock();
@@ -180,23 +215,58 @@ fn load_poci(store: &Storage, hash: &Hash) -> Option<Option<PociState>> {
     Some(Some(st))
 }
 
-/// Stage the PoCI rows of `state`: the block's record, and the configuration
-/// in force unless it is already stored (the earlier ones were stored by the
-/// blocks they were in force at).
-fn stage_poci(store: &Storage, batch: &mut rocksdb::WriteBatch, hash: &Hash, state: &PowitState) -> Result<(), String> {
-    let Some(st) = &state.poci else { return Ok(()) };
-    let head = st.config().id();
-    let ckey = poci_config_key(&head);
-    if store.get_meta(&ckey).map_err(|e| format!("storage: powit poci: {e}"))?.is_none() {
-        let row = PociConfigRow { config: (**st.config()).clone(), prev: st.previous().map(|c| c.id()) };
-        let bytes = bincode::serde::encode_to_vec(&row, bincode::config::standard())
-            .map_err(|e| format!("powit poci encode: {e}"))?;
-        store.stage_meta(batch, &ckey, &bytes).map_err(|e| format!("storage: powit poci: {e}"))?;
+fn stage_row<T: serde::Serialize>(store: &Storage, batch: &mut rocksdb::WriteBatch, key: &str, row: &T, skip_if_stored: bool)
+    -> Result<(), String>
+{
+    if skip_if_stored && store.get_meta(key).map_err(|e| format!("storage: powit poci: {e}"))?.is_some() {
+        return Ok(());
     }
-    let rec = PociRecord { head, bans: st.bans.clone() };
-    let bytes = bincode::serde::encode_to_vec(&rec, bincode::config::standard())
+    let bytes = bincode::serde::encode_to_vec(row, bincode::config::standard())
         .map_err(|e| format!("powit poci encode: {e}"))?;
-    store.stage_meta(batch, &poci_key(hash), &bytes).map_err(|e| format!("storage: powit poci: {e}"))
+    store.stage_meta(batch, key, &bytes).map_err(|e| format!("storage: powit poci: {e}"))
+}
+
+/// Stage the PoCI rows of `state`: the block's record, and the history nodes
+/// and configurations it needs unless already stored. Usually the selected
+/// parent's record already names the history (or the one below a handoff in
+/// this block): one row read. Otherwise (tools, tests) every node is
+/// derived from the oldest configuration up.
+fn stage_poci(store: &Storage, batch: &mut rocksdb::WriteBatch, hash: &Hash, parent: Option<&Hash>, state: &PowitState)
+    -> Result<(), String>
+{
+    let Some(st) = &state.poci else { return Ok(()) };
+    let head_cfg = st.config().id();
+    let prev_cfg = st.previous().map(|c| c.id());
+    // The parent's history and its newest configuration.
+    let parent_hist = parent
+        .and_then(|p| store.get_meta(&poci_key(p)).ok().flatten())
+        .and_then(|b| bincode_decode::<PociRecord>(&b))
+        .and_then(|r| {
+            let node: PociHistRow = bincode_decode(&store.get_meta(&poci_hist_key(&r.head)).ok()??)?;
+            Some((r.head, node.config))
+        });
+    let head = match parent_hist {
+        Some((hid, cfg)) if cfg == head_cfg => hid,
+        Some((hid, cfg)) if Some(cfg) == prev_cfg => {
+            let id = poci_history_id(Some(&hid), &head_cfg);
+            stage_row(store, batch, &poci_config_key(&head_cfg), &PociConfigRow { config: (**st.config()).clone() }, true)?;
+            stage_row(store, batch, &poci_hist_key(&id), &PociHistRow { config: head_cfg, prev: Some(hid) }, true)?;
+            id
+        }
+        _ => {
+            let configs: Vec<&Arc<Configuration>> = st.history().collect();
+            let mut prev: Option<Hash> = None;
+            for c in configs.into_iter().rev() {
+                let cid = c.id();
+                let id = poci_history_id(prev.as_ref(), &cid);
+                stage_row(store, batch, &poci_config_key(&cid), &PociConfigRow { config: (**c).clone() }, true)?;
+                stage_row(store, batch, &poci_hist_key(&id), &PociHistRow { config: cid, prev }, true)?;
+                prev = Some(id);
+            }
+            prev.expect("a PoCI ledger has a configuration in force")
+        }
+    };
+    stage_row(store, batch, &poci_key(hash), &PociRecord { head, bans: st.bans.clone() }, false)
 }
 
 /// `hash`'s stored PoWit state (`store`: per-epoch segments plus per-block
@@ -238,7 +308,7 @@ pub fn stage_state(store: &Storage, batch: &mut rocksdb::WriteBatch, hash: &Hash
     if let Some(x) = encode_exited(state)? {
         store.stage_meta(batch, &exited_key(hash), &x).map_err(|e| format!("storage: powit exits: {e}"))?;
     }
-    stage_poci(store, batch, hash, state)?;
+    stage_poci(store, batch, hash, parent, state)?;
     if let Some((key, row)) = finality_row(hash, state) {
         store.stage_meta(batch, &key, &row).map_err(|e| format!("storage: powit finality row: {e}"))?;
     }
@@ -1505,18 +1575,81 @@ pub fn info_json(dag: &GhostDAG, store: &Storage) -> serde_json::Value {
         "signers": crate::powit_signer::statuses(),
         // PoCI (ObenBlock, DESIGN-obenblock-poci.md): the configuration in
         // force (`null` on GnB and during the launch bootstrap).
-        "poci": poci_info_json(st.as_ref()),
+        "poci": poci_info_json(dag, store, st.as_ref()),
     })
 }
 
-/// The PoCI part of `getpowitinfo`: the configuration in force (epoch, id,
-/// exact total, entries, quorum threshold) and the bans.
-fn poci_info_json(st: Option<&PowitState>) -> serde_json::Value {
+/// The PoCI part of `getfinalityinfo` (ObenBlock; `null` on GnB): the
+/// configuration in force at the selected tip, as in `getpowitinfo`, with
+/// the latest finalized checkpoint and the summary of its kept certificate
+/// (`getfinalitycertificate` serves the certificate itself).
+pub fn poci_finality_json(dag: &GhostDAG, store: &Storage) -> serde_json::Value {
+    if PociParams::for_chain(core::node_chain_id()).is_none() {
+        return serde_json::Value::Null;
+    }
+    let tip = dag.selected_tip();
+    let tip_h = tip.and_then(|t| dag.get_block_data(&t)).map(|d| d.height).unwrap_or(0);
+    let st = selected_chain_since(dag, tip, tip_h.saturating_sub(16)).into_iter().find_map(|(h, _)| load_state(store, &h));
+    poci_info_json(dag, store, st.as_ref())
+}
+
+/// Per epoch from the configuration's own (at most the last
+/// `POCI_PRUNE_AFTER_EPOCHS` before the state's epoch) to the state's: the
+/// weight and the number of the configuration's keys with no vote included
+/// on this chain for a target in that epoch (DESIGN-obenblock-poci.md §4.1:
+/// operators see absent weight grow long before it reaches a third). Read
+/// from the state's included links (the tip's chain, finalized or not).
+fn poci_absent_json(pp: &PociParams, st: &PowitState, c: &Configuration) -> Vec<serde_json::Value> {
+    let now = st.epoch.max(c.epoch());
+    let from = now.saturating_sub(poci::POCI_PRUNE_AFTER_EPOCHS).max(c.epoch());
+    let span = (now - from + 1) as usize;
+    let mut present = vec![0u128; span];
+    let mut present_keys = vec![0usize; span];
+    for (k, w) in c.entries() {
+        let mut seen = vec![false; span];
+        // Links are bounded by the window (`apply_poci` prunes them).
+        for (_, th, _) in st.links.get(k).into_iter().flatten() {
+            let e = pp.epoch_of(*th);
+            if (from..=now).contains(&e) {
+                seen[(e - from) as usize] = true;
+            }
+        }
+        for (i, s) in seen.into_iter().enumerate() {
+            if s {
+                present[i] = present[i].saturating_add(*w);
+                present_keys[i] += 1;
+            }
+        }
+    }
+    (0..span).map(|i| serde_json::json!({
+        "epoch": from + i as u64,
+        "absent_weight": c.total().saturating_sub(present[i]).to_string(),
+        "absent_keys": c.len() - present_keys[i],
+    })).collect()
+}
+
+/// The PoCI part of `getpowitinfo` and `getfinalityinfo`: the configuration
+/// in force (epoch, id, exact total, entries), its absent weight per epoch,
+/// the bans, and the latest finalized checkpoint with its kept certificate.
+fn poci_info_json(dag: &GhostDAG, store: &Storage, st: Option<&PowitState>) -> serde_json::Value {
     let Some(pp) = PociParams::for_chain(core::node_chain_id()) else { return serde_json::Value::Null };
-    let Some(ps) = st.and_then(|s| s.poci.as_ref()) else {
+    let Some((s, ps)) = st.and_then(|s| s.poci.as_ref().map(|p| (s, p))) else {
         return serde_json::json!({ "active": false, "bootstrap_epochs": pp.bootstrap_epochs });
     };
     let c = ps.config();
+    let f = s.finalized;
+    let certificate = if certificate::final_by_definition(&pp, &f) {
+        serde_json::json!({ "available": false, "reason": "final by definition (launch checkpoint)" })
+    } else {
+        match certificate::load(store, &f.hash) {
+            Some(k) => {
+                let mut j = certificate::certificate_json(dag, &k, false);
+                j["available"] = true.into();
+                j
+            }
+            None => serde_json::json!({ "available": false, "reason": "not kept yet (getfinalitycertificate rebuilds it)" }),
+        }
+    };
     let bans: Vec<serde_json::Value> = ps.bans.iter().flat_map(|(k, bl)| bl.iter().map(move |b| serde_json::json!({
         "key": hex::encode(k), "config_id": hex::encode(b.config_id), "included_at": b.included_at,
         "start": b.start, "end": b.end(pp.ban_epochs),
@@ -1531,7 +1664,10 @@ fn poci_info_json(st: Option<&PowitState>) -> serde_json::Value {
         "params_digest": hex::encode(pp.digest()),
         "previous_config_id": ps.previous().map(|p| hex::encode(p.id())),
         "configurations": ps.history().count(),
+        "absent": poci_absent_json(&pp, s, c),
         "bans": bans,
+        "finalized": { "slot": f.height, "hash": hex::encode(f.hash) },
+        "finalized_certificate": certificate,
     })
 }
 
