@@ -131,6 +131,43 @@ impl AddressFamily {
     }
 }
 
+// Process-wide address family of the wallet/CLI/RPC display and input
+// paths. Set once at startup from the chain selection; GnB if never set, so
+// a process that selects nothing behaves exactly as before.
+static PROCESS_FAMILY: std::sync::OnceLock<AddressFamily> = std::sync::OnceLock::new();
+
+/// Fix the process's address family (idempotent for the same value).
+/// Returns `Err(existing)` if it was already set to the other family.
+///
+/// Integration point (O6a): the chain selector (`core::chain::
+/// set_process_chain`, `set_node_chain_id`) calls this with the selected
+/// chain's family, or `process_family` reads the selected chain directly.
+pub fn set_process_family(family: AddressFamily) -> Result<(), AddressFamily> {
+    match PROCESS_FAMILY.set(family) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let current = process_family();
+            if current == family { Ok(()) } else { Err(current) }
+        }
+    }
+}
+
+/// The process's address family: GnB until [`set_process_family`].
+/// Consensus never reads this; scripts and hashes are family-independent.
+pub fn process_family() -> AddressFamily {
+    PROCESS_FAMILY.get().copied().unwrap_or(AddressFamily::Gnb)
+}
+
+/// An address string as this process shows it: unchanged on GnB, the
+/// `obb1…` form of the same script on ObenBlock (see
+/// [`normalize_legacy_address_in`]).
+pub fn display_address(s: &str) -> String {
+    match process_family() {
+        AddressFamily::Gnb => s.to_string(),
+        family => normalize_legacy_address_in(s, family),
+    }
+}
+
 const NETWORKS: [Network; 2] = [Network::Mainnet, Network::Testnet];
 
 /// Rewrite an accepted alias prefix of a legacy single-key string to the
@@ -525,6 +562,20 @@ mod tests {
         let as_str = addr.to_string();
         let parsed = Address::parse(&as_str).unwrap();
         assert_eq!(addr, parsed);
+    }
+
+    /// No library test selects a family, so this binary is a process that
+    /// chose no chain: GnB, and display leaves every string as it is (even a
+    /// Bloch one, as before). ObenBlock is tested in its own process
+    /// (`tests/obb_process_family.rs`).
+    #[test]
+    fn unset_process_family_is_gnb_and_display_is_unchanged() {
+        assert_eq!(process_family(), AddressFamily::Gnb);
+        let gnb = Address::from_hash([3u8; 20], Network::Mainnet).to_string();
+        let bloch = gnb.replacen(MAINNET_PREFIX, LEGACY_BLOCH_MAINNET_PREFIX, 1);
+        for s in [gnb.as_str(), bloch.as_str(), "not an address", ""] {
+            assert_eq!(display_address(s), s);
+        }
     }
 
     #[test]

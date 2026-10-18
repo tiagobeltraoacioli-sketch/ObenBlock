@@ -50,7 +50,17 @@ checksum covers only the hash, so `gnb1q…` and `obb1q…` of one key differ in
 the prefix only; the legacy policy checksum covers the prefix, so the
 `obb1m…` form of a `gnb1m…` address has a new checksum, and swapping the
 prefix alone fails. The reference is `reference/obb_address.py`, with vectors
-in `reference/obb_address_vectors.json`. An application operating on a particular network must
+in `reference/obb_address_vectors.json`.
+
+A wallet, CLI or node process fixes its family once at startup
+(`address::set_process_family`, from the chain selection; GnB when nothing is
+selected). Its display (`address::display_address`) and its address inputs
+(destinations, RPC queries, `validateaddress`) use that family. Keystores keep
+the address string they were written with (the GnB form): the v3 associated
+data binds it, so a GnB v2/v3 keystore opens unchanged on either chain and is
+shown as `obb1…` on ObenBlock.
+
+An application operating on a particular network must
 compare the decoded network with that network and reject mismatches. A valid
 address for the other network is not a recipient on the current network.
 Changing the HRP without recomputing the checksum must fail. The checksum is

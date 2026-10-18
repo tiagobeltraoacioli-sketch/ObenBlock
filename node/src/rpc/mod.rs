@@ -2683,14 +2683,14 @@ fn address_query_error(error: crate::address::AddressError) -> String {
 /// The legacy holder/history index is keyed by a single-key hash, never the
 /// textual encoding. Policy scripts remain outside these 20-byte indices.
 fn parse_address(addr: &str) -> Result<[u8; 20], String> {
-    let address = crate::address::Address::parse(addr).map_err(address_query_error)?;
+    let address = crate::address::Address::parse_in(addr, crate::address::process_family()).map_err(address_query_error)?;
     require_rpc_address_network(address.network()).map_err(address_query_error)?;
     Ok(*address.hash())
 }
 
 /// UTXO indices use the full output script, including the policy tag/hash.
 fn parse_rpc_destination(addr: &str) -> Result<Vec<u8>, String> {
-    let (network, script) = crate::address::destination_script(addr).map_err(address_query_error)?;
+    let (network, script) = crate::address::destination_script_in(addr, crate::address::process_family()).map_err(address_query_error)?;
     require_rpc_address_network(network).map_err(address_query_error)?;
     Ok(script)
 }
@@ -2698,12 +2698,15 @@ fn parse_rpc_destination(addr: &str) -> Result<Vec<u8>, String> {
 /// `valid`/`isvalid` means usable on this node's network. `checksum` remains
 /// syntactic: a well-formed address for the other network has checksum=true,
 /// validity=false and a reason. Conversion fields are only emitted on success.
+/// The canonical and Bech32m forms are the process's address family
+/// (`obb1…` on ObenBlock, which also accepts every GnB form).
 fn validate_rpc_address(addr: &str, verbose: bool) -> Value {
     use crate::address::{Address, Network, PolicyAddress};
+    let family = crate::address::process_family();
     let field = if verbose { "valid" } else { "isvalid" };
     let mut result = json!({ "address": addr });
     result[field] = json!(false);
-    let (network, script) = match crate::address::destination_script(addr) {
+    let (network, script) = match crate::address::destination_script_in(addr, family) {
         Ok(parsed) => parsed,
         Err(error) => {
             result["reason"] = json!(error.to_string());
@@ -2724,11 +2727,11 @@ fn validate_rpc_address(addr: &str, verbose: bool) -> Value {
     }
     let (canonical, bech32m, hash, prefix) = if let Ok(hash) = <[u8; 20]>::try_from(script.as_slice()) {
         let address = Address::from_hash(hash, network);
-        (address.to_string(), address.to_bech32m(), hex::encode(hash), network.prefix())
+        (address.to_string_in(family), address.to_bech32m_in(family), hex::encode(hash),
+            family.key_prefix(network))
     } else if let Some(address) = PolicyAddress::from_script(&script, network) {
-        (address.to_string(), address.to_bech32m(), hex::encode(&script[1..]),
-            match network { Network::Mainnet => crate::address::POLICY_MAINNET_PREFIX,
-                Network::Testnet => crate::address::POLICY_TESTNET_PREFIX })
+        (address.to_string_in(family), address.to_bech32m_in(family), hex::encode(&script[1..]),
+            family.policy_prefix(network))
     } else {
         result["reason"] = json!("unsupported address script");
         return result;
