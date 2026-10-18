@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>ObenBlock Explorer</title>
-<meta name="description" content="Block explorer for ObenBlock, the SHA-256d proof-of-work BlockDAG with PoWit finality: blocks, the GhostDAG, transactions, addresses and holders.">
+<meta name="description" content="Block explorer for ObenBlock, the SHA-256d proof-of-work BlockDAG with PoWit finality: blocks, the GhostDAG, finality, transactions, obb1 addresses and holders.">
 <meta name="theme-color" content="#000000">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png">
@@ -110,6 +110,9 @@ td .mono, td code { font-size: .82rem; }
 .dot.blue { background: var(--dag-blue); }
 .dot.red { background: transparent; border: 2px dashed var(--dag-red); }
 .dot.pending { background: transparent; border: 2px solid var(--mute); }
+.dot.final { background: #7fd1a8; }
+.badge.final { border-color: #7fd1a8; color: #7fd1a8; }
+.stat.final .v { color: #7fd1a8; }
 .badge { display: inline-flex; align-items: center; gap: 7px; font-family: var(--f-mono); font-size: .72rem; letter-spacing: .06em; text-transform: uppercase; padding: 4px 9px; border-radius: 999px; border: 1px solid var(--line-2); color: var(--text); }
 
 .io { display: grid; grid-template-columns: minmax(0, 1fr) 28px minmax(0, 1fr); gap: 12px; align-items: start; }
@@ -165,16 +168,16 @@ footer .wrap { display: flex; flex-wrap: wrap; gap: 10px 24px; justify-content: 
 </head>
 <body>
 <header class="top"><div class="wrap"><a class="brandlink" href="/" aria-label="ObenBlock home"><img class="mono-tile" src="/favicon.svg" alt="" width="30" height="30"><span class="wm">obenblock<b>.</b></span></a><span class="tag">Explorer</span>
-<nav class="nav" aria-label="Explorer"><a href="#/" data-nav="home">Overview</a><a href="#/blocks" data-nav="blocks">Blocks</a><a href="#/dag" data-nav="dag">DAG</a><a href="#/holders" data-nav="holders">Holders</a><a href="/wallet">Wallet</a><a href="/">ObenBlock</a></nav>
+<nav class="nav" aria-label="Explorer"><a href="#/" data-nav="home">Overview</a><a href="#/blocks" data-nav="blocks">Blocks</a><a href="#/dag" data-nav="dag">DAG</a><a href="#/finality" data-nav="finality">Finality</a><a href="#/holders" data-nav="holders">Holders</a><a href="/wallet">Wallet</a><a href="/">ObenBlock</a></nav>
 </div></header>
 <div class="searchbar"><div class="wrap"><form id="search" role="search" autocomplete="off">
-<input id="q" name="q" type="search" spellcheck="false" placeholder="Search a block hash, transaction id, address or chain height" aria-label="Search">
+<input id="q" name="q" type="search" spellcheck="false" placeholder="Search a block hash, transaction id, obb1 address or chain height" aria-label="Search">
 <button class="btn" type="submit">Search</button></form></div></div>
 <main><div class="wrap" id="app" aria-live="polite"></div></main>
 <footer><div class="wrap"><p>ObenBlock Explorer · mainnet at launch · not audited</p><p>Data from a node through a read-only API. <a href="/">obenblock.xyz</a> · <a href="/downloads">Downloads</a> · <a href="/brand">Brand</a></p></div></footer>
-<link rel="modulepreload" href="/assets/safe.js" integrity="sha384-6yw4lJOfmwaVtVwKGN+x0dHakBIrSCo4gU8sMxr4NQMMihrGmXyUmuOOqlwGGlsi">
-<link rel="modulepreload" href="/assets/explorer-views.js" integrity="sha384-a7kTtoWmAs7d1uDVbLOQ2XVnb37KY8N7Ao0BqyKmsZ6/YgXgOdvyLdKWWisR2M1F">
-<script type="module" src="/explorer.js" integrity="sha384-OoI1AivuxJeAyzxSes7U2GkZBMzZllVZgXuLy6p2ugFSyKBnTFHNdowxDUJqaPew"></script>
+<link rel="modulepreload" href="/assets/safe.js" integrity="sha384-rVNBtFXesyKPS0ueXEe0SxoS4PuT2PZOBEHZYALkqZbdlHuB2BW7YMTCr9nT3HOV">
+<link rel="modulepreload" href="/assets/explorer-views.js" integrity="sha384-vU5dZGCsYDkLU9+AjKNaXeR8rtUrmPbjQERvy+200ew14I033Lh96AAJSvapjGIt">
+<script type="module" src="/explorer.js" integrity="sha384-umWcsKQpM8giQ5an0wQQNf4aqaOjuJy8DLp/OhK9it7BUtMRS9OHQrJUHtsRoZnG"></script>
 
 </body>
 </html>

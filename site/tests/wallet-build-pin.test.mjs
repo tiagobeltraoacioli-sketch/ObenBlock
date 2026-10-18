@@ -7,9 +7,9 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { execFileSync } from "node:child_process";
 
-test("pin-only generator replaces stale pins in both served wallets", () => {
+test("pin-only generator replaces a stale pin in the served wallet", () => {
   const fixture = mkdtempSync(join(tmpdir(), "gnb-wallet-pin-"));
-  const files = ["scripts/build-wallet-wasm.sh", "site/wallet/app.js", "site/wallet/main.js",
+  const files = ["scripts/build-wallet-wasm.sh", "site/wallet/app.js",
     "site/wallet/core.js", "site/wallet/qrcode.js", "site/assets/safe.js",
     "site/assets/site.js", "site/explorer.js", "site/assets/explorer-views.js",
     "site/wallet.html", "site/explorer.html", "site/index.html", "site/brand.html",
@@ -20,7 +20,7 @@ test("pin-only generator replaces stale pins in both served wallets", () => {
       mkdirSync(dirname(target), { recursive: true });
       writeFileSync(target, readFileSync(new URL("../../" + name, import.meta.url)));
     }
-    for (const [file, constant] of [["app.js", "WASM_SHA256"], ["main.js", "CORE_SHA256"]]) {
+    for (const [file, constant] of [["app.js", "WASM_SHA256"]]) {
       const target = join(fixture, "site/wallet", file);
       writeFileSync(target, readFileSync(target, "utf8").replace(
         new RegExp(`^const ${constant} = "[0-9a-f]{64}";$`, "m"),
@@ -31,7 +31,7 @@ test("pin-only generator replaces stale pins in both served wallets", () => {
     writeFileSync(binaryPath, binary);
     execFileSync("sh", [join(fixture, "scripts/build-wallet-wasm.sh"), "--pin-only"], { cwd: fixture });
     const expected = createHash("sha256").update(binary).digest("hex");
-    for (const [file, constant] of [["app.js", "WASM_SHA256"], ["main.js", "CORE_SHA256"]]) {
+    for (const [file, constant] of [["app.js", "WASM_SHA256"]]) {
       const actual = readFileSync(join(fixture, "site/wallet", file), "utf8")
         .match(new RegExp(`^const ${constant} = "([0-9a-f]{64})";$`, "m"))?.[1];
       assert.equal(actual, expected, `${file}: generator left a stale pin`);

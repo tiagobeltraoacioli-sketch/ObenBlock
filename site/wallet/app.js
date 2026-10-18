@@ -1,23 +1,29 @@
 // ObenBlock web wallet. Keys are decrypted and used only inside the WebAssembly
 // core (core.js / gnb_wallet.wasm); this file never sees a private key.
 //
+// ObenBlock: the core signs for chain id 0x4F420001 (mainnet) or 0x4F420002
+// (regtest) only, every payment is a version-3 transaction (sighash v3, from
+// height 0), and addresses are shown as obb1… (gnb1… and bloch1… strings are
+// accepted as the same script). The network is the one the site's node
+// reports (getnetworkinfo chain_id); the page refuses to sign when the node is
+// not an ObenBlock node or runs another network than the wallet.
+//
 // Audit fixes: all markup is built with the escaping `html` template and API
 // values are type-checked (WAL-3); the wasm core is checked against the
-// SHA-256 pinned below before it runs (WAL-5); from the hardening activation
-// height (read from the node: getdaginfo next_block_height) payments are
-// version-3 transactions whose signatures commit to every spent value, below
-// it the claimed values of the UTXOs a payment spends are verified against
-// their previous transactions inside the core; the review shows the ACTUAL
-// fee and any input that could not be verified (WAL-1, WAL-6); new wallets
-// are backed by a 24-word recovery phrase (WAL-7). Only coins spendable in the
-// next block reach the core: an immature coinbase output is neither counted as
-// spendable nor offered to the core (core.js splitByMaturity).
-import { loadCore, spendableWindow, splitByMaturity, getutxosFetcher, COINBASE_MATURITY, UTXO_WINDOW, UTXO_WIDE_WINDOW } from "/wallet/core.js";
+// SHA-256 pinned below before it runs (WAL-5); a version-3 signature commits
+// to every spent value, and the review shows the ACTUAL fee and any input that
+// could not be verified (WAL-1, WAL-6); new wallets are backed by a 24-word
+// recovery phrase (WAL-7). Only coins spendable in the next block reach the
+// core: an immature coinbase output is neither counted as spendable nor
+// offered to the core (core.js splitByMaturity). Received coins are final
+// once PoWit finalizes their block (getpowitinfo finalized), which the
+// activity list shows per movement.
+import { loadCore, spendableWindow, splitByMaturity, getutxosFetcher, networkOfChainId, walletNetwork, COINBASE_MATURITY, UTXO_WINDOW, UTXO_WIDE_WINDOW } from "/wallet/core.js";
 import { html, raw, isAddress, watchAddress, isHex64, num, sats } from "/assets/safe.js";
 
 // SHA-256 of /wallet/gnb_wallet.wasm. Written by scripts/build-wallet-wasm.sh
 // and checked by `node --test site/tests/`; loadCore refuses any other binary.
-const WASM_SHA256 = "b91372ded4265e51eddd0842d991d6a6602d5531d46600d107e6d2e6b11c6c66";
+const WASM_SHA256 = "1c6eef6e2fa5bc2ba470132d868bfa3a3289e91cdce635c79f4ecda0d11e59ea";
 
 const SAT = 100000000n;
 // UTXO_WINDOW / UTXO_WIDE_WINDOW (core.js): rows asked of getutxos, the same
@@ -25,9 +31,13 @@ const SAT = 100000000n;
 const IDLE_LOCK_MS = 10 * 60 * 1000;
 const app = document.getElementById("app");
 const lockBtn = document.getElementById("lock");
+const netBadge = document.getElementById("netbadge");
 let core = null;
-let state = { mode: "locked", address: null, tab: "send", balance: null, utxos: [], immature: [], pending: null };
+let state = { mode: "locked", address: null, network: null, tab: "send", balance: null, utxos: [], immature: [], pending: null };
 let idleTimer = null, pollTimer = null;
+// The site's node: its network (from the chain id it reports), tip and PoWit
+// finality. `error` is set when it is unreachable or not an ObenBlock node.
+let node = { network: null, error: null, tip: null, finalized: null };
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 const show = (el, markup) => { el.innerHTML = String(markup); };
@@ -72,6 +82,40 @@ function download(name, text) {
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 const nextFrame = () => new Promise((r) => requestAnimationFrame(() => setTimeout(r, 0)));
+/** Ask the site's node which network it runs (getnetworkinfo chain_id) and
+ *  how far PoWit has finalized (getpowitinfo). Never throws: `node.error`. */
+async function refreshNode() {
+  try {
+    const info = await api("getnetworkinfo");
+    node.network = networkOfChainId(info.chain_id);
+    node.error = null;
+    try {
+      const pw = await api("getpowitinfo");
+      node.tip = Number.isSafeInteger(num(pw.tip_height)) ? num(pw.tip_height) : null;
+      const f = num(pw.finalized?.block_height);
+      node.finalized = Number.isSafeInteger(f) ? f : null;
+    } catch { node.finalized = null; }
+  } catch (e) {
+    node.network = null;
+    node.error = e?.message || String(e);
+  }
+  paintNetBadge();
+  return node;
+}
+function paintNetBadge() {
+  if (!netBadge) return;
+  const text = node.network
+    ? `ObenBlock ${node.network}${node.finalized !== null ? ` · finalized #${node.finalized.toLocaleString("en-US")}` : ""}`
+    : node.error ? "node unavailable" : "connecting…";
+  netBadge.textContent = text;
+  netBadge.dataset.state = node.network ? "ok" : node.error ? "bad" : "";
+  netBadge.title = node.error || "Network and PoWit finality reported by this site's node";
+}
+/** The node runs `network`, or an error that says why the page will not sign. */
+function requireNodeNetwork(network) {
+  if (!node.network) throw new Error(node.error ? `Cannot reach an ObenBlock node: ${node.error}` : "The node's network is not known yet; try again.");
+  if (node.network !== network) throw new Error(`This wallet is on ObenBlock ${network}, but the site's node runs ${node.network}. Nothing was signed.`);
+}
 async function getCore() {
   if (!WASM_SHA256) throw new Error("wallet core hash is not pinned; refusing to load it");
   if (!core) core = await loadCore("/wallet/gnb_wallet.wasm", WASM_SHA256);
@@ -90,7 +134,7 @@ function armIdleLock() {
 function lock(message) {
   try { core?.wipe(); } catch {}
   clearTimeout(idleTimer); clearInterval(pollTimer);
-  state = { mode: "locked", address: null, tab: "send", balance: null, utxos: [], immature: [], pending: null };
+  state = { mode: "locked", address: null, network: null, tab: "send", balance: null, utxos: [], immature: [], pending: null };
   lockBtn.hidden = true;
   renderGate(message);
 }
@@ -103,15 +147,17 @@ function renderGate(message) {
   <div class="gate-head"><span class="eyebrow">ObenBlock Wallet</span><h1>Hold OBB with post-quantum keys.</h1>
    <p>Open an ObenBlock, GnB or Bloch keystore, create a new one, or watch an address. Your keystore is decrypted in this tab with its password, and signing happens here too. Nothing secret is uploaded.</p></div>
   ${message ? html`<div class="alert ok">${message}</div>` : ""}
+  <div class="netpick"><label>Network<select id="net">${["mainnet", "regtest"].map((n) => html`<option value="${n}" ${n === (node.network || "mainnet") ? raw("selected") : ""}>ObenBlock ${n}</option>`)}</select></label>
+   <p class="note" id="net-note">${node.network ? html`The site's node runs ObenBlock ${node.network}. Signatures commit to its chain id, so a transaction is valid on this network only.` : node.error ? html`The site's node cannot be used: ${node.error}. You can open or create a wallet; sending waits for an ObenBlock node.` : "Asking the site's node which network it runs…"}</p></div>
   <div class="doors">
    <section class="door primary"><span class="num">01 · OPEN</span><h2>Open a keystore</h2>
-    <p>A <span class="mono">.json</span> keystore from ObenBlock, GnB or Bloch (Genesis-3). A Bloch address becomes the same <span class="mono">gnb1q…</span> address.</p>
+    <p>A <span class="mono">.json</span> keystore from ObenBlock, GnB or Bloch (Genesis-3). Its <span class="mono">gnb1q…</span> or <span class="mono">bloch1q…</span> address is the same <span class="mono">obb1q…</span> address: the same key holds the genesis carryover here.</p>
     <div class="drop" id="drop" tabindex="0" role="button" aria-label="Choose keystore file"><b>Drop the keystore here</b><br>or click to choose a file</div>
     <input type="file" id="file" accept=".json,application/json" hidden>
     <label>Password<input type="password" id="pw" autocomplete="current-password"></label>
     <button class="btn" id="open">Unlock</button><div id="open-msg"></div></section>
    <section class="door"><span class="num">02 · CREATE</span><h2>Create a wallet</h2>
-    <p>A new ML-DSA-65 + Falcon-1024 key, generated here from a 24-word recovery phrase that you write down. You also download its encrypted keystore.</p>
+    <p>A new ML-DSA-65 + Falcon-1024 key, generated here from a 24-word recovery phrase that you write down (mainnet; a regtest key has no phrase). You also download its encrypted keystore.</p>
     <label>Password<input type="password" id="npw" autocomplete="new-password"></label>
     <label>Repeat password<input type="password" id="npw2" autocomplete="new-password"></label>
     <p class="note">At least 12 characters, three of upper, lower, digit, symbol.</p>
@@ -122,19 +168,21 @@ function renderGate(message) {
     <label>New keystore password<input type="password" id="rpw" autocomplete="new-password"></label>
     <button class="btn ghost" id="restore">Restore and download</button><div id="restore-msg"></div></section>
    <section class="door"><span class="num">04 · WATCH</span><h2>Watch an address</h2>
-    <p>Balance, activity and a receive QR for any <span class="mono">gnb1q…</span> or <span class="mono">bloch1q…</span> address. No keys involved.</p>
-    <label>Address<input id="waddr" spellcheck="false" placeholder="gnb1q…"></label>
+    <p>Balance, activity and a receive QR for any <span class="mono">obb1q…</span> address (a <span class="mono">gnb1q…</span> or <span class="mono">bloch1q…</span> one is the same address). No keys involved.</p>
+    <label>Address<input id="waddr" spellcheck="false" placeholder="obb1q…"></label>
     <button class="btn ghost" id="watch">Watch</button><div id="watch-msg"></div></section>
   </div>
   <div class="trust">
    <div><b>Keys stay in the tab</b><span>Decryption (Argon2id, AES-256-GCM) and signing run in WebAssembly in this page. The page loads only code from this site, checked against pinned hashes.</span></div>
-   <div><b>Post-quantum signatures</b><span>Every input is signed with ML-DSA-65 and Falcon-1024 together; both must verify.</span></div>
+   <div><b>Post-quantum signatures</b><span>Every input is signed with ML-DSA-65 and Falcon-1024 together; both must verify. Each signature commits to the ObenBlock chain id and to every spent value (version-3 transactions).</span></div>
    <div><b>Locks itself</b><span>The key is wiped from memory on Lock, when the tab closes, and after 10 minutes idle.</span></div>
   </div></div>`);
   let fileText = null;
   const drop = document.getElementById("drop"), file = document.getElementById("file");
+  const picked = () => walletNetwork(document.getElementById("net").value);
   const take = async (f) => { if (!f) return; if (f.size > 4 * 1024 * 1024) return showError(document.getElementById("open-msg"), "That file is too large to be a keystore.");
     fileText = await f.text(); show(drop, html`<b>${f.name}</b><br>${(f.size / 1024).toFixed(1)} kB · ready`); document.getElementById("pw").focus(); };
+  document.getElementById("net").addEventListener("change", (e) => { e.target.dataset.touched = "1"; });
   drop.addEventListener("click", () => file.click());
   drop.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); file.click(); } });
   file.addEventListener("change", () => take(file.files[0]));
@@ -147,9 +195,10 @@ function renderGate(message) {
     if (!fileText) return showError(msg, "Choose a keystore file first.");
     busy(btn, "Decrypting (a few seconds)…"); await nextFrame();
     try {
-      const c = await getCore(); const r = c.open(fileText, document.getElementById("pw").value);
+      const network = picked();
+      const c = await getCore(); const r = c.open(fileText, document.getElementById("pw").value, network);
       document.getElementById("pw").value = ""; fileText = null;
-      enter("keys", r.address);
+      enter("keys", r.address, undefined, network);
     } catch (e) { unbusy(btn); showError(msg, e); }
   });
   document.getElementById("create").addEventListener("click", async (ev) => {
@@ -158,11 +207,16 @@ function renderGate(message) {
     if (p1 !== p2) return showError(msg, "The passwords do not match.");
     busy(btn, "Generating and encrypting…"); await nextFrame();
     try {
-      const c = await getCore(); const r = c.create();
+      const network = picked();
+      const c = await getCore(); const r = c.create(network);
       let ks;
       try { ks = c.exportKeystore(p1); } catch (e) { c.wipe(); throw e; }
       document.getElementById("npw").value = document.getElementById("npw2").value = "";
-      showPhrase(r, ks);
+      if (r.words) showPhrase(r, ks, network);
+      else {
+        download(keystoreName(r.address), ks);
+        enter("keys", r.address, "New regtest wallet created (random key, no recovery phrase). Its encrypted keystore was downloaded.", network);
+      }
     } catch (e) { unbusy(btn); showError(msg, e); }
   });
   document.getElementById("restore").addEventListener("click", async (ev) => {
@@ -174,21 +228,21 @@ function renderGate(message) {
       let ks;
       try { ks = c.exportKeystore(document.getElementById("rpw").value); } catch (e) { c.wipe(); throw e; }
       document.getElementById("rwords").value = document.getElementById("rpw").value = "";
-      download(`gnb-wallet-${String(r.address).slice(0, 14)}.json`, ks);
-      enter("keys", r.address, "Wallet restored from its recovery phrase. A new encrypted keystore was downloaded.");
+      download(keystoreName(r.address), ks);
+      enter("keys", r.address, "Wallet restored from its recovery phrase. A new encrypted keystore was downloaded.", "mainnet");
     } catch (e) { unbusy(btn); showError(msg, e); }
   });
   document.getElementById("watch").addEventListener("click", async (ev) => {
     const btn = ev.currentTarget, msg = document.getElementById("watch-msg"); msg.innerHTML = "";
     busy(btn, "Checking…");
-    try { const c = await getCore(); enter("watch", c.normalize(document.getElementById("waddr").value)); }
+    try { const c = await getCore(); const a = c.classify(document.getElementById("waddr").value); enter("watch", a.address, undefined, walletNetwork(a.network)); }
     catch (e) { unbusy(btn); showError(msg, e); }
   });
 }
 
 /** WAL-7: show the new recovery phrase once; continue only after the user
  *  confirms it is written down. */
-function showPhrase(created, keystore) {
+function showPhrase(created, keystore, network) {
   const words = String(created.words || "").split(" ").filter(Boolean);
   show(app, html`<div class="gate"><div class="gate-head"><span class="eyebrow">Recovery phrase</span><h1>Write these 24 words down.</h1>
     <p>They restore this wallet on any device. Anyone who has them controls the funds. They are shown once and never stored or sent.</p></div>
@@ -198,15 +252,18 @@ function showPhrase(created, keystore) {
   const done = document.getElementById("phrase-done");
   document.getElementById("wrote").addEventListener("change", (e) => { done.disabled = !e.target.checked; });
   done.addEventListener("click", () => {
-    download(`gnb-wallet-${String(created.address).slice(0, 14)}.json`, keystore);
-    enter("keys", created.address, "New wallet created. Keep the recovery phrase offline and the keystore with its password.");
+    download(keystoreName(created.address), keystore);
+    enter("keys", created.address, "New wallet created. Keep the recovery phrase offline and the keystore with its password.", network);
   });
 }
 
 // ── the vault (unlocked or watching) ─────────────────────────────────────────
-function enter(mode, address, notice) {
+/** The download name of a keystore: obenblock-wallet-<address start>.json. */
+const keystoreName = (address) => `obenblock-wallet-${String(address).slice(0, 14)}.json`;
+
+function enter(mode, address, notice, network = "mainnet") {
   if (!isAddress(address)) throw new Error("invalid address");
-  state = { mode, address, tab: mode === "keys" ? "send" : "receive", balance: null, utxos: [], immature: [], pending: null, notice };
+  state = { mode, address, network: walletNetwork(network), tab: mode === "keys" ? "send" : "receive", balance: null, utxos: [], immature: [], pending: null, notice };
   lockBtn.hidden = false; lockBtn.textContent = mode === "keys" ? "Lock" : "Close";
   armIdleLock(); renderVault(); refresh();
   clearInterval(pollTimer); pollTimer = setInterval(refresh, 20000);
@@ -214,6 +271,12 @@ function enter(mode, address, notice) {
 
 async function refresh() {
   if (state.mode === "locked") return;
+  await refreshNode();
+  if (state.network && node.network && node.network !== state.network) {
+    const el = document.getElementById("slab-err");
+    if (el) showError(el, `This wallet is on ObenBlock ${state.network}; the site's node runs ${node.network}, so its balance is not shown.`);
+    return;
+  }
   try {
     const address = state.address;
     const fetchUtxos = getutxosFetcher(api, address);
@@ -251,10 +314,11 @@ function paintSlab() {
   const keys = state.mode === "keys";
   show(el, html`<span class="k">Balance</span>
    <div class="bal">${state.balance === null ? raw(`<span class="busy"></span>`) : fmt(state.balance)}<small>OBB</small></div>
-   <div class="row">${keys ? raw(`<span class="chip on">● Unlocked</span>`) : raw(`<span class="chip watch">◌ Watching</span>`)}<a class="chip" href="/explorer#/address/${state.address}" target="_blank" rel="noopener">Explorer ↗</a></div>
+   <div class="row">${keys ? raw(`<span class="chip on">● Unlocked</span>`) : raw(`<span class="chip watch">◌ Watching</span>`)}<span class="chip static">ObenBlock ${state.network || "mainnet"}</span><a class="chip" href="/explorer#/address/${state.address}" target="_blank" rel="noopener">Explorer ↗</a></div>
    <span class="k">Address</span><div class="addr" id="addr">${state.address}</div>
    <div class="row"><button class="chip" id="copy">Copy address</button><button class="chip" id="refresh">Refresh</button></div>
    <div class="facts"><div><b>${state.utxoCount ?? "—"}</b><span>Unspent outputs</span></div><div><b>${state.utxos.length ? fmt(state.utxoTotal, 4) : "—"}</b><span>Spendable now*</span></div>${state.immature.length ? html`<div><b>${fmt(state.immatureTotal, 4)}</b><span>Immature (mining rewards)</span></div>` : ""}</div>
+   ${node.finalized !== null ? html`<p class="note">PoWit finalized through height ${count(node.finalized)}${node.tip !== null ? ` (tip ${count(node.tip)})` : ""}. Coins received at or below it are final.</p>` : ""}
    <p class="note">* One payment can spend up to ${UTXO_WINDOW} outputs (each input carries an ~8.5 kB post-quantum signature).${state.immature.length ? ` Mining rewards (coinbase outputs) become spendable ${COINBASE_MATURITY} blocks after their block; ${state.immature.length} are not yet and are not counted.` : ""}${state.utxosTruncated ? " The node listed only part of this address's outputs; more may be spendable." : ""}</p><div id="slab-err"></div>`);
   document.getElementById("copy").addEventListener("click", (e) => navigator.clipboard?.writeText(state.address).then(() => { e.target.textContent = "Copied"; setTimeout(() => (e.target.textContent = "Copy address"), 1200); }));
   document.getElementById("refresh").addEventListener("click", refresh);
@@ -268,8 +332,8 @@ function paintPane() {
 /** Height of the next block: the node's getdaginfo next_block_height (the
  *  height its mempool and block template check a payment against; it can
  *  exceed tip_height + 1), or tip_height + 1 from a node without the field.
- *  The core signs version 3 (sighash v3, which commits to every spent value)
- *  from the hardening activation height and version 1 below it. */
+ *  On ObenBlock the core signs version 3 (sighash v3, which commits to every
+ *  spent value) at every height; the height still bounds coinbase maturity. */
 async function nextBlockHeight() {
   const dag = await api("getdaginfo");
   if (dag.next_block_height !== undefined && dag.next_block_height !== null) {
@@ -282,11 +346,12 @@ async function nextBlockHeight() {
   return tip + 1;
 }
 
-/** WAL-1 (version-1 payments): fetch the creating transactions of the inputs
- *  the core plans to spend. A transaction the server cannot provide
- *  (carryover, pruned) is simply absent: that input stays unverified and is
- *  flagged. The core hashes every provided transaction against its txid, so
- *  a forged one is refused. Version 3 needs none (plan returns no txids). */
+/** WAL-1 (version-1 payments, never on ObenBlock): fetch the creating
+ *  transactions of the inputs the core plans to spend. A transaction the
+ *  server cannot provide (carryover, pruned) is simply absent: that input
+ *  stays unverified and is flagged. The core hashes every provided
+ *  transaction against its txid, so a forged one is refused. Version 3 needs
+ *  none (plan returns no txids). */
 async function fetchPrevTxs(txids) {
   const out = {};
   await Promise.all(txids.filter(isHex64).map(async (txid) => {
@@ -297,7 +362,7 @@ async function fetchPrevTxs(txids) {
 
 function paintSend(pane = document.getElementById("pane")) {
   show(pane, html`<h3>Send OBB</h3>
-   <label>To<input id="to" spellcheck="false" placeholder="gnb1q… (a bloch1q… address is accepted)"></label>
+   <label>To<input id="to" spellcheck="false" placeholder="obb1q… (gnb1q… and bloch1q… are the same address)"></label>
    <div class="field-row"><label>Amount (OBB)<input id="amt" inputmode="decimal" placeholder="0.00"></label><button class="btn ghost" id="max">Max</button></div>
    <p class="note">The network fee is the consensus minimum for the transaction's real size (≈ 0.00002 OBB per kB, at least 0.0001 OBB). Fees above 0.02 OBB are refused.</p>
    <button class="btn" id="review">Review payment</button><div id="send-out"></div>`);
@@ -310,7 +375,9 @@ function paintSend(pane = document.getElementById("pane")) {
   document.getElementById("review").addEventListener("click", async (ev) => {
     const btn = ev.currentTarget, out = document.getElementById("send-out"); out.innerHTML = "";
     try {
-      const to = core.normalize(document.getElementById("to").value);
+      const dest = core.classify(document.getElementById("to").value);
+      const to = dest.address;
+      if (walletNetwork(dest.network) !== state.network) throw new Error(`That is an ObenBlock ${walletNetwork(dest.network)} address; this wallet is on ${state.network}.`);
       const amount = parseGnb(document.getElementById("amt").value);
       if (amount <= 0n) throw new Error("Enter an amount above zero.");
       if (!state.utxos.length) {
@@ -319,6 +386,8 @@ function paintSend(pane = document.getElementById("pane")) {
           : "No spendable outputs found for this address yet.");
       }
       busy(btn, "Verifying inputs and signing…"); await nextFrame();
+      await refreshNode();
+      requireNodeNetwork(state.network);
       const next = await nextBlockHeight();
       // The rows of the last refresh, checked again at this height.
       const coins = splitByMaturity(state.utxos, next).spendable;
@@ -349,6 +418,7 @@ function paintSend(pane = document.getElementById("pane")) {
       confirmBtn.addEventListener("click", async (e2) => {
         const b2 = e2.currentTarget; busy(b2, "Broadcasting…");
         try {
+          requireNodeNetwork(state.network);
           await broadcast(state.pending.raw);
           const id = isHex64(state.pending.txid) ? state.pending.txid : ""; state.pending = null;
           show(out, html`<div class="alert ok">Sent. Transaction <a class="mono" href="/explorer#/tx/${id}" target="_blank" rel="noopener">${id.slice(0, 16)}…</a> is in the mempool and will confirm in the next blocks.</div>`);
@@ -365,7 +435,8 @@ function paintReceive(pane = document.getElementById("pane")) {
   try { const q = window.qrcode(0, "M"); q.addData(state.address, "Byte"); q.make(); qr = raw(q.createSvgTag({ cellSize: 6, margin: 0, scalable: true })); } catch {}
   show(pane, html`<h3>Receive OBB</h3><div class="receive"><div class="qr" aria-label="QR code of the address">${qr}</div>
    <div style="display:grid;gap:12px"><p>Share this address. Anyone can send OBB to it; only the keystore can spend it.</p><div class="addr">${state.address}</div>
-   <p class="note">Same key as the Bloch address <span class="mono">bloch1q${state.address.slice(5)}</span>: OBB from the Genesis-3 carryover is already here.</p></div></div>`);
+   ${state.network === "mainnet" && state.address.startsWith("obb1q") ? html`<p class="note">The same key as the GnB address <span class="mono">gnb1q${state.address.slice(5)}</span> and the Bloch address <span class="mono">bloch1q${state.address.slice(5)}</span>: OBB from the Genesis-3 carryover is already here. Wallets that know only those forms can pay either one; the coins arrive here.</p>` : ""}
+   <p class="note">Coins sent to this address are final once PoWit finalizes their block; the Activity tab marks each movement.</p></div></div>`);
 }
 
 async function paintActivity(pane = document.getElementById("pane")) {
@@ -378,12 +449,19 @@ async function paintActivity(pane = document.getElementById("pane")) {
     const items = Array.isArray(h.items) ? h.items : [];
     show(pane, html`<h3>Activity</h3>
      ${c?.in_carryover === true ? html`<div class="alert ok">Genesis carryover: ${fmt(c.amount)} OBB from the Bloch Genesis-3 snapshot (${count(c.utxos)} outputs).</div>` : ""}
-     ${items.length ? html`<table class="activity"><thead><tr><th>Height</th><th>Transaction</th><th></th><th class="num">OBB</th></tr></thead><tbody>
+     ${items.length ? html`<table class="activity"><thead><tr><th>Height</th><th>Transaction</th><th></th><th>Finality</th><th class="num">OBB</th></tr></thead><tbody>
       ${items.map((i) => { const txid = isHex64(i.txid) ? i.txid : ""; const incoming = i.direction === "in";
-        return html`<tr><td class="mono">${count(i.height)}</td><td><a class="mono" href="/explorer#/tx/${txid}" target="_blank" rel="noopener">${txid.slice(0, 12)}…</a></td><td class="muted">${incoming ? "received" : "sent"}</td><td class="num ${incoming ? "in" : ""}">${incoming ? "+" : "−"}${fmt(i.amount)}</td></tr>`; })}
+        return html`<tr><td class="mono">${count(i.height)}</td><td><a class="mono" href="/explorer#/tx/${txid}" target="_blank" rel="noopener">${txid.slice(0, 12)}…</a></td><td class="muted">${incoming ? "received" : "sent"}</td><td class="muted">${finalityOf(i.height)}</td><td class="num ${incoming ? "in" : ""}">${incoming ? "+" : "−"}${fmt(i.amount)}</td></tr>`; })}
       </tbody></table>${num(h.total) > 25 ? html`<p class="note">Showing the latest 25 of ${count(h.total)}. <a href="/explorer#/address/${state.address}" target="_blank" rel="noopener">Full history in the explorer ↗</a></p>` : ""}`
       : html`<p class="muted">No on-chain movements yet.</p>`}`);
   } catch (e) { showError(pane, e); }
+}
+
+/** "final" at or below the PoWit-finalized height, else "pending". */
+function finalityOf(height) {
+  const h = num(height);
+  if (node.finalized === null || !Number.isSafeInteger(h)) return "—";
+  return h <= node.finalized ? "final" : "pending";
 }
 
 function paintBackup(pane = document.getElementById("pane")) {
@@ -392,13 +470,13 @@ function paintBackup(pane = document.getElementById("pane")) {
    <label>Password<input type="password" id="bpw" autocomplete="new-password"></label>
    <label>Repeat password<input type="password" id="bpw2" autocomplete="new-password"></label>
    <button class="btn ghost" id="bdl">Download encrypted keystore</button><div id="b-out"></div>
-   <p class="note">The file can be opened here, with <span class="mono">obenblock-cli send</span>, and with the other node tools. Never share it together with its password.</p>`);
+   <p class="note">The file can be opened here, with <span class="mono">obenblock-cli send</span>, and with the GnB tools (it records the key's <span class="mono">gnb1…</span> form, the same address). Never share it together with its password.</p>`);
   document.getElementById("bdl").addEventListener("click", async (ev) => {
     const btn = ev.currentTarget, out = document.getElementById("b-out"); out.innerHTML = "";
     const p1 = document.getElementById("bpw").value, p2 = document.getElementById("bpw2").value;
     if (p1 !== p2) return showError(out, "The passwords do not match.");
     busy(btn, "Encrypting…"); await nextFrame();
-    try { download(`gnb-wallet-${state.address.slice(0, 14)}.json`, core.exportKeystore(p1)); unbusy(btn); show(out, html`<div class="alert ok">Keystore downloaded.</div>`);
+    try { download(keystoreName(state.address), core.exportKeystore(p1)); unbusy(btn); show(out, html`<div class="alert ok">Keystore downloaded.</div>`);
       document.getElementById("bpw").value = document.getElementById("bpw2").value = ""; }
     catch (e) { unbusy(btn); showError(out, e); }
   });
@@ -406,10 +484,21 @@ function paintBackup(pane = document.getElementById("pane")) {
 
 // Shareable watch links: /wallet#watch/<address>
 async function boot() {
+  paintNetBadge();
   const address = watchAddress(location.hash);
   if (address) {
-    try { const c = await getCore(); return enter("watch", c.normalize(address)); } catch {}
+    try { const c = await getCore(); const a = c.classify(address); refreshNode(); return enter("watch", a.address, undefined, walletNetwork(a.network)); } catch {}
   }
   renderGate();
+  await refreshNode();
+  // Follow the node's network unless the user already picked one.
+  if (state.mode === "locked") {
+    const sel = document.getElementById("net");
+    if (sel && node.network && !sel.dataset.touched) sel.value = node.network;
+    const note = document.getElementById("net-note");
+    if (note) note.textContent = node.network
+      ? `The site's node runs ObenBlock ${node.network}. Signatures commit to its chain id, so a transaction is valid on this network only.`
+      : `The site's node cannot be used: ${node.error}. You can open or create a wallet; sending waits for an ObenBlock node.`;
+  }
 }
 boot();

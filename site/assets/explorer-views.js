@@ -14,7 +14,10 @@ export const unlockedSat = (h) => {
   return 2n * (k === LOCK_N ? LOCK_EACH : base * BigInt(k));
 };
 export const TARGET = 30;
-const POW_LIMIT = BigInt("0xffff" + "0".repeat(60)); // target of compact bits 0x2100ffff = difficulty 1
+// SHA-256d difficulty on Bitcoin's scale: difficulty 1 is the target of compact
+// bits 0x1d00ffff, ObenBlock's pow limit (docs/DESIGN-obenblock.md §4.2). The
+// explorer API computes `difficulty` the same way (deploy/explorer-api).
+export const DIFF1_TARGET = BigInt("0xffff" + "0".repeat(52));
 
 // ── formatting ───────────────────────────────────────────────────────────────
 export const int = (n) => numOr(n, (x) => x.toLocaleString("en-US"));
@@ -54,13 +57,26 @@ export const utc = (ts) => {
   const d = new Date(t * 1000);
   return Number.isNaN(d.getTime()) ? "—" : d.toISOString().replace("T", " ").replace(".000Z", " UTC");
 };
+// SHA-256d hashrate: CPU miners (MH/s) up to rented ASIC fleets (PH/s, EH/s).
 export function hashrate(v) {
   let h = num(v); if (!Number.isFinite(h)) return "—";
-  const u = ["H/s", "kH/s", "MH/s", "GH/s"]; let i = 0;
-  while (h >= 1000 && i < 3) { h /= 1000; i++; }
+  const u = ["H/s", "kH/s", "MH/s", "GH/s", "TH/s", "PH/s", "EH/s", "ZH/s"]; let i = 0;
+  while (h >= 1000 && i < u.length - 1) { h /= 1000; i++; }
   return `${h.toFixed(h < 10 ? 2 : 1)} ${u[i]}`;
 }
-export const diff = (v) => numOr(v, (d) => (d >= 1e6 ? (d / 1e6).toFixed(2) + "M" : d >= 1e3 ? (d / 1e3).toFixed(2) + "k" : d.toFixed(2)));
+const SCALE = [[1e15, "P"], [1e12, "T"], [1e9, "G"], [1e6, "M"], [1e3, "k"]];
+export const diff = (v) => numOr(v, (d) => {
+  for (const [f, u] of SCALE) if (d >= f) return (d / f).toFixed(2) + u;
+  return d >= 1 ? d.toFixed(2) : d.toPrecision(3);
+});
+/** Difficulty of a big-endian target (hex), Bitcoin's scale. */
+export function targetDifficulty(targetHex) {
+  if (!isHex(targetHex) || !targetHex.replace(/^0x/i, "")) return 0;
+  const target = BigInt("0x" + targetHex.replace(/^0x/i, ""));
+  if (target <= 0n) return 0;
+  // Keep 6 significant fractional digits without losing BigInt precision.
+  return Number((DIFF1_TARGET * 1000000n) / target) / 1000000;
+}
 
 export const link = {
   block: (h, t) => html`<a class="mono" href="#/block/${hex64(h)}">${t ?? short(hex64(h))}</a>`,
@@ -78,6 +94,16 @@ const BADGES = {
   pending: raw(`<span class="badge"><i class="dot pending"></i>Not yet merged</span>`),
 };
 export const colourBadge = (c) => (Object.hasOwn(BADGES, c) ? BADGES[c] : html`<span class="badge">${c}</span>`);
+// PoWit finality (the explorer API's `finality`): final at or below the
+// finalized checkpoint, pending above it, off-chain when nothing merged it.
+const FINALITY = {
+  finalized: raw(`<span class="badge final"><i class="dot final"></i>Finalized by PoWit</span>`),
+  pending: raw(`<span class="badge"><i class="dot pending"></i>Not final yet</span>`),
+  "off-chain": raw(`<span class="badge"><i class="dot red"></i>Off the selected chain</span>`),
+};
+export const finalityBadge = (f) => (Object.hasOwn(FINALITY, f) ? FINALITY[f] : "");
+const FINAL_SHORT = { finalized: "final", pending: "pending", "off-chain": "off-chain" };
+export const finalityShort = (f) => (Object.hasOwn(FINAL_SHORT, f) ? FINAL_SHORT[f] : "—");
 const COLOURS = new Set(["chain", "blue", "red", "pending"]);
 const colourOf = (c) => (COLOURS.has(c) ? c : "pending");
 export const loading = (label = "Loading") => html`<div class="empty"><span class="skel"></span>&nbsp; ${label}…</div>`;
@@ -164,8 +190,8 @@ export function dagSvg(nodesIn, { height = 230, compactMode = false } = {}) {
 export function blocksTable(blocksIn, freshSet = new Set()) {
   const blocks = arr(blocksIn);
   if (!blocks.length) return html`<div class="empty">No blocks.</div>`;
-  return html`<div class="tablewrap"><table><thead><tr><th class="num">Height</th><th>Block</th><th>Age</th><th>Miner</th><th class="num">Reward</th><th class="num hide-sm">Txs</th><th class="num hide-sm">Merged</th><th class="num hide-sm">Difficulty</th></tr></thead><tbody>
-  ${blocks.map((b) => html`<tr class="${freshSet.has(b.hash) ? "fresh" : ""}"><td class="num mono">${int(b.height)}</td><td>${link.block(b.hash)}</td><td class="muted">${ago(b.timestamp)}</td><td>${link.addr(b.miner)}</td><td class="num amount">${b.reward ? gnb(b.reward, { dp: 4 }) : "—"}</td><td class="num hide-sm">${int(b.tx_count)}</td><td class="num hide-sm">${int(b.merged)}${num(b.reds) > 0 ? html` <span class="muted">(${int(b.reds)} red)</span>` : ""}</td><td class="num hide-sm mono">${b.difficulty ? diff(b.difficulty) : "—"}</td></tr>`)}
+  return html`<div class="tablewrap"><table><thead><tr><th class="num">Height</th><th>Block</th><th>Age</th><th>Miner</th><th class="num">Reward</th><th class="hide-sm">Finality</th><th class="num hide-sm">Txs</th><th class="num hide-sm">Merged</th><th class="num hide-sm">Difficulty</th></tr></thead><tbody>
+  ${blocks.map((b) => html`<tr class="${freshSet.has(b.hash) ? "fresh" : ""}"><td class="num mono">${int(b.height)}</td><td>${link.block(b.hash)}</td><td class="muted">${ago(b.timestamp)}</td><td>${link.addr(b.miner)}</td><td class="num amount">${b.reward ? gnb(b.reward, { dp: 4 }) : "—"}</td><td class="hide-sm muted">${finalityShort(b.finality)}</td><td class="num hide-sm">${int(b.tx_count)}</td><td class="num hide-sm">${int(b.merged)}${num(b.reds) > 0 ? html` <span class="muted">(${int(b.reds)} red)</span>` : ""}</td><td class="num hide-sm mono">${b.difficulty ? diff(b.difficulty) : "—"}</td></tr>`)}
   </tbody></table></div>`;
 }
 
@@ -182,7 +208,7 @@ export function txCard(t, standalone = false, offChain = false) {
 // ── pages ────────────────────────────────────────────────────────────────────
 export const homeHead = () => html`<div class="pagehead"><span class="eyebrow">ObenBlock mainnet</span><h1>Network overview</h1><p class="sub">A BlockDAG mined with SHA-256d and finalized by PoWit. Live data, refreshed every 10 seconds.</p></div><div id="h-stats">${loading("Reading the chain")}</div><div id="h-rest"></div>`;
 
-export function homeStats({ dag, supply, stats, pct, chain, mem }) {
+export function homeStats({ dag, supply, stats, pct, chain, mem, pw = null }) {
   const height = num(supply.current_height);
   const issued = sats(supply.issued_sat) ?? 0n, unlocked = Number.isSafeInteger(height) ? unlockedSat(height) : 0n;
   const locked = 2n * LOCK_EACH - unlocked, total = CARRY + issued + unlocked;
@@ -191,23 +217,31 @@ export function homeStats({ dag, supply, stats, pct, chain, mem }) {
   const pctCarry = Number((CARRY * 10000n) / CAP) / 100, pctMined = Number((issued * 1000000n) / CAP) / 10000;
   const first = arr(chain.blocks)[0];
   return html`<div class="stats">
-   ${stat("Chain height", int(dag.tip_height), `blue score ${int(dag.tip_blue_score)} · ${int(dag.block_count)} blocks in DAG`, true)}
+   ${stat("Chain height", int(dag.tip_height), `blue score ${int(dag.tip_blue_score)} · ${int(dag.block_count)} blocks in DAG · ${int(dag.tip_count)} tips (k = ${numOr(dag.k)})`, true)}
    ${stat("Block time", `${numOr(pct.p50_secs)}s`, `median of last ${numOr(pct.window)} · mean ${numOr(pct.avg_secs, (n) => n.toFixed(1))}s · target ${numOr(pct.target_secs)}s`)}
    ${stat("Hashrate", hashrate(stats.hashrate_hs), "SHA-256d hashes per second")}
    ${stat("Difficulty", diff(first?.difficulty || 0), `ASERT · bits ${first?.bits || ""}`)}
    ${stat("Circulating", compact(total.toString()), html`of 12.5M OBB cap · ${pctCarry.toFixed(2)}% carryover + ${pctMined.toFixed(4)}% mined · ${compact(locked.toString())} team/founder locked<div class="meter" aria-hidden="true"><i style="width:${pctWidth(pctCarry)}%;background:var(--mark)"></i><i style="width:${pctWidth(Math.max(pctMined, 0.3))}%;background:var(--fluor-hi)"></i></div>`)}
    ${stat("Block reward", numOr(supply.subsidy_per_block_sat, (n) => (n / 1e8).toFixed(4)), `OBB · next halving in ${int(nextHalving)} blocks`)}
    ${stat("Mempool", int(mem.size), `min fee ${numOr(supply.min_tx_fee_sat, (n) => (n / 1e8).toFixed(4))} OBB`)}
-   ${stat("Tips", int(dag.tip_count), `GhostDAG k = ${numOr(dag.k)}`)}
+   ${finalityStat(stat, dag, pw)}
   </div>`;
+}
+
+/** The home page's PoWit finality tile: the finalized checkpoint the node
+ *  reports (getpowitinfo), how far below the tip it is, and the epoch. */
+function finalityStat(stat, dag, pw) {
+  const fin = pw && typeof pw === "object" ? pw.finalized : null;
+  const f = num(fin?.block_height ?? dag.finalized_height);
+  if (!Number.isSafeInteger(f)) return stat("PoWit finality", "—", "no finalized checkpoint yet (the witness set forms over the first epochs)");
+  const behind = num(dag.tip_height) - f;
+  return stat("PoWit finality", html`<a href="#/finality">#${int(f)}</a>`,
+    `${Number.isSafeInteger(behind) ? `${int(behind)} blocks below the tip` : ""}${Number.isSafeInteger(num(pw?.epoch)) ? ` · epoch ${int(pw.epoch)}` : ""}${pw?.witness_set ? ` · ${int(pw.witness_set.size)} witnesses` : ""}`);
 }
 
 export function homeRest({ dagWindow, chain, fresh, hist }) {
   const pts = arr(hist.points).filter((p) => Number.isFinite(num(p.timestamp)) && isHex(p.target_hex) && p.target_hex.length > 0).slice().reverse();
-  const diffPts = pts.map((p) => {
-    const target = BigInt("0x" + p.target_hex.replace(/^0x/i, ""));
-    return { x: num(p.timestamp), y: target > 0n ? Number((POW_LIMIT * 1000n) / target) / 1000 : 0, label: html`<b>height ${int(p.height)}</b> · ${p.bits_hex} · ${utc(p.timestamp)}` };
-  });
+  const diffPts = pts.map((p) => ({ x: num(p.timestamp), y: targetDifficulty(p.target_hex), label: html`<b>height ${int(p.height)}</b> · ${p.bits_hex} · ${utc(p.timestamp)}` }));
   const gaps = []; for (let i = 1; i < pts.length; i++) gaps.push(Math.max(0, num(pts[i].timestamp) - num(pts[i - 1].timestamp)));
   const edges = [0, 10, 20, 30, 40, 50, 60, 90, 120, 180, 300];
   const bins = edges.map((e, i) => ({ x: i === edges.length - 1 ? `${e}+` : `${e}–${edges[i + 1]}`, lo: e, hi: edges[i + 1] ?? Infinity, y: 0 }));
@@ -217,7 +251,7 @@ export function homeRest({ dagWindow, chain, fresh, hist }) {
    <section class="block card"><div class="cardhead"><h2>Block DAG</h2><span class="live"><i></i>live · last ${nodes.length} blocks</span></div>${dagSvg(nodes)}</section>
    <section class="block card"><div class="cardhead"><h2>Latest chain blocks</h2><a class="note" href="#/blocks">All blocks →</a></div>${blocksTable(chain.blocks, fresh)}</section>
    <div class="grid2 block" style="margin-top:22px">
-    <section class="card"><div class="cardhead"><h2>Difficulty</h2><span class="note">expected evaluations per block, last ${pts.length} blocks</span></div>${lineChart(diffPts, { yLabel: "Difficulty", fmt: (v) => (v >= 1000 ? (v / 1000).toFixed(1) + "k" : Math.round(v).toString()) })}</section>
+    <section class="card"><div class="cardhead"><h2>Difficulty</h2><span class="note">SHA-256d, Bitcoin scale (1 = bits 0x1d00ffff), last ${pts.length} blocks</span></div>${lineChart(diffPts, { yLabel: "Difficulty", fmt: (v) => diff(v) })}</section>
     <section class="card"><div class="cardhead"><h2>Time between blocks</h2><span class="note">seconds, last ${gaps.length} intervals · target ${TARGET}s</span></div>${barChart(bins, { fmt: (b) => html`<b>${b.y} blocks</b> · ${b.lo}${b.hi === Infinity ? "+" : "–" + b.hi} s` })}</section>
    </div>`;
 }
@@ -234,20 +268,23 @@ export function blocksPage(r, page, per) {
 
 export const dagHead = () => html`<div class="pagehead"><span class="eyebrow">GhostDAG · k = 10</span><h1>The block DAG</h1><p class="sub">Every block points to all tips it knew about. GhostDAG picks a selected parent chain and colours each merged block blue (inside the k-cluster) or red. Click any block.</p></div><div class="card" id="d-dag">${loading()}</div>`;
 
-export function blockPage(b) {
+export function blockPage(b, full = null) {
   const chip = (h, cls) => html`<a class="chip" href="#/block/${hex64(h)}"><i class="dot ${cls}"></i>${short(hex64(h), 8)}</a>`;
   const chips = (list, cls) => arr(list).length ? html`<div class="chips">${arr(list).map((h) => chip(h, cls))}</div>` : html`<span class="muted">none</span>`;
   const txs = arr(b.transactions);
   const cb = txs[0];
   const offChain = b.colour !== "chain";
-  return html`<div class="pagehead"><span class="eyebrow">Block</span><h1>Block ${int(b.height)}</h1><div class="hash">${hex64(b.hash)}${copyBtn(hex64(b.hash))}</div><div>${colourBadge(b.colour)}</div></div>
+  const pw = full && typeof full === "object" && full.powit && typeof full.powit === "object" ? full.powit : null;
+  return html`<div class="pagehead"><span class="eyebrow">Block</span><h1>Block ${int(b.height)}</h1><div class="hash">${hex64(b.hash)}${copyBtn(hex64(b.hash))}</div><div>${colourBadge(b.colour)} ${finalityBadge(b.finality)}</div></div>
   <div class="grid2">
-   <section class="card"><div class="cardhead"><h2>Header</h2></div><div class="kv">
+   <section class="card"><div class="cardhead"><h2>Header</h2><span class="note">SHA-256d · 80-byte header</span></div><div class="kv">
     <div>Timestamp</div><div>${utc(b.timestamp)} <span class="muted">(${ago(b.timestamp)})</span></div>
     <div>Height · blue score</div><div class="mono">${int(b.height)} · ${int(b.blue_score)}</div>
     <div>Confirmations</div><div class="mono">${int(b.confirmations)} <span class="muted">blue score</span></div>
+    <div>Finality</div><div>${b.finality === "finalized" ? "Finalized by PoWit: no reorganization can remove it." : b.finality === "pending" ? html`Above the finalized checkpoint (#${int(b.finalized_height)}).` : b.finality === "off-chain" ? "Not merged by the selected chain." : html`<span class="muted">not reported</span>`}</div>
     <div>Difficulty</div><div class="mono">${b.difficulty ? diff(b.difficulty) : "—"} <span class="muted">bits ${b.bits || ""}</span></div>
-    <div>Nonce</div><div class="mono">${b.nonce ?? "—"}</div>
+    ${hex64(b.pow_hash) ? html`<div>PoW hash</div><div class="hash" title="The block id in the byte order Bitcoin tools display">${hex64(b.pow_hash)}</div>` : ""}
+    <div>Version · nonce</div><div class="mono">${b.version !== undefined && b.version !== null ? html`0x${numOr(b.version, (v) => (v >>> 0).toString(16).padStart(8, "0"))}` : "—"} · ${b.nonce ?? "—"}</div>
     <div>Merkle root</div><div class="hash">${b.merkle_root || "—"}</div>
     <div>Size</div><div class="mono">${b.size ? html`${int(b.size)} bytes` : "—"}</div>
     <div>Miner</div><div class="hash">${cb ? link.addr(arr(cb.outputs)[0]?.address, arr(cb.outputs)[0]?.address) : "—"}</div>
@@ -263,6 +300,11 @@ export function blockPage(b) {
     <div>Blue work</div><div class="mono">${int(b.blue_work)}</div>
    </div></section>
   </div>
+  ${pw ? html`<section class="block card"><div class="cardhead"><h2>PoWit</h2><span class="note">witness shares and attestations carried by this block</span></div><div class="kv">
+    <div>Witness shares</div><div class="mono">${arr(pw.shares).length}</div>
+    <div>Attestations</div><div>${arr(pw.attestations).length ? arr(pw.attestations).map((a) => html`<div class="mono" style="font-size:.82rem">${short(isHex(a.witness) ? a.witness : "", 8)} · slot ${int(a.source?.slot)} → ${int(a.target?.slot)} · KES epoch ${int(a.kes_epoch)}</div>`) : html`<span class="muted">none</span>`}</div>
+    <div>Equivocation proofs</div><div class="mono">${arr(pw.evidence).length}</div>
+  </div></section>` : ""}
   <section class="block card"><div class="cardhead"><h2>Transactions (${txs.length})</h2>${offChain ? raw(`<span class="note">off the selected chain · not applied</span>`) : ""}</div>${txs.length ? txs.map((t) => txCard(t, false, offChain)) : raw(`<div class="empty">Block body not stored on this node.</div>`)}</section>`;
 }
 
@@ -272,6 +314,7 @@ export function txPage(r) {
   return html`<div class="pagehead"><span class="eyebrow">Transaction</span><h1>${t.coinbase ? "Coinbase transaction" : "Transaction"}</h1><div class="hash">${hex64(t.txid)}${copyBtn(hex64(t.txid))}</div><div>${mempool ? raw(`<span class="badge"><i class="dot pending"></i>In mempool</span>`) : colourBadge(r.block_colour)}</div></div>
   <section class="card"><div class="kv">
    <div>Status</div><div>${mempool ? "Waiting in the mempool" : html`Confirmed in ${link.block(r.block_hash)} at height ${int(r.block_height)}`}</div>
+   <div>Finality</div><div>${finalityBadge(r.finality) || html`<span class="muted">not reported</span>`}</div>
    ${r.timestamp ? html`<div>Time</div><div>${utc(r.timestamp)} <span class="muted">(${ago(r.timestamp)})</span></div>` : ""}
    <div>Total out</div><div class="amount">${gnb(t.total_out)}</div>
    <div>Fee</div><div class="amount">${t.fee ? gnb(t.fee) : t.coinbase ? "—" : raw(`<span class="muted">unknown (spends carryover outputs)</span>`)}</div>
@@ -300,12 +343,12 @@ export function addressPage(addrIn, h, carry, page, per) {
     <div>Transactions</div><div class="mono">${int(h.total)} <span class="muted">indexed movements</span></div>
    </div></section>
    <section class="card"><div class="cardhead"><h2>Bloch carryover</h2></div>${inCarry
-      ? html`<div class="kv"><div>Received at genesis</div><div class="amount">${gnb(carry.amount)}</div><div>From Bloch G3</div><div class="mono">${int(((sats(carry.bloch_amount) ?? 0n) / SAT).toString())} BLCH · ${int(carry.utxos)} outputs</div></div><p class="muted" style="margin-top:12px;font-size:.9rem">Same owner hash as the Bloch Genesis-3 address <span class="mono">bloch1q${addr.slice(5)}</span>, converted at 1,000,000 GNB for 3,810,744,000 BLCH.</p>`
+      ? html`<div class="kv"><div>Received at genesis</div><div class="amount">${gnb(carry.amount)}</div><div>From Bloch G3</div><div class="mono">${int(((sats(carry.bloch_amount) ?? 0n) / SAT).toString())} BLCH · ${int(carry.utxos)} outputs</div></div><p class="muted" style="margin-top:12px;font-size:.9rem">Same owner hash as the Bloch Genesis-3 address <span class="mono">bloch1q${addr.slice(5)}</span> and the GnB address <span class="mono">gnb1q${addr.slice(5)}</span>, converted at 1,000,000 OBB for 3,810,744,000 BLCH.</p>`
       : raw(`<p class="muted">This address held nothing in the Bloch Genesis-3 snapshot.</p>`)}</section>
   </div>
   <section class="block card"><div class="cardhead"><h2>History</h2><span class="note">newest first</span></div>
-  ${items.length ? html`<div class="tablewrap"><table><thead><tr><th class="num">Height</th><th>Transaction</th><th>Direction</th><th class="num">Amount</th></tr></thead><tbody>
-   ${items.map((i) => { const incoming = i.direction === "in"; return html`<tr><td class="num mono">${int(i.height)}</td><td>${link.tx(i.txid)}</td><td>${incoming ? "received" : "sent"}</td><td class="num amount ${incoming ? "pos" : "neg"}">${incoming ? "+" : "−"}${gnb(i.amount)}</td></tr>`; })}
+  ${items.length ? html`<div class="tablewrap"><table><thead><tr><th class="num">Height</th><th>Transaction</th><th>Direction</th><th class="hide-sm">Finality</th><th class="num">Amount</th></tr></thead><tbody>
+   ${items.map((i) => { const incoming = i.direction === "in"; return html`<tr><td class="num mono">${int(i.height)}</td><td>${link.tx(i.txid)}</td><td>${incoming ? "received" : "sent"}</td><td class="hide-sm muted">${finalityShort(i.finality)}</td><td class="num amount ${incoming ? "pos" : "neg"}">${incoming ? "+" : "−"}${gnb(i.amount)}</td></tr>`; })}
   </tbody></table></div><div class="pager"><span>page ${page + 1} of ${pages}</span>
    <a class="btn ghost" ${newer}>← Newer</a>
    <a class="btn ghost" ${cursor ? html`href="#/address/${addr}/${page + 1}/${cursor}"` : page + 1 < pages ? html`href="#/address/${addr}/${page + 1}"` : off}>Older →</a></div>`
@@ -329,3 +372,39 @@ export function holdersPage(rich, dist) {
    </tbody></table></div></section>`;
 }
 
+// ── PoWit finality ───────────────────────────────────────────────────────────
+export const finalityHead = () => html`<div class="pagehead"><span class="eyebrow">PoWit</span><h1>Finality</h1><p class="sub">Witnesses earn their weight with SHA-256d witness shares and sign checkpoints with forward-secure KES keys. A checkpoint two thirds of the witness weight attests is finalized: no reorganization below it is accepted. Wallets and exchanges credit at finalized, not at a number of blocks.</p></div><div id="fi">${loading()}</div>`;
+
+export function finalityPage(pw, info, blocks) {
+  if (!pw || typeof pw !== "object") return html`<div class="err">The node did not report PoWit finality.</div>`;
+  const cp = (c, label, cls) => (c && hex64(c.hash)
+    ? html`<div class="stat ${cls}"><span class="k">${label}</span><div class="v">slot ${int(c.slot)}</div>${link.block(c.hash, `block #${int(c.block_height)}`)}</div>`
+    : html`<div class="stat"><span class="k">${label}</span><div class="v">—</div><span class="muted">none yet</span></div>`);
+  const ws = pw.witness_set && typeof pw.witness_set === "object" ? pw.witness_set : { size: 0, top: [] };
+  const params = pw.params && typeof pw.params === "object" ? pw.params : {};
+  const tip = num(pw.tip_height), fin = num(pw.finalized?.block_height);
+  const atts = [];
+  for (const b of arr(blocks)) for (const a of arr(b?.powit?.attestations)) atts.push({ a, hash: b.hash, height: b.height });
+  const shares = arr(blocks).reduce((n, b) => n + arr(b?.powit?.shares).length, 0);
+  const pin = info && typeof info === "object" ? info : null;
+  return html`<div class="stats">
+    ${cp(pw.finalized, "Finalized", "final")}
+    ${cp(pw.justified, "Justified", "")}
+    <div class="stat"><span class="k">Tip</span><div class="v">#${int(tip)}</div><span class="muted">${Number.isSafeInteger(tip) && Number.isSafeInteger(fin) ? `${int(tip - fin)} blocks above finality` : ""}</span></div>
+    <div class="stat"><span class="k">Epoch</span><div class="v">${int(pw.epoch)}</div><span class="muted">${int(params.epoch_len)} blocks per epoch · checkpoint every ${int(params.checkpoint_interval)}</span></div>
+   </div>
+   <div class="grid2 block">
+    <section class="card"><div class="cardhead"><h2>Witness set</h2><span class="note">${int(ws.size)} of ${int(params.max_witnesses)} seats · window ${int(params.window_epochs)} epochs</span></div>
+     ${arr(ws.top).length ? html`<div class="tablewrap"><table><thead><tr><th>Witness key</th><th class="num">Weight</th></tr></thead><tbody>${arr(ws.top).map((w) => html`<tr><td class="mono">${short(isHex(w.key) ? w.key : "", 12)}</td><td class="num mono">${numOr(w.weight, (n) => n.toLocaleString("en-US"))}</td></tr>`)}</tbody></table></div>` : html`<div class="empty">No witness has weight yet: the set forms from witness shares over the first epochs.</div>`}
+     <p class="note" style="margin-top:10px">Weight is witness-share work over the window, earned by mining, not stake. ${int(pw.barred_keys)} barred · ${int(pw.exited_keys)} exited · inactivity leak ${pw.inactivity_leak === "1/2" || pw.inactivity_leak === "1/16" ? pw.inactivity_leak : "—"}</p></section>
+    <section class="card"><div class="cardhead"><h2>Finality pin</h2><span class="note">what this node treats as irreversible</span></div><div class="kv">
+     <div>Pin</div><div>${pin && hex64(pin.pin?.hash) ? link.block(pin.pin.hash, `block #${int(pin.pin.block_height)}`) : html`<span class="muted">none</span>`}</div>
+     <div>Origin</div><div class="mono">${pin && typeof pin.origin === "string" ? pin.origin : "—"}</div>
+     <div>Bloch anchor</div><div>${pin && hex64(pin.anchor?.hash) ? link.block(pin.anchor.hash, `block #${int(pin.anchor.block_height)}`) : html`<span class="muted">none</span>`} ${pin && pin.anchor_status ? html`<span class="muted">(${String(pin.anchor_status)})</span>` : ""}</div>
+     <div>Conflict</div><div>${pin && pin.conflict ? html`<span class="neg">conflicting finalized checkpoints: the operator decides</span>` : "none"}</div>
+    </div></section>
+   </div>
+   <section class="block card"><div class="cardhead"><h2>Recent attestations</h2><span class="note">last ${arr(blocks).length} chain blocks · ${atts.length} attestations · ${shares} witness shares</span></div>
+    ${atts.length ? html`<div class="tablewrap"><table><thead><tr><th>In block</th><th>Witness</th><th>Link</th><th class="num">KES epoch</th></tr></thead><tbody>${atts.map(({ a, hash, height }) => html`<tr><td>${link.block(hash, `#${int(height)}`)}</td><td class="mono">${short(isHex(a.witness) ? a.witness : "", 10)}</td><td class="mono">slot ${int(a.source?.slot)} → ${int(a.target?.slot)}</td><td class="num mono">${int(a.kes_epoch)}</td></tr>`)}</tbody></table></div>` : html`<div class="empty">No attestations in the recent chain blocks.</div>`}
+   </section>`;
+}

@@ -1,21 +1,24 @@
-// The committed wallet core, loaded exactly as the page loads it (core.js):
-// pinned-hash check (WAL-5), phrase-backed create/restore (WAL-7), plan/pay
-// with previous-transaction verification and the actual fee (WAL-1/WAL-6).
+// The committed ObenBlock wallet core, loaded exactly as the page loads it
+// (core.js): pinned-hash check (WAL-5), phrase-backed create/restore (WAL-7),
+// version-3 plan/pay with the actual fee (WAL-1/WAL-6), obb1 addresses and
+// the mainnet / regtest selector.
 // node --test site/tests/*.test.mjs
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
-import { loadCore, splitByMaturity, spendableWindow, COINBASE_MATURITY } from "../wallet/core.js";
+import { loadCore, splitByMaturity, spendableWindow, networkOfChainId, walletNetwork, COINBASE_MATURITY } from "../wallet/core.js";
 
 const wasm = readFileSync(new URL("../wallet/gnb_wallet.wasm", import.meta.url));
 const pin = readFileSync(new URL("../wallet/app.js", import.meta.url), "utf8").match(/^const WASM_SHA256 = "([0-9a-f]{64})";$/m)[1];
-// The mainnet hardening activation height, read from the consensus source
-// (never a literal here): the core compiles it in, so a core built before the
-// height moved fails the activation test below until it is rebuilt.
-const MAINNET_ACTIVATION = (() => {
+// GnB's mainnet hardening activation height, read from the consensus source
+// (never a literal here). ObenBlock signs version 3 from height 0, also
+// below it: the test below checks the committed core does.
+const GNB_MAINNET_ACTIVATION = (() => {
   const rust = readFileSync(new URL("../../crates/gnb-crypto/src/core/activation.rs", import.meta.url), "utf8");
   const m = rust.match(/pub const MAINNET_HARDENING_ACTIVATION_HEIGHT:\s*u64\s*=\s*([0-9_]+);/);
   assert.ok(m, "MAINNET_HARDENING_ACTIVATION_HEIGHT not found in crates/gnb-crypto/src/core/activation.rs");
+  const obb = rust.match(/pub const OBENBLOCK_HARDENING_ACTIVATION_HEIGHT:\s*u64\s*=\s*([0-9_]+);/);
+  assert.ok(obb && Number(obb[1]) === 0, "ObenBlock activates the hardening rules (version 3) from genesis");
   return Number(m[1].replaceAll("_", ""));
 })();
 globalThis.fetch = async () => new Response(wasm);
@@ -25,15 +28,20 @@ test("loadCore refuses a missing or wrong pin", async () => {
   await assert.rejects(loadCore("/wallet/gnb_wallet.wasm", "0".repeat(64)), /integrity check failed/);
 });
 
-test("phrase-backed wallet, plan, verified pay and the actual fee", async () => {
+test("phrase-backed ObenBlock wallet, plan, pay and the actual fee", async () => {
   const core = await loadCore("/wallet/gnb_wallet.wasm", pin);
   const created = core.create();
-  assert.match(created.address, /^gnb1q[0-9a-f]{48}$/);
+  assert.match(created.address, /^obb1q[0-9a-f]{48}$/);
   assert.equal(created.words.split(" ").length, 24);
   core.wipe();
   assert.equal(core.restore(created.words).address, created.address);
   const ks = core.exportKeystore("Correct-Horse-9-battery");
   assert.match(ks, /"version": 3/);
+  // The keystore binds the key's gnb1q form (the GnB tools open it too).
+  assert.ok(ks.includes(`gnb1q${created.address.slice(5)}`));
+  core.wipe();
+  assert.equal(core.open(ks, "Correct-Horse-9-battery").address, created.address);
+  assert.throws(() => core.open(ks, "Correct-Horse-9-battery", "regtest"), /regtest|testnet/);
 
   const spk = created.address.slice(5, 45);
   const utxos = [
@@ -41,20 +49,28 @@ test("phrase-backed wallet, plan, verified pay and the actual fee", async () => 
     { txid: "22".repeat(32), index: 0, value: "20000000", script_pubkey: spk },
   ];
   const dest = core.normalize(created.address); // own address is a valid destination
-  // Mainnet, next block far below the hardening activation: version 1.
   const next = 12;
-  assert.ok(next < MAINNET_ACTIVATION);
   const plan = core.plan(utxos, dest, "100000000", "0", next);
-  assert.equal(plan.version, 1);
-  assert.deepEqual(plan.prev_txids, ["11".repeat(32)], "one covering input, not the small one");
-  // A transaction that does not hash to its claimed id is refused.
+  assert.equal(plan.version, 3);
+  assert.deepEqual(plan.prev_txids, [], "a version-3 signature commits every spent value");
+  // A supplied transaction that does not hash to its claimed id is refused.
   assert.throws(() => core.pay(utxos, dest, "100000000", "0", next, { ["11".repeat(32)]: "00" }));
   const tx = core.pay(utxos, dest, "100000000", "0", next, {});
-  assert.equal(tx.version, 1);
+  assert.equal(tx.version, 3);
+  assert.equal(tx.amounts_committed, true);
   assert.equal(tx.inputs, 1);
-  assert.equal(tx.unverified_inputs, 1);
+  assert.equal(tx.unverified_inputs, 0);
+  assert.equal(tx.raw.slice(0, 8), "03000000");
   assert.equal(BigInt(tx.fee), 500000000n - 100000000n - BigInt(tx.change));
   assert.ok(BigInt(tx.fee) < 100000n);
+  // A gnb1q destination is the same script as its obb1q form.
+  const gnbDest = `gnb1q${dest.slice(5)}`;
+  // (Falcon signatures vary in length: compare what is paid, not the size.)
+  const viaGnb = core.pay(utxos, gnbDest, "100000000", "0", next, {});
+  assert.ok(viaGnb.raw.includes(spk), "paid to the same 20-byte script");
+  assert.equal(viaGnb.amount, tx.amount);
+  // A regtest destination is another network.
+  assert.throws(() => core.pay(utxos, `obb1t${dest.slice(5)}`, "100000000", "0", next, {}), /network/);
   // The fee guard holds even if a caller asks for a huge fee.
   assert.throws(() => core.pay(utxos, dest, "1", "490000000", next, {}), /guard/);
   // Without the next block's height the core refuses to sign.
@@ -62,27 +78,40 @@ test("phrase-backed wallet, plan, verified pay and the actual fee", async () => 
   core.wipe();
 });
 
-test("from the activation height the core signs version 3 and fetches nothing", async () => {
+test("the core signs version 3 at every height, also below GnB's activation", async () => {
   const core = await loadCore("/wallet/gnb_wallet.wasm", pin);
   const created = core.create();
   const spk = created.address.slice(5, 45);
   const utxos = [{ txid: "33".repeat(32), index: 1, value: "500000000", script_pubkey: spk }];
   const dest = core.normalize(created.address);
-  const activation = MAINNET_ACTIVATION;
-  const plan = core.plan(utxos, dest, "100000000", "0", activation);
-  assert.equal(plan.version, 3,
-    `the committed core does not activate at ${activation} (MAINNET_HARDENING_ACTIVATION_HEIGHT): ` +
-    "it was built with another height; rebuild and re-pin it (scripts/build-wallet-wasm.sh)");
-  assert.deepEqual(plan.prev_txids, [], "a version-3 signature commits every spent value");
-  const tx = core.pay(utxos, dest, "100000000", "0", activation, {});
-  assert.equal(tx.version, 3);
-  assert.equal(tx.amounts_committed, true);
-  assert.equal(tx.unverified_inputs, 0);
-  // The raw transaction starts with version 3 (u32 little-endian).
-  assert.equal(tx.raw.slice(0, 8), "03000000");
-  // One block earlier: version 1.
-  assert.equal(core.plan(utxos, dest, "100000000", "0", activation - 1).version, 1);
+  for (const h of [0, 1, GNB_MAINNET_ACTIVATION - 1, GNB_MAINNET_ACTIVATION]) {
+    const plan = core.plan(utxos, dest, "100000000", "0", h);
+    assert.equal(plan.version, 3, `the committed core does not sign version 3 at ${h}: rebuild and re-pin it (scripts/build-wallet-wasm.sh)`);
+    assert.deepEqual(plan.prev_txids, []);
+    const tx = core.pay(utxos, dest, "100000000", "0", h, {});
+    assert.equal(tx.version, 3);
+    assert.equal(tx.raw.slice(0, 8), "03000000");
+  }
   core.wipe();
+});
+
+test("network selector: regtest keys and the node's chain id", async () => {
+  const core = await loadCore("/wallet/gnb_wallet.wasm", pin);
+  const reg = core.create("regtest");
+  assert.match(reg.address, /^obb1t[0-9a-f]{48}$/);
+  assert.equal(reg.words, undefined, "a regtest key has no recovery phrase");
+  const ks = core.exportKeystore("Correct-Horse-9-battery");
+  core.wipe();
+  assert.equal(core.open(ks, "Correct-Horse-9-battery", "regtest").address, reg.address);
+  assert.equal(core.open(ks, "Correct-Horse-9-battery", "testnet").address, reg.address, "testnet is regtest's older name");
+  assert.throws(() => core.open(ks, "Correct-Horse-9-battery"), /mainnet/);
+  assert.match(core.create(true).address, /^obb1t/, "the boolean form still means regtest");
+  assert.throws(() => core.create("signet"), /unknown wallet network/);
+  core.wipe();
+  assert.equal(networkOfChainId("0x4f420001"), "mainnet");
+  assert.equal(networkOfChainId("0x4F420002"), "regtest");
+  for (const id of ["0x474e0001", "0x474e0002", undefined, 1330774017]) assert.throws(() => networkOfChainId(id), /not an ObenBlock node/);
+  assert.equal(walletNetwork("testnet"), "regtest");
 });
 
 // Coinbase maturity: the page counts as spendable, and hands the core, only
@@ -150,7 +179,7 @@ test("the page hands the core only the coins spendable at the next block", async
 
   // With the rows the page passes, even a core that does not check maturity
   // itself (the committed binary until it is rebuilt) cannot select an
-  // immature output. Given both rows, that core pays 1 GNB from the 2 GNB
+  // immature output. Given both rows, that core pays 1 OBB from the 2 OBB
   // immature mining reward (the closest fit), a payment every node refuses.
   const core = await loadCore("/wallet/gnb_wallet.wasm", pin);
   const created = core.create();

@@ -80,7 +80,9 @@ test("pinned WASM supports a 2-of-3 PQ-PSBT exchange with no network during sign
     assert.throws(() => cores[0].signPqPsbt(packet, "mainnet", activation, "050000"), /decimal integer/i);
     assert.throws(() => cores[0].signPqPsbt(packet, "mainnet", activation, "49999"), /fee|ceiling/i);
     assert.throws(() => cores[0].signPqPsbt(packet, "testnet", activation, "50000"), /network/i);
-    assert.throws(() => cores[0].signPqPsbt(packet, "mainnet", activation - 1, "50000"), /version|activation|standard/i);
+    assert.throws(() => cores[0].signPqPsbt(packet, "regtest", activation, "50000"), /network/i);
+    // ObenBlock signs version 3 at every height, so an earlier target
+    // height is no version mismatch (on GnB it was, below the activation).
     const first = cores[0].signPqPsbt(packet, "mainnet", activation, "50000");
     const third = cores[2].signPqPsbt(packet, "mainnet", activation, "50000");
     assert.equal(first.key_index, 0);
