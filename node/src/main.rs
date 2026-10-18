@@ -3705,14 +3705,24 @@ mod ingress_processor_tests {
         sweep_orphan_parents(&mut orphans, &mut tracker, &dag, &otx).await;
         assert_eq!(drain(&mut orx), 0);
         assert_eq!(tracker.len(), cap);
-        // Bodies that arrive make room for the next ones.
+        // Bodies that arrive make room for the next ones. An arrived block
+        // can become the selected tip, and only the bodies of blocks that
+        // could beat it stay wanted (`GhostDAG::wanted_body_blocks`), so how
+        // many fresh bodies are still wanted depends on the window the
+        // sweep's random rotation tracked (a fixed 30 failed about one run
+        // in ten). The request path fills exactly the room the in-flight
+        // bodies leave, from what is still wanted and not tracked.
         let arrived: Vec<[u8; 32]> = dag.read().body_pending_blocks().into_iter()
             .filter(|h| tracker.is_awaited(h)).take(30).collect();
         for h in &arrived {
             dag.write().clear_body_pending(h);
         }
+        let wanted = dag.read().wanted_body_blocks();
+        let in_flight = wanted.iter().filter(|h| tracker.is_awaited(h)).count();
+        let fresh = wanted.len() - in_flight;
+        assert!(in_flight <= cap - arrived.len(), "the arrived bodies are no longer in flight");
         request_awaited_bodies(&dag, &mut tracker, &otx).await;
-        assert_eq!(drain(&mut orx), 30);
+        assert_eq!(drain(&mut orx), fresh.min(cap - in_flight));
     }
 
     /// The latch with the minimum chain work off: the NET-6 rules below are
