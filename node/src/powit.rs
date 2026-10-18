@@ -1438,25 +1438,34 @@ fn anchor_in_force(setting: AnchorSetting) -> Option<Anchor> {
     }
 }
 
-/// Review round 2 of the PoWit finality pin, H1: the target of a vote of
-/// `block` that authentically claims a finality newer than the node's: its
-/// source lies above `floor` (`ingress::finality_claim_floor`), and it is
-/// signed, under the message of `block`'s rules, by a key with weight in the
-/// witness set `state` (the node's selected tip's PoWit state) derives for
-/// the vote's target epoch under those rules. From the second hardening
-/// activation a chain that shares the node's finality reads the same frozen
-/// finalized window (`PowitState::h2_window_epoch`); before it, the node's
-/// own share history of the target's window. At most `max_checks`
-/// signatures are verified (membership is checked first). Whether the
-/// target lies on the chain the vote reaches the node along is checked by
+/// Review round 2 of the PoWit finality pin, H1 (and round 3, LOW 2-3): the
+/// target (block, checkpoint slot) of a vote of `block` that authentically
+/// claims a finality newer than the node's: its source lies above `floor`
+/// (`ingress::finality_claim_floor`), its target is not in a future epoch,
+/// and it is signed by a key with weight in the witness set `state` (the
+/// node's selected tip's PoWit state) derives for the vote's target epoch,
+/// not barred at the node's current epoch. The rules are those of a block
+/// at `max(block.height, next_height)` (`next_height`: the node's next
+/// block): the orphan's wire height is the sender's choice, and must not
+/// select the first rule's witness set once the node's chain has the second
+/// hardening activation's. From that activation a chain that shares the
+/// node's finality reads the same frozen finalized window
+/// (`PowitState::h2_window_epoch`); before it, the node's own share history
+/// of the target's window, of which at most `max_checks` distinct target
+/// epochs are built per orphan. At most `max_checks` signatures are
+/// verified (membership is checked first). Whether the target lies on the
+/// chain the vote reaches the node along is checked by
 /// `ingress::OrphanPool::claim_backs`.
-pub fn authenticated_finality_claim(block: &Block, floor: u64, state: &PowitState, max_checks: usize) -> Option<Hash> {
+pub fn authenticated_finality_claim(block: &Block, floor: u64, state: &PowitState, next_height: u64,
+                                    max_checks: usize) -> Option<(Hash, u64)>
+{
     let p = powit::params();
     let chain = core::node_chain_id();
     let act = state.activation;
     let h2 = hardening2_height();
-    let regime = Regime::at(block.height, h2);
+    let regime = Regime::at(block.height.max(next_height), h2);
     let msg_h2 = if regime == Regime::Hardening2 { h2 } else { activation::NEVER };
+    let now_epoch = p.epoch(act, next_height.max(act));
     let mut v1_sets: Vec<(u64, Vec<(KeyId, u128)>)> = Vec::new();
     let mut checks = 0usize;
     for a in &block.powit.attestations {
@@ -1465,10 +1474,16 @@ pub fn authenticated_finality_claim(block: &Block, floor: u64, state: &PowitStat
         }
         let te = p.epoch(act, a.target.height);
         let key = a.key_id();
+        if te > now_epoch + 1 || state.is_banned(&key, now_epoch) {
+            continue;
+        }
         let member = match regime {
             Regime::Hardening2 => state.member_weight_h2(&p, te, &key).is_some(),
             Regime::V1 => {
                 if !v1_sets.iter().any(|(e, _)| *e == te) {
+                    if v1_sets.len() >= max_checks {
+                        continue;
+                    }
                     v1_sets.push((te, state.witness_set(&p, te)));
                 }
                 v1_sets.iter().find(|(e, _)| *e == te)
@@ -1483,10 +1498,30 @@ pub fn authenticated_finality_claim(block: &Block, floor: u64, state: &PowitStat
         }
         checks += 1;
         if a.verify_signature_at(chain, &p, act, msg_h2) {
-            return Some(a.target.hash);
+            return Some((a.target.hash, a.target.height));
         }
     }
     None
+}
+
+/// How long a configured anchor may stay unknown, out of initial block
+/// download, before the node alerts whatever height it names (review round
+/// 3, LOW 4).
+pub const UNKNOWN_ANCHOR_ALERT_AFTER: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+thread_local! {
+    static ALERT_AFTER_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test seam (this thread): replace [`UNKNOWN_ANCHOR_ALERT_AFTER`]; `None`
+/// restores it.
+#[allow(dead_code)] // tests only; the node binary compiles this module too
+pub fn set_unknown_anchor_alert_after(d: Option<std::time::Duration>) {
+    ALERT_AFTER_OVERRIDE.with(|c| c.set(d));
+}
+
+fn unknown_anchor_alert_after() -> std::time::Duration {
+    ALERT_AFTER_OVERRIDE.with(|c| c.get()).unwrap_or(UNKNOWN_ANCHOR_ALERT_AFTER)
 }
 
 /// The applied tip: the block the UTXO set sits on (the persisted tip
@@ -1511,7 +1546,7 @@ fn applied_tip(dag: &GhostDAG, store: &Storage) -> Option<Hash> {
 /// of counted checkpoints that conflict with the pin. Returns the outcome.
 pub fn refresh_finality_pin(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage) -> PinOutcome {
     let min_chain_work = crate::ingress::minimum_chain_work();
-    let (outcome, previous, sticky) = {
+    let (mut outcome, previous, sticky, unknown_since, in_ibd) = {
         let d = dag.read();
         let idx = d.finality_index();
         let policy = PinPolicy {
@@ -1521,8 +1556,19 @@ pub fn refresh_finality_pin(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage
             applied: applied_tip(&d, store),
             sticky: idx.sticky(),
         };
-        (d.compute_finality_pin(&policy), d.finality_outcome().clone(), idx.sticky())
+        (d.compute_finality_pin(&policy), d.finality_outcome().clone(), idx.sticky(), idx.anchor_unknown_since,
+         crate::ingress::below_minimum_chain_work(&d, min_chain_work))
     };
+    // Review round 3, LOW 4: the height an unknown anchor names is
+    // unchecked (a typo above the tip would silence the alert), so the node
+    // also alerts once the anchor has stayed unknown for a while out of
+    // initial block download, by its own clock.
+    let now = std::time::Instant::now();
+    let unknown_since = (outcome.anchor == crate::consensus::finality::AnchorStatus::Unknown && !in_ibd)
+        .then(|| unknown_since.unwrap_or(now));
+    if unknown_since.is_some_and(|t| now.saturating_duration_since(t) >= unknown_anchor_alert_after()) {
+        outcome.anchor_overdue = true;
+    }
     if outcome.pin != previous.pin {
         match outcome.pin {
             Some((h, height)) => log::info!("PoWit finality pin: {} (DAG height {height}, {})",
@@ -1557,10 +1603,12 @@ pub fn refresh_finality_pin(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage
     if outcome.anchor_overdue && !previous.anchor_overdue {
         let a = anchor_in_force(dag.read().finality_index().anchor_setting);
         log::error!("PoWit finality anchor {} (DAG height {}) is UNKNOWN while this node's chain is above that \
-            height: no finalized checkpoint above it counts until the block arrives. The node holds its pin ({}) \
-            instead of following the most work. Check the checkpoint (`getfinalityinfo`; `--finalitycheckpoint`, \
-            `setfinalitycheckpoint`) and its peers: the block is on a chain it has not received, or on none",
+            height, or has been for {} min out of initial block download: no finalized checkpoint above it counts \
+            until the block arrives. The node holds its pin ({}) instead of following the most work. Check the \
+            checkpoint (`getfinalityinfo`; `--finalitycheckpoint`, `setfinalitycheckpoint`) and its peers: the \
+            block is on a chain it has not received, or on none",
             a.map(|a| hex::encode(a.hash)).unwrap_or_default(), a.map(|a| a.height).unwrap_or(0),
+            unknown_anchor_alert_after().as_secs() / 60,
             outcome.pin.map(|(h, _)| hex::encode(&h[..8])).unwrap_or_else(|| "none".into()));
     }
     if outcome.anchor != previous.anchor && matches!(outcome.anchor,
@@ -1570,9 +1618,14 @@ pub fn refresh_finality_pin(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage
             at another height; check it, or `setfinalitycheckpoint none`)",
             anchor_in_force(dag.read().finality_index().anchor_setting).map(|a| hex::encode(a.hash)), outcome.anchor);
     }
-    dag.write().set_finality_pin(outcome.clone());
-    // The pinned checkpoint is the node's own finality from now on: persist
-    // it (a lost write falls back to the applied chain's finality).
+    {
+        let mut d = dag.write();
+        d.finality_index_mut().anchor_unknown_since = unknown_since;
+        d.set_finality_pin(outcome.clone());
+    }
+    // The pinned block is the node's own finality from now on (a finalized
+    // checkpoint), or the pin it holds should an anchor become unknown:
+    // persist it (a lost write falls back to the applied chain's finality).
     let pinned = dag.read().finality_index().sticky();
     if pinned != sticky {
         let r = match pinned {
@@ -1843,6 +1896,88 @@ mod tests {
         assert_eq!(s.of(&k1).count(), SEEN_LINKS_PER_KEY - 1, "the globally oldest link went");
         assert_eq!(s.of(&a.key_id()).count(), 1, "the newest is kept");
         assert_eq!(s.by_key.values().map(|v| v.len()).sum::<usize>(), SEEN_LINKS_CAP);
+    }
+
+    /// A vote by a fresh KES key (depth 2) for `target`, signed under `h2`.
+    fn vote_by(seed: u8, source: Checkpoint, target: Checkpoint, act: u64, h2: u64) -> (KeyId, Attestation) {
+        let p = powit::params();
+        let mut signer = gnb_crypto::core::kes::KesSigner::generate(2, [seed; 32], |_| {}).unwrap();
+        let e = p.epoch(act, target.height);
+        if e > signer.epoch() {
+            signer.evolve_to(e).unwrap();
+        }
+        let a = Attestation::sign_at(core::node_chain_id(), h2, source, target, &signer).unwrap();
+        (a.key_id(), a)
+    }
+
+    fn claim_block(height: u64, vote: Attestation) -> Block {
+        Block {
+            header: core::BlockHeader { version: 1, parents: vec![[9; 32]], merkle_root: core::MerkleRoot::ZERO,
+                                        timestamp: 0, bits: 0x2100ffff, nonce: 0 },
+            transactions: Vec::new(),
+            blue_score: height,
+            height,
+            shielded_transactions: Vec::new(),
+            powit: PowitBody { shares: Vec::new(), attestations: vec![vote], evidence: Vec::new() },
+        }
+    }
+
+    /// Review round 3, LOW 2: a claim is authenticated under the rules of
+    /// the node's next block at least (the orphan's wire height is the
+    /// sender's choice), and a key barred NOW is no witness, whatever epoch
+    /// its vote's target names.
+    #[test]
+    fn a_claim_is_judged_by_the_bars_of_now() {
+        let p = powit::params();
+        let act = 1_000u64;
+        let e = p.epoch_len;
+        let target = Checkpoint { height: act + 3 * e, hash: [3; 32] };
+        let source = Checkpoint { height: act + 3 * e - p.checkpoint_interval, hash: [2; 32] };
+        let next = act + 2 * e + 1;
+        {
+            // A key barred until epoch 3 votes for a target in epoch 3.
+            let _g = activation::scoped_override_v2(activation::NEVER);
+            let (k, vote) = vote_by(41, source, target, act, activation::NEVER);
+            let mut st = PowitState::genesis(act, [1; 32]);
+            st.epoch = 2;
+            for ep in 0..=1 {
+                st.epoch_work.entry(ep).or_default().insert(k, 1_000);
+            }
+            st.banned.insert(k, 3);
+            let r = authenticated_finality_claim(&claim_block(target.height, vote.clone()), act, &st, next, 2);
+            assert_eq!(r, None, "barred at the node's epoch");
+            st.banned.clear();
+            let r = authenticated_finality_claim(&claim_block(target.height, vote), act, &st, next, 2);
+            assert_eq!(r, Some((target.hash, target.height)), "the same vote once the bar is lifted");
+        }
+    }
+
+    /// Review round 3, LOW 2 (the regime half).
+    #[test]
+    fn a_claim_is_judged_by_the_rules_of_the_nodes_next_block() {
+        let p = powit::params();
+        let act = 1_000u64;
+        let e = p.epoch_len;
+        let target = Checkpoint { height: act + 3 * e, hash: [3; 32] };
+        let source = Checkpoint { height: act + 3 * e - p.checkpoint_interval, hash: [2; 32] };
+        let next = act + 2 * e + 1;
+        {
+            // From the second hardening activation (at epoch 2) the frozen
+            // finalized window holds only epoch 0: K2 (work in epoch 1 only)
+            // is no witness there, but would be under the first rule, which an
+            // orphan claiming a wire height below the activation selected.
+            let h2 = act + 2 * e;
+            let _g = activation::scoped_override_v2(h2);
+            let (k2, vote) = vote_by(42, source, target, act, activation::NEVER);
+            let mut st = PowitState::genesis(act, [1; 32]);
+            st.epoch = 2;
+            st.finalized = Checkpoint { height: act + e, hash: [1; 32] };
+            st.justified = st.finalized;
+            st.epoch_work.entry(0).or_default().insert([0xAA; 20], 1_000);
+            st.epoch_work.entry(1).or_default().insert(k2, 1_000);
+            let r = authenticated_finality_claim(&claim_block(act + 100, vote), act, &st, next, 2);
+            assert_eq!(r, None, "judged by the rules of the node's next block ({next})");
+        }
     }
 
     /// Review MEDIUM 6: `--finalitycheckpoint HASH:HEIGHT` (or `none`).

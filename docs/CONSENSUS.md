@@ -879,11 +879,14 @@ way back is `setfinalitycheckpoint` on a block of the original chain.
 
 While a configured anchor (release, `--finalitycheckpoint` or
 `setfinalitycheckpoint <hash> <height>`) is unknown, the node holds the
-finalized checkpoint it pinned last (`origin: held`): it neither clears nor
-replaces the persisted pin, so an anchor it never receives does not take
-its finality away. Once its applied tip is above the anchor's height it
-alerts (`anchor_overdue` in `getfinalityinfo`, an error log line, the
-metric `gnb_finality_anchor_unknown`). The pinned checkpoint is persisted
+block it pinned last, a finalized checkpoint or a previous anchor
+(`origin: held`): it neither clears nor replaces the persisted pin, so an
+anchor it never receives does not take its finality away. It alerts
+(`anchor_overdue` in `getfinalityinfo`, an error log line, the metric
+`gnb_finality_anchor_unknown`) once its applied tip is above the anchor's
+height, or once the anchor has stayed unknown for 30 minutes out of initial
+block download (the height an unknown block is given is unchecked: a typo
+above the tip must not silence the alert). The pinned checkpoint is persisted
 after each change of pin, outside the block's own write: if that write were
 lost and the chain state then rebuilt from genesis during a conflict, the
 node's own finality would fall back to the highest checkpoint of the
@@ -1163,26 +1166,33 @@ bound of B's blue work:
      so a chain that finalized `F` beyond the pin links from `F` + one
      interval or later, and the node's own chain from at most its pin + one
      interval;
-   - is signed, under the message of the orphan's rules, by a key with
-     weight in the witness set the node's own selected-tip state derives for
-     the attestation's target epoch (at most two signatures are checked per
-     orphan, membership first). From the second hardening activation a chain
-     that shares the node's finality reads the same frozen finalized window
-     ("Witness set from finalized history"); before it, the node's own share
-     history of that window.
+   - is signed by a key with weight in the witness set the node's own
+     selected-tip state derives for the attestation's target epoch, under the
+     rules of a block at the orphan's wire height or the node's next height,
+     whichever is higher (the wire height is the sender's choice), the key
+     not barred at the node's current epoch and the target not in a future
+     epoch (at most two signatures are checked per orphan, membership first,
+     and at most two first-rule witness sets built). From the second
+     hardening activation a chain that shares the node's finality reads the
+     same frozen finalized window ("Witness set from finalized history");
+     before it, the node's own share history of that window.
 
    The claim is recorded in the orphan's pool entry once the orphan is
    buffered (and in its skeleton if it is evicted): the pool's bounds per
    delivering peer and its eviction rules bound the claims, and no claim
-   displaces another. B (its parents all known) is backed when, in the
-   closure of the buffered orphans and skeletons waiting on B, B itself
-   included, one carries a claim whose attestation targets B, a block of
-   that closure, or a stored block on B's selected chain (at most 4,096
-   blocks of the closure are visited, nearest first). The target binds the
-   claim to the chain it reaches the node along: an authentic attestation
-   is public, and copied onto another chain it targets a block that chain
-   does not contain. The backing is recomputed at each admission, so a block
-   requested again while orphans above it still wait is backed again. A
+   displaces another. B (its parents all known) is backed when B is a
+   claimed target, or an ancestor of one through buffered orphans and
+   skeletons (a flag their own parent edges carry down: an orphan that
+   merely lists B as a parent neither sets nor hides it, review round 3,
+   M-A), or when a claimed target is a stored block on B's selected chain at
+   most `vote_ttl` checkpoint slots below B (the blocks between a target and
+   the attestations for it). The target binds the claim to the chain it
+   reaches the node along: an authentic attestation is public, and copied
+   onto another chain it targets a block that chain does not contain, or, on
+   a chain that branches above a stored target, backs at most `vote_ttl`
+   blocks above that target. The backing is recomputed at each admission, so
+   a block requested again while orphans above it still wait is backed
+   again. A
    backed B is admitted below `T` only if it also extends the pinned
    checkpoint's chain (its selected parent is the pin or descends from it: a
    chain that forks below the pin cannot advance it; with no pin, only when
@@ -1202,9 +1212,9 @@ bound of B's blue work:
    fetched again when it is next announced. The DAG-7 merge-backed budget
    (item 3) is not charged: it rations deep insertions an unauthenticated
    orphan can make needed, and would hold a heal of hundreds of blocks for
-   hours. An attacker with no witness key spends none of these budgets; a
-   witness signing links to a chain of its own spends at most them, at the
-   floor's work per block. A claim is only a reason to fetch: the claimed
+   hours. Whoever spends these budgets (a chain built on a stored target
+   with a copied attestation, or a witness signing links to a chain of its
+   own) pays the floor's work per block. A claim is only a reason to fetch: the claimed
    finality counts once the blocks are stored and their PoWit states
    computed, like any other. Once the node pins the claimed finality, its
    selected tip is on that chain and the rest of it is within the window

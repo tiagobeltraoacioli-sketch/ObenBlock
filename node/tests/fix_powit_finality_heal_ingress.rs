@@ -585,3 +585,75 @@ fn a_claim_on_a_chain_that_forks_below_the_pin_buys_nothing() {
     pull(&mut core, &n, &h.a, PeerId::random(), None, Instant::now());
     assert_eq!((pin_of(&n), applied_tip(&n)), (Some(h.a_fin.hash), Some(h.a.last().unwrap().block_hash())));
 }
+
+// ── Review round 3, M-A: the claim search cannot be crowded out ─────────────
+
+/// An orphan on `parent` from a crowd. It claims a header height above the
+/// activation, where (under `test-pow-limit`) it announces no work: as a
+/// crowd at the floor's work, 1/16 of a block each, announces too little to
+/// back its parent by work (POW-3's `ChainBacked`).
+fn crowd_orphan(i: u32, parent: BlockHash, bits: u32) -> Block {
+    let height = 470;
+    let mut b = Block {
+        header: BlockHeader { version: 1, parents: vec![parent], merkle_root: MerkleRoot::ZERO,
+                              timestamp: unix_now(), bits, nonce: u64::from(i) },
+        transactions: vec![Transaction {
+            version: 1,
+            inputs: vec![TxInput { prev_txid: [0; 32], prev_index: u32::MAX,
+                                   script_sig: format!("crowd{i}").into_bytes(), sequence: u32::MAX }],
+            outputs: Block::coinbase_outputs(height, vec![0xC0; 20], 0, &[]),
+            locktime: 0,
+        }],
+        blue_score: height,
+        height,
+        shielded_transactions: Vec::new(),
+        powit: PowitBody::default(),
+    };
+    commit_block(&mut b);
+    b.test_only_assume_pow_valid();
+    b
+}
+
+/// Review round 3, M-A: the block hashes of the lighter side are public, so
+/// anyone can buffer orphans that list the heal's next block as a parent.
+/// 4,200 such orphans (two Sybil peers, at the floor's work) used to fill
+/// the bounded upward search from that block before it reached side A's
+/// orphan above it: the block was refused as low-work and the heal stalled.
+/// Backing now follows the ancestry of the claimed targets downward, which
+/// no other orphan can enter.
+#[test]
+fn a_crowd_of_orphans_on_the_heals_next_block_cannot_stop_it() {
+    let h = heal();
+    let n = side_b_node(&h);
+    let mut core = BlockIngress::new();
+    let now = Instant::now();
+    pull(&mut core, &n, &h.a[1..], PeerId::random(), None, now);
+    let x = &h.a[0];
+    let sybils = [PeerId::random(), PeerId::random()];
+    for i in 0..4_200u32 {
+        let b = crowd_orphan(i, x.block_hash(), x.header.bits);
+        let o = core.handle_block(b.clone(), b.block_hash(), b.to_wire_bytes().len(), Some(sybils[(i % 2) as usize]),
+            false, now, unix_now(), &ctx(&n));
+        assert!(matches!(o, BlockOutcome::Buffered { .. }), "crowd orphan {i}: {o:?}");
+    }
+    let o = core.handle_block(x.clone(), x.block_hash(), x.to_wire_bytes().len(), Some(PeerId::random()), true, now,
+        unix_now(), &ctx(&n));
+    assert!(matches!(o, BlockOutcome::Processed { admission: WorkAdmission::FinalityBacked, .. }), "{o:?}");
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(h.a_fin.hash), Some(h.a.last().unwrap().block_hash())));
+}
+
+/// Review round 3, LOW 3: below the second hardening activation a claim is
+/// authenticated against the first rule's witness set the node's own state
+/// derives (built for at most two target epochs per orphan); the heal
+/// converges the same way.
+#[test]
+fn a_healed_partition_converges_under_the_first_witness_set_rule() {
+    let _g = gnb::core::activation::scoped_override_v2(gnb::core::activation::NEVER);
+    let h = heal();
+    let n = side_b_node(&h);
+    let mut core = BlockIngress::new();
+    let out = pull(&mut core, &n, &h.a, PeerId::random(), None, Instant::now());
+    assert!(matches!(out.last().unwrap(), BlockOutcome::Processed { admission: WorkAdmission::FinalityBacked, .. }),
+        "{:?}", out.last().unwrap());
+    assert_eq!((pin_of(&n), applied_tip(&n)), (Some(h.a_fin.hash), Some(h.a.last().unwrap().block_hash())));
+}

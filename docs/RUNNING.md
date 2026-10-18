@@ -801,10 +801,11 @@ gnb --finalitycheckpoint <block-hash>:<dag-height> ...
 the block from nodes you trust (`getblockdag`). While the anchor is unknown,
 no finalized checkpoint above its height counts and none at or below it is
 decided, so a node eclipsed on a fork during sync is never pinned to the
-fork's finality. A node that already had a pin holds it meanwhile
-(`origin: held` in `getfinalityinfo`; the persisted pin is kept), instead of
-falling back to the most work. If the node's chain passes the anchor's
-height and the block still has not arrived, it alerts: an error log line
+fork's finality. A node that already had a pin (a finalized checkpoint or
+a previous anchor) holds it meanwhile (`origin: held` in `getfinalityinfo`;
+the persisted pin is kept), instead of falling back to the most work. If
+the node's chain passes the anchor's height, or the anchor stays unknown
+for 30 minutes after initial block download, it alerts: an error log line
 ("PoWit finality anchor ... is UNKNOWN"), `anchor_overdue: true`, and the
 metric `gnb_finality_anchor_unknown` = 1. Check the hash and height you
 gave, and that your peers serve that chain; `setfinalitycheckpoint

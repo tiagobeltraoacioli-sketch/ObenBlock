@@ -959,9 +959,12 @@ pub struct OrphanEntry {
     /// the only keys its eviction remembers work under (POW-3). A parent
     /// already in the DAG is never looked up by the work rule.
     pub missing: Vec<[u8; 32]>,
-    /// Review round 2, H1: the target of an authenticated finality claim it
-    /// carries ([`OrphanPool::set_claim`], [`OrphanPool::claim_backs`]).
-    pub claim:  Option<[u8; 32]>,
+    /// Review round 2, H1: the target (block, checkpoint slot) of an
+    /// authenticated finality claim it carries ([`OrphanPool::set_claim`]).
+    pub claim:  Option<([u8; 32], u64)>,
+    /// Review round 3, M-A: it is an authenticated claim's target or one of
+    /// that target's ancestors (through buffered or remembered orphans).
+    pub under_target: bool,
     seq:        u64,
 }
 
@@ -977,7 +980,9 @@ struct Skeleton {
     parents: Vec<[u8; 32]>,
     owner:   Option<PeerId>,
     /// The evicted orphan's authenticated finality claim, if any (its target).
-    claim:   Option<[u8; 32]>,
+    claim:   Option<([u8; 32], u64)>,
+    /// See [`OrphanEntry::under_target`].
+    under_target: bool,
     seq:     u64,
 }
 
@@ -1052,6 +1057,12 @@ pub struct OrphanPool {
     /// was buffered, or a remembered path grew). Lets the ingress core cache
     /// a LowWork verdict until then.
     generation:     u64,
+    // ── Review round 2/3: authenticated finality claims ───────────────────
+    /// Target block -> (its checkpoint slot, claims recorded for it by
+    /// buffered orphans and skeletons).
+    claims:         HashMap<[u8; 32], (u64, u32)>,
+    /// Checkpoint slot -> the claimed targets at that slot.
+    claims_by_slot: BTreeMap<u64, HashSet<[u8; 32]>>,
 }
 
 /// `(work, insertion sequence, id)`: orders remembered entries lowest work
@@ -1107,6 +1118,8 @@ impl OrphanPool {
             path_by_owner: HashMap::new(),
             rem_seq: 0,
             generation: 0,
+            claims: HashMap::new(),
+            claims_by_slot: BTreeMap::new(),
         }
     }
 
@@ -1235,8 +1248,19 @@ impl OrphanPool {
         self.drop_skeleton(&hash);
         self.generation = self.generation.wrapping_add(1);
         self.entries.insert(hash, OrphanEntry {
-            block, height, bytes, peer, evidence, missing: missing_parents.to_vec(), claim: None, seq,
+            block, height, bytes, peer, evidence, missing: missing_parents.to_vec(), claim: None,
+            under_target: false, seq,
         });
+        // Review round 3, M-A: an authenticated claim's target, or a parent of
+        // a block that is one or descends to one, is under that target. Only
+        // real parent edges carry the flag down: an orphan that merely lists
+        // this block as a parent cannot set it (it is an ancestor of no target).
+        let under = self.claims.contains_key(&hash)
+            || self.waiting_for.get(&hash).into_iter().flatten().any(|w| self.node_under_target(w) == Some(true))
+            || self.skel_children.get(&hash).into_iter().flatten().any(|w| self.node_under_target(w) == Some(true));
+        if under {
+            self.mark_under_target(hash);
+        }
         OrphanInsert::Inserted { evicted }
     }
 
@@ -1249,19 +1273,19 @@ impl OrphanPool {
             let work = header_work(&e.block);
             let keys: Vec<[u8; 32]> = e.missing.iter().take(REMEMBERED_KEYS_PER_ORPHAN).copied().collect();
             let owner = e.peer;
-            let claim = e.claim;
+            let (claim, under) = (e.claim, e.under_target);
             let path = work.saturating_add(self.path_work_above(h));
             for p in &keys {
                 self.remember_path(*p, path, owner);
             }
-            self.add_skeleton(*h, work, keys, owner, claim);
+            self.add_skeleton(*h, work, keys, owner, claim, under);
         }
         self.remove(h);
     }
 
     /// Keep an evicted orphan as a skeleton, within the store's bounds.
     fn add_skeleton(&mut self, hash: [u8; 32], work: u128, parents: Vec<[u8; 32]>, owner: Option<PeerId>,
-                    claim: Option<[u8; 32]>) {
+                    claim: Option<([u8; 32], u64)>, under_target: bool) {
         if self.remembered_cap == 0 || self.skeletons.contains_key(&hash) {
             return;
         }
@@ -1294,11 +1318,17 @@ impl OrphanPool {
         }
         self.skel_by_work.insert((work, seq, hash));
         self.skel_by_owner.entry(owner).or_default().insert((seq, hash));
-        self.skeletons.insert(hash, Skeleton { work, parents, owner, claim, seq });
+        if let Some((t, slot)) = claim {
+            self.add_claim(t, slot);
+        }
+        self.skeletons.insert(hash, Skeleton { work, parents, owner, claim, under_target, seq });
     }
 
     fn drop_skeleton(&mut self, h: &[u8; 32]) -> Option<Skeleton> {
         let s = self.skeletons.remove(h)?;
+        if let Some((t, _)) = s.claim {
+            self.release_claim(&t);
+        }
         self.skel_by_work.remove(&(s.work, s.seq, *h));
         if let Some(set) = self.skel_by_owner.get_mut(&s.owner) {
             set.remove(&(s.seq, *h));
@@ -1579,68 +1609,113 @@ impl OrphanPool {
     /// Remove one orphan, detaching it from every parent it waited on.
     /// Orphans waiting on IT keep waiting (their parent is just not buffered).
     /// Review round 2, H1: record that the buffered orphan `hash` carries an
-    /// authenticated finality claim whose vote targets `target`. Only a
-    /// buffered orphan can carry one (nothing is recorded for a refused
-    /// insert), and it lives and goes with the orphan (or its skeleton): the
-    /// pool's per-peer quotas and its eviction rules bound it, and no claim
-    /// displaces another.
-    pub fn set_claim(&mut self, hash: &[u8; 32], target: [u8; 32]) {
-        if let Some(e) = self.entries.get_mut(hash) {
-            e.claim = Some(target);
+    /// authenticated finality claim whose vote targets `target` (checkpoint
+    /// `slot`). Only a buffered orphan can carry one (nothing is recorded for
+    /// a refused insert), and it lives and goes with the orphan (or its
+    /// skeleton): the pool's per-peer quotas and its eviction rules bound it,
+    /// and no claim displaces another.
+    pub fn set_claim(&mut self, hash: &[u8; 32], target: [u8; 32], slot: u64) {
+        let Some(e) = self.entries.get_mut(hash) else { return };
+        if e.claim.is_some() {
+            return;
+        }
+        e.claim = Some((target, slot));
+        self.add_claim(target, slot);
+        if self.node_under_target(&target) == Some(false) {
+            self.mark_under_target(target);
         }
     }
 
-    /// Review round 2, H1: whether an authenticated finality claim backs `x`,
-    /// a block about to be stored below the work threshold whose parents are
-    /// `parents`: in the closure of the buffered orphans (and skeletons of
-    /// evicted ones) waiting on `x`, transitively, `x` itself included, one
-    /// carries a claim whose vote targets `x`, a block of that closure, or a
-    /// stored block on `x`'s selected chain. The target binds the claim to
-    /// the chain it reaches the node along: an authentic vote copied onto
-    /// another chain targets a block that chain does not contain, and a
-    /// block another chain hangs a claim on (a random parent of a crafted
-    /// orphan) is not below its target. Recomputed at each admission, so a
-    /// block requested again while it is still waited on is backed again. At
-    /// most `limit` blocks of the closure are visited (breadth first from
-    /// `x`, so the nearest claim above it is found first).
-    pub fn claim_backs(&self, x: &[u8; 32], parents: &[BlockHash], dag: &GhostDAG, limit: usize) -> bool {
-        let sp = dag.preview_selected_parent(parents);
-        let below = |t: &[u8; 32]| sp.is_some_and(|p| dag.has_block(t) && dag.is_chain_ancestor_or_self(t, &p));
-        let mut visited: HashSet<[u8; 32]> = HashSet::new();
-        let mut targets: HashSet<[u8; 32]> = HashSet::new();
-        let mut queue: VecDeque<[u8; 32]> = VecDeque::new();
-        visited.insert(*x);
-        queue.push_back(*x);
-        while let Some(v) = queue.pop_front() {
-            if targets.contains(&v) {
-                return true;
-            }
-            let claim = self.entries.get(&v).and_then(|e| e.claim).or_else(|| self.skeletons.get(&v).and_then(|s| s.claim));
-            if let Some(t) = claim {
-                if visited.contains(&t) || below(&t) {
-                    return true;
-                }
-                targets.insert(t);
-            }
-            let waiters = self.waiting_for.get(&v).into_iter().flatten()
-                .chain(self.skel_children.get(&v).into_iter().flatten());
-            for w in waiters {
-                if visited.len() >= limit {
-                    return false;
-                }
-                if visited.insert(*w) {
-                    if targets.contains(w) {
-                        return true;
-                    }
-                    queue.push_back(*w);
+    fn add_claim(&mut self, target: [u8; 32], slot: u64) {
+        let n = self.claims.entry(target).or_insert((slot, 0));
+        n.1 += 1;
+        self.claims_by_slot.entry(n.0).or_default().insert(target);
+    }
+
+    fn release_claim(&mut self, target: &[u8; 32]) {
+        let Some(n) = self.claims.get_mut(target) else { return };
+        n.1 = n.1.saturating_sub(1);
+        if n.1 == 0 {
+            let slot = n.0;
+            self.claims.remove(target);
+            if let Some(set) = self.claims_by_slot.get_mut(&slot) {
+                set.remove(target);
+                if set.is_empty() {
+                    self.claims_by_slot.remove(&slot);
                 }
             }
         }
-        false
+    }
+
+    /// The flag of a buffered or remembered orphan (`None`: neither).
+    fn node_under_target(&self, h: &[u8; 32]) -> Option<bool> {
+        self.entries.get(h).map(|e| e.under_target).or_else(|| self.skeletons.get(h).map(|s| s.under_target))
+    }
+
+    /// Flag `start` and every buffered or remembered orphan below it
+    /// (through their own parent edges) as under a claim's target.
+    fn mark_under_target(&mut self, start: [u8; 32]) {
+        let mut stack = vec![start];
+        while let Some(h) = stack.pop() {
+            let parents: Vec<[u8; 32]> = if let Some(e) = self.entries.get_mut(&h) {
+                if e.under_target && h != start {
+                    continue;
+                }
+                e.under_target = true;
+                e.missing.clone()
+            } else if let Some(s) = self.skeletons.get_mut(&h) {
+                if s.under_target && h != start {
+                    continue;
+                }
+                s.under_target = true;
+                s.parents.clone()
+            } else {
+                continue;
+            };
+            stack.extend(parents.into_iter().filter(|p| self.node_under_target(p) == Some(false)));
+        }
+    }
+
+    /// Review round 3, M-A (round 2, H1): whether an authenticated finality
+    /// claim backs `x`, a block about to be stored below the work threshold
+    /// whose parents are `parents`:
+    ///
+    /// * `x` is a claim's target, or an ancestor of one through buffered or
+    ///   remembered orphans: their own parent edges, fixed by their ids,
+    ///   carry the flag down, so an orphan that merely lists `x` as a parent
+    ///   neither sets nor hides it (round 2 searched upward from `x` through
+    ///   every orphan waiting on it, with a bound a crowd of them filled);
+    /// * or a claim's target is a stored block on `x`'s selected chain, at
+    ///   most `vote_ttl` checkpoint slots below `x` (the blocks between a
+    ///   target and the votes for it: a vote is includable for `vote_ttl`).
+    ///
+    /// The target binds the claim to the chain: an authentic vote is public,
+    /// and copied onto another chain it targets a block that chain does not
+    /// contain (or, if that chain branches above a stored target, backs at
+    /// most `vote_ttl` blocks above it, at the floor's work per block). Cost:
+    /// the orphans waiting on `x` and the claims of `vote_ttl` slots.
+    pub fn claim_backs(&self, x: &[u8; 32], parents: &[BlockHash], dag: &GhostDAG, vote_ttl: u64) -> bool {
+        if self.node_under_target(x) == Some(true) || self.claims.contains_key(x) {
+            return true;
+        }
+        let waiters = self.waiting_for.get(x).into_iter().flatten()
+            .chain(self.skel_children.get(x).into_iter().flatten());
+        if waiters.into_iter().any(|w| self.node_under_target(w) == Some(true)) {
+            return true;
+        }
+        let Some(sp) = dag.preview_selected_parent(parents) else { return false };
+        let Some(height) = parents.iter().filter_map(|p| dag.get_block_data(p)).map(|d| d.height).max()
+            .map(|h| h.saturating_add(1)) else { return false };
+        self.claims_by_slot.range(height.saturating_sub(vote_ttl)..=height)
+            .flat_map(|(_, ts)| ts.iter())
+            .any(|t| dag.has_block(t) && dag.is_chain_ancestor_or_self(t, &sp))
     }
 
     pub fn remove(&mut self, h: &[u8; 32]) -> Option<OrphanEntry> {
         let e = self.entries.remove(h)?;
+        if let Some((t, _)) = e.claim {
+            self.release_claim(&t);
+        }
         self.order.remove(&e.seq);
         if let Some(u) = self.per_peer.get_mut(&e.peer) {
             u.seqs.remove(&e.seq);
@@ -1801,17 +1876,26 @@ pub fn work_admission(lb: u128, threshold: u128, chain_above: u128, merge_lb: u1
 //   chain's justified checkpoint, so a chain that finalized `F` beyond the
 //   pin links from `F` + one interval or later, the node's own chain from at
 //   most its pin + one interval;
-// * is AUTHENTIC (review round 2, H1): signed, under the message of the
-//   orphan's rules, by a key with weight in the witness set the node's own
-//   state (its selected tip's) derives for the vote's target epoch
-//   (`powit::authenticated_finality_claim`, at most
-//   `MAX_CLAIM_SIGNATURE_CHECKS` signatures per orphan). From the second
-//   hardening activation a chain that shares the node's finality reads the
-//   same frozen window; before it, the node's own recent share history;
-// * is BOUND to the chain (`OrphanPool::claim_backs`): a block is backed
-//   only if the vote's target is that block, lies in the pulled chain above
-//   it, or is a stored block below it. An authentic vote is public: copied
-//   onto another chain, it targets a block that chain does not contain.
+// * is AUTHENTIC (review round 2, H1; round 3, LOW 2-3): signed by a key
+//   with weight in the witness set the node's own state (its selected
+//   tip's) derives for the vote's target epoch, under the rules of a block
+//   at the orphan's wire height or the node's next height, whichever is
+//   higher, the key not barred at the node's current epoch and the target
+//   not in a future epoch (`powit::authenticated_finality_claim`: at most
+//   `MAX_CLAIM_SIGNATURE_CHECKS` signatures, and as many first-rule witness
+//   sets, per orphan). From the second hardening activation a chain that
+//   shares the node's finality reads the same frozen window; before it, the
+//   node's own recent share history;
+// * is BOUND to the chain (`OrphanPool::claim_backs`, round 3, M-A): a block
+//   is backed if it is a claimed target or an ancestor of one through
+//   buffered or remembered orphans (a flag their own parent edges carry
+//   down, so orphans that merely list a block as a parent can neither set
+//   nor hide it), or if a claimed target is stored on its selected chain at
+//   most `vote_ttl` slots below it (the blocks between a target and the
+//   votes for it). An authentic vote is public: copied onto another chain
+//   it targets a block that chain does not contain, or, on a chain that
+//   branches above a stored target, backs at most `vote_ttl` blocks above
+//   that target.
 //
 // The claim is recorded in the orphan's pool entry once it is buffered
 // (`OrphanPool::set_claim`), and survives its eviction in its skeleton, so
@@ -1841,9 +1925,9 @@ pub fn work_admission(lb: u128, threshold: u128, chain_above: u128, merge_lb: u1
 // DAG-7 merge-backed budget (four, then one per 30 s) is not charged: it
 // rations deep insertions an unauthenticated crafted orphan can make
 // needed, and would hold a heal of hundreds of blocks for hours; these
-// budgets ration the finality-backed ones. An attacker with no witness key
-// can spend none of them; a witness signing links to its own chain spends
-// at most these, at the floor's work per block.
+// budgets ration the finality-backed ones. Whoever spends them (a chain
+// built on a stored target with a copied vote, review round 3, LOW 1, or a
+// witness signing links to its own chain) pays the floor's work per block.
 
 /// Admissions below the work threshold per delivering peer (burst).
 pub const FINALITY_PULL_PEER_BURST: u32 = 1_440;
@@ -1855,10 +1939,6 @@ pub const FINALITY_PULL_BURST: u32 = 2_880;
 pub const FINALITY_PULL_REFILL: f64 = 1.0 / 30.0;
 /// Delivering peers tracked by the per-peer budget.
 const FINALITY_PULL_PEERS_TRACKED: usize = 1_024;
-/// Blocks of the orphan closure above a block that [`OrphanPool::claim_backs`]
-/// visits looking for a claim (an honest side claims within a few checkpoint
-/// intervals of the fork point).
-pub const FINALITY_CLAIM_SEARCH_MAX: usize = 4_096;
 /// Attestation signatures checked per orphan to authenticate a claim.
 pub const MAX_CLAIM_SIGNATURE_CHECKS: usize = 2;
 
@@ -1930,21 +2010,23 @@ impl FinalityPulls {
         }
     }
 
-    /// The target of an authentic finality claim `block` carries, given the
-    /// node's claim floor and selected tip (read under the DAG lock by the
-    /// caller; the state is decoded and the signatures checked without it).
-    pub fn authenticate(&mut self, block: &core::Block, floor: u64, tip: Option<BlockHash>, store: &Storage)
-        -> Option<[u8; 32]>
+    /// The target (block, checkpoint slot) of an authentic finality claim
+    /// `block` carries, given the node's claim floor and selected tip with
+    /// its height (read under the DAG lock by the caller; the state is
+    /// decoded and the signatures checked without it).
+    pub fn authenticate(&mut self, block: &core::Block, floor: u64, tip: Option<(BlockHash, u64)>, store: &Storage)
+        -> Option<([u8; 32], u64)>
     {
         if !claims_finality(block, floor) {
             return None;
         }
-        let tip = tip?;
+        let (tip, tip_h) = tip?;
         if self.tip_state.as_ref().map(|(h, _)| *h) != Some(tip) {
             self.tip_state = Some((tip, crate::powit::load_state(store, &tip)));
         }
         let state = self.tip_state.as_ref()?.1.as_ref()?;
-        crate::powit::authenticated_finality_claim(block, floor, state, MAX_CLAIM_SIGNATURE_CHECKS)
+        crate::powit::authenticated_finality_claim(block, floor, state, tip_h.saturating_add(1),
+            MAX_CLAIM_SIGNATURE_CHECKS)
     }
 
     /// Spend one admission delivered by `peer`: its budget and the node's.
@@ -2506,7 +2588,7 @@ fn finality_backed(orphans: &OrphanPool, block: &core::Block, hash: &[u8; 32], r
     let floor = orphan_floor_from(&reference_for_height(reference, tip_h.saturating_add(1), block.height), block.height);
     bits_meet_floor(block.header.bits, &floor)
         && extends_pin(dag, &block.header.parents)
-        && orphans.claim_backs(hash, &block.header.parents, dag, FINALITY_CLAIM_SEARCH_MAX)
+        && orphans.claim_backs(hash, &block.header.parents, dag, core::powit::params().vote_ttl)
 }
 
 impl BlockIngress {
@@ -2761,7 +2843,8 @@ impl BlockIngress {
             let claim = {
                 let (floor, tip) = {
                     let d = ctx.dag.read();
-                    (finality_claim_floor(&d), d.selected_tip())
+                    let tip = d.selected_tip().and_then(|t| d.get_block_data(&t).map(|x| (t, x.height)));
+                    (finality_claim_floor(&d), tip)
                 };
                 self.finality.authenticate(&block, floor, tip, ctx.store)
             };
@@ -2774,8 +2857,8 @@ impl BlockIngress {
             let height = block.height;
             match self.orphans.insert(hash, block, height, wire_bytes, peer, evidence, &missing) {
                 OrphanInsert::Inserted { evicted } => {
-                    if let Some(t) = claim {
-                        self.orphans.set_claim(&hash, t);
+                    if let Some((t, slot)) = claim {
+                        self.orphans.set_claim(&hash, t, slot);
                     }
                     for mp in &fresh {
                         self.parent_fetch.note_requested(*mp, now);
