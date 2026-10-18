@@ -203,22 +203,50 @@ impl BlockTemplate {
         if !self.hardened {
             return None;
         }
-        // The witness root ignores position 0 (the coinbase).
+        // The witness root ignores position 0 (the coinbase), and the
+        // commitment never reads the header's root, time, bits or nonce. On
+        // ObenBlock it also commits to the PoWit section (with its exits
+        // list from the liveness activation), so it is computed from the
+        // same block shape `assemble_block` builds
+        // (`block_rules::expected_coinbase_commitment`).
         let placeholder = Transaction { version: 0, inputs: vec![], outputs: vec![], locktime: 0 };
-        let txs: Vec<Transaction> = std::iter::once(placeholder)
-            .chain(self.transactions.iter().map(|(t, _)| t.clone()))
-            .collect();
-        Some(core::block_rules::coinbase_commitment(
-            self.height, &self.parents, &core::block_rules::witness_root(&txs)))
+        let shell = Block {
+            header: BlockHeader { version: 0, parents: self.parents.clone(), merkle_root: MerkleRoot::ZERO,
+                                  timestamp: 0, bits: 0, nonce: 0 },
+            transactions: std::iter::once(placeholder).chain(self.transactions.iter().map(|(t, _)| t.clone())).collect(),
+            blue_score: self.blue_score,
+            height: self.height,
+            shielded_transactions: Vec::new(),
+            powit: self.powit.clone(),
+        };
+        Some(core::block_rules::expected_coinbase_commitment(&shell))
     }
 
     /// The sibling hashes from the coinbase leaf to the header Merkle root,
-    /// under the rule of the template's height.
+    /// under the rule of the template's height ([`Self::header_tree_is_tagged`]).
     pub fn coinbase_merkle_branch(&self) -> Vec<[u8; 32]> {
         let ids: Vec<[u8; 32]> = std::iter::once([0u8; 32])
             .chain(self.transactions.iter().map(|(t, _)| t.txid()))
             .collect();
-        core::block_rules::coinbase_merkle_branch(&ids, self.hardened)
+        core::block_rules::coinbase_merkle_branch(&ids, self.header_tree_is_tagged())
+    }
+
+    /// Whether the header root of a block built from this template is GnB's
+    /// tagged tree (hardened GnB) or Bitcoin's SHA-256d tree (GnB below the
+    /// activation, and ObenBlock at every height: `core::pow_scheme`).
+    pub fn header_tree_is_tagged(&self) -> bool {
+        self.hardened && core::pow_scheme::node_sha256d_params().is_none()
+    }
+
+    /// The `merkle_rule` name of `getblocktemplate`.
+    pub fn merkle_rule_name(&self) -> &'static str {
+        if core::pow_scheme::node_sha256d_params().is_some() {
+            "bitcoin-sha256d"
+        } else if self.hardened {
+            "gnb-tagged-v1"
+        } else {
+            "sha256d-duplicate-last"
+        }
     }
 
     /// In-template dependencies (BIP22 `depends`): for each listed

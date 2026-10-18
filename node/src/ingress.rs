@@ -664,6 +664,7 @@ pub fn verdict_for_accept_error(err: &str) -> GossipVerdict {
         "invalid height",
         "invalid difficulty",
         "consensus rejection: invalid GnB-SMH proof of work",
+        "consensus rejection: invalid SHA-256d proof of work",
         "consensus rejection: non-genesis block without parents",
         "timestamp rejected: timestamp before parent",
         "coinbase rejected",
@@ -746,7 +747,9 @@ pub enum BlockFault {
 /// context-free; every other error [`verdict_for_accept_error`] rejects
 /// depends on the parents).
 pub fn accept_error_fault(err: &str) -> BlockFault {
-    if err.starts_with("consensus rejection: invalid GnB-SMH proof of work") {
+    if err.starts_with("consensus rejection: invalid GnB-SMH proof of work")
+        || err.starts_with("consensus rejection: invalid SHA-256d proof of work")
+    {
         BlockFault::ContextFree
     } else {
         BlockFault::Context

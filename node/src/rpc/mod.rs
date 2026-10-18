@@ -2053,7 +2053,9 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             let mut result = json!({
                 "hardening_active":     tmpl.hardened,
                 "hardening_activation_height": tmpl.activation_height,
-                "merkle_rule":          if tmpl.hardened { "gnb-tagged-v1" } else { "sha256d-duplicate-last" },
+                // ObenBlock: "bitcoin-sha256d" (Bitcoin's tree; the body is
+                // committed by the coinbase commitment).
+                "merkle_rule":          tmpl.merkle_rule_name(),
                 "size_rule":            if tmpl.hardened { "wire" } else { "bincode" },
                 "coinbase_script_sig_prefix": commitment.map(hex::encode).unwrap_or_default(),
                 "max_coinbase_extra_bytes": max_extra,

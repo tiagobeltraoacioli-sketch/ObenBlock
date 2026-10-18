@@ -39,7 +39,7 @@ use std::sync::OnceLock;
 use gnb_smh::difficulty::{self, AsertAnchor, AsertParams, Target};
 use gnb_smh::sha256d::{self, ParentsError, PowHeader};
 
-use super::{pow_cache, Block, BlockHeader, ASERT_HALFLIFE_SECS, MAX_PARENTS, TARGET_BLOCK_TIME};
+use super::{pow_cache, Block, BlockHeader, MerkleRoot, ASERT_HALFLIFE_SECS, MAX_PARENTS, TARGET_BLOCK_TIME};
 
 // ── ObenBlock constants ─────────────────────────────────────────────────────
 
@@ -305,10 +305,103 @@ pub(super) fn validate_pow_sha256d(block: &Block, params: &Sha256dParams) -> boo
     ok
 }
 
+// ── The header Merkle root under SHA-256d (Bitcoin's tree) ──────────────────
+//
+// docs/CONSENSUS.md, "Header Merkle root and body commitment (ObenBlock)".
+// Stock Stratum V1 firmware rebuilds `merkle_root` itself whenever it rolls
+// extranonce2: `sha256d(coinb1 ‖ extranonce1 ‖ extranonce2 ‖ coinb2)` folded
+// up the job's merkle branch with `sha256d(cur ‖ sibling)`. So on ObenBlock
+// the header root is Bitcoin's transaction root over the txids, and every
+// other byte of the block (witnesses, the shielded section, the PoWit
+// section) is committed by the coinbase commitment instead
+// ([`obb_body_commitment`]), which the coinbase txid covers. GnB keeps its
+// tagged tree and its body roots.
+
+/// Tag of the ObenBlock body commitment (coinbase commitment bytes 48..80).
+pub const OBB_BODY_COMMITMENT_TAG: &[u8] = b"OBB/coinbase/body";
+
+/// Bitcoin's Merkle root over `ids` and Bitcoin Core's `mutated` flag
+/// (`ComputeMerkleRoot`, consensus/merkle.cpp):
+///
+/// * no ids: 32 zero bytes;
+/// * each level pairs its nodes left to right with `SHA-256d(l ‖ r)`; a
+///   level of odd length first appends a copy of its last node;
+/// * `mutated` is set when, on any level BEFORE that duplication, the nodes
+///   at positions `2i` and `2i + 1` are equal (CVE-2012-2459: `[.., x]` and
+///   `[.., x, x]` share a root; a block whose tree is mutated is invalid).
+pub fn bitcoin_merkle_root(ids: &[[u8; 32]]) -> (MerkleRoot, bool) {
+    if ids.is_empty() {
+        return (MerkleRoot::ZERO, false);
+    }
+    let mut mutated = false;
+    let mut level: Vec<[u8; 32]> = ids.to_vec();
+    while level.len() > 1 {
+        mutated |= level.chunks_exact(2).any(|p| p[0] == p[1]);
+        if level.len() % 2 == 1 {
+            let last = level[level.len() - 1];
+            level.push(last);
+        }
+        level = level.chunks_exact(2).map(|p| bitcoin_merkle_node(&p[0], &p[1])).collect();
+    }
+    (MerkleRoot(level[0]), mutated)
+}
+
+/// An inner node of Bitcoin's tree: `SHA-256d(left ‖ right)`.
+pub fn bitcoin_merkle_node(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut buf = [0u8; 64];
+    buf[..32].copy_from_slice(left);
+    buf[32..].copy_from_slice(right);
+    sha256d::sha256d(&buf)
+}
+
+/// [`bitcoin_merkle_root`] over the txids of `txs` (`Transaction::txid`:
+/// SHA-256d of the wire encoding, `script_sig`s included only for the
+/// coinbase), in block order.
+pub fn obb_tx_merkle_root(txs: &[super::Transaction]) -> (MerkleRoot, bool) {
+    let ids: Vec<[u8; 32]> = txs.iter().map(super::Transaction::txid).collect();
+    bitcoin_merkle_root(&ids)
+}
+
+/// The ObenBlock header-root rule: `header.merkle_root` is Bitcoin's root
+/// over the block's txids and the tree is not mutated.
+pub fn obb_validate_merkle(block: &Block) -> bool {
+    let (root, mutated) = obb_tx_merkle_root(&block.transactions);
+    !mutated && root == block.header.merkle_root
+}
+
+/// The error `check_block_hardened_at` reports for a block whose header root
+/// fails: a mutated tree (under SHA-256d) or any other mismatch.
+pub fn merkle_error(block: &Block) -> &'static str {
+    if node_sha256d_params().is_some() && obb_tx_merkle_root(&block.transactions).1 {
+        "bad-txns-duplicate: mutated merkle tree (CVE-2012-2459)"
+    } else {
+        "invalid merkle root"
+    }
+}
+
+/// `tagged_hash("OBB/coinbase/body", witness_root ‖ shielded_root ‖ powit_root)`:
+/// the 32 bytes an ObenBlock coinbase commitment carries at offset 48 in
+/// place of GnB's bare witness root.
+pub fn obb_body_commitment_parts(witness_root: &MerkleRoot, shielded_root: &[u8; 32], powit_root: &[u8; 32]) -> MerkleRoot {
+    MerkleRoot(super::block_rules::tagged_hash(OBB_BODY_COMMITMENT_TAG, &[&witness_root.0, shielded_root, powit_root]))
+}
+
+/// The body commitment of `block`: its witness root
+/// (`block_rules::witness_root`, the wtxids with the coinbase as zero), the
+/// root of its shielded section and the root of its PoWit section (with the
+/// exits list from the liveness activation, as GnB's v2 body root has it).
+/// Together with the header's transaction root this commits every byte of
+/// the block's wire encoding except the uncommitted `blue_score` and the
+/// height (bound to the parents by `accept_block` and committed by the
+/// coinbase commitment's height field).
+pub fn obb_body_commitment(block: &Block) -> MerkleRoot {
+    let powit_root = block.powit.root_with(super::liveness::liveness_active_at(block.height));
+    obb_body_commitment_parts(&super::block_rules::witness_root(&block.transactions), &block.shielded_root(), &powit_root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::MerkleRoot;
 
     fn header(parents: Vec<[u8; 32]>, bits: u32, nonce: u64) -> BlockHeader {
         BlockHeader { version: OBB_BLOCK_VERSION, parents, merkle_root: MerkleRoot([7; 32]), timestamp: 1_800_000_000, bits, nonce }

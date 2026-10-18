@@ -31,7 +31,7 @@ fn obenblock_regtest_runs_every_rule_from_genesis() {
     assert_eq!(g.block_hash(), g.header.sha256d_block_id());
     assert_eq!(g.block_hash(), chain_genesis(ChainId::ObenBlockRegtest).block().block_hash());
     assert!(g.validate_pow());
-    assert!(g.validate_merkle(), "the header root is the body root the node computes at height 0");
+    assert!(g.validate_merkle(), "the header root is Bitcoin's root the node computes at height 0");
     assert_eq!(g.body_merkle_root(), genesis::obenblock_genesis_merkle_root(&g.transactions[0]));
     assert_eq!(block_rules::check_coinbase_commitment(&g), Ok(()));
     assert_eq!(g.validate_coinbase_value(0), Ok(()));
