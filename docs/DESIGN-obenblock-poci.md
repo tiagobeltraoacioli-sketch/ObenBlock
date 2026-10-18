@@ -397,12 +397,34 @@ tests.
   `GrowthCapWeights`, the growth cap of DESIGN-obenblock.md §6.3 (package
   B3, §14); the absence pruning of §4.1 is the ledger's (§13).
 - `PowitState::poci` is not part of the serde encoding (GnB states are
-  stored as before); the node stores it beside the state
-  (`powit/poci/<block>`, `powit/pocicfg/<config id>`).
+  stored as before); the node stores it beside the state (§13, storage).
 - Block body: in the PoCI format (`BodyFormat { poci: true }`) the evidence
   list carries `PociEvidence` (`config_id ‖ a ‖ b`) instead of GnB's
   equivocation proofs. An empty section encodes the same in every format.
   The gossip item `ITEM_EVIDENCE` carries `PociEvidence` on ObenBlock.
+  Gossip classification (review fix, 2026-10-18,
+  `ingress::poci_evidence_fault_is_context_free`): a refusal the item alone
+  shows (`different_keys`, `different_configs`, `identical`,
+  `no_conflict`, `signature`) is a context-free fault: the delivering
+  peer's verification-budget charge is kept and it is penalised through the
+  block gate, so forged signatures of a real member cannot be submitted for
+  free; a refusal that depends on this node's chain (unknown
+  configuration, non-member: refused before any signature and charged;
+  ban pending or running; proof already held) is `Ignore`.
+- Body commitment (decision D1, 2026-10-18): the ObenBlock coinbase body
+  commitment (`pow_scheme::obb_body_commitment`, docs/CONSENSUS.md) hashes
+  the WHOLE PoWit section in the exact wire encoding of the block's
+  `BodyFormat` (`PowitBody::root_for(BodyFormat::at(height))`): shares,
+  attestations, the PoCI evidence list and the membership list (exits, then
+  rejoins). The block id therefore commits to every byte of the block. A
+  copy whose PoCI evidence or rejoins were deleted, added or swapped fails
+  the commitment (`bad witness commitment`), is refused before it is
+  stored and does not disqualify the id, so the honest body is still
+  accepted (`node/tests/poci_partition.rs`,
+  `stripped_poci_items_fail_the_body_commitment`). Before this fix the
+  commitment hashed the GnB/liveness encoding (`root_with`), which carries
+  neither list: a relay could strip them without changing the id and split
+  the PoCI state of nodes that saw different copies.
 - The witness duty and `gnb-cli powitattest --config-id=<hex>` sign v3 with
   the configuration in force, recorded in the vote record (§8).
 
@@ -440,11 +462,22 @@ tests.
   will, signature last), gossip item kind 5 (`ITEM_REJOIN`, ObenBlock only:
   on GnB kind 5 stays unknown), `submitpowititem [5, hex]`, templates after
   the exits, `gnb-cli powitrejoin`; the witness duty publishes the rejoin
-  of its own key when the tip shows it pruned (`WitnessDuty::maybe_rejoin`). The ledger is stored per block
-  (`powit/poci/<block>`: head, bans, pruned, rejoins, seen); configurations
-  as history nodes `powit/pocihist/<node id>` whose id commits to the whole
-  history, so two branches with the same `C_x` after different predecessors
-  each reload their own (tests `node/tests/poci_state_store.rs`).
+  of its own key when the tip shows it pruned (`WitnessDuty::maybe_rejoin`).
+- Storage (review fix, 2026-10-18; `node/src/powit/store.rs`, "PoCI ledger
+  rows"): configurations as history nodes `powit/pocihist/<node id>` whose
+  id commits to the whole history, so two branches with the same `C_x`
+  after different predecessors each reload their own. The ledger is laid
+  out like the A3 work records: the slow part (bans, pruned, rejoins) as a
+  content-addressed segment `powit/pocis/<digest>`, `seen` as one
+  content-addressed segment per block epoch, and per block
+  `powit/pocir/<block>` = history head, slow digest, and either an anchor
+  (the epoch segments) or a diff against the selected parent's record (the
+  `seen` entries added or lowered). An anchor is written every
+  `ANCHOR_EVERY` (32) records, when an entry was dropped (`trim_seen`, a
+  handoff) and when the parent has no record in this layout. The whole
+  ledger used to be written per block (`powit/poci/<block>`, tens of MB a
+  day); such rows of older data dirs are still read. Tests: `store.rs`
+  `poci_ledger_*`, `node/tests/poci_state_store.rs`.
 
 ## 14. Implementation (package B3, growth cap)
 
@@ -500,11 +533,16 @@ tests.
   heights `t ..= B` (the only blocks that may include such a vote; the
   duplicate rule keeps one per key). `C` cannot change in between: only a
   finalization changes it, and that moves the justified checkpoint away
-  from `F` first. On acceptance of `B` the node builds it, verifies it once
-  against `C` (every signature) and keeps it (`powit/pocicert/<F hash>`,
+  from `F` first. On acceptance of `B` the node builds it from the votes the
+  acceptance pipeline counted (their signatures were verified by
+  `apply_poci` when their blocks were accepted), checks shape, membership
+  and strict quorum without verifying the signatures again and without
+  holding the DAG lock while it reads bodies (review fix, 2026-10-18), and
+  keeps it (`powit/pocicert/<F hash>`,
   with the block that finalized `F` and the configuration it handed off
   to); a checkpoint without a kept row is rebuilt from the selected chain on
-  request (at most `vote_ttl + 1` bodies) and kept then. The genesis slot
+  request (at most `vote_ttl + 1` bodies, every signature verified) and
+  kept then. The genesis slot
   and the launch checkpoint of §9 are final by definition and have none.
 - RPC `getfinalitycertificate [slot | checkpoint hash]` (default: the latest
   finalized checkpoint of the selected tip; `gnb-cli finalitycertificate`)

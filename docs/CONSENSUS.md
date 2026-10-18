@@ -2989,8 +2989,19 @@ offset 48, instead of the bare witness root:
 body_commitment = tagged_hash("OBB/coinbase/body", witness_root ‖ shielded_root ‖ powit_root)
 witness_root    = tagged Merkle root over [ 0^32, wtxid(tx_1), ..., wtxid(tx_n) ]   (as above)
 shielded_root   = SHA3-256("gnb:block:shielded:v1" ‖ SHA3-256(stx_1) ‖ ...)
-powit_root      = SHA3-256("GNB-POWIT-v1/body" ‖ PoWit section wire, with the exits list)
+powit_root      = SHA3-256("GNB-POWIT-v1/body" ‖ PoWit section wire in the block's body format)
 ```
+
+`powit_root` hashes the PoWit section exactly as the block's wire encoding
+carries it (`PowitBody::write_wire_for(BodyFormat::at(height))`): shares,
+attestations, then on a PoCI chain (both ObenBlock networks) the PoCI
+evidence list (`varint n ‖ n × PociEvidence`) and, from the liveness
+activation (height 0 on ObenBlock), the membership list (`varint n ‖ n ×
+(u8 tag ‖ item)`: the exits, tag 0, then the rejoins, tag 1). Every item a
+block carries, PoCI evidence and rejoins included, is therefore under the
+block id: deleting, adding or swapping one changes the commitment. An empty
+section is the same bytes in every format, so the genesis commitments are
+unchanged.
 
 The commitment is in the coinbase `script_sig`, which the coinbase txid
 covers, so the block id commits to every byte of the block's wire

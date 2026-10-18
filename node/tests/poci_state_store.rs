@@ -125,3 +125,59 @@ fn branches_with_the_same_configuration_keep_their_own_history() {
     let c5 = a.history().nth(1).unwrap().id();
     assert!(la.find_config(&c5).is_some() && lb.find_config(&c5).is_none());
 }
+
+/// Review finding (LOW): the acceptance pipeline stored a full copy of the
+/// PoCI ledger per block (`powit/poci/<block>`). Staged with its selected
+/// parent (`powit::stage_state`), a block now stores a small diff of the
+/// ledger (`powit/pocir/<block>`) and no whole-ledger row; every block's
+/// state reloads exactly after the store is reopened, on both branches of
+/// a fork.
+#[test]
+fn poci_ledger_is_stored_as_diffs_and_survives_a_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let pp = OBB_REGTEST_POCI;
+    let hash = |n: u64| {
+        let mut h = [0u8; 32];
+        h[..8].copy_from_slice(&n.to_le_bytes());
+        h[31] = 0xC3;
+        h
+    };
+    let mut expected = Vec::new();
+    {
+        let store = Storage::open(&dir.path().join("db")).unwrap();
+        let mut st = PowitState::genesis(0, [0; 32]);
+        let mut ledger = PociState::launch(&pp, &weights(8, 100)).unwrap();
+        let first = pp.opening(4) + 1;
+        let mut parent: Option<[u8; 32]> = None;
+        for (i, height) in (first..first + 3 * pp.epoch_len).enumerate() {
+            ledger.record_vote(&pp, &[(i % 8) as u8 + 1; 20], height);
+            ledger.trim_seen(pp.epoch_of(height));
+            st.poci = Some(ledger.clone());
+            let h = hash(i as u64);
+            let mut batch = rocksdb::WriteBatch::default();
+            gnb::powit::stage_state(&store, &mut batch, &h, parent.as_ref(), &st).unwrap();
+            store.write_batch(batch).unwrap();
+            assert!(store.get_meta(&format!("powit/poci/{}", hex::encode(h))).unwrap().is_none(),
+                "no whole-ledger row per block");
+            assert!(store.get_meta(&format!("powit/pocir/{}", hex::encode(h))).unwrap().is_some());
+            expected.push((h, st.clone()));
+            parent = Some(h);
+        }
+        // A fork from the middle: its own diff chain.
+        let (fork_parent, fork_state) = expected[10].clone();
+        let mut fl = fork_state.poci.clone().unwrap();
+        fl.record_vote(&pp, &[3; 20], first + 11);
+        fl.record_vote(&pp, &[4; 20], first + 11);
+        let mut fs = fork_state.clone();
+        fs.poci = Some(fl);
+        let fh = [0xF0; 32];
+        let mut batch = rocksdb::WriteBatch::default();
+        gnb::powit::stage_state(&store, &mut batch, &fh, Some(&fork_parent), &fs).unwrap();
+        store.write_batch(batch).unwrap();
+        expected.push((fh, fs));
+    }
+    let store = Storage::open(&dir.path().join("db")).unwrap();
+    for (h, st) in &expected {
+        assert_eq!(gnb::powit::load_state(&store, h).as_ref(), Some(st), "{}", hex::encode(&h[..8]));
+    }
+}

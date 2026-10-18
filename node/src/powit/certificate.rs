@@ -15,17 +15,21 @@
 //! and that moves the justified checkpoint away from `F` first.
 //!
 //! Kept: when a block that finalizes a checkpoint is accepted
-//! ([`keep`]), its certificate is built, verified once against `C`
-//! (`poci::Certificate::verify`, every signature) and stored as
+//! ([`keep`]), its certificate is built from the votes the acceptance
+//! pipeline just counted (each signature already verified by
+//! `PowitState::apply_poci` against `C`), checked for shape, membership and
+//! quorum without re-verifying the signatures, outside the DAG lock
+//! ([`Check::Included`]), and stored as
 //! `powit/pocicert/<checkpoint hash>`; `C` itself is stored by id
 //! (`powit/pocicfg/<id>`, the ledger rows). A checkpoint without a row (a
 //! data directory from before this code) is rebuilt on request from the
 //! selected chain ([`lookup`]) and stored then. The launch checkpoint of §9
 //! (and the genesis slot) is final by definition and has no certificate.
 //!
-//! Cost: building reads at most `vote_ttl + 1` bodies and verifies one
-//! signature per vote, once per finalized checkpoint; serving a kept
-//! certificate reads one row and checks nothing again.
+//! Cost: keeping reads at most `vote_ttl + 1` bodies and verifies no
+//! signature; a rebuild on request ([`lookup`], [`Check::Full`]) verifies
+//! one signature per vote; serving a kept certificate reads one row and
+//! checks nothing again.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -110,18 +114,56 @@ pub fn final_by_definition(pp: &PociParams, f: &Checkpoint) -> bool {
     f.height == 0 || f.height == pp.opening(pp.bootstrap_epochs)
 }
 
-/// Build the certificate of the checkpoint `fin` (its PoWit state
-/// `fin_state`) finalized: see the module docs. Verifies it.
-pub fn build(dag: &GhostDAG, store: &Storage, fin: &Hash, fin_state: &PowitState) -> Result<KeptCertificate, String> {
-    let pp = params().ok_or("PoCI: not an ObenBlock chain")?;
-    let f = fin_state.finalized;
-    if final_by_definition(&pp, &f) {
-        return Err("checkpoint is final by definition (genesis or the PoCI launch checkpoint): no certificate".into());
-    }
+/// How much of a certificate [`assemble`] checks before it is kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Check {
+    /// Every signature (`Certificate::verify`): a rebuild on request, from
+    /// bodies read back from the store.
+    Full,
+    /// Shape, membership and quorum only: the votes are the ones the
+    /// acceptance pipeline just counted (`PowitState::apply_poci` verified
+    /// each one's v3 signature against this configuration when the block
+    /// that includes it was accepted), so their signatures are not checked
+    /// a second time on the acceptance path (review finding LOW).
+    Included,
+}
+
+/// The selected-chain facts of a finalizing block a certificate is built
+/// from, read under a short DAG read lock ([`gather`]).
+struct Gathered {
+    height: u64,
+    parent: Hash,
+    /// `fin`'s selected chain down to the child slot, newest first.
+    chain: Vec<(Hash, u64)>,
+}
+
+fn gather(dag: &GhostDAG, fin: &Hash, fin_state: &PowitState) -> Result<Gathered, String> {
     let d = dag.get_block_data(fin).ok_or("finalizing block not in the DAG")?;
     let height = d.height;
     let parent = d.selected_parent.ok_or("finalizing block without a selected parent")?;
-    let pst = load_state(store, &parent).ok_or("storage: missing PoWit state of the finalizing block's parent")?;
+    let chain = selected_chain_since(dag, Some(*fin), fin_state.justified.height);
+    Ok(Gathered { height, parent, chain })
+}
+
+/// Build the certificate of the checkpoint `fin` (its PoWit state
+/// `fin_state`) finalized: see the module docs. Verifies it
+/// ([`Check::Full`]).
+pub fn build(dag: &GhostDAG, store: &Storage, fin: &Hash, fin_state: &PowitState) -> Result<KeptCertificate, String> {
+    let pp = params().ok_or("PoCI: not an ObenBlock chain")?;
+    if final_by_definition(&pp, &fin_state.finalized) {
+        return Err("checkpoint is final by definition (genesis or the PoCI launch checkpoint): no certificate".into());
+    }
+    let g = gather(dag, fin, fin_state)?;
+    assemble(store, &pp, fin, &g, fin_state, Check::Full)
+}
+
+/// [`build`] from what [`gather`] read: no DAG lock is held here (bodies
+/// and the parent's state come from the store).
+fn assemble(store: &Storage, pp: &PociParams, fin: &Hash, g: &Gathered, fin_state: &PowitState, check: Check)
+    -> Result<KeptCertificate, String>
+{
+    let f = fin_state.finalized;
+    let pst = load_state(store, &g.parent).ok_or("storage: missing PoWit state of the finalizing block's parent")?;
     if pst.finalized == f || pst.justified != f {
         return Err("block does not finalize this checkpoint (its parent's justified checkpoint is not it)".into());
     }
@@ -135,8 +177,8 @@ pub fn build(dag: &GhostDAG, store: &Storage, fin: &Hash, fin_state: &PowitState
     // only the blocks since the first counted vote, not `vote_ttl` of them.
     let mut expected: usize = pst.votes.get(&t).map_or(0, |v| v.len());
     let mut votes: BTreeMap<KeyId, (KesPublic, KesSignature)> = BTreeMap::new();
-    for (i, (h, _)) in selected_chain_since(dag, Some(*fin), t.height).into_iter().enumerate() {
-        let b = store.get_block(&h).map_err(|e| format!("storage: {e}"))?
+    for (i, (h, _)) in g.chain.iter().enumerate() {
+        let b = store.get_block(h).map_err(|e| format!("storage: {e}"))?
             .ok_or_else(|| format!("block body {} not stored (pruned?)", hex::encode(&h[..8])))?;
         for a in &b.powit.attestations {
             let k = a.key_id();
@@ -151,11 +193,36 @@ pub fn build(dag: &GhostDAG, store: &Storage, fin: &Hash, fin_state: &PowitState
             break;
         }
     }
-    let cert = Certificate::<Kes>::new(pp.chain_id, config.id(), f, t, votes.into_values().collect());
-    cert.verify(&pp, &config).map_err(|e| e.to_string())?;
+    let cert = finish(pp, &config, f, t, votes.into_values().collect(), check)?;
     let next = fin_state.poci_config().map(|c| c.id()).filter(|id| *id != config.id());
     let size = cert.encode().len();
-    Ok(KeptCertificate { certificate: cert, config, finalized_by: *fin, finalized_at: height, next_config_id: next, size })
+    Ok(KeptCertificate { certificate: cert, config, finalized_by: *fin, finalized_at: g.height, next_config_id: next, size })
+}
+
+/// The certificate of `votes` for `f -> t` under `config`, checked as
+/// `check` says: [`Check::Full`] is `Certificate::verify`; [`Check::Included`]
+/// the same without the signatures (chain id, config id, link, membership,
+/// strict quorum; the order is `Certificate::new`'s).
+fn finish(pp: &PociParams, config: &Configuration, f: Checkpoint, t: Checkpoint,
+          votes: Vec<(KesPublic, KesSignature)>, check: Check) -> Result<Certificate<Kes>, String> {
+    let cert = Certificate::<Kes>::new(pp.chain_id, config.id(), f, t, votes);
+    match check {
+        Check::Full => cert.verify(pp, config).map_err(|e| e.to_string())?,
+        Check::Included => {
+            if !(pp.is_slot(f.height) && f.height.checked_add(pp.checkpoint_interval) == Some(t.height)) {
+                return Err("finalizing link is not source -> direct child".into());
+            }
+            let mut got: u128 = 0;
+            for (k, _) in &cert.votes {
+                let w = config.weight(&k.witness_id()).ok_or("certificate vote by a key outside its configuration")?;
+                got = got.saturating_add(w);
+            }
+            if !gnb_crypto::core::powit::poci::quorum(got, config.total()) {
+                return Err("certificate votes do not reach the strict quorum of their configuration".into());
+            }
+        }
+    }
+    Ok(cert)
 }
 
 fn store_row(store: &Storage, k: &KeptCertificate) -> Result<(), String> {
@@ -199,16 +266,25 @@ pub fn keep(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage, hash: &Hash, s
     if st.poci.is_none() || final_by_definition(&pp, &st.finalized) {
         return;
     }
-    let height = match dag.read().get_block_data(hash) {
-        Some(d) => d.height,
-        None => return,
-    };
     // Finalized by this block (`finalized_at` is the finalizing block's
-    // height), not yet kept.
-    if st.finalized_at != height || matches!(store.get_meta(&cert_key(&st.finalized.hash)), Ok(Some(_))) {
+    // height), not yet kept. The DAG read lock is held only to read the
+    // block's height, parent and selected chain (`gather`, at most
+    // `vote_ttl + 1` entries); bodies are read and the certificate
+    // assembled after it is released, and the votes, which this block's
+    // acceptance has just counted with their signatures verified, are not
+    // verified again (`Check::Included`; `lookup` rebuilds with
+    // `Check::Full`).
+    let gathered = {
+        let d = dag.read();
+        match d.get_block_data(hash) {
+            Some(b) if b.height == st.finalized_at => gather(&d, hash, st),
+            _ => return,
+        }
+    };
+    if matches!(store.get_meta(&cert_key(&st.finalized.hash)), Ok(Some(_))) {
         return;
     }
-    let built = build(&dag.read(), store, hash, st);
+    let built = gathered.and_then(|g| assemble(store, &pp, hash, &g, st, Check::Included));
     match built.and_then(|k| store_row(store, &k)) {
         Ok(()) => {}
         Err(e) => log::warn!("PoCI: finality certificate of slot {} not kept: {e}", st.finalized.height),
@@ -343,4 +419,37 @@ pub fn certificate_json(dag: &GhostDAG, k: &KeptCertificate, full: bool) -> serd
         out["registry_proof"] = json!(k.config.registry_proof(&voters).map(|p| hex::encode(p.encode())));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gnb_crypto::core::powit::poci::OBB_REGTEST_POCI as PP;
+
+    /// Review finding (LOW): `keep` re-verified every signature of the
+    /// certificate under the DAG read lock on the acceptance path. On that
+    /// path the votes were verified when their blocks were accepted, so it
+    /// checks shape, membership and quorum only (`Check::Included`); the
+    /// rebuild on request still verifies every signature (`Check::Full`).
+    #[test]
+    fn keeping_checks_the_quorum_without_the_signatures() {
+        let key = |n: u8| KesPublic { depth: 1, root: [n; 32] };
+        let sig = |n: u8| KesSignature { index: 0, leaf_pk: vec![n], sig: vec![n; 8], path: vec![[n; 32]] };
+        let mut entries: Vec<(KeyId, u128)> = (1..=4).map(|n| (key(n).witness_id(), 10)).collect();
+        entries.sort();
+        let config = Configuration::new(&PP, 4, entries).unwrap();
+        let f = Checkpoint { height: PP.opening(5), hash: [1; 32] };
+        let t = Checkpoint { height: f.height + PP.checkpoint_interval, hash: [2; 32] };
+        let votes = |ns: &[u8]| ns.iter().map(|&n| (key(n), sig(n))).collect::<Vec<_>>();
+        // Three of four (30 of 40 > 2/3): kept without a signature check.
+        let c = finish(&PP, &config, f, t, votes(&[3, 1, 2]), Check::Included).unwrap();
+        assert!(c.votes.windows(2).all(|w| w[0].0.witness_id() < w[1].0.witness_id()), "sorted");
+        // The same votes with full verification: the forged signatures fail.
+        assert!(finish(&PP, &config, f, t, votes(&[3, 1, 2]), Check::Full).unwrap_err().contains("signature"));
+        // Without the signatures the rest is still checked.
+        assert!(finish(&PP, &config, f, t, votes(&[1, 2]), Check::Included).unwrap_err().contains("quorum"));
+        assert!(finish(&PP, &config, f, t, votes(&[1, 2, 9]), Check::Included).unwrap_err().contains("outside"));
+        let far = Checkpoint { height: t.height + PP.checkpoint_interval, hash: [3; 32] };
+        assert!(finish(&PP, &config, f, far, votes(&[1, 2, 3]), Check::Included).unwrap_err().contains("link"));
+    }
 }

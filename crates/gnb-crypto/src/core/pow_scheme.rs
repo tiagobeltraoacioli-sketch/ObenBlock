@@ -388,14 +388,26 @@ pub fn obb_body_commitment_parts(witness_root: &MerkleRoot, shielded_root: &[u8;
 
 /// The body commitment of `block`: its witness root
 /// (`block_rules::witness_root`, the wtxids with the coinbase as zero), the
-/// root of its shielded section and the root of its PoWit section (with the
-/// exits list from the liveness activation, as GnB's v2 body root has it).
-/// Together with the header's transaction root this commits every byte of
-/// the block's wire encoding except the uncommitted `blue_score` and the
-/// height (bound to the parents by `accept_block` and committed by the
-/// coinbase commitment's height field).
+/// root of its shielded section and the root of its PoWit section in the
+/// exact wire encoding of the block's body format
+/// (`PowitBody::root_for(BodyFormat::at(height))`: on a PoCI chain the PoCI
+/// evidence list and the membership list with its exits and rejoins; with
+/// the exits list from the liveness activation; GnB's v2 body root hashes
+/// the same section the same way). Together with the header's transaction
+/// root this commits every byte of the block's wire encoding except the
+/// uncommitted `blue_score` and the height (bound to the parents by
+/// `accept_block` and committed by the coinbase commitment's height field):
+/// a relay that deletes, adds or swaps any PoWit item (share, vote, PoCI
+/// evidence, exit, rejoin) changes the commitment, so the altered copy is
+/// refused (`bad witness commitment`) without disqualifying the id.
 pub fn obb_body_commitment(block: &Block) -> MerkleRoot {
-    let powit_root = block.powit.root_with(super::liveness::liveness_active_at(block.height));
+    obb_body_commitment_for(block, super::powit::BodyFormat::at(block.height))
+}
+
+/// [`obb_body_commitment`] with the PoWit section hashed in an explicit
+/// body format (tools and tests; consensus uses the block's own format).
+pub fn obb_body_commitment_for(block: &Block, fmt: super::powit::BodyFormat) -> MerkleRoot {
+    let powit_root = block.powit.root_for(fmt);
     obb_body_commitment_parts(&super::block_rules::witness_root(&block.transactions), &block.shielded_root(), &powit_root)
 }
 
@@ -496,6 +508,86 @@ mod tests {
         let withheld: u64 = (1..SLOW_START_BLOCKS).map(|h| full - slow_start_subsidy_sat(full, h)).sum();
         assert_eq!(withheld / super::super::tokenomics::SAT_PER_GNB, 3_081, "about 3,080 OBB (§4.2)");
         assert_eq!(slow_start_subsidy_sat(u64::MAX, SLOW_START_BLOCKS - 1), (u64::MAX as u128 * 5_759 / 5_760) as u64);
+    }
+
+    /// Review finding (CRITICAL, D1): the body commitment hashed the PoWit
+    /// section in the GnB/liveness encoding, which carries neither the PoCI
+    /// evidence list nor the rejoins, so a relay could strip or swap them
+    /// under the same block id. In the PoCI format every item is committed.
+    #[test]
+    fn body_commitment_covers_poci_evidence_and_rejoins() {
+        use super::super::kes::{KesPublic, KesSignature};
+        use super::super::powit::{poci::PociEvidence, Attestation, BodyFormat, Checkpoint, PowitBody, WitnessExit,
+                                  WitnessRejoin};
+        let sig = |n: u8| KesSignature { index: 0, leaf_pk: vec![n], sig: vec![n; 4], path: vec![[n; 32]] };
+        let key = |n: u8| KesPublic { depth: 1, root: [n; 32] };
+        let vote = |n: u8, t: u8| Attestation {
+            source: Checkpoint { height: 80, hash: [1; 32] },
+            target: Checkpoint { height: 85, hash: [t; 32] },
+            witness: key(n),
+            sig: sig(t),
+        };
+        let ev = |n: u8| PociEvidence { config_id: [0xC0; 32], a: vote(n, 2), b: vote(n, 3) };
+        let rejoin = |n: u8| WitnessRejoin { witness: key(n), epoch: 9, sig: sig(n) };
+        let block = |powit: PowitBody| Block {
+            header: header(vec![[3; 32]], 0x207f_ffff, 0),
+            transactions: Vec::new(),
+            blue_score: 90,
+            height: 90,
+            shielded_transactions: Vec::new(),
+            powit,
+        };
+        let full = PowitBody {
+            poci_evidence: vec![ev(5), ev(6)],
+            exits: vec![WitnessExit { witness: key(7), epoch: 9, sig: sig(7) }],
+            rejoins: vec![rejoin(8), rejoin(9)],
+            ..PowitBody::default()
+        };
+        let poci = BodyFormat { exits: true, poci: true };
+        let honest = obb_body_commitment_for(&block(full.clone()), poci);
+        let mut variants: Vec<(&str, PowitBody)> = Vec::new();
+        let mut b = full.clone();
+        b.poci_evidence.pop();
+        variants.push(("evidence deleted", b));
+        let mut b = full.clone();
+        b.poci_evidence.swap(0, 1);
+        variants.push(("evidence swapped", b));
+        let mut b = full.clone();
+        let e = &mut b.poci_evidence[0];
+        std::mem::swap(&mut e.a, &mut e.b);
+        variants.push(("evidence votes swapped", b));
+        let mut b = full.clone();
+        b.rejoins.remove(0);
+        variants.push(("rejoin deleted", b));
+        let mut b = full.clone();
+        b.rejoins.swap(0, 1);
+        variants.push(("rejoins swapped", b));
+        let mut b = full.clone();
+        b.rejoins[1] = rejoin(10);
+        variants.push(("rejoin replaced", b));
+        let mut b = full.clone();
+        b.exits.clear();
+        variants.push(("exit deleted", b));
+        for (what, body) in variants {
+            let altered = block(body);
+            assert_eq!(altered.block_hash(), block(full.clone()).block_hash(), "{what}: same header, same id");
+            assert_ne!(obb_body_commitment_for(&altered, poci), honest, "{what}: the commitment changes");
+        }
+        // The commitment is the hash of the section's wire bytes.
+        let mut wire = Vec::new();
+        full.write_wire_for(&mut wire, poci);
+        let back = PowitBody::read_wire_for(&mut std::io::Cursor::new(&wire[..]), poci).unwrap();
+        assert_eq!(obb_body_commitment_for(&block(back), poci), honest);
+        // The encoding the commitment used before ignores both lists.
+        let mut stripped = full.clone();
+        stripped.poci_evidence.clear();
+        stripped.rejoins.clear();
+        assert_eq!(full.root_with(true), stripped.root_with(true), "the old encoding: the bug");
+        // An empty section is the same with and without PoCI (genesis
+        // commitments unchanged).
+        let empty = block(PowitBody::default());
+        assert_eq!(obb_body_commitment_for(&empty, poci),
+                   obb_body_commitment_for(&empty, BodyFormat { exits: true, poci: false }));
     }
 
     #[test]

@@ -247,15 +247,17 @@ const _: () = assert!(super::liveness::OBENBLOCK_LIVENESS_ACTIVATION_HEIGHT == 0
 
 /// The body commitment of an ObenBlock genesis with coinbase `cb`
 /// (`pow_scheme::obb_body_commitment` of the genesis): its witness root, the
-/// empty shielded section and the empty PoWit section with its exits list
-/// (liveness applies from height 0 on both ObenBlock networks). Computed
+/// empty shielded section and the empty PoWit section in the ObenBlock body
+/// format (exits list and PoCI on both ObenBlock networks from height 0; an
+/// empty section is the same bytes in every format). Computed
 /// without the process-wide heights so tools and other chains' processes
 /// get it too; equal to the node's value in a process running ObenBlock
 /// (`tests/obb_genesis_regtest.rs`).
 pub fn obenblock_genesis_body_commitment(cb: &Transaction) -> MerkleRoot {
     let shell = genesis_shell(cb);
     pow_scheme::obb_body_commitment_parts(
-        &block_rules::witness_root(&shell.transactions), &shell.shielded_root(), &shell.powit.root_with(true))
+        &block_rules::witness_root(&shell.transactions), &shell.shielded_root(),
+        &shell.powit.root_for(super::powit::BodyFormat { exits: true, poci: true }))
 }
 
 /// The header Merkle root of an ObenBlock genesis with coinbase `cb`:
