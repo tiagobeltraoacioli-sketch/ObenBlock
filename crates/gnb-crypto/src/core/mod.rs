@@ -2775,8 +2775,9 @@ mod chain_id_tests {
     /// answer GnB in a process that selected no chain).
     #[test]
     fn unset_process_keeps_gnb_ids() {
+        // (`powit_height()` is not checked: another test of this binary
+        // installs a process-wide override.)
         assert_eq!(node_chain_id(), ChainId::Mainnet);
-        assert_eq!(powit_height(), POWIT_HEIGHT_MAINNET);
         assert_eq!(chain::params(ChainId::ObenBlockMainnet).chain_id, ChainId::ObenBlockMainnet);
     }
 }
