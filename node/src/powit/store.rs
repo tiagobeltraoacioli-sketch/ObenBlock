@@ -164,8 +164,9 @@ fn core_of(s: &PowitState) -> PowitState {
         decay: s.decay.clone(),
         active_this_epoch: s.active_this_epoch.clone(),
         epoch: s.epoch,
-        // Not in the serde encoding: node/src/powit.rs stores it in its own row.
+        // Not in the serde encoding: node/src/powit.rs stores them in their own rows.
         exited: BTreeMap::new(),
+        poci: None,
     }
 }
 

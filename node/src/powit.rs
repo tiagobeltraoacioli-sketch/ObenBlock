@@ -2093,7 +2093,7 @@ mod tests {
             blue_score: height,
             height,
             shielded_transactions: Vec::new(),
-            powit: PowitBody { shares: Vec::new(), attestations: vec![vote], evidence: Vec::new(), exits: Vec::new() },
+            powit: PowitBody { shares: Vec::new(), attestations: vec![vote], evidence: Vec::new(), exits: Vec::new(), poci_evidence: Vec::new() },
         }
     }
 

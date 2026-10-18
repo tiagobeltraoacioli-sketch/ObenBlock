@@ -66,6 +66,9 @@ use super::witness_share::WitnessShare;
 use super::kes::{self, KesPublic, KesSignature, KesSigner};
 use super::{read_varint, write_varint, ChainId};
 
+pub mod poci;
+use poci::{PociEvidence, PociParams, PociState};
+
 /// 20-byte key id: SHA3-256(public key)[0..20], the same hash a
 /// pay-to-pubkey-hash `script_pubkey` holds.
 pub type KeyId = [u8; 20];
@@ -513,11 +516,41 @@ pub struct PowitBody {
     /// activation ([`Self::write_wire_with`]); empty below it.
     #[serde(default)]
     pub exits: Vec<WitnessExit>,
+    /// PoCI equivocation evidence (ObenBlock, `docs/DESIGN-obenblock-poci.md`
+    /// §5): on the wire in place of `evidence` in the PoCI body format
+    /// ([`BodyFormat`]); always empty on GnB, where `evidence` is used.
+    #[serde(default)]
+    pub poci_evidence: Vec<PociEvidence>,
+}
+
+/// The encoding of a block's PoWit section: with the exits list (liveness
+/// activation) and with PoCI evidence in place of GnB's equivocation proofs
+/// (ObenBlock). An empty section encodes the same in every format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BodyFormat {
+    pub exits: bool,
+    pub poci: bool,
+}
+
+impl BodyFormat {
+    /// GnB before the liveness activation: `PowitBody::write_wire`, bit for bit.
+    pub const GNB: BodyFormat = BodyFormat { exits: false, poci: false };
+
+    /// The format of a block at `height` on the node's chain.
+    pub fn at(height: u64) -> Self {
+        BodyFormat { exits: super::liveness::liveness_active_at(height), poci: poci_active() }
+    }
+}
+
+/// Whether the node's chain runs PoCI (ObenBlock, from genesis).
+pub fn poci_active() -> bool {
+    PociParams::for_chain(super::node_chain_id()).is_some()
 }
 
 impl PowitBody {
     pub fn is_empty(&self) -> bool {
         self.shares.is_empty() && self.attestations.is_empty() && self.evidence.is_empty() && self.exits.is_empty()
+            && self.poci_evidence.is_empty()
     }
 
     /// The section's encoding for a block where exits are (`with_exits`) or
@@ -544,6 +577,74 @@ impl PowitBody {
             }
         }
         Ok(b)
+    }
+
+    /// The section's encoding in `fmt`: [`Self::write_wire_with`] unless
+    /// `fmt.poci`; with PoCI the evidence list holds `poci_evidence`
+    /// (`varint n ‖ n × PociEvidence`) and `evidence` is not encoded (a PoCI
+    /// block carries none: `PowitState::apply_poci`).
+    pub fn write_wire_for(&self, out: &mut Vec<u8>, fmt: BodyFormat) {
+        if !fmt.poci {
+            return self.write_wire_with(out, fmt.exits);
+        }
+        write_varint(out, self.shares.len() as u64);
+        for s in &self.shares {
+            out.extend_from_slice(&s.to_wire_bytes());
+        }
+        write_varint(out, self.attestations.len() as u64);
+        for a in &self.attestations {
+            out.extend_from_slice(&a.to_wire_bytes());
+        }
+        write_varint(out, self.poci_evidence.len() as u64);
+        for e in &self.poci_evidence {
+            out.extend_from_slice(&e.to_wire_bytes());
+        }
+        if fmt.exits {
+            write_varint(out, self.exits.len() as u64);
+            for x in &self.exits {
+                out.extend_from_slice(&x.to_wire_bytes());
+            }
+        }
+    }
+
+    /// Inverse of [`Self::write_wire_for`].
+    pub fn read_wire_for(cur: &mut std::io::Cursor<&[u8]>, fmt: BodyFormat) -> Result<Self, String> {
+        if !fmt.poci {
+            return Self::read_wire_with(cur, fmt.exits);
+        }
+        let n = read_count(cur, super::witness_share::MAX_SHARES_PER_BLOCK, "shares")?;
+        let mut shares = Vec::with_capacity(n);
+        for _ in 0..n {
+            shares.push(WitnessShare::read_wire(cur)?);
+        }
+        let n = read_count(cur, MAINNET_PARAMS.max_attestations_per_block, "attestations")?;
+        let mut attestations = Vec::with_capacity(n);
+        for _ in 0..n {
+            attestations.push(Attestation::read_wire(cur)?);
+        }
+        let n = read_count(cur, MAINNET_PARAMS.max_evidence_per_block, "evidence")?;
+        let mut poci_evidence = Vec::with_capacity(n);
+        for _ in 0..n {
+            poci_evidence.push(PociEvidence::read_wire(cur)?);
+        }
+        let mut exits = Vec::new();
+        if fmt.exits {
+            let n = read_count(cur, super::liveness::MAX_EXITS_PER_BLOCK, "exits")?;
+            for _ in 0..n {
+                exits.push(WitnessExit::read_wire(cur)?);
+            }
+        }
+        Ok(PowitBody { shares, attestations, evidence: Vec::new(), exits, poci_evidence })
+    }
+
+    /// [`Self::root`] of the encoding [`Self::write_wire_for`].
+    pub fn root_for(&self, fmt: BodyFormat) -> [u8; 32] {
+        let mut buf = Vec::new();
+        self.write_wire_for(&mut buf, fmt);
+        let mut h = Sha3_256::new();
+        h.update(DS_BODY);
+        h.update(&buf);
+        h.finalize().into()
     }
 
     /// [`Self::root`] of the encoding [`Self::write_wire_with`].
@@ -589,7 +690,7 @@ impl PowitBody {
         for _ in 0..n {
             evidence.push(Equivocation::read_wire(cur)?);
         }
-        Ok(PowitBody { shares, attestations, evidence, exits: Vec::new() })
+        Ok(PowitBody { shares, attestations, evidence, exits: Vec::new(), poci_evidence: Vec::new() })
     }
 
     /// Commitment folded into the block's body Merkle root.
@@ -713,6 +814,12 @@ pub struct PowitState {
     /// the state (`node/src/powit.rs`).
     #[serde(skip)]
     pub exited: BTreeMap<KeyId, u64>,
+    /// PoCI (ObenBlock, `docs/DESIGN-obenblock-poci.md`): the configuration
+    /// in force, the ones before it and the bans; `None` on GnB and during
+    /// the PoCI launch bootstrap (§9). Not part of the serde encoding, like
+    /// `exited`: the node stores it beside the state.
+    #[serde(skip)]
+    pub poci: Option<PociState>,
 }
 
 impl PowitState {
@@ -735,6 +842,7 @@ impl PowitState {
             active_this_epoch: BTreeSet::new(),
             epoch: 0,
             exited: BTreeMap::new(),
+            poci: None,
         }
     }
 
@@ -993,6 +1101,10 @@ impl PowitState {
     pub fn apply_full(&self, p: &PowitParams, chain: ChainId, hardening2_height: u64, liveness_height: u64,
                       b: &BlockInput<'_>, view: &dyn ChainView) -> Result<PowitState, String>
     {
+        if let Some(pp) = PociParams::for_chain(chain) {
+            // ObenBlock: PoCI from genesis (its evidence comes through `apply_block`).
+            return self.apply_poci(&pp, p, chain, liveness_height, b, &[], view, &mut WindowWeights);
+        }
         let exits_on = activation::is_active_at(b.height, liveness_height);
         if !b.exits.is_empty() && !exits_on {
             return Err("powit: witness exit before the liveness activation".into());
@@ -1209,6 +1321,260 @@ impl PowitState {
         // Votes for targets that can no longer be included are dropped.
         s.votes.retain(|t, _| b.height <= t.height + p.vote_ttl);
         Ok(s)
+    }
+}
+
+impl PowitState {
+    /// One block under the rules of `chain`: PoCI on ObenBlock
+    /// ([`Self::apply_poci`] with the block's `poci_evidence` and the default
+    /// configuration weights, [`WindowWeights`]); PoWit on GnB
+    /// ([`Self::apply_full`]), where a block carries no PoCI evidence.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_block(&self, p: &PowitParams, chain: ChainId, hardening2_height: u64, liveness_height: u64,
+                       b: &BlockInput<'_>, poci_evidence: &[PociEvidence], view: &dyn ChainView)
+        -> Result<PowitState, String>
+    {
+        match PociParams::for_chain(chain) {
+            Some(pp) => self.apply_poci(&pp, p, chain, liveness_height, b, poci_evidence, view, &mut WindowWeights),
+            None if !poci_evidence.is_empty() => Err("powit: PoCI evidence on a chain without PoCI".into()),
+            None => self.apply_full(p, chain, hardening2_height, liveness_height, b, view),
+        }
+    }
+
+    /// The PoCI configuration in force, if any (ObenBlock after the launch
+    /// bootstrap).
+    pub fn poci_config(&self) -> Option<&std::sync::Arc<poci::Configuration>> {
+        self.poci.as_ref().map(PociState::config)
+    }
+
+    /// One block under PoCI (`docs/DESIGN-obenblock-poci.md`; ObenBlock, PoWit
+    /// from height 0). What differs from PoWit ([`Self::apply_full`]):
+    ///
+    /// - **Launch** (§9): the first `bootstrap_epochs` epochs are PoW only (no
+    ///   votes, no evidence). The first block of epoch `bootstrap_epochs`
+    ///   makes the slot opening it justified and final and puts `C_4` in force
+    ///   (weights from `weights`, the history below that slot).
+    /// - **Votes** name the configuration in force: an attestation's signature
+    ///   covers the v3 message with its `config_id`
+    ///   ([`Attestation::verify_signature_v3`]); its weight is the registry's.
+    ///   A key outside the configuration cannot vote.
+    /// - **Strict quorum** of the configuration's frozen total ([`poci::quorum`],
+    ///   `3 got > 2 total`); Casper FFG otherwise ([`poci::ffg_step`]).
+    /// - **Handoff** (§4): finalizing `F` with `epoch(F)` above the
+    ///   configuration's epoch puts `C_epoch(F)` in force (weights from
+    ///   `weights` for `F`, banned keys left out) and starts the pending bans
+    ///   whose evidence `F` finalizes.
+    /// - **Proof of Corruption** (§5): `poci_evidence` ([`PociState::admit_evidence`],
+    ///   included at `b.height + 1` in the ledger's convention); GnB's
+    ///   `evidence` is refused. Nothing in force changes.
+    /// - **No inactivity leak**: absence never changes a weight in force
+    ///   (`decay` and `banned` stay empty). Exits and bans take effect at
+    ///   the next handoff (the weights provider leaves exited keys out).
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_poci(&self, pp: &PociParams, p: &PowitParams, chain: ChainId, liveness_height: u64,
+                      b: &BlockInput<'_>, poci_evidence: &[PociEvidence], view: &dyn ChainView,
+                      weights: &mut dyn ConfigWeights) -> Result<PowitState, String>
+    {
+        if self.activation != 0 {
+            return Err("powit: PoCI runs PoWit from height 0".into());
+        }
+        if pp.chain_id != chain.to_u32() || pp.epoch_len != p.epoch_len || pp.checkpoint_interval != p.checkpoint_interval
+            || pp.vote_ttl != p.vote_ttl
+        {
+            return Err("powit: PoCI parameters do not match the chain's PoWit parameters".into());
+        }
+        let exits_on = activation::is_active_at(b.height, liveness_height);
+        if !b.exits.is_empty() && !exits_on {
+            return Err("powit: witness exit before the liveness activation".into());
+        }
+        if b.exits.len() > super::liveness::MAX_EXITS_PER_BLOCK {
+            return Err("powit: too many witness exits".into());
+        }
+        if !b.evidence.is_empty() {
+            return Err("powit: PoWit equivocation proofs on a PoCI chain (PoCI evidence names its configuration)".into());
+        }
+        if b.attestations.len() > p.max_attestations_per_block {
+            return Err("powit: too many attestations".into());
+        }
+        if poci_evidence.len() > p.max_evidence_per_block {
+            return Err("powit: too many equivocation proofs".into());
+        }
+        let mut s = self.clone();
+        let epoch = p.epoch(0, b.height);
+
+        // ── Epoch boundary: prune old history (no inactivity decay) ───────
+        if epoch > s.epoch {
+            s.active_this_epoch.clear();
+            s.epoch = epoch;
+            let keep_from = epoch.saturating_sub(p.window_epochs + 2);
+            s.epoch_work = s.epoch_work.split_off(&keep_from);
+            if !s.exited.is_empty() {
+                let live: BTreeSet<KeyId> = s.epoch_work.values().flat_map(|m| m.keys().copied()).collect();
+                s.exited.retain(|k, _| live.contains(k));
+            }
+            let link_floor = b.height.saturating_sub((p.window_epochs + 2) * p.epoch_len);
+            for v in s.links.values_mut() {
+                v.retain(|(_, th, _)| *th >= link_floor);
+            }
+            s.links.retain(|_, v| !v.is_empty());
+        }
+
+        // ── Launch (§9) ──────────────────────────────────────────────────
+        if s.poci.is_none() && epoch >= pp.bootstrap_epochs {
+            let height = pp.opening(pp.bootstrap_epochs);
+            let hash = view.selected_at(height).ok_or("powit: PoCI launch checkpoint is not on the selected chain")?;
+            let cp = Checkpoint { height, hash };
+            let w = weights.weights(&s, pp, pp.bootstrap_epochs, &cp);
+            s.poci = Some(PociState::launch(pp, &w).map_err(|e| format!("powit: {e}"))?);
+            s.justified = cp;
+            s.finalized = cp;
+            s.finalized_at = b.height;
+            s.votes.clear();
+        }
+        if s.poci.is_none() && (!b.attestations.is_empty() || !poci_evidence.is_empty()) {
+            return Err("powit: PoCI launch bootstrap: no finality votes or evidence before its first configuration".into());
+        }
+
+        // ── Proof of Corruption ──────────────────────────────────────────
+        let finalized_height = s.finalized.height;
+        for ev in poci_evidence {
+            let st = s.poci.as_mut().expect("checked above");
+            let (va, vb) = ev.votes();
+            st.admit_evidence(pp, b.height + 1, finalized_height, &va, &vb).map_err(|e| format!("powit: {e}"))?;
+        }
+
+        // ── Witness exits (as PoWit; they leave at the next handoff) ─────
+        for x in b.exits {
+            if !super::liveness::exit_epoch_ok(epoch, x.epoch) {
+                return Err("powit: witness exit not signed for this block's epoch or the one before".into());
+            }
+            let k = x.key_id();
+            if s.exited.contains_key(&k) {
+                return Err("powit: witness already exited".into());
+            }
+            if !s.epoch_work.values().any(|m| m.contains_key(&k)) {
+                return Err("powit: witness exit by a key without share work".into());
+            }
+            if !x.verify_signature(chain.to_u32()) {
+                return Err("powit: invalid witness exit signature (KES leaf must be the exit's epoch)".into());
+            }
+            s.exited.insert(k, epoch + 1);
+        }
+
+        // ── Shares ───────────────────────────────────────────────────────
+        for (k, w) in b.share_work {
+            if s.poci.as_ref().is_some_and(|st| st.banned_at(pp, k, epoch)) {
+                return Err("powit: share paid to a barred key".into());
+            }
+            if s.exited.contains_key(k) {
+                return Err("powit: share credited to a witness that exited".into());
+            }
+            let e = s.epoch_work.entry(epoch).or_default().entry(*k).or_insert(0);
+            *e = e.saturating_add(*w);
+        }
+
+        let Some(config) = s.poci_config().cloned() else { return Ok(s) };
+
+        // ── Attestations: v3 votes under the configuration in force ──────
+        let config_id = config.id();
+        let mut seen_in_block: BTreeSet<(KeyId, Checkpoint)> = BTreeSet::new();
+        for a in b.attestations {
+            let k = a.key_id();
+            let t = a.target;
+            if !pp.is_slot(t.height) || t.height > b.height {
+                return Err("powit: target is not a checkpoint slot at or below this block".into());
+            }
+            if b.height > t.height + p.vote_ttl {
+                return Err("powit: attestation expired".into());
+            }
+            if a.source != s.justified {
+                return Err("powit: source is not the justified checkpoint".into());
+            }
+            if view.selected_at(t.height) != Some(t.hash) {
+                return Err("powit: target is not on this block's selected chain".into());
+            }
+            let weight = config.weight(&k).ok_or("powit: attester is not in the PoCI configuration in force")?;
+            if !seen_in_block.insert((k, t)) || s.votes.get(&t).is_some_and(|v| v.contains_key(&k)) {
+                return Err("powit: duplicate attestation".into());
+            }
+            if let Some(hist) = s.links.get(&k) {
+                for &(sh, th, thash) in hist {
+                    let earlier = Checkpoint { height: th, hash: thash };
+                    if poci::conflict(sh, &earlier, a.source.height, &t).is_some() {
+                        return Err("powit: attestation conflicts with this key's earlier vote".into());
+                    }
+                }
+            }
+            if !a.verify_signature_v3(pp, &config_id) {
+                return Err("powit: invalid attestation signature (v3 message of the configuration in force, \
+                            KES leaf of the target's epoch)".into());
+            }
+            s.votes.entry(t).or_default().insert(k, weight);
+            s.links.entry(k).or_default().push((a.source.height, t.height, t.hash));
+            s.active_this_epoch.insert(k);
+        }
+
+        // ── Justification, finality and handoff ──────────────────────────
+        let mut newly: Option<Checkpoint> = None;
+        for (t, votes) in &s.votes {
+            let got = votes.values().fold(0u128, |acc, w| acc.saturating_add(*w));
+            if config.quorum(got) && t.height > s.justified.height && newly.is_none_or(|n| t.height > n.height) {
+                newly = Some(*t);
+            }
+        }
+        if let Some(t) = newly {
+            let step = poci::ffg_step(pp, &mut s.justified, &t, true);
+            if let Some(f) = step.finalized {
+                s.finalized = f;
+                s.finalized_at = b.height;
+                if let Some(e) = s.poci.as_ref().and_then(|st| st.handoff_epoch(pp, &f)) {
+                    let w = weights.weights(&s, pp, e, &f);
+                    s.poci.as_mut().expect("in force").finalized(pp, &f, |_| w).map_err(|e| format!("powit: {e}"))?;
+                }
+            }
+            s.votes.clear();
+        }
+        s.votes.retain(|t, _| b.height <= t.height + p.vote_ttl);
+        Ok(s)
+    }
+}
+
+/// The candidate weights of a new PoCI configuration `C_epoch`, computed
+/// from the chain's state when `finalized` (the checkpoint whose
+/// finalization hands off, or the launch checkpoint) is final. Bans are
+/// applied by [`PociState`]; the provider applies everything else that
+/// decides who is in (the window, the growth cap of DESIGN-obenblock.md
+/// §6.3, absence pruning of DESIGN-obenblock-poci.md §4.1, exits).
+pub trait ConfigWeights {
+    fn weights(&mut self, state: &PowitState, params: &PociParams, epoch: u64, finalized: &Checkpoint)
+        -> BTreeMap<KeyId, u128>;
+}
+
+/// The default provider until the growth cap (package O10) lands: every key's
+/// share work over epochs `epoch - window_epochs ..= epoch - 1` (history
+/// entirely below the slot opening `epoch`, as far as the state keeps it),
+/// keys that exited by `epoch` left out.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowWeights;
+
+impl ConfigWeights for WindowWeights {
+    fn weights(&mut self, state: &PowitState, params: &PociParams, epoch: u64, _finalized: &Checkpoint)
+        -> BTreeMap<KeyId, u128>
+    {
+        let mut out: BTreeMap<KeyId, u128> = BTreeMap::new();
+        if epoch == 0 {
+            return out;
+        }
+        let lo = epoch.saturating_sub(params.window_epochs);
+        for (_, m) in state.epoch_work.range(lo..epoch) {
+            for (k, w) in m {
+                if !state.has_exited(k, epoch) {
+                    let e = out.entry(*k).or_insert(0);
+                    *e = e.saturating_add(*w);
+                }
+            }
+        }
+        out
     }
 }
 

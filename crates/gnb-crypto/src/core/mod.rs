@@ -1218,7 +1218,7 @@ impl Block {
             write_shielded_tx(&mut out, stx);
         }
         if powit_active(self.height) {
-            self.powit.write_wire_with(&mut out, liveness::liveness_active_at(self.height));
+            self.powit.write_wire_for(&mut out, powit::BodyFormat::at(self.height));
         }
         out
     }
@@ -1233,7 +1233,7 @@ impl Block {
         // The PoWit section is part of the encoding from `powit_height()`.
         let powit = if powit_active(self.height) {
             let mut v = Vec::new();
-            self.powit.write_wire_with(&mut v, liveness::liveness_active_at(self.height));
+            self.powit.write_wire_for(&mut v, powit::BodyFormat::at(self.height));
             v.len()
         } else {
             0
@@ -1284,7 +1284,7 @@ impl Block {
 
         let powit = if powit_active(height) {
             let mut pc = Cursor::new(&body[offset..]);
-            let pb = powit::PowitBody::read_wire_with(&mut pc, liveness::liveness_active_at(height))
+            let pb = powit::PowitBody::read_wire_for(&mut pc, powit::BodyFormat::at(height))
                 .map_err(|e| format!("powit section: {e}"))?;
             offset += pc.position() as usize;
             pb
@@ -1321,7 +1321,7 @@ impl Block {
             c.update(tx_root.0);
             c.update(self.shielded_root());
             // Exits are part of the section from the liveness activation.
-            c.update(self.powit.root_with(liveness::liveness_active_at(self.height)));
+            c.update(self.powit.root_for(powit::BodyFormat::at(self.height)));
             return MerkleRoot(c.finalize().into());
         }
         if self.shielded_transactions.is_empty() {
@@ -2038,7 +2038,7 @@ mod wire_canonical_tests {
         // The PoWit section (from powit_height), read as the real decoder does.
         let powit = if powit_active(height) {
             let mut pc = Cursor::new(&body[offset..]);
-            let pb = powit::PowitBody::read_wire_with(&mut pc, liveness::liveness_active_at(height))
+            let pb = powit::PowitBody::read_wire_for(&mut pc, powit::BodyFormat::at(height))
                 .map_err(|e| format!("powit section: {e}"))?;
             offset += pc.position() as usize;
             pb

@@ -101,7 +101,7 @@ fn build(n: &Node, mut parents: Vec<BlockHash>, tag: &str, shares: Vec<WitnessSh
         blue_score: height,
         height,
         shielded_transactions: Vec::new(),
-        powit: PowitBody { shares, attestations: atts, evidence: Vec::new(), exits: Vec::new() },
+        powit: PowitBody { shares, attestations: atts, evidence: Vec::new(), exits: Vec::new(), poci_evidence: Vec::new() },
     };
     commit_block(&mut b);
     b.test_only_assume_pow_valid();
@@ -505,7 +505,7 @@ fn stray_orphan(i: u32, bits: u32, parents: usize, vote: Option<Attestation>) ->
         blue_score: height,
         height,
         shielded_transactions: Vec::new(),
-        powit: PowitBody { shares: Vec::new(), attestations: vote.into_iter().collect(), evidence: Vec::new(), exits: Vec::new() },
+        powit: PowitBody { shares: Vec::new(), attestations: vote.into_iter().collect(), evidence: Vec::new(), exits: Vec::new(), poci_evidence: Vec::new() },
     };
     commit_block(&mut b);
     b.test_only_assume_pow_valid();
