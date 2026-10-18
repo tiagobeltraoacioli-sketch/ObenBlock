@@ -406,6 +406,10 @@ mutual anchoring. **Both directions are used** (owner, 2026-10-17).
 Each package follows the audit's process: reproduce first, references and
 vectors, three-lens review, full tests, a draft PR.
 
+Future evolutions beyond these packages are proposed as ObenBlock
+Improvement Proposals in `docs/obip/` (index: `docs/obip/README.md`); this
+document stays the base specification and is not restated there.
+
 ## 10. Open points for the owner
 
 Decided on 2026-10-17:
