@@ -22,7 +22,8 @@ p { margin: 0; }
 .top .wrap { display: flex; align-items: center; gap: 18px; min-height: 60px; }
 .brandlink { display: flex; align-items: center; gap: 12px; text-decoration: none; flex: none; }
 .brandlink .mono-tile { width: 30px; height: 30px; display: block; }
-.brandlink .wm { width: 112px; height: auto; display: block; }
+.brandlink .wm { font-family: var(--f-display); font-weight: 600; font-size: 1.4rem; line-height: 1; letter-spacing: -.06em; color: var(--ink); }
+.brandlink .wm b { color: var(--fluor); font-weight: 600; }
 .tag { font-family: var(--f-mono); font-size: .7rem; letter-spacing: .14em; text-transform: uppercase; color: var(--fluor-ink); background: var(--fluor); border-radius: 4px; padding: 2px 7px; }
 .nav { display: flex; gap: 20px; margin-left: auto; }
 .nav a { font-family: var(--f-mono); font-size: .75rem; letter-spacing: .08em; text-transform: uppercase; color: var(--mute); text-decoration: none; }

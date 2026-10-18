@@ -69,6 +69,6 @@ test("valid data still renders links and amounts", () => {
   assert.ok(out.includes(`href="#/block/${H}"`));
   assert.ok(out.includes(`href="#/address/${A}"`));
   assert.ok(out.includes("1.0702"));
-  assert.equal(String(V.gnb("123456789")), "1.23456789 <small>GNB</small>");
+  assert.equal(String(V.gnb("123456789")), "1.23456789 <small>OBB</small>");
   assert.equal(String(V.gnb(EVIL)), "—");
 });
