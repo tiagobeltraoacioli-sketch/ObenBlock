@@ -466,11 +466,11 @@ impl TipWitnesses {
     /// Whether `att` carries a valid signature for the next block: the v3
     /// message of the configuration in force (PoCI), else the PoWit message
     /// of its target's height.
-    fn verify_attestation(&self, att: &Attestation, chain: core::ChainId, p: &PowitParams) -> bool {
+    fn verify_attestation(&self, att: &Attestation, chain: core::ChainId, p: &PowitParams, act: u64) -> bool {
         match (self.poci, self.state.poci_config()) {
             (Some(pp), Some(c)) => att.verify_signature_v3(&pp, &c.id()),
             (Some(_), None) => false,
-            (None, _) => att.verify_signature_at(chain, p, self.activation, self.hardening2),
+            (None, _) => att.verify_signature_at(chain, p, act, self.hardening2),
         }
     }
 
@@ -891,6 +891,7 @@ impl PowitPool {
         }
         let chain = core::node_chain_id();
         let p = powit::params();
+        let act = core::powit_height();
         let t = att.target;
         // What `verify_signature` refuses before any signature check: a
         // link that is never valid anywhere.
@@ -908,7 +909,7 @@ impl PowitPool {
         // The message of the target's height (v2 from the second hardening
         // activation: it commits the witness key); PoCI: the v3 message of
         // the configuration in force.
-        if !view.verify_attestation(&att, chain, &p) {
+        if !view.verify_attestation(&att, chain, &p, act) {
             return Err("invalid attestation signature".into());
         }
         let config_id = view.poci_config().map(|c| c.id());
