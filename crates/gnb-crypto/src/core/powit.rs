@@ -176,10 +176,13 @@ pub const fn obenblock_window(p: PowitParams) -> PowitParams {
     PowitParams { window_epochs: OBB_WINDOW_EPOCHS, ban_epochs: OBB_WINDOW_EPOCHS, ..p }
 }
 
-/// ObenBlock mainnet (`docs/DESIGN-obenblock.md` §5.2): GnB mainnet's clock
-/// and bounds with the half leak. [`params_for`] selects it, with the
-/// 112-epoch window of [`obenblock_window`], for [`ChainId::ObenBlockMainnet`].
-pub const OBENBLOCK_MAINNET_PARAMS: PowitParams = PowitParams { leak: InactivityLeak::Half, ..MAINNET_PARAMS };
+/// ObenBlock mainnet (`docs/DESIGN-obenblock.md` §5.2, §6.2): GnB mainnet's
+/// clock and bounds with the half leak and the 112-epoch window and ban of
+/// [`obenblock_window`]. The constant is the complete parameter set
+/// [`params_for`] returns for [`ChainId::ObenBlockMainnet`], so no caller
+/// can pick up GnB's 28-epoch window through it.
+pub const OBENBLOCK_MAINNET_PARAMS: PowitParams =
+    obenblock_window(PowitParams { leak: InactivityLeak::Half, ..MAINNET_PARAMS });
 
 /// ObenBlock regtest: the short test clock (and window) with the half leak.
 pub const OBENBLOCK_REGTEST_PARAMS: PowitParams = PowitParams { leak: InactivityLeak::Half, ..TESTNET_PARAMS };
@@ -195,7 +198,7 @@ pub fn params_for(chain: ChainId) -> PowitParams {
     match chain {
         ChainId::Mainnet => MAINNET_PARAMS,
         ChainId::Testnet => TESTNET_PARAMS,
-        ChainId::ObenBlockMainnet => obenblock_window(OBENBLOCK_MAINNET_PARAMS),
+        ChainId::ObenBlockMainnet => OBENBLOCK_MAINNET_PARAMS,
         ChainId::ObenBlockRegtest => OBENBLOCK_REGTEST_PARAMS,
     }
 }
