@@ -246,7 +246,8 @@ struct Cli {
     /// operator setting made with `setfinalitycheckpoint` takes precedence.
     /// Until the block arrives no finalized checkpoint above its height
     /// counts; a node that had a pin holds it, and once its chain is above
-    /// that height it alerts (`anchor_overdue`, error log, metric
+    /// that height, or after 30 minutes out of initial block download, it
+    /// alerts (`anchor_overdue`, error log, metric
     /// `gnb_finality_anchor_unknown`). Non-consensus, node-local
     /// (docs/RUNNING.md).
     #[arg(long = "finalitycheckpoint")]                  finality_checkpoint: Option<String>,
