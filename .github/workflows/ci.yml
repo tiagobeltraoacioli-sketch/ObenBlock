@@ -84,6 +84,12 @@ jobs:
         run: |
           python3 reference/powit_reference_test.py -v
           python3 reference/powit_reference.py --check
+      # docs/DESIGN-obenblock.md §6.3 (ObenBlock growth cap on W, the weights
+      # of every PoCI configuration): reference tests and reproducible vectors.
+      - name: ObenBlock growth cap reference and reproducible vectors
+        run: |
+          python3 reference/obb_growth_cap_test.py -v
+          python3 reference/obb_growth_cap.py --check
 
   rust:
     runs-on: ubuntu-latest

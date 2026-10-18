@@ -1,0 +1,3901 @@
+{
+ "format": "obb-growth-cap-vectors-v1",
+ "description": "ObenBlock growth cap on W (docs/DESIGN-obenblock.md \u00a76.3; reference/obb_growth_cap.py)",
+ "constants": {
+  "growth_div": 64,
+  "g_min_div": 8,
+  "max_shares_per_block": 16,
+  "share_target_shift": 4,
+  "params": {
+   "obenblock": {
+    "epoch_len": 720,
+    "window_epochs": 112
+   },
+   "small": {
+    "epoch_len": 20,
+    "window_epochs": 3
+   }
+  },
+  "epochs_to_triple_w": 71,
+  "epochs_to_double_w": 45
+ },
+ "g_min": [
+  {
+   "epoch_len": 720,
+   "bits": 486604799,
+   "share_work": "268439552",
+   "g_min": "386552954880"
+  },
+  {
+   "epoch_len": 720,
+   "bits": 386089497,
+   "share_work": "23190106061197875228172",
+   "g_min": "33393752728124940328567680"
+  },
+  {
+   "epoch_len": 720,
+   "bits": 545259519,
+   "share_work": "1",
+   "g_min": "1440"
+  },
+  {
+   "epoch_len": 720,
+   "bits": 494993407,
+   "share_work": "0",
+   "g_min": "0"
+  },
+  {
+   "epoch_len": 720,
+   "bits": 50331649,
+   "share_work": "340282366920938463463374607431768211455",
+   "g_min": "340282366920938463463374607431768211455"
+  },
+  {
+   "epoch_len": 20,
+   "bits": 486604799,
+   "share_work": "268439552",
+   "g_min": "10737582080"
+  },
+  {
+   "epoch_len": 20,
+   "bits": 386089497,
+   "share_work": "23190106061197875228172",
+   "g_min": "927604242447915009126880"
+  },
+  {
+   "epoch_len": 20,
+   "bits": 545259519,
+   "share_work": "1",
+   "g_min": "40"
+  },
+  {
+   "epoch_len": 20,
+   "bits": 494993407,
+   "share_work": "0",
+   "g_min": "0"
+  },
+  {
+   "epoch_len": 20,
+   "bits": 50331649,
+   "share_work": "340282366920938463463374607431768211455",
+   "g_min": "340282366920938463463374607431768211455"
+  }
+ ],
+ "steps": [
+  {
+   "name": "under_budget_all_admitted",
+   "prev_weights": {
+    "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "6400"
+   },
+   "new_work": {
+    "44c044b328fb9f6d90b0fc5a9d1813be4bfd06f7": "40",
+    "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "60"
+   },
+   "expiring": {},
+   "g_min": "0",
+   "w_total": null,
+   "excluded": [],
+   "result": {
+    "w": "6400",
+    "g": "100",
+    "sum_x": "100",
+    "renewed": "0",
+    "admitted": "100",
+    "dropped": "0",
+    "admitted_new": "40",
+    "credit": {
+     "44c044b328fb9f6d90b0fc5a9d1813be4bfd06f7": "40",
+     "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "60"
+    },
+    "weights": {
+     "44c044b328fb9f6d90b0fc5a9d1813be4bfd06f7": "40",
+     "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "6460"
+    }
+   }
+  },
+  {
+   "name": "renewal_first_then_pro_rata",
+   "prev_weights": {
+    "44c044b328fb9f6d90b0fc5a9d1813be4bfd06f7": "6400",
+    "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "6400"
+   },
+   "new_work": {
+    "44c044b328fb9f6d90b0fc5a9d1813be4bfd06f7": "10",
+    "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "300",
+    "cb3929ac23a5849b1b5273dd8e24ab7c6f16faec": "900"
+   },
+   "expiring": {
+    "44c044b328fb9f6d90b0fc5a9d1813be4bfd06f7": "200",
+    "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "200"
+   },
+   "g_min": "0",
+   "w_total": null,
+   "excluded": [],
+   "result": {
+    "w": "12800",
+    "g": "200",
+    "sum_x": "1000",
+    "renewed": "210",
+    "admitted": "200",
+    "dropped": "800",
+    "admitted_new": "180",
+    "credit": {
+     "44c044b328fb9f6d90b0fc5a9d1813be4bfd06f7": "10",
+     "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "220",
+     "cb3929ac23a5849b1b5273dd8e24ab7c6f16faec": "180"
+    },
+    "weights": {
+     "44c044b328fb9f6d90b0fc5a9d1813be4bfd06f7": "6210",
+     "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "6420",
+     "cb3929ac23a5849b1b5273dd8e24ab7c6f16faec": "180"
+    }
+   }
+  },
+  {
+   "name": "g_min_dominates",
+   "prev_weights": {
+    "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "64"
+   },
+   "new_work": {
+    "44c044b328fb9f6d90b0fc5a9d1813be4bfd06f7": "1000"
+   },
+   "expiring": {},
+   "g_min": "37",
+   "w_total": null,
+   "excluded": [],
+   "result": {
+    "w": "64",
+    "g": "37",
+    "sum_x": "1000",
+    "renewed": "0",
+    "admitted": "37",
+    "dropped": "963",
+    "admitted_new": "37",
+    "credit": {
+     "44c044b328fb9f6d90b0fc5a9d1813be4bfd06f7": "37"
+    },
+    "weights": {
+     "44c044b328fb9f6d90b0fc5a9d1813be4bfd06f7": "37",
+     "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "64"
+    }
+   }
+  },
+  {
+   "name": "pro_rata_floors",
+   "prev_weights": {
+    "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "448"
+   },
+   "new_work": {
+    "44c044b328fb9f6d90b0fc5a9d1813be4bfd06f7": "1",
+    "cb3929ac23a5849b1b5273dd8e24ab7c6f16faec": "1",
+    "f5d24e5985fe3dffe837cb805e7ee5e67860d118": "1"
+   },
+   "expiring": {},
+   "g_min": "0",
+   "w_total": null,
+   "excluded": [],
+   "result": {
+    "w": "448",
+    "g": "7",
+    "sum_x": "3",
+    "renewed": "0",
+    "admitted": "3",
+    "dropped": "0",
+    "admitted_new": "3",
+    "credit": {
+     "44c044b328fb9f6d90b0fc5a9d1813be4bfd06f7": "1",
+     "cb3929ac23a5849b1b5273dd8e24ab7c6f16faec": "1",
+     "f5d24e5985fe3dffe837cb805e7ee5e67860d118": "1"
+    },
+    "weights": {
+     "44c044b328fb9f6d90b0fc5a9d1813be4bfd06f7": "1",
+     "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "448",
+     "cb3929ac23a5849b1b5273dd8e24ab7c6f16faec": "1",
+     "f5d24e5985fe3dffe837cb805e7ee5e67860d118": "1"
+    }
+   }
+  },
+  {
+   "name": "expiry_without_renewal",
+   "prev_weights": {
+    "44c044b328fb9f6d90b0fc5a9d1813be4bfd06f7": "500",
+    "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "500"
+   },
+   "new_work": {},
+   "expiring": {
+    "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "200"
+   },
+   "g_min": "0",
+   "w_total": null,
+   "excluded": [],
+   "result": {
+    "w": "1000",
+    "g": "15",
+    "sum_x": "0",
+    "renewed": "0",
+    "admitted": "0",
+    "dropped": "0",
+    "admitted_new": "0",
+    "credit": {},
+    "weights": {
+     "44c044b328fb9f6d90b0fc5a9d1813be4bfd06f7": "500",
+     "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "300"
+    }
+   }
+  },
+  {
+   "name": "excluded_work_dropped_and_not_competing",
+   "prev_weights": {
+    "44c044b328fb9f6d90b0fc5a9d1813be4bfd06f7": "6400",
+    "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "6400"
+   },
+   "new_work": {
+    "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "500",
+    "cb3929ac23a5849b1b5273dd8e24ab7c6f16faec": "500"
+   },
+   "expiring": {
+    "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "100"
+   },
+   "g_min": "0",
+   "w_total": null,
+   "excluded": [
+    "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c"
+   ],
+   "result": {
+    "w": "6400",
+    "g": "100",
+    "sum_x": "500",
+    "renewed": "0",
+    "admitted": "100",
+    "dropped": "900",
+    "admitted_new": "100",
+    "credit": {
+     "cb3929ac23a5849b1b5273dd8e24ab7c6f16faec": "100"
+    },
+    "weights": {
+     "44c044b328fb9f6d90b0fc5a9d1813be4bfd06f7": "6400",
+     "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "6300",
+     "cb3929ac23a5849b1b5273dd8e24ab7c6f16faec": "100"
+    }
+   }
+  },
+  {
+   "name": "explicit_w_total",
+   "prev_weights": {
+    "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "6400"
+   },
+   "new_work": {
+    "cb3929ac23a5849b1b5273dd8e24ab7c6f16faec": "10000"
+   },
+   "expiring": {},
+   "g_min": "0",
+   "w_total": "12800",
+   "excluded": [],
+   "result": {
+    "w": "12800",
+    "g": "200",
+    "sum_x": "10000",
+    "renewed": "0",
+    "admitted": "200",
+    "dropped": "9800",
+    "admitted_new": "200",
+    "credit": {
+     "cb3929ac23a5849b1b5273dd8e24ab7c6f16faec": "200"
+    },
+    "weights": {
+     "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "6400",
+     "cb3929ac23a5849b1b5273dd8e24ab7c6f16faec": "200"
+    }
+   }
+  },
+  {
+   "name": "exact_256_bit_intermediates",
+   "prev_weights": {
+    "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "340282366920938463463374607431768211455"
+   },
+   "new_work": {
+    "44c044b328fb9f6d90b0fc5a9d1813be4bfd06f7": "340282366920938463463374607431768211455",
+    "cb3929ac23a5849b1b5273dd8e24ab7c6f16faec": "340282366920938463463374607431768211454",
+    "f5d24e5985fe3dffe837cb805e7ee5e67860d118": "3"
+   },
+   "expiring": {},
+   "g_min": "0",
+   "w_total": null,
+   "excluded": [],
+   "result": {
+    "w": "340282366920938463463374607431768211455",
+    "g": "5316911983139663491615228241121378303",
+    "sum_x": "680564733841876926926749214863536422912",
+    "renewed": "0",
+    "admitted": "5316911983139663491615228241121378302",
+    "dropped": "675247821858737263435133986622415044610",
+    "admitted_new": "5316911983139663491615228241121378302",
+    "credit": {
+     "44c044b328fb9f6d90b0fc5a9d1813be4bfd06f7": "2658455991569831745807614120560689151",
+     "cb3929ac23a5849b1b5273dd8e24ab7c6f16faec": "2658455991569831745807614120560689151"
+    },
+    "weights": {
+     "44c044b328fb9f6d90b0fc5a9d1813be4bfd06f7": "2658455991569831745807614120560689151",
+     "c5998ce1ebe2bbb00c5e38d4be5cba2d5d4ddb4c": "340282366920938463463374607431768211455",
+     "cb3929ac23a5849b1b5273dd8e24ab7c6f16faec": "2658455991569831745807614120560689151"
+    }
+   }
+  }
+ ],
+ "sequences": [
+  {
+   "name": "every_epoch",
+   "params": "small",
+   "history": {
+    "share_work": {
+     "0": {
+      "794da207cf54d070c8402af52fa546143af66546": "400",
+      "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "400"
+     },
+     "1": {
+      "794da207cf54d070c8402af52fa546143af66546": "400",
+      "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "4000",
+      "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "400"
+     },
+     "2": {
+      "794da207cf54d070c8402af52fa546143af66546": "400",
+      "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "4000",
+      "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "400"
+     },
+     "3": {
+      "794da207cf54d070c8402af52fa546143af66546": "400",
+      "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "4000"
+     },
+     "4": {
+      "30e881b62003b9bc78e835ae13322758fbb56e2b": "50",
+      "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "4000",
+      "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "400"
+     },
+     "5": {
+      "794da207cf54d070c8402af52fa546143af66546": "1",
+      "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "4000",
+      "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "800"
+     },
+     "6": {
+      "794da207cf54d070c8402af52fa546143af66546": "400",
+      "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "400"
+     },
+     "7": {}
+    },
+    "first_block_bits": {
+     "0": 545259519,
+     "1": 545259519,
+     "2": 545259519,
+     "3": 545259519,
+     "4": 545259519,
+     "5": 545259519,
+     "6": 545259519,
+     "7": 545259519
+    }
+   },
+   "exclusions": [],
+   "handoffs": [
+    {
+     "to_epoch": 2,
+     "steps": [
+      {
+       "w": "0",
+       "g": "40",
+       "sum_x": "800",
+       "renewed": "0",
+       "admitted": "40",
+       "dropped": "760",
+       "admitted_new": "40",
+       "credit": {
+        "794da207cf54d070c8402af52fa546143af66546": "20",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "20"
+       },
+       "weights": {
+        "794da207cf54d070c8402af52fa546143af66546": "20",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "20"
+       }
+      }
+     ],
+     "credits": {
+      "0": {
+       "794da207cf54d070c8402af52fa546143af66546": "20",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "20"
+      }
+     },
+     "configuration": [
+      [
+       "794da207cf54d070c8402af52fa546143af66546",
+       "20"
+      ],
+      [
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01",
+       "20"
+      ]
+     ],
+     "total": "40"
+    },
+    {
+     "to_epoch": 3,
+     "steps": [
+      {
+       "w": "40",
+       "g": "40",
+       "sum_x": "4800",
+       "renewed": "0",
+       "admitted": "39",
+       "dropped": "4761",
+       "admitted_new": "33",
+       "credit": {
+        "794da207cf54d070c8402af52fa546143af66546": "3",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "3"
+       },
+       "weights": {
+        "794da207cf54d070c8402af52fa546143af66546": "23",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "23"
+       }
+      }
+     ],
+     "credits": {
+      "0": {
+       "794da207cf54d070c8402af52fa546143af66546": "20",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "20"
+      },
+      "1": {
+       "794da207cf54d070c8402af52fa546143af66546": "3",
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "3"
+      }
+     },
+     "configuration": [
+      [
+       "794da207cf54d070c8402af52fa546143af66546",
+       "23"
+      ],
+      [
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4",
+       "33"
+      ],
+      [
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01",
+       "23"
+      ]
+     ],
+     "total": "79"
+    },
+    {
+     "to_epoch": 4,
+     "steps": [
+      {
+       "w": "79",
+       "g": "40",
+       "sum_x": "4800",
+       "renewed": "0",
+       "admitted": "39",
+       "dropped": "4761",
+       "admitted_new": "0",
+       "credit": {
+        "794da207cf54d070c8402af52fa546143af66546": "3",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "3"
+       },
+       "weights": {
+        "794da207cf54d070c8402af52fa546143af66546": "26",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "66",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "26"
+       }
+      }
+     ],
+     "credits": {
+      "0": {
+       "794da207cf54d070c8402af52fa546143af66546": "20",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "20"
+      },
+      "1": {
+       "794da207cf54d070c8402af52fa546143af66546": "3",
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "3"
+      },
+      "2": {
+       "794da207cf54d070c8402af52fa546143af66546": "3",
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "3"
+      }
+     },
+     "configuration": [
+      [
+       "794da207cf54d070c8402af52fa546143af66546",
+       "26"
+      ],
+      [
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4",
+       "66"
+      ],
+      [
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01",
+       "26"
+      ]
+     ],
+     "total": "118"
+    },
+    {
+     "to_epoch": 5,
+     "steps": [
+      {
+       "w": "118",
+       "g": "40",
+       "sum_x": "4380",
+       "renewed": "20",
+       "admitted": "39",
+       "dropped": "4341",
+       "admitted_new": "0",
+       "credit": {
+        "794da207cf54d070c8402af52fa546143af66546": "23",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "36"
+       },
+       "weights": {
+        "794da207cf54d070c8402af52fa546143af66546": "29",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "102",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "6"
+       }
+      }
+     ],
+     "credits": {
+      "1": {
+       "794da207cf54d070c8402af52fa546143af66546": "3",
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "3"
+      },
+      "2": {
+       "794da207cf54d070c8402af52fa546143af66546": "3",
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "3"
+      },
+      "3": {
+       "794da207cf54d070c8402af52fa546143af66546": "23",
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "36"
+      }
+     },
+     "configuration": [
+      [
+       "794da207cf54d070c8402af52fa546143af66546",
+       "29"
+      ],
+      [
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4",
+       "102"
+      ],
+      [
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01",
+       "6"
+      ]
+     ],
+     "total": "137"
+    },
+    {
+     "to_epoch": 6,
+     "steps": [
+      {
+       "w": "137",
+       "g": "40",
+       "sum_x": "4414",
+       "renewed": "36",
+       "admitted": "38",
+       "dropped": "4376",
+       "admitted_new": "0",
+       "credit": {
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "68",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "6"
+       },
+       "weights": {
+        "794da207cf54d070c8402af52fa546143af66546": "26",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "137",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "9"
+       }
+      }
+     ],
+     "credits": {
+      "2": {
+       "794da207cf54d070c8402af52fa546143af66546": "3",
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "3"
+      },
+      "3": {
+       "794da207cf54d070c8402af52fa546143af66546": "23",
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "36"
+      },
+      "4": {
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "68",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "6"
+      }
+     },
+     "configuration": [
+      [
+       "794da207cf54d070c8402af52fa546143af66546",
+       "26"
+      ],
+      [
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4",
+       "137"
+      ],
+      [
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01",
+       "9"
+      ]
+     ],
+     "total": "172"
+    },
+    {
+     "to_epoch": 7,
+     "steps": [
+      {
+       "w": "172",
+       "g": "40",
+       "sum_x": "4764",
+       "renewed": "37",
+       "admitted": "39",
+       "dropped": "4725",
+       "admitted_new": "0",
+       "credit": {
+        "794da207cf54d070c8402af52fa546143af66546": "1",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "66",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "9"
+       },
+       "weights": {
+        "794da207cf54d070c8402af52fa546143af66546": "24",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "170",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "15"
+       }
+      }
+     ],
+     "credits": {
+      "3": {
+       "794da207cf54d070c8402af52fa546143af66546": "23",
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "36"
+      },
+      "4": {
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "68",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "6"
+      },
+      "5": {
+       "794da207cf54d070c8402af52fa546143af66546": "1",
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "66",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "9"
+      }
+     },
+     "configuration": [
+      [
+       "794da207cf54d070c8402af52fa546143af66546",
+       "24"
+      ],
+      [
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4",
+       "170"
+      ],
+      [
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01",
+       "15"
+      ]
+     ],
+     "total": "209"
+    },
+    {
+     "to_epoch": 8,
+     "steps": [
+      {
+       "w": "209",
+       "g": "40",
+       "sum_x": "777",
+       "renewed": "23",
+       "admitted": "39",
+       "dropped": "738",
+       "admitted_new": "0",
+       "credit": {
+        "794da207cf54d070c8402af52fa546143af66546": "42",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "20"
+       },
+       "weights": {
+        "794da207cf54d070c8402af52fa546143af66546": "43",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "134",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "35"
+       }
+      }
+     ],
+     "credits": {
+      "4": {
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "68",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "6"
+      },
+      "5": {
+       "794da207cf54d070c8402af52fa546143af66546": "1",
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "66",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "9"
+      },
+      "6": {
+       "794da207cf54d070c8402af52fa546143af66546": "42",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "20"
+      }
+     },
+     "configuration": [
+      [
+       "794da207cf54d070c8402af52fa546143af66546",
+       "43"
+      ],
+      [
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4",
+       "134"
+      ],
+      [
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01",
+       "35"
+      ]
+     ],
+     "total": "212"
+    },
+    {
+     "to_epoch": 9,
+     "steps": [
+      {
+       "w": "212",
+       "g": "40",
+       "sum_x": "0",
+       "renewed": "0",
+       "admitted": "0",
+       "dropped": "0",
+       "admitted_new": "0",
+       "credit": {},
+       "weights": {
+        "794da207cf54d070c8402af52fa546143af66546": "43",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "66",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "29"
+       }
+      }
+     ],
+     "credits": {
+      "5": {
+       "794da207cf54d070c8402af52fa546143af66546": "1",
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "66",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "9"
+      },
+      "6": {
+       "794da207cf54d070c8402af52fa546143af66546": "42",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "20"
+      }
+     },
+     "configuration": [
+      [
+       "794da207cf54d070c8402af52fa546143af66546",
+       "43"
+      ],
+      [
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4",
+       "66"
+      ],
+      [
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01",
+       "29"
+      ]
+     ],
+     "total": "138"
+    }
+   ]
+  },
+  {
+   "name": "skipping_handoffs",
+   "params": "small",
+   "history": {
+    "share_work": {
+     "0": {
+      "794da207cf54d070c8402af52fa546143af66546": "400",
+      "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "400"
+     },
+     "1": {
+      "794da207cf54d070c8402af52fa546143af66546": "400",
+      "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "4000",
+      "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "400"
+     },
+     "2": {
+      "794da207cf54d070c8402af52fa546143af66546": "400",
+      "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "4000",
+      "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "400"
+     },
+     "3": {
+      "794da207cf54d070c8402af52fa546143af66546": "400",
+      "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "4000"
+     },
+     "4": {
+      "30e881b62003b9bc78e835ae13322758fbb56e2b": "50",
+      "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "4000",
+      "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "400"
+     },
+     "5": {
+      "794da207cf54d070c8402af52fa546143af66546": "1",
+      "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "4000",
+      "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "800"
+     },
+     "6": {
+      "794da207cf54d070c8402af52fa546143af66546": "400",
+      "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "400"
+     },
+     "7": {}
+    },
+    "first_block_bits": {
+     "0": 545259519,
+     "1": 545259519,
+     "2": 545259519,
+     "3": 545259519,
+     "4": 545259519,
+     "5": 545259519,
+     "6": 545259519,
+     "7": 545259519
+    }
+   },
+   "exclusions": [],
+   "handoffs": [
+    {
+     "to_epoch": 4,
+     "steps": [
+      {
+       "w": "0",
+       "g": "40",
+       "sum_x": "800",
+       "renewed": "0",
+       "admitted": "40",
+       "dropped": "760",
+       "admitted_new": "40",
+       "credit": {
+        "794da207cf54d070c8402af52fa546143af66546": "20",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "20"
+       },
+       "weights": {
+        "794da207cf54d070c8402af52fa546143af66546": "20",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "20"
+       }
+      },
+      {
+       "w": "40",
+       "g": "40",
+       "sum_x": "4800",
+       "renewed": "0",
+       "admitted": "39",
+       "dropped": "4761",
+       "admitted_new": "33",
+       "credit": {
+        "794da207cf54d070c8402af52fa546143af66546": "3",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "3"
+       },
+       "weights": {
+        "794da207cf54d070c8402af52fa546143af66546": "23",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "23"
+       }
+      },
+      {
+       "w": "79",
+       "g": "40",
+       "sum_x": "4800",
+       "renewed": "0",
+       "admitted": "39",
+       "dropped": "4761",
+       "admitted_new": "0",
+       "credit": {
+        "794da207cf54d070c8402af52fa546143af66546": "3",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "3"
+       },
+       "weights": {
+        "794da207cf54d070c8402af52fa546143af66546": "26",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "66",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "26"
+       }
+      }
+     ],
+     "credits": {
+      "0": {
+       "794da207cf54d070c8402af52fa546143af66546": "20",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "20"
+      },
+      "1": {
+       "794da207cf54d070c8402af52fa546143af66546": "3",
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "3"
+      },
+      "2": {
+       "794da207cf54d070c8402af52fa546143af66546": "3",
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "3"
+      }
+     },
+     "configuration": [
+      [
+       "794da207cf54d070c8402af52fa546143af66546",
+       "26"
+      ],
+      [
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4",
+       "66"
+      ],
+      [
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01",
+       "26"
+      ]
+     ],
+     "total": "118"
+    },
+    {
+     "to_epoch": 9,
+     "steps": [
+      {
+       "w": "118",
+       "g": "40",
+       "sum_x": "4380",
+       "renewed": "20",
+       "admitted": "39",
+       "dropped": "4341",
+       "admitted_new": "0",
+       "credit": {
+        "794da207cf54d070c8402af52fa546143af66546": "23",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "36"
+       },
+       "weights": {
+        "794da207cf54d070c8402af52fa546143af66546": "29",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "102",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "6"
+       }
+      },
+      {
+       "w": "137",
+       "g": "40",
+       "sum_x": "4414",
+       "renewed": "36",
+       "admitted": "38",
+       "dropped": "4376",
+       "admitted_new": "0",
+       "credit": {
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "68",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "6"
+       },
+       "weights": {
+        "794da207cf54d070c8402af52fa546143af66546": "26",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "137",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "9"
+       }
+      },
+      {
+       "w": "172",
+       "g": "40",
+       "sum_x": "4764",
+       "renewed": "37",
+       "admitted": "39",
+       "dropped": "4725",
+       "admitted_new": "0",
+       "credit": {
+        "794da207cf54d070c8402af52fa546143af66546": "1",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "66",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "9"
+       },
+       "weights": {
+        "794da207cf54d070c8402af52fa546143af66546": "24",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "170",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "15"
+       }
+      },
+      {
+       "w": "209",
+       "g": "40",
+       "sum_x": "777",
+       "renewed": "23",
+       "admitted": "39",
+       "dropped": "738",
+       "admitted_new": "0",
+       "credit": {
+        "794da207cf54d070c8402af52fa546143af66546": "42",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "20"
+       },
+       "weights": {
+        "794da207cf54d070c8402af52fa546143af66546": "43",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "134",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "35"
+       }
+      },
+      {
+       "w": "212",
+       "g": "40",
+       "sum_x": "0",
+       "renewed": "0",
+       "admitted": "0",
+       "dropped": "0",
+       "admitted_new": "0",
+       "credit": {},
+       "weights": {
+        "794da207cf54d070c8402af52fa546143af66546": "43",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "66",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "29"
+       }
+      }
+     ],
+     "credits": {
+      "5": {
+       "794da207cf54d070c8402af52fa546143af66546": "1",
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "66",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "9"
+      },
+      "6": {
+       "794da207cf54d070c8402af52fa546143af66546": "42",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "20"
+      }
+     },
+     "configuration": [
+      [
+       "794da207cf54d070c8402af52fa546143af66546",
+       "43"
+      ],
+      [
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4",
+       "66"
+      ],
+      [
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01",
+       "29"
+      ]
+     ],
+     "total": "138"
+    }
+   ]
+  },
+  {
+   "name": "ban_of_c_from_4_to_7",
+   "params": "small",
+   "history": {
+    "share_work": {
+     "0": {
+      "794da207cf54d070c8402af52fa546143af66546": "400",
+      "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "400"
+     },
+     "1": {
+      "794da207cf54d070c8402af52fa546143af66546": "400",
+      "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "4000",
+      "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "400"
+     },
+     "2": {
+      "794da207cf54d070c8402af52fa546143af66546": "400",
+      "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "4000",
+      "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "400"
+     },
+     "3": {
+      "794da207cf54d070c8402af52fa546143af66546": "400",
+      "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "4000"
+     },
+     "4": {
+      "30e881b62003b9bc78e835ae13322758fbb56e2b": "50",
+      "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "4000",
+      "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "400"
+     },
+     "5": {
+      "794da207cf54d070c8402af52fa546143af66546": "1",
+      "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "4000",
+      "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "800"
+     },
+     "6": {
+      "794da207cf54d070c8402af52fa546143af66546": "400",
+      "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "400"
+     },
+     "7": {}
+    },
+    "first_block_bits": {
+     "0": 545259519,
+     "1": 545259519,
+     "2": 545259519,
+     "3": 545259519,
+     "4": 545259519,
+     "5": 545259519,
+     "6": 545259519,
+     "7": 545259519
+    }
+   },
+   "exclusions": [
+    [
+     "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4",
+     4,
+     7
+    ]
+   ],
+   "handoffs": [
+    {
+     "to_epoch": 2,
+     "steps": [
+      {
+       "w": "0",
+       "g": "40",
+       "sum_x": "800",
+       "renewed": "0",
+       "admitted": "40",
+       "dropped": "760",
+       "admitted_new": "40",
+       "credit": {
+        "794da207cf54d070c8402af52fa546143af66546": "20",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "20"
+       },
+       "weights": {
+        "794da207cf54d070c8402af52fa546143af66546": "20",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "20"
+       }
+      }
+     ],
+     "credits": {
+      "0": {
+       "794da207cf54d070c8402af52fa546143af66546": "20",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "20"
+      }
+     },
+     "configuration": [
+      [
+       "794da207cf54d070c8402af52fa546143af66546",
+       "20"
+      ],
+      [
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01",
+       "20"
+      ]
+     ],
+     "total": "40"
+    },
+    {
+     "to_epoch": 3,
+     "steps": [
+      {
+       "w": "40",
+       "g": "40",
+       "sum_x": "4800",
+       "renewed": "0",
+       "admitted": "39",
+       "dropped": "4761",
+       "admitted_new": "33",
+       "credit": {
+        "794da207cf54d070c8402af52fa546143af66546": "3",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "3"
+       },
+       "weights": {
+        "794da207cf54d070c8402af52fa546143af66546": "23",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "23"
+       }
+      }
+     ],
+     "credits": {
+      "0": {
+       "794da207cf54d070c8402af52fa546143af66546": "20",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "20"
+      },
+      "1": {
+       "794da207cf54d070c8402af52fa546143af66546": "3",
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "3"
+      }
+     },
+     "configuration": [
+      [
+       "794da207cf54d070c8402af52fa546143af66546",
+       "23"
+      ],
+      [
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4",
+       "33"
+      ],
+      [
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01",
+       "23"
+      ]
+     ],
+     "total": "79"
+    },
+    {
+     "to_epoch": 4,
+     "steps": [
+      {
+       "w": "79",
+       "g": "40",
+       "sum_x": "800",
+       "renewed": "0",
+       "admitted": "40",
+       "dropped": "4760",
+       "admitted_new": "0",
+       "credit": {
+        "794da207cf54d070c8402af52fa546143af66546": "20",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "20"
+       },
+       "weights": {
+        "794da207cf54d070c8402af52fa546143af66546": "43",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "43"
+       }
+      }
+     ],
+     "credits": {
+      "0": {
+       "794da207cf54d070c8402af52fa546143af66546": "20",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "20"
+      },
+      "1": {
+       "794da207cf54d070c8402af52fa546143af66546": "3",
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "3"
+      },
+      "2": {
+       "794da207cf54d070c8402af52fa546143af66546": "20",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "20"
+      }
+     },
+     "configuration": [
+      [
+       "794da207cf54d070c8402af52fa546143af66546",
+       "43"
+      ],
+      [
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01",
+       "43"
+      ]
+     ],
+     "total": "86"
+    },
+    {
+     "to_epoch": 5,
+     "steps": [
+      {
+       "w": "86",
+       "g": "40",
+       "sum_x": "380",
+       "renewed": "20",
+       "admitted": "40",
+       "dropped": "4340",
+       "admitted_new": "0",
+       "credit": {
+        "794da207cf54d070c8402af52fa546143af66546": "60"
+       },
+       "weights": {
+        "794da207cf54d070c8402af52fa546143af66546": "83",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "23"
+       }
+      }
+     ],
+     "credits": {
+      "1": {
+       "794da207cf54d070c8402af52fa546143af66546": "3",
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "3"
+      },
+      "2": {
+       "794da207cf54d070c8402af52fa546143af66546": "20",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "20"
+      },
+      "3": {
+       "794da207cf54d070c8402af52fa546143af66546": "60"
+      }
+     },
+     "configuration": [
+      [
+       "794da207cf54d070c8402af52fa546143af66546",
+       "83"
+      ],
+      [
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01",
+       "23"
+      ]
+     ],
+     "total": "106"
+    },
+    {
+     "to_epoch": 6,
+     "steps": [
+      {
+       "w": "106",
+       "g": "40",
+       "sum_x": "447",
+       "renewed": "3",
+       "admitted": "39",
+       "dropped": "4408",
+       "admitted_new": "4",
+       "credit": {
+        "30e881b62003b9bc78e835ae13322758fbb56e2b": "4",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "38"
+       },
+       "weights": {
+        "30e881b62003b9bc78e835ae13322758fbb56e2b": "4",
+        "794da207cf54d070c8402af52fa546143af66546": "80",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "58"
+       }
+      }
+     ],
+     "credits": {
+      "2": {
+       "794da207cf54d070c8402af52fa546143af66546": "20",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "20"
+      },
+      "3": {
+       "794da207cf54d070c8402af52fa546143af66546": "60"
+      },
+      "4": {
+       "30e881b62003b9bc78e835ae13322758fbb56e2b": "4",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "38"
+      }
+     },
+     "configuration": [
+      [
+       "30e881b62003b9bc78e835ae13322758fbb56e2b",
+       "4"
+      ],
+      [
+       "794da207cf54d070c8402af52fa546143af66546",
+       "80"
+      ],
+      [
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01",
+       "58"
+      ]
+     ],
+     "total": "142"
+    },
+    {
+     "to_epoch": 7,
+     "steps": [
+      {
+       "w": "142",
+       "g": "40",
+       "sum_x": "4780",
+       "renewed": "21",
+       "admitted": "39",
+       "dropped": "4741",
+       "admitted_new": "33",
+       "credit": {
+        "794da207cf54d070c8402af52fa546143af66546": "1",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "26"
+       },
+       "weights": {
+        "30e881b62003b9bc78e835ae13322758fbb56e2b": "4",
+        "794da207cf54d070c8402af52fa546143af66546": "61",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "64"
+       }
+      }
+     ],
+     "credits": {
+      "3": {
+       "794da207cf54d070c8402af52fa546143af66546": "60"
+      },
+      "4": {
+       "30e881b62003b9bc78e835ae13322758fbb56e2b": "4",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "38"
+      },
+      "5": {
+       "794da207cf54d070c8402af52fa546143af66546": "1",
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "26"
+      }
+     },
+     "configuration": [
+      [
+       "30e881b62003b9bc78e835ae13322758fbb56e2b",
+       "4"
+      ],
+      [
+       "794da207cf54d070c8402af52fa546143af66546",
+       "61"
+      ],
+      [
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4",
+       "33"
+      ],
+      [
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01",
+       "64"
+      ]
+     ],
+     "total": "162"
+    },
+    {
+     "to_epoch": 8,
+     "steps": [
+      {
+       "w": "162",
+       "g": "40",
+       "sum_x": "740",
+       "renewed": "60",
+       "admitted": "39",
+       "dropped": "701",
+       "admitted_new": "0",
+       "credit": {
+        "794da207cf54d070c8402af52fa546143af66546": "78",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "21"
+       },
+       "weights": {
+        "30e881b62003b9bc78e835ae13322758fbb56e2b": "4",
+        "794da207cf54d070c8402af52fa546143af66546": "79",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "85"
+       }
+      }
+     ],
+     "credits": {
+      "4": {
+       "30e881b62003b9bc78e835ae13322758fbb56e2b": "4",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "38"
+      },
+      "5": {
+       "794da207cf54d070c8402af52fa546143af66546": "1",
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "26"
+      },
+      "6": {
+       "794da207cf54d070c8402af52fa546143af66546": "78",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "21"
+      }
+     },
+     "configuration": [
+      [
+       "30e881b62003b9bc78e835ae13322758fbb56e2b",
+       "4"
+      ],
+      [
+       "794da207cf54d070c8402af52fa546143af66546",
+       "79"
+      ],
+      [
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4",
+       "33"
+      ],
+      [
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01",
+       "85"
+      ]
+     ],
+     "total": "201"
+    },
+    {
+     "to_epoch": 9,
+     "steps": [
+      {
+       "w": "201",
+       "g": "40",
+       "sum_x": "0",
+       "renewed": "0",
+       "admitted": "0",
+       "dropped": "0",
+       "admitted_new": "0",
+       "credit": {},
+       "weights": {
+        "794da207cf54d070c8402af52fa546143af66546": "79",
+        "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+        "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "47"
+       }
+      }
+     ],
+     "credits": {
+      "5": {
+       "794da207cf54d070c8402af52fa546143af66546": "1",
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4": "33",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "26"
+      },
+      "6": {
+       "794da207cf54d070c8402af52fa546143af66546": "78",
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01": "21"
+      }
+     },
+     "configuration": [
+      [
+       "794da207cf54d070c8402af52fa546143af66546",
+       "79"
+      ],
+      [
+       "c8af0f61c732677ecfc7fae55f9dd48cc9fd20f4",
+       "33"
+      ],
+      [
+       "e849cfe370a4cd3458452f26fc9e4c0caaedaf01",
+       "47"
+      ]
+     ],
+     "total": "159"
+    }
+   ]
+  }
+ ],
+ "floods": [
+  {
+   "k": 2,
+   "epochs_to_strict_two_thirds": null,
+   "trace": [
+    {
+     "epoch": 114,
+     "total": "1137500000",
+     "attacker": "17500000",
+     "g": "17500000",
+     "admitted_new": "17500000",
+     "dropped": "2500000"
+    },
+    {
+     "epoch": 115,
+     "total": "1155273435",
+     "attacker": "35273435",
+     "g": "17773437",
+     "admitted_new": "0",
+     "dropped": "2226565"
+    },
+    {
+     "epoch": 116,
+     "total": "1173324580",
+     "attacker": "53324580",
+     "g": "18051147",
+     "admitted_new": "0",
+     "dropped": "1948855"
+    },
+    {
+     "epoch": 117,
+     "total": "1191657775",
+     "attacker": "71657775",
+     "g": "18333196",
+     "admitted_new": "0",
+     "dropped": "1666805"
+    },
+    {
+     "epoch": 118,
+     "total": "1210277425",
+     "attacker": "90277425",
+     "g": "18619652",
+     "admitted_new": "0",
+     "dropped": "1380350"
+    },
+    {
+     "epoch": 119,
+     "total": "1229188005",
+     "attacker": "109188005",
+     "g": "18910584",
+     "admitted_new": "0",
+     "dropped": "1089420"
+    },
+    {
+     "epoch": 120,
+     "total": "1248394065",
+     "attacker": "128394065",
+     "g": "19206062",
+     "admitted_new": "0",
+     "dropped": "793940"
+    },
+    {
+     "epoch": 121,
+     "total": "1267900220",
+     "attacker": "147900220",
+     "g": "19506157",
+     "admitted_new": "0",
+     "dropped": "493845"
+    },
+    {
+     "epoch": 122,
+     "total": "1287711160",
+     "attacker": "167711160",
+     "g": "19810940",
+     "admitted_new": "0",
+     "dropped": "189060"
+    },
+    {
+     "epoch": 123,
+     "total": "1307711160",
+     "attacker": "187711160",
+     "g": "20120486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 124,
+     "total": "1327711160",
+     "attacker": "207711160",
+     "g": "20432986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 125,
+     "total": "1347711160",
+     "attacker": "227711160",
+     "g": "20745486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 126,
+     "total": "1367711160",
+     "attacker": "247711160",
+     "g": "21057986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 127,
+     "total": "1387711160",
+     "attacker": "267711160",
+     "g": "21370486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 128,
+     "total": "1407711160",
+     "attacker": "287711160",
+     "g": "21682986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 129,
+     "total": "1427711160",
+     "attacker": "307711160",
+     "g": "21995486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 130,
+     "total": "1447711160",
+     "attacker": "327711160",
+     "g": "22307986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 131,
+     "total": "1467711160",
+     "attacker": "347711160",
+     "g": "22620486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 132,
+     "total": "1487711160",
+     "attacker": "367711160",
+     "g": "22932986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 133,
+     "total": "1507711160",
+     "attacker": "387711160",
+     "g": "23245486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 134,
+     "total": "1527711160",
+     "attacker": "407711160",
+     "g": "23557986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 135,
+     "total": "1547711160",
+     "attacker": "427711160",
+     "g": "23870486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 136,
+     "total": "1567711160",
+     "attacker": "447711160",
+     "g": "24182986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 137,
+     "total": "1587711160",
+     "attacker": "467711160",
+     "g": "24495486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 138,
+     "total": "1607711160",
+     "attacker": "487711160",
+     "g": "24807986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 139,
+     "total": "1627711160",
+     "attacker": "507711160",
+     "g": "25120486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 140,
+     "total": "1647711160",
+     "attacker": "527711160",
+     "g": "25432986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 141,
+     "total": "1667711160",
+     "attacker": "547711160",
+     "g": "25745486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 142,
+     "total": "1687711160",
+     "attacker": "567711160",
+     "g": "26057986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 143,
+     "total": "1707711160",
+     "attacker": "587711160",
+     "g": "26370486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 144,
+     "total": "1727711160",
+     "attacker": "607711160",
+     "g": "26682986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 145,
+     "total": "1747711160",
+     "attacker": "627711160",
+     "g": "26995486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 146,
+     "total": "1767711160",
+     "attacker": "647711160",
+     "g": "27307986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 147,
+     "total": "1787711160",
+     "attacker": "667711160",
+     "g": "27620486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 148,
+     "total": "1807711160",
+     "attacker": "687711160",
+     "g": "27932986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 149,
+     "total": "1827711160",
+     "attacker": "707711160",
+     "g": "28245486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 150,
+     "total": "1847711160",
+     "attacker": "727711160",
+     "g": "28557986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 151,
+     "total": "1867711160",
+     "attacker": "747711160",
+     "g": "28870486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 152,
+     "total": "1887711160",
+     "attacker": "767711160",
+     "g": "29182986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 153,
+     "total": "1907711160",
+     "attacker": "787711160",
+     "g": "29495486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 154,
+     "total": "1927711160",
+     "attacker": "807711160",
+     "g": "29807986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 155,
+     "total": "1947711160",
+     "attacker": "827711160",
+     "g": "30120486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 156,
+     "total": "1967711160",
+     "attacker": "847711160",
+     "g": "30432986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 157,
+     "total": "1987711160",
+     "attacker": "867711160",
+     "g": "30745486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 158,
+     "total": "2007711160",
+     "attacker": "887711160",
+     "g": "31057986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 159,
+     "total": "2027711160",
+     "attacker": "907711160",
+     "g": "31370486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 160,
+     "total": "2047711160",
+     "attacker": "927711160",
+     "g": "31682986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 161,
+     "total": "2067711160",
+     "attacker": "947711160",
+     "g": "31995486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 162,
+     "total": "2087711160",
+     "attacker": "967711160",
+     "g": "32307986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 163,
+     "total": "2107711160",
+     "attacker": "987711160",
+     "g": "32620486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 164,
+     "total": "2127711160",
+     "attacker": "1007711160",
+     "g": "32932986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 165,
+     "total": "2147711160",
+     "attacker": "1027711160",
+     "g": "33245486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 166,
+     "total": "2167711160",
+     "attacker": "1047711160",
+     "g": "33557986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 167,
+     "total": "2187711160",
+     "attacker": "1067711160",
+     "g": "33870486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 168,
+     "total": "2207711160",
+     "attacker": "1087711160",
+     "g": "34182986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 169,
+     "total": "2227711160",
+     "attacker": "1107711160",
+     "g": "34495486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 170,
+     "total": "2247711160",
+     "attacker": "1127711160",
+     "g": "34807986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 171,
+     "total": "2267711160",
+     "attacker": "1147711160",
+     "g": "35120486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 172,
+     "total": "2287711160",
+     "attacker": "1167711160",
+     "g": "35432986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 173,
+     "total": "2307711160",
+     "attacker": "1187711160",
+     "g": "35745486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 174,
+     "total": "2327711160",
+     "attacker": "1207711160",
+     "g": "36057986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 175,
+     "total": "2347711160",
+     "attacker": "1227711160",
+     "g": "36370486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 176,
+     "total": "2367711160",
+     "attacker": "1247711160",
+     "g": "36682986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 177,
+     "total": "2387711160",
+     "attacker": "1267711160",
+     "g": "36995486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 178,
+     "total": "2407711160",
+     "attacker": "1287711160",
+     "g": "37307986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 179,
+     "total": "2427711160",
+     "attacker": "1307711160",
+     "g": "37620486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 180,
+     "total": "2447711160",
+     "attacker": "1327711160",
+     "g": "37932986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 181,
+     "total": "2467711160",
+     "attacker": "1347711160",
+     "g": "38245486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 182,
+     "total": "2487711160",
+     "attacker": "1367711160",
+     "g": "38557986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 183,
+     "total": "2507711160",
+     "attacker": "1387711160",
+     "g": "38870486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 184,
+     "total": "2527711160",
+     "attacker": "1407711160",
+     "g": "39182986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 185,
+     "total": "2547711160",
+     "attacker": "1427711160",
+     "g": "39495486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 186,
+     "total": "2567711160",
+     "attacker": "1447711160",
+     "g": "39807986",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 187,
+     "total": "2587711160",
+     "attacker": "1467711160",
+     "g": "40120486",
+     "admitted_new": "0",
+     "dropped": "0"
+    },
+    {
+     "epoch": 188,
+     "total": "2607711160",
+     "attacker": "1487711160",
+     "g": "40432986",
+     "admitted_new": "0",
+     "dropped": "0"
+    }
+   ]
+  },
+  {
+   "k": 10,
+   "epochs_to_strict_two_thirds": 71,
+   "trace": [
+    {
+     "epoch": 114,
+     "total": "1137500000",
+     "attacker": "17500000",
+     "g": "17500000",
+     "admitted_new": "17500000",
+     "dropped": "82500000"
+    },
+    {
+     "epoch": 115,
+     "total": "1155273435",
+     "attacker": "35273435",
+     "g": "17773437",
+     "admitted_new": "0",
+     "dropped": "82226565"
+    },
+    {
+     "epoch": 116,
+     "total": "1173324580",
+     "attacker": "53324580",
+     "g": "18051147",
+     "admitted_new": "0",
+     "dropped": "81948855"
+    },
+    {
+     "epoch": 117,
+     "total": "1191657775",
+     "attacker": "71657775",
+     "g": "18333196",
+     "admitted_new": "0",
+     "dropped": "81666805"
+    },
+    {
+     "epoch": 118,
+     "total": "1210277425",
+     "attacker": "90277425",
+     "g": "18619652",
+     "admitted_new": "0",
+     "dropped": "81380350"
+    },
+    {
+     "epoch": 119,
+     "total": "1229188005",
+     "attacker": "109188005",
+     "g": "18910584",
+     "admitted_new": "0",
+     "dropped": "81089420"
+    },
+    {
+     "epoch": 120,
+     "total": "1248394065",
+     "attacker": "128394065",
+     "g": "19206062",
+     "admitted_new": "0",
+     "dropped": "80793940"
+    },
+    {
+     "epoch": 121,
+     "total": "1267900220",
+     "attacker": "147900220",
+     "g": "19506157",
+     "admitted_new": "0",
+     "dropped": "80493845"
+    },
+    {
+     "epoch": 122,
+     "total": "1287711160",
+     "attacker": "167711160",
+     "g": "19810940",
+     "admitted_new": "0",
+     "dropped": "80189060"
+    },
+    {
+     "epoch": 123,
+     "total": "1307831645",
+     "attacker": "187831645",
+     "g": "20120486",
+     "admitted_new": "0",
+     "dropped": "79879515"
+    },
+    {
+     "epoch": 124,
+     "total": "1328266510",
+     "attacker": "208266510",
+     "g": "20434869",
+     "admitted_new": "0",
+     "dropped": "79565135"
+    },
+    {
+     "epoch": 125,
+     "total": "1349020670",
+     "attacker": "229020670",
+     "g": "20754164",
+     "admitted_new": "0",
+     "dropped": "79245840"
+    },
+    {
+     "epoch": 126,
+     "total": "1370099115",
+     "attacker": "250099115",
+     "g": "21078447",
+     "admitted_new": "0",
+     "dropped": "78921555"
+    },
+    {
+     "epoch": 127,
+     "total": "1391506910",
+     "attacker": "271506910",
+     "g": "21407798",
+     "admitted_new": "0",
+     "dropped": "78592205"
+    },
+    {
+     "epoch": 128,
+     "total": "1413249205",
+     "attacker": "293249205",
+     "g": "21742295",
+     "admitted_new": "0",
+     "dropped": "78257705"
+    },
+    {
+     "epoch": 129,
+     "total": "1435331220",
+     "attacker": "315331220",
+     "g": "22082018",
+     "admitted_new": "0",
+     "dropped": "77917985"
+    },
+    {
+     "epoch": 130,
+     "total": "1457758270",
+     "attacker": "337758270",
+     "g": "22427050",
+     "admitted_new": "0",
+     "dropped": "77572950"
+    },
+    {
+     "epoch": 131,
+     "total": "1480535740",
+     "attacker": "360535740",
+     "g": "22777472",
+     "admitted_new": "0",
+     "dropped": "77222530"
+    },
+    {
+     "epoch": 132,
+     "total": "1503669110",
+     "attacker": "383669110",
+     "g": "23133370",
+     "admitted_new": "0",
+     "dropped": "76866630"
+    },
+    {
+     "epoch": 133,
+     "total": "1527163935",
+     "attacker": "407163935",
+     "g": "23494829",
+     "admitted_new": "0",
+     "dropped": "76505175"
+    },
+    {
+     "epoch": 134,
+     "total": "1551025870",
+     "attacker": "431025870",
+     "g": "23861936",
+     "admitted_new": "0",
+     "dropped": "76138065"
+    },
+    {
+     "epoch": 135,
+     "total": "1575260645",
+     "attacker": "455260645",
+     "g": "24234779",
+     "admitted_new": "0",
+     "dropped": "75765225"
+    },
+    {
+     "epoch": 136,
+     "total": "1599874090",
+     "attacker": "479874090",
+     "g": "24613447",
+     "admitted_new": "0",
+     "dropped": "75386555"
+    },
+    {
+     "epoch": 137,
+     "total": "1624872120",
+     "attacker": "504872120",
+     "g": "24998032",
+     "admitted_new": "0",
+     "dropped": "75001970"
+    },
+    {
+     "epoch": 138,
+     "total": "1650260745",
+     "attacker": "530260745",
+     "g": "25388626",
+     "admitted_new": "0",
+     "dropped": "74611375"
+    },
+    {
+     "epoch": 139,
+     "total": "1676046065",
+     "attacker": "556046065",
+     "g": "25785324",
+     "admitted_new": "0",
+     "dropped": "74214680"
+    },
+    {
+     "epoch": 140,
+     "total": "1702234280",
+     "attacker": "582234280",
+     "g": "26188219",
+     "admitted_new": "0",
+     "dropped": "73811785"
+    },
+    {
+     "epoch": 141,
+     "total": "1728831690",
+     "attacker": "608831690",
+     "g": "26597410",
+     "admitted_new": "0",
+     "dropped": "73402590"
+    },
+    {
+     "epoch": 142,
+     "total": "1755844685",
+     "attacker": "635844685",
+     "g": "27012995",
+     "admitted_new": "0",
+     "dropped": "72987005"
+    },
+    {
+     "epoch": 143,
+     "total": "1783279755",
+     "attacker": "663279755",
+     "g": "27435073",
+     "admitted_new": "0",
+     "dropped": "72564930"
+    },
+    {
+     "epoch": 144,
+     "total": "1811143500",
+     "attacker": "691143500",
+     "g": "27863746",
+     "admitted_new": "0",
+     "dropped": "72136255"
+    },
+    {
+     "epoch": 145,
+     "total": "1839442615",
+     "attacker": "719442615",
+     "g": "28299117",
+     "admitted_new": "0",
+     "dropped": "71700885"
+    },
+    {
+     "epoch": 146,
+     "total": "1868183905",
+     "attacker": "748183905",
+     "g": "28741290",
+     "admitted_new": "0",
+     "dropped": "71258710"
+    },
+    {
+     "epoch": 147,
+     "total": "1897374275",
+     "attacker": "777374275",
+     "g": "29190373",
+     "admitted_new": "0",
+     "dropped": "70809630"
+    },
+    {
+     "epoch": 148,
+     "total": "1927020745",
+     "attacker": "807020745",
+     "g": "29646473",
+     "admitted_new": "0",
+     "dropped": "70353530"
+    },
+    {
+     "epoch": 149,
+     "total": "1957130440",
+     "attacker": "837130440",
+     "g": "30109699",
+     "admitted_new": "0",
+     "dropped": "69890305"
+    },
+    {
+     "epoch": 150,
+     "total": "1987710600",
+     "attacker": "867710600",
+     "g": "30580163",
+     "admitted_new": "0",
+     "dropped": "69419840"
+    },
+    {
+     "epoch": 151,
+     "total": "2018768575",
+     "attacker": "898768575",
+     "g": "31057978",
+     "admitted_new": "0",
+     "dropped": "68942025"
+    },
+    {
+     "epoch": 152,
+     "total": "2050311830",
+     "attacker": "930311830",
+     "g": "31543258",
+     "admitted_new": "0",
+     "dropped": "68456745"
+    },
+    {
+     "epoch": 153,
+     "total": "2082347950",
+     "attacker": "962347950",
+     "g": "32036122",
+     "admitted_new": "0",
+     "dropped": "67963880"
+    },
+    {
+     "epoch": 154,
+     "total": "2114884635",
+     "attacker": "994884635",
+     "g": "32536686",
+     "admitted_new": "0",
+     "dropped": "67463315"
+    },
+    {
+     "epoch": 155,
+     "total": "2147929705",
+     "attacker": "1027929705",
+     "g": "33045072",
+     "admitted_new": "0",
+     "dropped": "66954930"
+    },
+    {
+     "epoch": 156,
+     "total": "2181491105",
+     "attacker": "1061491105",
+     "g": "33561401",
+     "admitted_new": "0",
+     "dropped": "66438600"
+    },
+    {
+     "epoch": 157,
+     "total": "2215576900",
+     "attacker": "1095576900",
+     "g": "34085798",
+     "admitted_new": "0",
+     "dropped": "65914205"
+    },
+    {
+     "epoch": 158,
+     "total": "2250195285",
+     "attacker": "1130195285",
+     "g": "34618389",
+     "admitted_new": "0",
+     "dropped": "65381615"
+    },
+    {
+     "epoch": 159,
+     "total": "2285354585",
+     "attacker": "1165354585",
+     "g": "35159301",
+     "admitted_new": "0",
+     "dropped": "64840700"
+    },
+    {
+     "epoch": 160,
+     "total": "2321063250",
+     "attacker": "1201063250",
+     "g": "35708665",
+     "admitted_new": "0",
+     "dropped": "64291335"
+    },
+    {
+     "epoch": 161,
+     "total": "2357329860",
+     "attacker": "1237329860",
+     "g": "36266613",
+     "admitted_new": "0",
+     "dropped": "63733390"
+    },
+    {
+     "epoch": 162,
+     "total": "2394163135",
+     "attacker": "1274163135",
+     "g": "36833279",
+     "admitted_new": "0",
+     "dropped": "63166725"
+    },
+    {
+     "epoch": 163,
+     "total": "2431571930",
+     "attacker": "1311571930",
+     "g": "37408798",
+     "admitted_new": "0",
+     "dropped": "62591205"
+    },
+    {
+     "epoch": 164,
+     "total": "2469565240",
+     "attacker": "1349565240",
+     "g": "37993311",
+     "admitted_new": "0",
+     "dropped": "62006690"
+    },
+    {
+     "epoch": 165,
+     "total": "2508152195",
+     "attacker": "1388152195",
+     "g": "38586956",
+     "admitted_new": "0",
+     "dropped": "61413045"
+    },
+    {
+     "epoch": 166,
+     "total": "2547342070",
+     "attacker": "1427342070",
+     "g": "39189878",
+     "admitted_new": "0",
+     "dropped": "60810125"
+    },
+    {
+     "epoch": 167,
+     "total": "2587144285",
+     "attacker": "1467144285",
+     "g": "39802219",
+     "admitted_new": "0",
+     "dropped": "60197785"
+    },
+    {
+     "epoch": 168,
+     "total": "2627568410",
+     "attacker": "1507568410",
+     "g": "40424129",
+     "admitted_new": "0",
+     "dropped": "59575875"
+    },
+    {
+     "epoch": 169,
+     "total": "2668624165",
+     "attacker": "1548624165",
+     "g": "41055756",
+     "admitted_new": "0",
+     "dropped": "58944245"
+    },
+    {
+     "epoch": 170,
+     "total": "2710321415",
+     "attacker": "1590321415",
+     "g": "41697252",
+     "admitted_new": "0",
+     "dropped": "58302750"
+    },
+    {
+     "epoch": 171,
+     "total": "2752670185",
+     "attacker": "1632670185",
+     "g": "42348772",
+     "admitted_new": "0",
+     "dropped": "57651230"
+    },
+    {
+     "epoch": 172,
+     "total": "2795680655",
+     "attacker": "1675680655",
+     "g": "43010471",
+     "admitted_new": "0",
+     "dropped": "56989530"
+    },
+    {
+     "epoch": 173,
+     "total": "2839363165",
+     "attacker": "1719363165",
+     "g": "43682510",
+     "admitted_new": "0",
+     "dropped": "56317490"
+    },
+    {
+     "epoch": 174,
+     "total": "2883728210",
+     "attacker": "1763728210",
+     "g": "44365049",
+     "admitted_new": "0",
+     "dropped": "55634955"
+    },
+    {
+     "epoch": 175,
+     "total": "2928786460",
+     "attacker": "1808786460",
+     "g": "45058253",
+     "admitted_new": "0",
+     "dropped": "54941750"
+    },
+    {
+     "epoch": 176,
+     "total": "2974548745",
+     "attacker": "1854548745",
+     "g": "45762288",
+     "admitted_new": "0",
+     "dropped": "54237715"
+    },
+    {
+     "epoch": 177,
+     "total": "3021026065",
+     "attacker": "1901026065",
+     "g": "46477324",
+     "admitted_new": "0",
+     "dropped": "53522680"
+    },
+    {
+     "epoch": 178,
+     "total": "3068229595",
+     "attacker": "1948229595",
+     "g": "47203532",
+     "admitted_new": "0",
+     "dropped": "52796470"
+    },
+    {
+     "epoch": 179,
+     "total": "3116170680",
+     "attacker": "1996170680",
+     "g": "47941087",
+     "admitted_new": "0",
+     "dropped": "52058915"
+    },
+    {
+     "epoch": 180,
+     "total": "3164860845",
+     "attacker": "2044860845",
+     "g": "48690166",
+     "admitted_new": "0",
+     "dropped": "51309835"
+    },
+    {
+     "epoch": 181,
+     "total": "3214311795",
+     "attacker": "2094311795",
+     "g": "49450950",
+     "admitted_new": "0",
+     "dropped": "50549050"
+    },
+    {
+     "epoch": 182,
+     "total": "3264535415",
+     "attacker": "2144535415",
+     "g": "50223621",
+     "admitted_new": "0",
+     "dropped": "49776380"
+    },
+    {
+     "epoch": 183,
+     "total": "3315543780",
+     "attacker": "2195543780",
+     "g": "51008365",
+     "admitted_new": "0",
+     "dropped": "48991635"
+    },
+    {
+     "epoch": 184,
+     "total": "3367349150",
+     "attacker": "2247349150",
+     "g": "51805371",
+     "admitted_new": "0",
+     "dropped": "48194630"
+    },
+    {
+     "epoch": 185,
+     "total": "3419963980",
+     "attacker": "2299963980",
+     "g": "52614830",
+     "admitted_new": "0",
+     "dropped": "47385170"
+    },
+    {
+     "epoch": 186,
+     "total": "3473400915",
+     "attacker": "2353400915",
+     "g": "53436937",
+     "admitted_new": "0",
+     "dropped": "46563065"
+    },
+    {
+     "epoch": 187,
+     "total": "3527672800",
+     "attacker": "2407672800",
+     "g": "54271889",
+     "admitted_new": "0",
+     "dropped": "45728115"
+    },
+    {
+     "epoch": 188,
+     "total": "3582792685",
+     "attacker": "2462792685",
+     "g": "55119887",
+     "admitted_new": "0",
+     "dropped": "44880115"
+    }
+   ]
+  },
+  {
+   "k": 100,
+   "epochs_to_strict_two_thirds": 71,
+   "trace": [
+    {
+     "epoch": 114,
+     "total": "1137500000",
+     "attacker": "17500000",
+     "g": "17500000",
+     "admitted_new": "17500000",
+     "dropped": "982500000"
+    },
+    {
+     "epoch": 115,
+     "total": "1155273435",
+     "attacker": "35273435",
+     "g": "17773437",
+     "admitted_new": "0",
+     "dropped": "982226565"
+    },
+    {
+     "epoch": 116,
+     "total": "1173324580",
+     "attacker": "53324580",
+     "g": "18051147",
+     "admitted_new": "0",
+     "dropped": "981948855"
+    },
+    {
+     "epoch": 117,
+     "total": "1191657775",
+     "attacker": "71657775",
+     "g": "18333196",
+     "admitted_new": "0",
+     "dropped": "981666805"
+    },
+    {
+     "epoch": 118,
+     "total": "1210277425",
+     "attacker": "90277425",
+     "g": "18619652",
+     "admitted_new": "0",
+     "dropped": "981380350"
+    },
+    {
+     "epoch": 119,
+     "total": "1229188005",
+     "attacker": "109188005",
+     "g": "18910584",
+     "admitted_new": "0",
+     "dropped": "981089420"
+    },
+    {
+     "epoch": 120,
+     "total": "1248394065",
+     "attacker": "128394065",
+     "g": "19206062",
+     "admitted_new": "0",
+     "dropped": "980793940"
+    },
+    {
+     "epoch": 121,
+     "total": "1267900220",
+     "attacker": "147900220",
+     "g": "19506157",
+     "admitted_new": "0",
+     "dropped": "980493845"
+    },
+    {
+     "epoch": 122,
+     "total": "1287711160",
+     "attacker": "167711160",
+     "g": "19810940",
+     "admitted_new": "0",
+     "dropped": "980189060"
+    },
+    {
+     "epoch": 123,
+     "total": "1307831645",
+     "attacker": "187831645",
+     "g": "20120486",
+     "admitted_new": "0",
+     "dropped": "979879515"
+    },
+    {
+     "epoch": 124,
+     "total": "1328266510",
+     "attacker": "208266510",
+     "g": "20434869",
+     "admitted_new": "0",
+     "dropped": "979565135"
+    },
+    {
+     "epoch": 125,
+     "total": "1349020670",
+     "attacker": "229020670",
+     "g": "20754164",
+     "admitted_new": "0",
+     "dropped": "979245840"
+    },
+    {
+     "epoch": 126,
+     "total": "1370099115",
+     "attacker": "250099115",
+     "g": "21078447",
+     "admitted_new": "0",
+     "dropped": "978921555"
+    },
+    {
+     "epoch": 127,
+     "total": "1391506910",
+     "attacker": "271506910",
+     "g": "21407798",
+     "admitted_new": "0",
+     "dropped": "978592205"
+    },
+    {
+     "epoch": 128,
+     "total": "1413249205",
+     "attacker": "293249205",
+     "g": "21742295",
+     "admitted_new": "0",
+     "dropped": "978257705"
+    },
+    {
+     "epoch": 129,
+     "total": "1435331220",
+     "attacker": "315331220",
+     "g": "22082018",
+     "admitted_new": "0",
+     "dropped": "977917985"
+    },
+    {
+     "epoch": 130,
+     "total": "1457758270",
+     "attacker": "337758270",
+     "g": "22427050",
+     "admitted_new": "0",
+     "dropped": "977572950"
+    },
+    {
+     "epoch": 131,
+     "total": "1480535740",
+     "attacker": "360535740",
+     "g": "22777472",
+     "admitted_new": "0",
+     "dropped": "977222530"
+    },
+    {
+     "epoch": 132,
+     "total": "1503669110",
+     "attacker": "383669110",
+     "g": "23133370",
+     "admitted_new": "0",
+     "dropped": "976866630"
+    },
+    {
+     "epoch": 133,
+     "total": "1527163935",
+     "attacker": "407163935",
+     "g": "23494829",
+     "admitted_new": "0",
+     "dropped": "976505175"
+    },
+    {
+     "epoch": 134,
+     "total": "1551025870",
+     "attacker": "431025870",
+     "g": "23861936",
+     "admitted_new": "0",
+     "dropped": "976138065"
+    },
+    {
+     "epoch": 135,
+     "total": "1575260645",
+     "attacker": "455260645",
+     "g": "24234779",
+     "admitted_new": "0",
+     "dropped": "975765225"
+    },
+    {
+     "epoch": 136,
+     "total": "1599874090",
+     "attacker": "479874090",
+     "g": "24613447",
+     "admitted_new": "0",
+     "dropped": "975386555"
+    },
+    {
+     "epoch": 137,
+     "total": "1624872120",
+     "attacker": "504872120",
+     "g": "24998032",
+     "admitted_new": "0",
+     "dropped": "975001970"
+    },
+    {
+     "epoch": 138,
+     "total": "1650260745",
+     "attacker": "530260745",
+     "g": "25388626",
+     "admitted_new": "0",
+     "dropped": "974611375"
+    },
+    {
+     "epoch": 139,
+     "total": "1676046065",
+     "attacker": "556046065",
+     "g": "25785324",
+     "admitted_new": "0",
+     "dropped": "974214680"
+    },
+    {
+     "epoch": 140,
+     "total": "1702234280",
+     "attacker": "582234280",
+     "g": "26188219",
+     "admitted_new": "0",
+     "dropped": "973811785"
+    },
+    {
+     "epoch": 141,
+     "total": "1728831690",
+     "attacker": "608831690",
+     "g": "26597410",
+     "admitted_new": "0",
+     "dropped": "973402590"
+    },
+    {
+     "epoch": 142,
+     "total": "1755844685",
+     "attacker": "635844685",
+     "g": "27012995",
+     "admitted_new": "0",
+     "dropped": "972987005"
+    },
+    {
+     "epoch": 143,
+     "total": "1783279755",
+     "attacker": "663279755",
+     "g": "27435073",
+     "admitted_new": "0",
+     "dropped": "972564930"
+    },
+    {
+     "epoch": 144,
+     "total": "1811143500",
+     "attacker": "691143500",
+     "g": "27863746",
+     "admitted_new": "0",
+     "dropped": "972136255"
+    },
+    {
+     "epoch": 145,
+     "total": "1839442615",
+     "attacker": "719442615",
+     "g": "28299117",
+     "admitted_new": "0",
+     "dropped": "971700885"
+    },
+    {
+     "epoch": 146,
+     "total": "1868183905",
+     "attacker": "748183905",
+     "g": "28741290",
+     "admitted_new": "0",
+     "dropped": "971258710"
+    },
+    {
+     "epoch": 147,
+     "total": "1897374275",
+     "attacker": "777374275",
+     "g": "29190373",
+     "admitted_new": "0",
+     "dropped": "970809630"
+    },
+    {
+     "epoch": 148,
+     "total": "1927020745",
+     "attacker": "807020745",
+     "g": "29646473",
+     "admitted_new": "0",
+     "dropped": "970353530"
+    },
+    {
+     "epoch": 149,
+     "total": "1957130440",
+     "attacker": "837130440",
+     "g": "30109699",
+     "admitted_new": "0",
+     "dropped": "969890305"
+    },
+    {
+     "epoch": 150,
+     "total": "1987710600",
+     "attacker": "867710600",
+     "g": "30580163",
+     "admitted_new": "0",
+     "dropped": "969419840"
+    },
+    {
+     "epoch": 151,
+     "total": "2018768575",
+     "attacker": "898768575",
+     "g": "31057978",
+     "admitted_new": "0",
+     "dropped": "968942025"
+    },
+    {
+     "epoch": 152,
+     "total": "2050311830",
+     "attacker": "930311830",
+     "g": "31543258",
+     "admitted_new": "0",
+     "dropped": "968456745"
+    },
+    {
+     "epoch": 153,
+     "total": "2082347950",
+     "attacker": "962347950",
+     "g": "32036122",
+     "admitted_new": "0",
+     "dropped": "967963880"
+    },
+    {
+     "epoch": 154,
+     "total": "2114884635",
+     "attacker": "994884635",
+     "g": "32536686",
+     "admitted_new": "0",
+     "dropped": "967463315"
+    },
+    {
+     "epoch": 155,
+     "total": "2147929705",
+     "attacker": "1027929705",
+     "g": "33045072",
+     "admitted_new": "0",
+     "dropped": "966954930"
+    },
+    {
+     "epoch": 156,
+     "total": "2181491105",
+     "attacker": "1061491105",
+     "g": "33561401",
+     "admitted_new": "0",
+     "dropped": "966438600"
+    },
+    {
+     "epoch": 157,
+     "total": "2215576900",
+     "attacker": "1095576900",
+     "g": "34085798",
+     "admitted_new": "0",
+     "dropped": "965914205"
+    },
+    {
+     "epoch": 158,
+     "total": "2250195285",
+     "attacker": "1130195285",
+     "g": "34618389",
+     "admitted_new": "0",
+     "dropped": "965381615"
+    },
+    {
+     "epoch": 159,
+     "total": "2285354585",
+     "attacker": "1165354585",
+     "g": "35159301",
+     "admitted_new": "0",
+     "dropped": "964840700"
+    },
+    {
+     "epoch": 160,
+     "total": "2321063250",
+     "attacker": "1201063250",
+     "g": "35708665",
+     "admitted_new": "0",
+     "dropped": "964291335"
+    },
+    {
+     "epoch": 161,
+     "total": "2357329860",
+     "attacker": "1237329860",
+     "g": "36266613",
+     "admitted_new": "0",
+     "dropped": "963733390"
+    },
+    {
+     "epoch": 162,
+     "total": "2394163135",
+     "attacker": "1274163135",
+     "g": "36833279",
+     "admitted_new": "0",
+     "dropped": "963166725"
+    },
+    {
+     "epoch": 163,
+     "total": "2431571930",
+     "attacker": "1311571930",
+     "g": "37408798",
+     "admitted_new": "0",
+     "dropped": "962591205"
+    },
+    {
+     "epoch": 164,
+     "total": "2469565240",
+     "attacker": "1349565240",
+     "g": "37993311",
+     "admitted_new": "0",
+     "dropped": "962006690"
+    },
+    {
+     "epoch": 165,
+     "total": "2508152195",
+     "attacker": "1388152195",
+     "g": "38586956",
+     "admitted_new": "0",
+     "dropped": "961413045"
+    },
+    {
+     "epoch": 166,
+     "total": "2547342070",
+     "attacker": "1427342070",
+     "g": "39189878",
+     "admitted_new": "0",
+     "dropped": "960810125"
+    },
+    {
+     "epoch": 167,
+     "total": "2587144285",
+     "attacker": "1467144285",
+     "g": "39802219",
+     "admitted_new": "0",
+     "dropped": "960197785"
+    },
+    {
+     "epoch": 168,
+     "total": "2627568410",
+     "attacker": "1507568410",
+     "g": "40424129",
+     "admitted_new": "0",
+     "dropped": "959575875"
+    },
+    {
+     "epoch": 169,
+     "total": "2668624165",
+     "attacker": "1548624165",
+     "g": "41055756",
+     "admitted_new": "0",
+     "dropped": "958944245"
+    },
+    {
+     "epoch": 170,
+     "total": "2710321415",
+     "attacker": "1590321415",
+     "g": "41697252",
+     "admitted_new": "0",
+     "dropped": "958302750"
+    },
+    {
+     "epoch": 171,
+     "total": "2752670185",
+     "attacker": "1632670185",
+     "g": "42348772",
+     "admitted_new": "0",
+     "dropped": "957651230"
+    },
+    {
+     "epoch": 172,
+     "total": "2795680655",
+     "attacker": "1675680655",
+     "g": "43010471",
+     "admitted_new": "0",
+     "dropped": "956989530"
+    },
+    {
+     "epoch": 173,
+     "total": "2839363165",
+     "attacker": "1719363165",
+     "g": "43682510",
+     "admitted_new": "0",
+     "dropped": "956317490"
+    },
+    {
+     "epoch": 174,
+     "total": "2883728210",
+     "attacker": "1763728210",
+     "g": "44365049",
+     "admitted_new": "0",
+     "dropped": "955634955"
+    },
+    {
+     "epoch": 175,
+     "total": "2928786460",
+     "attacker": "1808786460",
+     "g": "45058253",
+     "admitted_new": "0",
+     "dropped": "954941750"
+    },
+    {
+     "epoch": 176,
+     "total": "2974548745",
+     "attacker": "1854548745",
+     "g": "45762288",
+     "admitted_new": "0",
+     "dropped": "954237715"
+    },
+    {
+     "epoch": 177,
+     "total": "3021026065",
+     "attacker": "1901026065",
+     "g": "46477324",
+     "admitted_new": "0",
+     "dropped": "953522680"
+    },
+    {
+     "epoch": 178,
+     "total": "3068229595",
+     "attacker": "1948229595",
+     "g": "47203532",
+     "admitted_new": "0",
+     "dropped": "952796470"
+    },
+    {
+     "epoch": 179,
+     "total": "3116170680",
+     "attacker": "1996170680",
+     "g": "47941087",
+     "admitted_new": "0",
+     "dropped": "952058915"
+    },
+    {
+     "epoch": 180,
+     "total": "3164860845",
+     "attacker": "2044860845",
+     "g": "48690166",
+     "admitted_new": "0",
+     "dropped": "951309835"
+    },
+    {
+     "epoch": 181,
+     "total": "3214311795",
+     "attacker": "2094311795",
+     "g": "49450950",
+     "admitted_new": "0",
+     "dropped": "950549050"
+    },
+    {
+     "epoch": 182,
+     "total": "3264535415",
+     "attacker": "2144535415",
+     "g": "50223621",
+     "admitted_new": "0",
+     "dropped": "949776380"
+    },
+    {
+     "epoch": 183,
+     "total": "3315543780",
+     "attacker": "2195543780",
+     "g": "51008365",
+     "admitted_new": "0",
+     "dropped": "948991635"
+    },
+    {
+     "epoch": 184,
+     "total": "3367349150",
+     "attacker": "2247349150",
+     "g": "51805371",
+     "admitted_new": "0",
+     "dropped": "948194630"
+    },
+    {
+     "epoch": 185,
+     "total": "3419963980",
+     "attacker": "2299963980",
+     "g": "52614830",
+     "admitted_new": "0",
+     "dropped": "947385170"
+    },
+    {
+     "epoch": 186,
+     "total": "3473400915",
+     "attacker": "2353400915",
+     "g": "53436937",
+     "admitted_new": "0",
+     "dropped": "946563065"
+    },
+    {
+     "epoch": 187,
+     "total": "3527672800",
+     "attacker": "2407672800",
+     "g": "54271889",
+     "admitted_new": "0",
+     "dropped": "945728115"
+    },
+    {
+     "epoch": 188,
+     "total": "3582792685",
+     "attacker": "2462792685",
+     "g": "55119887",
+     "admitted_new": "0",
+     "dropped": "944880115"
+    }
+   ]
+  }
+ ],
+ "launch": {
+  "bits": 486604799,
+  "share_work": "268439552",
+  "g_min": "386552954880",
+  "work_per_epoch": "3092423639040",
+  "steps": [
+   {
+    "epoch": 2,
+    "w": "0",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "386552954880"
+   },
+   {
+    "epoch": 3,
+    "w": "386552954880",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "773105909760"
+   },
+   {
+    "epoch": 4,
+    "w": "773105909760",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "1159658864640"
+   },
+   {
+    "epoch": 5,
+    "w": "1159658864640",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "1546211819520"
+   },
+   {
+    "epoch": 6,
+    "w": "1546211819520",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "1932764774400"
+   },
+   {
+    "epoch": 7,
+    "w": "1932764774400",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "2319317729280"
+   },
+   {
+    "epoch": 8,
+    "w": "2319317729280",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "2705870684160"
+   },
+   {
+    "epoch": 9,
+    "w": "2705870684160",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "3092423639040"
+   },
+   {
+    "epoch": 10,
+    "w": "3092423639040",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "3478976593920"
+   },
+   {
+    "epoch": 11,
+    "w": "3478976593920",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "3865529548800"
+   },
+   {
+    "epoch": 12,
+    "w": "3865529548800",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "4252082503680"
+   },
+   {
+    "epoch": 13,
+    "w": "4252082503680",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "4638635458560"
+   },
+   {
+    "epoch": 14,
+    "w": "4638635458560",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "5025188413440"
+   },
+   {
+    "epoch": 15,
+    "w": "5025188413440",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "5411741368320"
+   },
+   {
+    "epoch": 16,
+    "w": "5411741368320",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "5798294323200"
+   },
+   {
+    "epoch": 17,
+    "w": "5798294323200",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "6184847278080"
+   },
+   {
+    "epoch": 18,
+    "w": "6184847278080",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "6571400232960"
+   },
+   {
+    "epoch": 19,
+    "w": "6571400232960",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "6957953187840"
+   },
+   {
+    "epoch": 20,
+    "w": "6957953187840",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "7344506142720"
+   },
+   {
+    "epoch": 21,
+    "w": "7344506142720",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "7731059097600"
+   },
+   {
+    "epoch": 22,
+    "w": "7731059097600",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "8117612052480"
+   },
+   {
+    "epoch": 23,
+    "w": "8117612052480",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "8504165007360"
+   },
+   {
+    "epoch": 24,
+    "w": "8504165007360",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "8890717962240"
+   },
+   {
+    "epoch": 25,
+    "w": "8890717962240",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "9277270917120"
+   },
+   {
+    "epoch": 26,
+    "w": "9277270917120",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "9663823872000"
+   },
+   {
+    "epoch": 27,
+    "w": "9663823872000",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "10050376826880"
+   },
+   {
+    "epoch": 28,
+    "w": "10050376826880",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "10436929781760"
+   },
+   {
+    "epoch": 29,
+    "w": "10436929781760",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "10823482736640"
+   },
+   {
+    "epoch": 30,
+    "w": "10823482736640",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "11210035691520"
+   },
+   {
+    "epoch": 31,
+    "w": "11210035691520",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "11596588646400"
+   },
+   {
+    "epoch": 32,
+    "w": "11596588646400",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "11983141601280"
+   },
+   {
+    "epoch": 33,
+    "w": "11983141601280",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "12369694556160"
+   },
+   {
+    "epoch": 34,
+    "w": "12369694556160",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "12756247511040"
+   },
+   {
+    "epoch": 35,
+    "w": "12756247511040",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "13142800465920"
+   },
+   {
+    "epoch": 36,
+    "w": "13142800465920",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "13529353420800"
+   },
+   {
+    "epoch": 37,
+    "w": "13529353420800",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "13915906375680"
+   },
+   {
+    "epoch": 38,
+    "w": "13915906375680",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "14302459330560"
+   },
+   {
+    "epoch": 39,
+    "w": "14302459330560",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "14689012285440"
+   },
+   {
+    "epoch": 40,
+    "w": "14689012285440",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "15075565240320"
+   },
+   {
+    "epoch": 41,
+    "w": "15075565240320",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "15462118195200"
+   },
+   {
+    "epoch": 42,
+    "w": "15462118195200",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "15848671150080"
+   },
+   {
+    "epoch": 43,
+    "w": "15848671150080",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "16235224104960"
+   },
+   {
+    "epoch": 44,
+    "w": "16235224104960",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "16621777059840"
+   },
+   {
+    "epoch": 45,
+    "w": "16621777059840",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "17008330014720"
+   },
+   {
+    "epoch": 46,
+    "w": "17008330014720",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "17394882969600"
+   },
+   {
+    "epoch": 47,
+    "w": "17394882969600",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "17781435924480"
+   },
+   {
+    "epoch": 48,
+    "w": "17781435924480",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "18167988879360"
+   },
+   {
+    "epoch": 49,
+    "w": "18167988879360",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "18554541834240"
+   },
+   {
+    "epoch": 50,
+    "w": "18554541834240",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "18941094789120"
+   },
+   {
+    "epoch": 51,
+    "w": "18941094789120",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "19327647744000"
+   },
+   {
+    "epoch": 52,
+    "w": "19327647744000",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "19714200698880"
+   },
+   {
+    "epoch": 53,
+    "w": "19714200698880",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "20100753653760"
+   },
+   {
+    "epoch": 54,
+    "w": "20100753653760",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "20487306608640"
+   },
+   {
+    "epoch": 55,
+    "w": "20487306608640",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "20873859563520"
+   },
+   {
+    "epoch": 56,
+    "w": "20873859563520",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "21260412518400"
+   },
+   {
+    "epoch": 57,
+    "w": "21260412518400",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "21646965473280"
+   },
+   {
+    "epoch": 58,
+    "w": "21646965473280",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "22033518428160"
+   },
+   {
+    "epoch": 59,
+    "w": "22033518428160",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "22420071383040"
+   },
+   {
+    "epoch": 60,
+    "w": "22420071383040",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "22806624337920"
+   },
+   {
+    "epoch": 61,
+    "w": "22806624337920",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "23193177292800"
+   },
+   {
+    "epoch": 62,
+    "w": "23193177292800",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "23579730247680"
+   },
+   {
+    "epoch": 63,
+    "w": "23579730247680",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "23966283202560"
+   },
+   {
+    "epoch": 64,
+    "w": "23966283202560",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "24352836157440"
+   },
+   {
+    "epoch": 65,
+    "w": "24352836157440",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "24739389112320"
+   },
+   {
+    "epoch": 66,
+    "w": "24739389112320",
+    "g": "386552954880",
+    "admitted": "386552954880",
+    "total": "25125942067200"
+   },
+   {
+    "epoch": 67,
+    "w": "25125942067200",
+    "g": "392592844800",
+    "admitted": "392592844800",
+    "total": "25518534912000"
+   },
+   {
+    "epoch": 68,
+    "w": "25518534912000",
+    "g": "398727108000",
+    "admitted": "398727108000",
+    "total": "25917262020000"
+   },
+   {
+    "epoch": 69,
+    "w": "25917262020000",
+    "g": "404957219062",
+    "admitted": "404957219060",
+    "total": "26322219239060"
+   },
+   {
+    "epoch": 70,
+    "w": "26322219239060",
+    "g": "411284675610",
+    "admitted": "411284675608",
+    "total": "26733503914668"
+   },
+   {
+    "epoch": 71,
+    "w": "26733503914668",
+    "g": "417710998666",
+    "admitted": "417710998664",
+    "total": "27151214913332"
+   },
+   {
+    "epoch": 72,
+    "w": "27151214913332",
+    "g": "424237733020",
+    "admitted": "424237733020",
+    "total": "27575452646352"
+   },
+   {
+    "epoch": 73,
+    "w": "27575452646352",
+    "g": "430866447599",
+    "admitted": "430866447596",
+    "total": "28006319093948"
+   },
+   {
+    "epoch": 74,
+    "w": "28006319093948",
+    "g": "437598735842",
+    "admitted": "437598735840",
+    "total": "28443917829788"
+   },
+   {
+    "epoch": 75,
+    "w": "28443917829788",
+    "g": "444436216090",
+    "admitted": "444436216088",
+    "total": "28888354045876"
+   },
+   {
+    "epoch": 76,
+    "w": "28888354045876",
+    "g": "451380531966",
+    "admitted": "451380531964",
+    "total": "29339734577840"
+   },
+   {
+    "epoch": 77,
+    "w": "29339734577840",
+    "g": "458433352778",
+    "admitted": "458433352776",
+    "total": "29798167930616"
+   },
+   {
+    "epoch": 78,
+    "w": "29798167930616",
+    "g": "465596373915",
+    "admitted": "465596373912",
+    "total": "30263764304528"
+   },
+   {
+    "epoch": 79,
+    "w": "30263764304528",
+    "g": "472871317258",
+    "admitted": "472871317256",
+    "total": "30736635621784"
+   }
+  ]
+ }
+}
