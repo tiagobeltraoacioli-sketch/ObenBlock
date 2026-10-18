@@ -1,0 +1,51 @@
+# systemd unit for obenblock-cpu-miner on a server that also runs a node:
+# mines through a stratum server like the ASICs do.
+#   /opt/obenblock/bin/obenblock-cpu-miner
+#   /etc/obenblock/cpu-miner.env   OBB_MINER_URL   stratum+tcp://127.0.0.1:3333 (or the shared endpoint)
+#                                  OBB_MINER_USER  <obb1 address>.<server name>
+#                                  OBB_MINER_THREADS  e.g. 24 of 32 vCPUs, leaving cores to the node
+# Nice=19 and CPUWeight keep the node (block validation, PoWit signing) ahead.
+[Unit]
+Description=ObenBlock SHA-256d CPU miner (through stratum)
+After=network-online.target obenblock-stratum.service
+Wants=network-online.target
+
+[Service]
+User=obb-miner
+Group=obb-miner
+EnvironmentFile=/etc/obenblock/cpu-miner.env
+ExecStart=/opt/obenblock/bin/obenblock-cpu-miner -o ${OBB_MINER_URL} -u ${OBB_MINER_USER} -t ${OBB_MINER_THREADS}
+Restart=always
+RestartSec=10
+Nice=19
+CPUWeight=20
+MemoryMax=512M
+UMask=0077
+
+# ── Sandboxing (as gnb-node.service; deploy/test_deploy_files.py) ───────────
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

@@ -226,6 +226,10 @@ is `coinbase_merkle_branch`.
   header, as `getwork` did) mines ObenBlock unmodified.
 - **SV2 extended channels**: the same coinbase prefix / suffix and merkle
   path as Stratum V1 (4.1); the root is Bitcoin's, so they map directly.
+- **Stratum V1 server**: `tools/obenblock-stratum` (a solo-pool job server
+  and `obenblock-cpu-miner`) serves stock Stratum V1 jobs straight from the
+  header job's `stratum` object, rebuilds the coinbase per share and submits
+  blocks with their extranonce; its README has the details.
 - **Share difficulty**: pools set it as on Bitcoin; a share is a block when
   its id meets `target`.
 - **Witness shares** (PoWit, §6 of the design) are a separate header and a

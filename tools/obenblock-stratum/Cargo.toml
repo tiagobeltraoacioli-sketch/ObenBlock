@@ -1,0 +1,55 @@
+# obenblock-stratum: a Stratum V1 job server (solo pool) for ObenBlock's
+# SHA-256d proof of work, plus obenblock-cpu-miner, a multi-threaded SHA-256d
+# CPU miner that mines through the same stratum path.
+#
+# Ported from the Bloch pool proxy (bloch-pos/pool-proxy). The upstream is the
+# ObenBlock node's JSON-RPC (`getblocktemplate` header jobs and `submitblock`,
+# docs/OBENBLOCK-MINING.md); merged mining is removed.
+#
+# Its own [workspace], like the original: it is not a member of the node's
+# consensus workspace. The only in-repo dependency is the leaf proof-of-work
+# crate `gnb-smh` (SHA-256d header, targets, stall relief), so a share is
+# judged by the same functions the node uses.
+
+[workspace]
+
+[package]
+name = "obenblock-stratum"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+description = "Stratum V1 job server (solo pool) and SHA-256d CPU miner for ObenBlock"
+
+[[bin]]
+name = "obenblock-stratum"
+path = "src/main.rs"
+
+[[bin]]
+name = "obenblock-cpu-miner"
+path = "src/bin/obenblock-cpu-miner.rs"
+
+[lib]
+name = "obenblock_stratum"
+path = "src/lib.rs"
+
+[dependencies]
+gnb-smh = { path = "../../crates/gnb-smh" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+env_logger = "0.11"
+sha2 = { version = "0.10", features = ["compress"] }
+sha3 = "0.10"
+primitive-types = "0.13"
+hex = "0.4"
+rand = "0.8"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
+tempfile = "3"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
