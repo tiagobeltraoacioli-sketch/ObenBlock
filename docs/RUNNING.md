@@ -667,7 +667,8 @@ key are never charged.
 ## Chain selection and operator recovery
 
 The node always follows the best valid chain of the blocks it holds, at any
-depth: there is no reorg-depth limit and no finality checkpoint. A reorg of
+depth, among the chains through the PoWit checkpoint it finalized (below):
+there is no reorg-depth limit. A reorg of
 more than 1,000 blocks is logged at error level ("DEEP REORG committed") and
 counted in `gnb_deep_reorgs_total`; it is never refused.
 
@@ -696,6 +697,39 @@ are persisted and survive restarts, and they are the RPC methods of the same
 name (parameter: the block hash in hex). They are never served to an
 anonymous caller: they need the configured API key (`--rpc-api-key` /
 `--rpc-api-key-file`) or a trusted caller (`--rpc-trust-loopback`).
+
+### Finality alert (package A2)
+
+From the PoWit height the node pins the latest checkpoint its witness set
+finalized: it never moves to a chain that misses it, however much work that
+chain has. The pin is persisted and restored at start-up. It moves forward
+only, along its own chain, and it also moves when a block of another branch
+carries a later finalized checkpoint that extends it (after a partition, the
+side that did not finalize rejoins the side that did, also when that side
+has less work). A block that carries a finalized checkpoint that CONFLICTS
+with the pin (both sides of a partition longer than the inactivity leak
+finalized, or a third of the witness weight signed both) changes nothing.
+The node logs `FINALITY CONFLICT` at error level, records the alert, and
+stays where it is until the operator decides:
+
+```sh
+gnb-cli getfinalityinfo
+GNB_RPC_API_KEY=<key> gnb-cli setfinalitycheckpoint <block-hash>
+GNB_RPC_API_KEY=<key> gnb-cli ignorefinalized
+```
+
+`getfinalityinfo` shows the pin (`finalized`, and who set it), whether the
+applied tip is on its chain, and the conflicting checkpoints (`conflicts`:
+at most 8 distinct ones are kept, `conflicts_dropped` counts the rest; each
+with the first block that carried it and that block's blue work).
+`setfinalitycheckpoint` pins the given block (any branch, also an older
+checkpoint) and moves the node to the best chain through it.
+`ignorefinalized` drops the pin: the node follows the most work again and
+pins the finality of the chain it ends on (a conflicting branch that still
+arrives raises the alert again). Both clear the alert, are persisted, and
+need the API key or a trusted caller like `invalidateblock`; on a pruned node
+they return the same "retry once the bodies arrived" error, with the previous
+pin kept.
 
 A pruned node (the default; `--archive` keeps every block body) deletes, in
 steps of 1,000 blocks, the bodies of ALL blocks more than 10,000 DAG heights

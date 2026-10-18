@@ -8,6 +8,7 @@
 //!   validateaddress, estimatefee, getrawmempool,
 //!   decoderawtransaction, getdaginfo, listtransactions, getpeerinfo,
 //!   invalidateblock, reconsiderblock (admin: audit DAG-6)
+//!   getfinalityinfo; setfinalitycheckpoint, ignorefinalized (admin: package A2)
 //!
 //! Mempool policy (audit MEM-6, `docs/MEMPOOL.md`): `sendrawtransaction`
 //! accepts children of unconfirmed transactions (≤ 25 ancestors and
@@ -144,6 +145,11 @@ pub enum ChainAdminOp {
     /// Remove such disqualifications (the block, its selected-chain ancestors
     /// and descendants) and let the node re-evaluate them.
     Reconsider,
+    /// Package A2: pin PoWit finality to a block (`setfinalitycheckpoint`).
+    SetFinalityCheckpoint,
+    /// Package A2: drop the finality pin (`ignorefinalized`; the hash
+    /// argument is unused).
+    IgnoreFinalized,
 }
 
 /// Hook that performs a [`ChainAdminOp`] on a block through the acceptance
@@ -326,6 +332,7 @@ const KNOWN_RPC_METHODS: &[&str] = &[
     "getblocktimepercentiles", "gettxstatus", "getaddressinfo", "estimatefeeadvanced",
     "getmempoolstats", "validateaddressverbose", "gettxsbyblock", "getaddressbalance_at_height",
     "getattestation", "invalidateblock", "reconsiderblock", "gettxoutsetinfo",
+    "getfinalityinfo", "setfinalitycheckpoint", "ignorefinalized",
 ];
 
 /// Longest method-name prefix written to a log line (NET-13).
@@ -1250,7 +1257,7 @@ fn chain_admin_call(op: ChainAdminOp, params: Option<&Value>, state: &AppState) 
         None => return json!({ "error": "expected one parameter: a 64-hex-character block hash" }),
     };
     match &state.chain_admin {
-        None => json!({ "error": "invalidateblock/reconsiderblock not wired on this node" }),
+        None => json!({ "error": "chain overrides are not wired on this node" }),
         Some(hook) => match hook(op, hash) {
             Ok(v) => v,
             Err(e) => json!({ "error": e }),
@@ -2059,6 +2066,16 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         // reconsiderblock). Admin methods: never anonymous (auth::ADMIN_METHODS).
         "invalidateblock" => chain_admin_call(ChainAdminOp::Invalidate, params, state),
         "reconsiderblock" => chain_admin_call(ChainAdminOp::Reconsider, params, state),
+        // Package A2: the finality escape hatch (admin), and its alert.
+        "setfinalitycheckpoint" => chain_admin_call(ChainAdminOp::SetFinalityCheckpoint, params, state),
+        "ignorefinalized" => match &state.chain_admin {
+            None => json!({ "error": "chain overrides are not wired on this node" }),
+            Some(hook) => hook(ChainAdminOp::IgnoreFinalized, [0u8; 32]).unwrap_or_else(|e| json!({ "error": e })),
+        },
+        "getfinalityinfo" => {
+            let dag = state.dag.read();
+            crate::finality::info_json(&dag, &state.store)
+        }
 
         // submitpowititem [kind, hex]: kind 1 = witness share, 2 = attestation,
         // 3 = equivocation proof. Validated like a gossiped item, then relayed.

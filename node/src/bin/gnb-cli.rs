@@ -242,6 +242,17 @@ fn main() {
             require_params(params, 1, "reconsiderblock <block_hash>");
             ("reconsiderblock", serde_json::json!([params[0]]))
         }
+        // Package A2: the finality alert and its escape hatch.
+        "getfinalityinfo" | "finality" => {
+            ("getfinalityinfo", serde_json::Value::Null)
+        }
+        "setfinalitycheckpoint" => {
+            require_params(params, 1, "setfinalitycheckpoint <block_hash>");
+            ("setfinalitycheckpoint", serde_json::json!([params[0]]))
+        }
+        "ignorefinalized" => {
+            ("ignorefinalized", serde_json::Value::Null)
+        }
 
         "listtransactions" | "txlist" => {
             require_params(params, 1, "listtransactions <address> [count]");
@@ -1889,6 +1900,9 @@ fn print_usage() {
     gnb-cli invalidateblock <hash>        Leave the chain through <hash>: mark it and its
                                           selected-chain descendants invalid (persisted)
     gnb-cli reconsiderblock <hash>        Undo invalidateblock (and re-check the chain)
+    gnb-cli getfinalityinfo               Finalized checkpoint and the conflict alert
+    gnb-cli setfinalitycheckpoint <hash>  Pin finality to <hash> (any branch) and move there
+    gnb-cli ignorefinalized               Drop the finality pin; follow the most work again
 
   TRANSACTIONS
     gnb-cli tx <txid>                     Get transaction

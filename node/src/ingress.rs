@@ -1681,6 +1681,14 @@ pub enum WorkAdmission {
     /// parent (it merges a lower-work block); deep ones consume the
     /// [`DeepBackfillBudget`].
     MergeBacked,
+    /// Package A2, partition heal: its chain does not reach the threshold,
+    /// but its selected parent's chain passes through this node's PoWit
+    /// finality pin (at most [`FINALITY_HEAL_MAX_DEPTH`] blocks above it).
+    /// Such a branch can carry finality that extends the pin, which the node
+    /// adopts whatever the branch's work (`finality`), so it must be able to
+    /// get in: the side of a partition that did not finalize rejoins the
+    /// side that did. Rationed by [`FinalityHealBudget`].
+    FinalityHeal,
     /// Nothing backs it: its chain cannot come within the window of our tip.
     /// Not stored, not processed, not penalized; if a heavier chain ever
     /// builds on it, that chain's orphans make it `ChainBacked` /
@@ -1702,6 +1710,116 @@ pub fn work_admission(lb: u128, threshold: u128, chain_above: u128, merge_lb: u1
     } else {
         WorkAdmission::LowWork
     }
+}
+
+// ── Package A2: partition heal through ingress ───────────────────────────────
+
+/// Burst / refill of [`FinalityHealBudget`]: one epoch of blocks at once,
+/// then one per second, so a heal from a day-long partition (2,880 blocks at
+/// 30 s) gets in within about 40 minutes while a peer feeding low-work
+/// blocks above the pin gets at most one stored per second node-wide.
+pub const FINALITY_HEAL_BURST: u32 = 720;
+pub const FINALITY_HEAL_REFILL_PER_SEC: f64 = 1.0;
+
+/// Deepest selected parent, in DAG height above the finality pin, a
+/// [`WorkAdmission::FinalityHeal`] admission considers (about 68 hours at
+/// 30 s, past the leak's worst case of about 72 hours of stalled finality
+/// minus the hours a partition needs to be noticed): bounds the walk.
+pub const FINALITY_HEAL_MAX_DEPTH: u64 = 8_192;
+
+/// Bound of [`HealMemo`]'s verdicts (cleared when full).
+pub const FINALITY_HEAL_MEMO_MAX: usize = 65_536;
+
+/// Node-wide ration of [`WorkAdmission::FinalityHeal`] admissions, charged
+/// once a block's proof is known valid (as the merge-backed budget).
+pub struct FinalityHealBudget {
+    bucket: crate::network::ratelimit::TokenBuckets<()>,
+}
+
+impl Default for FinalityHealBudget {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FinalityHealBudget {
+    pub fn new() -> Self {
+        Self::with_rate(FINALITY_HEAL_BURST, FINALITY_HEAL_REFILL_PER_SEC)
+    }
+
+    pub fn with_rate(burst: u32, refill_per_sec: f64) -> Self {
+        Self { bucket: crate::network::ratelimit::TokenBuckets::new(burst, refill_per_sec, 1) }
+    }
+
+    /// Whether one admission is available at `now` (nothing consumed).
+    pub fn available_at(&mut self, now: Instant) -> bool {
+        if self.bucket.try_take_n_at((), 1, now) {
+            self.bucket.refund_n((), 1);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn allow_at(&mut self, now: Instant) -> bool {
+        self.bucket.allow_at((), now)
+    }
+}
+
+/// Memo of "this block's selected chain passes through the pin" for the
+/// heal admission: every block a walk visits keeps its verdict until the
+/// pin moves, so the walks of all admissions together visit each block
+/// above the pin at most once (an attacker re-sending children of the same
+/// deep parents costs map lookups).
+#[derive(Default)]
+pub struct HealMemo {
+    pin: Option<BlockHash>,
+    verdicts: HashMap<BlockHash, bool>,
+}
+
+impl HealMemo {
+    /// Whether `from`'s selected-parent chain passes through `dag`'s
+    /// finality pin, `from` at most [`FINALITY_HEAL_MAX_DEPTH`] above it.
+    /// `false` without a pin.
+    pub fn extends_pin(&mut self, dag: &GhostDAG, from: &BlockHash) -> bool {
+        let Some((pin, pin_h)) = dag.finalized() else { return false };
+        if self.pin != Some(pin) || self.verdicts.len() >= FINALITY_HEAL_MEMO_MAX {
+            self.pin = Some(pin);
+            self.verdicts.clear();
+        }
+        let mut visited: Vec<BlockHash> = Vec::new();
+        let mut cur = *from;
+        let verdict = loop {
+            if cur == pin {
+                break true;
+            }
+            if let Some(v) = self.verdicts.get(&cur) {
+                break *v;
+            }
+            let Some(d) = dag.get_block_data(&cur) else { break false };
+            if d.height <= pin_h || d.height - pin_h > FINALITY_HEAL_MAX_DEPTH {
+                break false;
+            }
+            visited.push(cur);
+            match d.selected_parent {
+                Some(sp) => cur = sp,
+                None => break false,
+            }
+        };
+        for v in visited {
+            self.verdicts.insert(v, verdict);
+        }
+        verdict
+    }
+}
+
+/// The heal state [`work_rule`] reads: the ration and the memo, and whether
+/// to charge the ration now (`false`: the caller charges it once the proof
+/// is valid).
+pub(crate) struct HealGate<'a> {
+    budget: &'a mut FinalityHealBudget,
+    memo:   &'a mut HealMemo,
+    charge: bool,
 }
 
 // ── The processor's block-ingress core ───────────────────────────────────────
@@ -1868,7 +1986,8 @@ pub enum DropReason {
     /// POW-3: a block whose chain cannot reach the anti-DoS work threshold.
     LowWork,
     /// POW-3 / DAG-7 / B1-T5: a merge-backed block while the merge-backed
-    /// insertion budget is exhausted (the orphan sweep re-requests it).
+    /// insertion budget is exhausted (the orphan sweep re-requests it); also
+    /// a finality-heal block while [`FinalityHealBudget`] is (package A2).
     DeepBudgetExhausted,
     /// POW-3 (Phase 4): an unrequested block while this node is below the
     /// minimum chain work, or one whose own chain work does not reach it
@@ -2124,6 +2243,9 @@ pub struct BlockIngress {
     /// admission is charged, not only those more than `CHECKPOINT_DEPTH`
     /// below the tip).
     pub deep_budget:  DeepBackfillBudget,
+    /// Package A2: the [`WorkAdmission::FinalityHeal`] ration and its memo.
+    pub heal_budget:  FinalityHealBudget,
+    heal_memo:        HealMemo,
     /// `(selected tip, anti_dos_work_threshold)` of the last work check: the
     /// threshold only changes when the selected tip does.
     threshold_cache:  Option<(BlockHash, u128)>,
@@ -2168,6 +2290,7 @@ impl Default for BlockIngress {
 fn work_rule(
     orphans:         &OrphanPool,
     budget:          Option<&mut DeepBackfillBudget>,
+    heal:            HealGate<'_>,
     threshold_cache: &mut Option<(BlockHash, u128)>,
     low_work:        &mut LowWorkCache,
     block:           &core::Block,
@@ -2202,6 +2325,17 @@ fn work_rule(
     };
     match work_admission(lb, threshold, chain_above, merge_lb) {
         WorkAdmission::LowWork => {
+            // Package A2: a branch above the finality pin may carry finality
+            // the node adopts whatever its work. The ration is looked at
+            // before the walk, so an exhausted one costs nothing.
+            if heal.budget.available_at(now)
+                && block.header.parents.iter().all(|p| dag.has_block(p))
+                && dag.preview_selected_parent(&block.header.parents)
+                    .is_some_and(|sp| heal.memo.extends_pin(dag, &sp))
+                && (!heal.charge || heal.budget.allow_at(now))
+            {
+                return Ok(WorkAdmission::FinalityHeal);
+            }
             low_work.note(*hash, state);
             Err(DropReason::LowWork)
         }
@@ -2223,6 +2357,8 @@ impl BlockIngress {
             orphans: OrphanPool::new(limits),
             parent_fetch: ParentFetchTracker::new(),
             deep_budget: DeepBackfillBudget::new(),
+            heal_budget: FinalityHealBudget::new(),
+            heal_memo: HealMemo::default(),
             threshold_cache: None,
             low_work: LowWorkCache::default(),
             min_chain_work: minimum_chain_work(),
@@ -2321,7 +2457,8 @@ impl BlockIngress {
         now_unix: u64,
         dag: &GhostDAG,
     ) -> Result<WorkAdmission, DropReason> {
-        work_rule(&self.orphans, Some(&mut self.deep_budget), &mut self.threshold_cache, &mut self.low_work,
+        let heal = HealGate { budget: &mut self.heal_budget, memo: &mut self.heal_memo, charge: true };
+        work_rule(&self.orphans, Some(&mut self.deep_budget), heal, &mut self.threshold_cache, &mut self.low_work,
             block, hash, now, now_unix, dag)
     }
 
@@ -2467,7 +2604,8 @@ impl BlockIngress {
                 let d = ctx.dag.read();
                 // The work rule on the read guard's DAG; a merge-backed
                 // admission is charged below, once its proof is known valid.
-                let a = match work_rule(&self.orphans, None, &mut self.threshold_cache, &mut self.low_work,
+                let heal = HealGate { budget: &mut self.heal_budget, memo: &mut self.heal_memo, charge: false };
+                let a = match work_rule(&self.orphans, None, heal, &mut self.threshold_cache, &mut self.low_work,
                     &block, &hash, now, now_unix, &d)
                 {
                     Ok(a) => a,
@@ -2498,6 +2636,10 @@ impl BlockIngress {
                 // first pass, then the resubmission once the PoW worker is
                 // done) and junk-nonce candidates drained it for free.
                 if admission == WorkAdmission::MergeBacked && !self.deep_budget.allow_at(now) {
+                    return Gated::Done(BlockOutcome::Dropped(DropReason::DeepBudgetExhausted));
+                }
+                // Package A2: the heal ration likewise, once per stored block.
+                if admission == WorkAdmission::FinalityHeal && !self.heal_budget.allow_at(now) {
                     return Gated::Done(BlockOutcome::Dropped(DropReason::DeepBudgetExhausted));
                 }
             }
@@ -2596,9 +2738,10 @@ impl BlockIngress {
     }
 
     fn drain_orphans_at(&mut self, accepted: [u8; 32], now: Instant, now_unix: u64, ctx: &AcceptCtx) -> Vec<[u8; 32]> {
-        let Self { orphans, deep_budget, threshold_cache, low_work, chain, .. } = self;
+        let Self { orphans, deep_budget, heal_budget, heal_memo, threshold_cache, low_work, chain, .. } = self;
         let mut gate = |pool: &OrphanPool, block: &core::Block, hash: &[u8; 32], d: &GhostDAG| {
-            work_rule(pool, Some(&mut *deep_budget), threshold_cache, low_work, block, hash, now, now_unix, d)
+            let heal = HealGate { budget: &mut *heal_budget, memo: &mut *heal_memo, charge: true };
+            work_rule(pool, Some(&mut *deep_budget), heal, threshold_cache, low_work, block, hash, now, now_unix, d)
         };
         let mut events = OrphanBlockEvents::default();
         process_orphans_gated(accepted, orphans, ctx, chain, &mut gate, &mut events);
@@ -3085,6 +3228,44 @@ mod tests {
             chain.push(h(i));
         }
         (dag, chain)
+    }
+
+    /// Package A2: the heal admission's walk, its depth bound and its memo.
+    #[test]
+    fn heal_memo_follows_the_pin_bounded_by_depth() {
+        let (mut dag, chain) = chain_dag(40, 10);
+        // A side branch from block 5: 5 - s1 - s2.
+        let s1 = { let mut x = h(200); x[1] = 1; x };
+        let s2 = { let mut x = h(201); x[1] = 1; x };
+        dag.add_block(s1, vec![chain[5]], 6, 1).unwrap();
+        dag.add_block(s2, vec![s1], 7, 1).unwrap();
+        let mut memo = HealMemo::default();
+        assert!(!memo.extends_pin(&dag, &chain[30]), "no pin");
+        dag.set_finalized(chain[10], 10);
+        assert!(memo.extends_pin(&dag, &chain[10]), "the pin itself");
+        assert!(memo.extends_pin(&dag, &chain[30]));
+        assert!(memo.extends_pin(&dag, &chain[20]), "memoized on the way");
+        assert!(!memo.extends_pin(&dag, &chain[9]), "below the pin");
+        assert!(!memo.extends_pin(&dag, &s2), "a branch forking below the pin");
+        dag.replace_finalized(Some((chain[3], 3)));
+        assert!(memo.extends_pin(&dag, &s2), "the pin moved: the memo is rebuilt");
+        let mut budget = FinalityHealBudget::with_rate(2, 0.0);
+        let now = Instant::now();
+        assert!(budget.available_at(now) && budget.available_at(now), "looking consumes nothing");
+        assert!(budget.allow_at(now) && budget.allow_at(now));
+        assert!(!budget.available_at(now) && !budget.allow_at(now));
+    }
+
+    /// The walk is bounded: a selected parent more than
+    /// FINALITY_HEAL_MAX_DEPTH DAG heights above the pin is not considered.
+    #[test]
+    fn heal_memo_refuses_beyond_the_depth_bound() {
+        let n = FINALITY_HEAL_MAX_DEPTH + 3;
+        let (mut dag, chain) = chain_dag(n, 1);
+        dag.set_finalized(chain[1], 1);
+        let mut memo = HealMemo::default();
+        assert!(!memo.extends_pin(&dag, &chain[n as usize]));
+        assert!(memo.extends_pin(&dag, &chain[(FINALITY_HEAL_MAX_DEPTH + 1) as usize]));
     }
 
     #[test]

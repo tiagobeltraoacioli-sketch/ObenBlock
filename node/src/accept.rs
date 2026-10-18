@@ -2388,6 +2388,28 @@ pub fn accept_block_tracking(
         )));
     }
 
+    // ── Finality this block carries (package A2, `finality`) ─────────
+    // Whatever branch the block is on: a checkpoint its witness set
+    // finalized that extends the pin moves the pin before the best chain is
+    // resolved (a partitioned side that did not finalize rejoins the side
+    // that did, docs/DESIGN-pow-powit.md §7.6); one that conflicts with it
+    // raises the alert and changes nothing. A disqualified block's state
+    // counts for nothing. Its checkpoint is an ancestor the DAG already
+    // holds, so the pin stays valid if this call fails below.
+    if !dag.read().is_invalid(&block_hash) {
+        let stored;
+        let st = match powit_state.as_ref() {
+            Some(s) => Some(s),
+            None => {
+                stored = crate::powit::load_state(store, &block_hash);
+                stored.as_ref()
+            }
+        };
+        if let Some(st) = st {
+            crate::finality::observe_block(dag, store, &block_hash, st);
+        }
+    }
+
     // ── Connect the best valid chain (any depth, audit DAG-6) ────────
     let trigger = (!replacing).then_some(TriggerRecord { hash: block_hash, powit: powit_state.as_ref() });
     // Review of audit F1, finding 2: blocks parked without a verdict whose
@@ -4042,6 +4064,89 @@ pub fn reconsider_block(
         hex::encode(&hash[..8]), clears.always.len(), clears.if_applied.len(), affected);
     let res = apply_operator_override(dag, store, mempool, node_state, tip_tx, shielded, Vec::new(), clears, affected);
     if let Err(e) = &res {
+        after_failed_override(dag, store, e);
+    }
+    res
+}
+
+// ── Operator finality escape hatch (package A2) ──────────────────────────────
+
+/// Operator `setfinalitycheckpoint` (package A2, `finality`): pin fork choice
+/// to `hash`, a block the DAG holds and that is not disqualified, whatever
+/// its relation to the current pin (an older checkpoint, another branch),
+/// persist it (source "operator"), clear the conflict alert and move the
+/// applied chain to the best valid block through it, committed in chunks
+/// like [`invalidate_block`]. The witness set's finality advances the pin
+/// from there as usual. When the move commits nothing (an error, or bodies
+/// a pruned node must re-fetch first: retry), the previous pin is restored;
+/// when chunks were committed before a failure the new pin stands and the
+/// move resumes with the next block or at the next start.
+#[allow(clippy::too_many_arguments)]
+pub fn set_finality_checkpoint(
+    hash: BlockHash,
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &Arc<storage::Storage>,
+    mempool: &Arc<mempool::Mempool>,
+    node_state: &Arc<RwLock<rpc::NodeState>>,
+    tip_tx: Option<&broadcast::Sender<tip::TipChanged>>,
+    shielded: &Arc<RwLock<ShieldedPool>>,
+) -> Result<ChainOverride, OverrideError> {
+    let _guard = store.acceptance_lock();
+    ensure_invalid_set_loaded(dag, store);
+    let height = dag.read().get_block_data(&hash).map(|d| d.height)
+        .ok_or_else(|| format!("block {} not found", hex::encode(hash)))?;
+    if dag.read().is_invalid(&hash) {
+        return Err(format!("block {} is disqualified; reconsiderblock it first", hex::encode(hash)).into());
+    }
+    warn!("setfinalitycheckpoint {} (DAG height {}): finality pinned by the operator",
+        hex::encode(&hash[..8]), height);
+    finality_override(Some((hash, height)), dag, store, mempool, node_state, tip_tx, shielded)
+}
+
+/// Operator `ignorefinalized` (package A2): drop the finality pin and the
+/// conflict alert and move the applied chain to the most-work valid block,
+/// committed in chunks like [`invalidate_block`]. The chain the node ends on
+/// pins its own witness set's finality again (a conflicting branch that
+/// still arrives raises the alert again). Undone like
+/// [`set_finality_checkpoint`] when the move commits nothing.
+#[allow(clippy::too_many_arguments)]
+pub fn ignore_finalized(
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &Arc<storage::Storage>,
+    mempool: &Arc<mempool::Mempool>,
+    node_state: &Arc<RwLock<rpc::NodeState>>,
+    tip_tx: Option<&broadcast::Sender<tip::TipChanged>>,
+    shielded: &Arc<RwLock<ShieldedPool>>,
+) -> Result<ChainOverride, OverrideError> {
+    let _guard = store.acceptance_lock();
+    ensure_invalid_set_loaded(dag, store);
+    warn!("ignorefinalized: the finality pin is dropped by the operator; following the most work");
+    finality_override(None, dag, store, mempool, node_state, tip_tx, shielded)
+}
+
+/// Shared tail of the two finality overrides (the caller holds the
+/// acceptance lock).
+#[allow(clippy::too_many_arguments)]
+fn finality_override(
+    pin: Option<(BlockHash, u64)>,
+    dag: &Arc<RwLock<consensus::GhostDAG>>,
+    store: &Arc<storage::Storage>,
+    mempool: &Arc<mempool::Mempool>,
+    node_state: &Arc<RwLock<rpc::NodeState>>,
+    tip_tx: Option<&broadcast::Sender<tip::TipChanged>>,
+    shielded: &Arc<RwLock<ShieldedPool>>,
+) -> Result<ChainOverride, OverrideError> {
+    let applied_before = store.get_meta("tip_hash").map_err(|e| e.to_string())?;
+    let prev = crate::finality::operator_replace(dag, store, pin)?;
+    let res = apply_operator_override(dag, store, mempool, node_state, tip_tx, shielded,
+                                      Vec::new(), MarkClears::default(), 0);
+    if let Err(e) = &res {
+        let applied_after = store.get_meta("tip_hash").ok().flatten();
+        if applied_after == applied_before {
+            // Nothing committed: the previous pin again (bodies the move
+            // needs are still requested; the operator retries).
+            crate::finality::operator_restore(dag, store, prev);
+        }
         after_failed_override(dag, store, e);
     }
     res

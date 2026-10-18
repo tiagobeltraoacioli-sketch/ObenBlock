@@ -101,6 +101,9 @@ pub const WRITE_METHODS: &[&str] = &[
     "submitpowititem",
     "invalidateblock",
     "reconsiderblock",
+    // Package A2: the finality escape hatch.
+    "setfinalitycheckpoint",
+    "ignorefinalized",
 ];
 
 /// Operator chain-override methods (audit DAG-6): `invalidateblock` /
@@ -115,6 +118,9 @@ pub const WRITE_METHODS: &[&str] = &[
 pub const ADMIN_METHODS: &[&str] = &[
     "invalidateblock",
     "reconsiderblock",
+    // Package A2: they move the node across finality it reached.
+    "setfinalitycheckpoint",
+    "ignorefinalized",
 ];
 
 /// Type alias for a direct (non-keyed) in-memory rate limiter.

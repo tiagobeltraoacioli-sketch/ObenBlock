@@ -974,6 +974,10 @@ pub struct GhostDAG {
     /// selected-parent chain does not pass through it is never selected or
     /// offered as a template parent: finalized history is never rolled back.
     finalized: Option<(BlockHash, u64)>,
+    /// Whether the node's persisted finality pin was restored into
+    /// `finalized` (package A2, `finality::restore_persisted`): once per
+    /// DAG instance, i.e. once per start.
+    finality_restored: bool,
     /// Whether the persisted invalid set has been loaded into `invalid`
     /// (set by `load_invalid`). The acceptance pipeline loads it lazily on
     /// first use if start-up did not.
@@ -1056,6 +1060,7 @@ impl GhostDAG {
             merge_skip: HashMap::new(),
             invalid: HashSet::new(),
             finalized: None,
+            finality_restored: false,
             invalid_loaded: false,
             invalid_roots: HashSet::new(),
             invalid_all_edges_roots: HashSet::new(),
@@ -3521,6 +3526,20 @@ impl GhostDAG {
         if self.finalized.is_none_or(|(_, h)| height > h) {
             self.finalized = Some((hash, height));
         }
+    }
+
+    /// Replace the PoWit-finalized checkpoint whatever its height, or clear
+    /// it: only for the operator's escape hatch and the start-up restore of
+    /// a persisted pin (package A2, `finality`). Automatic finality goes
+    /// through [`GhostDAG::set_finalized`], which never moves back.
+    pub fn replace_finalized(&mut self, pin: Option<(BlockHash, u64)>) {
+        self.finalized = pin;
+    }
+
+    /// True the first time it is called on this DAG instance: the caller
+    /// then restores the persisted finality pin (`finality`).
+    pub fn take_finality_restore(&mut self) -> bool {
+        !std::mem::replace(&mut self.finality_restored, true)
     }
 
     /// The PoWit-finalized checkpoint, if any.

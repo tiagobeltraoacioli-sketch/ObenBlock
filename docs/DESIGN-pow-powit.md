@@ -54,7 +54,11 @@ Implementation choices that refine the design below:
   initial block download is neither pinned, mined on nor advertised,
   docs/CONSENSUS.md. A fork's witness set still comes from the fork's own
   shares, not from finalized history; that is a consensus change for a
-  later activation.)
+  later activation. Package A2, `node/src/finality.rs`: the pin is
+  persisted and restored at start-up, moves only to a checkpoint that
+  extends it, from any held block's state (§7.6 convergence), and a
+  conflicting finalization raises an alert for the operator,
+  `getfinalityinfo` / `setfinalitycheckpoint` / `ignorefinalized`.)
 
 Parameters (`core::powit::MAINNET_PARAMS` / `TESTNET_PARAMS`):
 

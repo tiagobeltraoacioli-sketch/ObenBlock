@@ -46,6 +46,7 @@ mod assumevalid;  // assumed-valid block (Core's -assumevalid), P5-G
 mod template;     // Block templates for the miner + getblocktemplate (MEM-2, DAG-2)
 mod blockval;     // this chain's tx rules on top of the audit set (locktime, policy, BIP30)
 mod powit;        // PoW + PoWit: witness shares, attestations, finality (node side)
+mod finality;     // package A2: sticky finality pin, conflict alert, operator escape hatch
 
 // The acceptance pipeline lives in `accept.rs` (shared with the library so
 // integration tests drive the real path); same names and signatures as the
@@ -2831,6 +2832,10 @@ fn make_chain_admin_cb(
                 hash, &dag, &store, &mempool, &node_state, Some(&tip_tx), &shielded),
             rpc::ChainAdminOp::Reconsider => accept::reconsider_block(
                 hash, &dag, &store, &mempool, &node_state, Some(&tip_tx), &shielded),
+            rpc::ChainAdminOp::SetFinalityCheckpoint => accept::set_finality_checkpoint(
+                hash, &dag, &store, &mempool, &node_state, Some(&tip_tx), &shielded),
+            rpc::ChainAdminOp::IgnoreFinalized => accept::ignore_finalized(
+                &dag, &store, &mempool, &node_state, Some(&tip_tx), &shielded),
         };
         let r = match res {
             Ok(r) => r,
@@ -2847,7 +2852,9 @@ fn make_chain_admin_cb(
             Err(e) => return Err(e.to_string()),
         };
         Ok(serde_json::json!({
-            "block":       hex::encode(hash),
+            "block":       (op != rpc::ChainAdminOp::IgnoreFinalized).then(|| hex::encode(hash)),
+            "finalized":   dag.read().finalized().map(|(h, height)| serde_json::json!({
+                "hash": hex::encode(h), "dag_height": height })),
             "affected":    r.affected,
             "rolled_back": r.rolled_back,
             "connected":   r.connected,

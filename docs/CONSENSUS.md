@@ -723,7 +723,21 @@ coloring, blue work). A node takes or advances the pin only while the chain
 whose state finalized it has at least the node's minimum chain work
 (node-local, "Minimum chain work and unrequested blocks" below): a cheap fork
 carries its own witness set, so its finality pins nothing while the node may
-still be syncing a low-work chain. The
+still be syncing a low-work chain. The pin is sticky (package A2,
+`node/src/finality.rs`): it is persisted (`powit_finality_pin`) and restored
+at start-up before anything chooses a chain; it moves forward only, to a
+finalized checkpoint whose selected chain passes through it, taken from the
+PoWit state of any block the node holds with the minimum chain work (its
+applied chain's, or another branch's on arrival: the heaviest chain among
+those through the latest final checkpoint, docs/DESIGN-pow-powit.md §7.6). A
+finalized checkpoint that neither extends the pin nor lies on its chain
+moves nothing: it is recorded as an alert (`powit_finality_conflicts`, at
+most 8 distinct checkpoints, `getfinalityinfo`) and the operator decides
+(`setfinalitycheckpoint`, `ignorefinalized`). The ingress admits a block
+whose chain is below the anti-DoS work threshold if its selected parent's
+chain passes through the pin at most 8,192 DAG heights above it, rationed to
+a burst of 720 blocks and one per second node-wide
+(`ingress::FinalityHealBudget`), so such a branch can reach the node. The
 former 1,000-block `MAX_REORG_DEPTH` and the `finalized_height` gate compared
 a fork with the node's own history, so nodes that received the same blocks in
 different orders could end on different chains. As in Bitcoin Core (no depth

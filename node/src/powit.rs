@@ -1221,20 +1221,21 @@ pub fn pin_finalized_of(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage, ti
 }
 
 /// [`pin_finalized_of`] against an explicit minimum chain work.
+///
+/// Package A2 (`finality`): the pin is restored from disk first (it is
+/// sticky across restarts), moves only to a checkpoint that extends it and
+/// is persisted when it moves. A finalized checkpoint of `tip`'s state that
+/// conflicts with the pin leaves it in place (the conflict alert is raised
+/// by the block that carried that finality on arrival).
 pub fn pin_finalized_with(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage, tip: &Hash, min_chain_work: u128) {
-    let fin = {
-        let d = dag.read();
-        let enough_work = d.get_block_data(tip)
-            .is_some_and(|bd| bd.blue_work >= min_chain_work);
-        if !enough_work {
-            return;
-        }
-        load_state(store, tip)
-            .filter(|st| st.finalized.height > st.activation)
-            .and_then(|st| d.get_block_data(&st.finalized.hash).map(|bd| (st.finalized.hash, bd.height)))
-    };
-    if let Some((hash, height)) = fin {
-        dag.write().set_finalized(hash, height);
+    crate::finality::restore_persisted(dag, store);
+    let enough_work = dag.read().get_block_data(tip)
+        .is_some_and(|bd| bd.blue_work >= min_chain_work);
+    if !enough_work {
+        return;
+    }
+    if let Some(st) = load_state(store, tip) {
+        crate::finality::observe(dag, store, tip, &st, min_chain_work, false);
     }
 }
 
