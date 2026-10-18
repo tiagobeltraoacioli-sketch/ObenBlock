@@ -4954,7 +4954,7 @@ mod tests {
                     .collect(),
                 attestations: Vec::new(),
                 evidence: Vec::new(),
-                exits: Vec::new(),
+                exits: Vec::new(), poci_evidence: Vec::new(),
             };
             let txs = vec![Transaction {
                 version: 1,

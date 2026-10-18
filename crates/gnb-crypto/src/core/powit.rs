@@ -1625,3 +1625,5 @@ mod hardening2_tests;
 mod finalized_history_tests;
 #[cfg(test)]
 mod liveness_tests;
+#[cfg(test)]
+mod poci_tests;

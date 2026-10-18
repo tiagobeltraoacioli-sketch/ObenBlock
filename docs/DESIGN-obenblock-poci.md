@@ -333,3 +333,36 @@ tests.
   relief and the exit message are.
 - O10 (growth cap): computes the weights of each new configuration.
 - O8 (anchors): advisory until the registry verifies certificates (§6).
+
+## 12. Implementation (package B1, PoCI core)
+
+- `core::powit::poci` (`crates/gnb-crypto/src/core/powit/poci.rs`): the
+  byte-level rules of `reference/poci_reference.py`. `PociParams`
+  (`OBB_MAINNET_POCI`, `OBB_REGTEST_POCI`, `for_chain`; GnB has none),
+  `Configuration` (validated registry, `id`, `weight`, Merkle paths,
+  `registry_proof`), `attestation_message_v3`, `quorum`, `ffg_step`,
+  `check_evidence` / `PociEvidence`, the ledger `PociState` (configurations
+  in force, `finalized` = handoff with `ban_start`, `admit_evidence`), and
+  `Certificate` / `RegistryProof`. Signatures go through `VoteScheme`
+  (`Kes` on the node). `crates/gnb-crypto/tests/poci_vectors.rs` reproduces
+  every case of `reference/poci_vectors.json`.
+- Heights: the ledger compares the height at which evidence is included
+  with finalized checkpoint heights as the reference does
+  (`included_at <= F.height`). The node passes `block height + 1`, since a
+  slot names the highest selected-chain block strictly below it.
+- `PowitState::apply_poci` (ObenBlock; `apply_full` and `apply_block`
+  dispatch to it by chain id): launch at the first block of epoch 4, v3
+  votes of the configuration in force only, strict quorum, handoff on
+  finalization, PoCI evidence, no inactivity decay. The configuration
+  weights come from a `ConfigWeights` provider (default `WindowWeights`, to
+  be replaced by the growth cap of DESIGN-obenblock.md §6.3 and the absence
+  pruning of §4.1).
+- `PowitState::poci` is not part of the serde encoding (GnB states are
+  stored as before); the node stores it beside the state
+  (`powit/poci/<block>`, `powit/pocicfg/<config id>`).
+- Block body: in the PoCI format (`BodyFormat { poci: true }`) the evidence
+  list carries `PociEvidence` (`config_id ‖ a ‖ b`) instead of GnB's
+  equivocation proofs. An empty section encodes the same in every format.
+  The gossip item `ITEM_EVIDENCE` carries `PociEvidence` on ObenBlock.
+- The witness duty and `gnb-cli powitattest --config-id=<hex>` sign v3 with
+  the configuration in force, recorded in the vote record (§8).

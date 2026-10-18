@@ -3162,6 +3162,8 @@ pub fn powit_item_precheck(claimed: &[u8; 32], kind: u8, data: &[u8]) -> Result<
     match kind {
         crate::powit::ITEM_SHARE => core::witness_share::WitnessShare::read_wire(&mut cur).map(|_| ()),
         crate::powit::ITEM_ATTESTATION => core::powit::Attestation::read_wire(&mut cur).map(|_| ()),
+        crate::powit::ITEM_EVIDENCE if core::powit::poci_active() =>
+            core::powit::poci::PociEvidence::read_wire(&mut cur).map(|_| ()),
         crate::powit::ITEM_EVIDENCE => core::powit::Equivocation::read_wire(&mut cur).map(|_| ()),
         crate::powit::ITEM_EXIT => core::powit::WitnessExit::read_wire(&mut cur).map(|_| ()),
         k => Err(format!("unknown PoWit item kind {k}")),

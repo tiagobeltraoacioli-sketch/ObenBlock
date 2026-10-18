@@ -2230,7 +2230,7 @@ async fn main() {
                         // chain, and the persistent vote record would then
                         // bar this key's vote on the real one).
                         if ingress::below_minimum_chain_work(&d, ingress::minimum_chain_work()) {
-                            return (None, powit::pool_evidence());
+                            return (None, powit::pool_evidence_items());
                         }
                         let att = match duty_b.maybe_attest(&d, &store_b) {
                             Ok(Some(a)) => {
@@ -2240,7 +2240,7 @@ async fn main() {
                             Ok(None) => None,
                             Err(e) => { warn!("witness: {}", e); None }
                         };
-                        (att, powit::pool_evidence())
+                        (att, powit::pool_evidence_items())
                     }).await;
                     let Ok((att, evidence)) = out else { continue };
                     if let Some(a) = att {
@@ -2248,10 +2248,9 @@ async fn main() {
                         let (id, kind, data) = powit::attestation_item(&a);
                         let _ = otx_w.try_send(network::NetworkMessage::NewPowitItem { id, kind, data });
                     }
-                    for ev in evidence {
-                        if sent_evidence.insert(ev.a.key_id()) {
-                            warn!("🛡  equivocation by witness {} — proof gossiped", hex::encode(ev.a.key_id()));
-                            let (id, kind, data) = powit::evidence_item(&ev);
+                    for (key, (id, kind, data)) in evidence {
+                        if sent_evidence.insert(key) {
+                            warn!("🛡  equivocation by witness {} — proof gossiped", hex::encode(key));
                             let _ = otx_w.try_send(network::NetworkMessage::NewPowitItem { id, kind, data });
                         }
                     }

@@ -23,6 +23,7 @@ use parking_lot::Mutex;
 use crate::consensus::finality::{Anchor, AnchorSetting, PinOutcome, PinPolicy};
 use crate::consensus::GhostDAG;
 use crate::storage::Storage;
+use gnb_crypto::core::powit::poci::{self, Configuration, PociEvidence, PociParams, PociState};
 use gnb_crypto::core::powit::{self, Attestation, BlockInput, ChainView, Checkpoint, Equivocation,
                               KeyId, PowitBody, PowitParams, PowitState, Regime, WitnessExit};
 use gnb_crypto::core::witness_share::{self, WitnessShare, SHARE_WINDOW};
@@ -111,14 +112,102 @@ fn encode_exited(state: &PowitState) -> Result<Option<Vec<u8>>, String> {
         .map(Some).map_err(|e| format!("powit exits encode: {e}"))
 }
 
+/// The state's PoCI ledger (`PowitState::poci`, ObenBlock), stored beside it
+/// like the exits: per block the id of the configuration in force and the
+/// bans (`powit/poci/<block>`); each configuration once, content-addressed,
+/// with the id of the one in force before it (`powit/pocicfg/<config id>`).
+/// GnB states have none, so nothing changes for them.
+fn poci_key(hash: &Hash) -> String {
+    format!("powit/poci/{}", hex::encode(hash))
+}
+
+fn poci_config_key(id: &Hash) -> String {
+    format!("powit/pocicfg/{}", hex::encode(id))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PociRecord {
+    head: Hash,
+    bans: BTreeMap<KeyId, Vec<poci::Ban>>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PociConfigRow {
+    config: Configuration,
+    prev: Option<Hash>,
+}
+
+/// Histories by the id of their newest configuration (shared by every
+/// state of a chain; a handful are live at once).
+static POCI_HISTORIES: Mutex<Option<HashMap<Hash, PociState>>> = parking_lot::const_mutex(None);
+const POCI_HISTORY_CACHE_CAP: usize = 64;
+
+fn bincode_decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Option<T> {
+    match bincode::serde::decode_from_slice(bytes, bincode::config::standard()) {
+        Ok((v, used)) if used == bytes.len() => Some(v),
+        _ => None,
+    }
+}
+
+fn load_poci(store: &Storage, hash: &Hash) -> Option<Option<PociState>> {
+    let Some(bytes) = store.get_meta(&poci_key(hash)).ok()? else { return Some(None) };
+    let rec: PociRecord = bincode_decode(&bytes)?;
+    let cached = POCI_HISTORIES.lock().as_ref().and_then(|m| m.get(&rec.head).cloned());
+    let mut st = match cached {
+        Some(st) => st,
+        None => {
+            let mut history: Vec<Arc<Configuration>> = Vec::new();
+            let mut cur = Some(rec.head);
+            while let Some(id) = cur {
+                let row: PociConfigRow = bincode_decode(&store.get_meta(&poci_config_key(&id)).ok()??)?;
+                if row.config.id() != id {
+                    return None;
+                }
+                history.push(Arc::new(row.config));
+                cur = row.prev;
+            }
+            let st = PociState::from_history(history, BTreeMap::new())?;
+            let mut g = POCI_HISTORIES.lock();
+            let m = g.get_or_insert_with(HashMap::new);
+            if m.len() >= POCI_HISTORY_CACHE_CAP {
+                m.clear();
+            }
+            m.insert(rec.head, st.clone());
+            st
+        }
+    };
+    st.bans = rec.bans;
+    Some(Some(st))
+}
+
+/// Stage the PoCI rows of `state`: the block's record, and the configuration
+/// in force unless it is already stored (the earlier ones were stored by the
+/// blocks they were in force at).
+fn stage_poci(store: &Storage, batch: &mut rocksdb::WriteBatch, hash: &Hash, state: &PowitState) -> Result<(), String> {
+    let Some(st) = &state.poci else { return Ok(()) };
+    let head = st.config().id();
+    let ckey = poci_config_key(&head);
+    if store.get_meta(&ckey).map_err(|e| format!("storage: powit poci: {e}"))?.is_none() {
+        let row = PociConfigRow { config: (**st.config()).clone(), prev: st.previous().map(|c| c.id()) };
+        let bytes = bincode::serde::encode_to_vec(&row, bincode::config::standard())
+            .map_err(|e| format!("powit poci encode: {e}"))?;
+        store.stage_meta(batch, &ckey, &bytes).map_err(|e| format!("storage: powit poci: {e}"))?;
+    }
+    let rec = PociRecord { head, bans: st.bans.clone() };
+    let bytes = bincode::serde::encode_to_vec(&rec, bincode::config::standard())
+        .map_err(|e| format!("powit poci encode: {e}"))?;
+    store.stage_meta(batch, &poci_key(hash), &bytes).map_err(|e| format!("storage: powit poci: {e}"))
+}
+
 /// `hash`'s stored PoWit state (`store`: per-epoch segments plus per-block
 /// diffs, package A3; data dirs of earlier releases are read as written),
-/// with its witness exits.
+/// with its witness exits and its PoCI ledger.
 pub fn load_state(store: &Storage, hash: &Hash) -> Option<PowitState> {
     let mut st = store::load(store, hash)?;
     if let Some(x) = store.get_meta(&exited_key(hash)).ok()? {
         st.exited = bincode::serde::decode_from_slice(&x, bincode::config::standard()).ok()?.0;
     }
+    st.poci = load_poci(store, hash)?;
     Some(st)
 }
 
@@ -149,6 +238,7 @@ pub fn stage_state(store: &Storage, batch: &mut rocksdb::WriteBatch, hash: &Hash
     if let Some(x) = encode_exited(state)? {
         store.stage_meta(batch, &exited_key(hash), &x).map_err(|e| format!("storage: powit exits: {e}"))?;
     }
+    stage_poci(store, batch, hash, state)?;
     if let Some((key, row)) = finality_row(hash, state) {
         store.stage_meta(batch, &key, &row).map_err(|e| format!("storage: powit finality row: {e}"))?;
     }
@@ -266,7 +356,9 @@ pub fn block_state(block: &Block, block_hash: &Hash, dag: &GhostDAG, store: &Sto
         exits: &block.powit.exits,
     };
     let view = DagChainView { dag, start: sp };
-    base.apply_full(&powit::params(), core::node_chain_id(), hardening2_height(), liveness_height(), &input, &view)
+    // PoCI on ObenBlock (with the block's PoCI evidence), PoWit on GnB.
+    base.apply_block(&powit::params(), core::node_chain_id(), hardening2_height(), liveness_height(), &input,
+                     &block.powit.poci_evidence, &view)
         .map(Some)
 }
 
@@ -334,8 +426,11 @@ pub struct TipWitnesses {
     justified: Checkpoint,
     /// Epoch of the next block.
     epoch: u64,
-    /// The tip's state (barred keys; witness weights from the activation).
+    /// The tip's state (barred keys; witness weights from the activation;
+    /// the PoCI configuration in force on ObenBlock).
     state: PowitState,
+    /// PoCI (ObenBlock): its parameters; `None` on GnB.
+    poci: Option<PociParams>,
     /// Old-rule W(e) (the 64 heaviest) for the epochs from
     /// `EVIDENCE_MEMBER_EPOCHS` (or the oldest open target) before the next
     /// block's to the newest open target's; empty once the next block is at
@@ -358,7 +453,25 @@ impl TipWitnesses {
         } else {
             BTreeMap::new()
         };
-        TipWitnesses { tip, tip_h, activation: act, hardening2, justified: st.justified, epoch, state: st, sets }
+        let poci = PociParams::for_chain(core::node_chain_id());
+        TipWitnesses { tip, tip_h, activation: act, hardening2, justified: st.justified, epoch, state: st, poci, sets }
+    }
+
+    /// The PoCI configuration in force at the tip (ObenBlock after the
+    /// launch bootstrap).
+    pub fn poci_config(&self) -> Option<&Arc<Configuration>> {
+        self.poci.and(self.state.poci_config())
+    }
+
+    /// Whether `att` carries a valid signature for the next block: the v3
+    /// message of the configuration in force (PoCI), else the PoWit message
+    /// of its target's height.
+    fn verify_attestation(&self, att: &Attestation, chain: core::ChainId, p: &PowitParams) -> bool {
+        match (self.poci, self.state.poci_config()) {
+            (Some(pp), Some(c)) => att.verify_signature_v3(&pp, &c.id()),
+            (Some(_), None) => false,
+            (None, _) => att.verify_signature_at(chain, p, self.activation, self.hardening2),
+        }
     }
 
     fn next_height(&self) -> u64 {
@@ -373,6 +486,10 @@ impl TipWitnesses {
     /// `key`'s weight in W(epoch of `target`) under the rules of the earliest
     /// block that may include a vote for `target`, if it is a member.
     pub fn weight_for(&self, p: &PowitParams, target: &Checkpoint, key: &KeyId) -> Option<u128> {
+        if self.poci.is_some() {
+            // PoCI: the registry weight of the configuration in force.
+            return self.poci_config()?.weight(key);
+        }
         let e = p.epoch(self.activation, target.height.max(self.activation));
         match Regime::at(target.height.max(self.next_height()), self.hardening2) {
             Regime::V1 => self.sets.get(&e)?.get(key).copied(),
@@ -385,6 +502,11 @@ impl TipWitnesses {
     /// activation, its highest weight over the recent witness sets (node
     /// policy); from it, over the next block's evidence epochs (consensus).
     pub fn evidence_weight(&self, p: &PowitParams, key: &KeyId) -> Option<u128> {
+        if self.poci.is_some() {
+            // PoCI: a key of a configuration the chain has had in force.
+            let st = self.state.poci.as_ref()?;
+            return st.history().filter_map(|c| c.weight(key)).max();
+        }
         match self.regime() {
             Regime::V1 => self.sets.values().filter_map(|s| s.get(key)).max().copied(),
             Regime::Hardening2 => PowitState::evidence_epochs(self.epoch)
@@ -394,7 +516,13 @@ impl TipWitnesses {
     }
 
     fn is_banned(&self, key: &KeyId) -> bool {
-        self.state.is_banned(key, self.epoch)
+        match (self.poci, &self.state.poci) {
+            // PoCI: a ban pending or not over refuses new evidence (§5).
+            (Some(pp), Some(st)) => st.bans.get(key).is_some_and(|bl| bl.iter().any(|b| {
+                b.end(pp.ban_epochs).is_none_or(|end| st.config().epoch() < end)
+            })),
+            _ => self.state.is_banned(key, self.epoch),
+        }
     }
 
     /// What the next block checks of an exit before its signature
@@ -452,6 +580,8 @@ struct PendingAttestation {
 
 struct HeldEvidence {
     ev: Equivocation,
+    /// PoCI (ObenBlock): the configuration both votes name.
+    config_id: Option<Hash>,
     weight: u128,
 }
 
@@ -460,7 +590,8 @@ struct HeldEvidence {
 /// are caught against).
 #[derive(Default)]
 struct SeenLinks {
-    by_key: HashMap<KeyId, std::collections::VecDeque<(u64, Attestation)>>,
+    /// (arrival sequence, link, the PoCI configuration it was verified under).
+    by_key: HashMap<KeyId, std::collections::VecDeque<(u64, Attestation, Option<Hash>)>>,
     /// Arrival sequence -> key, oldest first.
     order: BTreeMap<u64, KeyId>,
     next: u64,
@@ -468,27 +599,37 @@ struct SeenLinks {
 
 impl SeenLinks {
     fn of(&self, key: &KeyId) -> impl Iterator<Item = &Attestation> {
-        self.by_key.get(key).into_iter().flat_map(|v| v.iter().map(|(_, a)| a))
+        self.by_key.get(key).into_iter().flat_map(|v| v.iter().map(|(_, a, _)| a))
     }
 
+    /// `key`'s links with the PoCI configuration each was verified under.
+    fn of_with_config(&self, key: &KeyId) -> impl Iterator<Item = (&Attestation, Option<Hash>)> {
+        self.by_key.get(key).into_iter().flat_map(|v| v.iter().map(|(_, a, c)| (a, *c)))
+    }
+
+    #[cfg(test)]
     fn record(&mut self, key: KeyId, att: &Attestation) {
+        self.record_with(key, att, None)
+    }
+
+    fn record_with(&mut self, key: KeyId, att: &Attestation, config_id: Option<Hash>) {
         let links = self.by_key.entry(key).or_default();
-        if links.iter().any(|(_, a)| a == att) {
+        if links.iter().any(|(_, a, c)| a == att && *c == config_id) {
             return;
         }
         let seq = self.next;
         self.next += 1;
-        links.push_back((seq, att.clone()));
+        links.push_back((seq, att.clone(), config_id));
         self.order.insert(seq, key);
         if links.len() > SEEN_LINKS_PER_KEY {
-            if let Some((old, _)) = links.pop_front() {
+            if let Some((old, _, _)) = links.pop_front() {
                 self.order.remove(&old);
             }
         }
         while self.order.len() > SEEN_LINKS_CAP {
             let Some((old, k)) = self.order.pop_first() else { break };
             if let Some(v) = self.by_key.get_mut(&k) {
-                v.retain(|(s, _)| *s != old);
+                v.retain(|(s, _, _)| *s != old);
                 if v.is_empty() {
                     self.by_key.remove(&k);
                 }
@@ -534,7 +675,15 @@ struct PoolInner {
 impl PoolInner {
     /// Hold `ev` against `key`. Full: the lightest key's proof (then the
     /// greatest KeyId's) makes room for a heavier one, never the reverse.
+    #[cfg(test)]
     fn insert_evidence(&mut self, key: KeyId, ev: Equivocation, weight: u128) -> Result<(), String> {
+        self.insert_evidence_for(key, ev, None, weight)
+    }
+
+    /// [`Self::insert_evidence`] with the PoCI configuration the proof names.
+    fn insert_evidence_for(&mut self, key: KeyId, ev: Equivocation, config_id: Option<Hash>, weight: u128)
+        -> Result<(), String>
+    {
         if self.evidence.contains_key(&key) {
             return Ok(());
         }
@@ -548,7 +697,7 @@ impl PoolInner {
                 _ => return Err("evidence pool full".into()),
             }
         }
-        self.evidence.insert(key, HeldEvidence { ev, weight });
+        self.evidence.insert(key, HeldEvidence { ev, config_id, weight });
         Ok(())
     }
 
@@ -742,7 +891,6 @@ impl PowitPool {
         }
         let chain = core::node_chain_id();
         let p = powit::params();
-        let act = core::powit_height();
         let t = att.target;
         // What `verify_signature` refuses before any signature check: a
         // link that is never valid anywhere.
@@ -758,22 +906,33 @@ impl PowitPool {
         let key = att.key_id();
         let weight = view.weight_for(&p, &t, &key).ok_or("attester is not in the witness set")?;
         // The message of the target's height (v2 from the second hardening
-        // activation: it commits the witness key).
-        if !att.verify_signature_at(chain, &p, act, view.hardening2) {
+        // activation: it commits the witness key); PoCI: the v3 message of
+        // the configuration in force.
+        if !view.verify_attestation(&att, chain, &p) {
             return Err("invalid attestation signature".into());
         }
+        let config_id = view.poci_config().map(|c| c.id());
         {
             let mut g = self.inner.lock();
             if g.attestations.contains_key(&id) {
                 return Ok(id);
             }
             // Every recorded link passed `verify_signature`: the shape check
-            // is the rest of `Equivocation::verify`.
-            let conflicting = g.seen_links.of(&key).find(|o| links_conflict(o, &att)).cloned();
+            // is the rest of `Equivocation::verify` (PoCI: under the same
+            // configuration).
+            let conflicting = g.seen_links.of_with_config(&key)
+                .find(|(o, c)| *c == config_id && links_conflict(o, &att)).map(|(o, _)| o.clone());
             if let Some(o) = conflicting {
-                let _ = g.insert_evidence(key, Equivocation { a: o, b: att.clone() }, weight);
+                // PoCI: only evidence the next block may carry (one ban at a time).
+                let admissible = match (view.poci, &view.state.poci, &config_id) {
+                    (Some(pp), Some(st), Some(cid)) => st.may_ban(&pp, &key, cid).is_ok(),
+                    _ => true,
+                };
+                if admissible {
+                    let _ = g.insert_evidence_for(key, Equivocation { a: o, b: att.clone() }, config_id, weight);
+                }
             }
-            g.seen_links.record(key, &att);
+            g.seen_links.record_with(key, &att, config_id);
         }
         if att.source != view.justified {
             return Err("attestation source is not the tip's justified checkpoint".into());
@@ -799,9 +958,34 @@ impl PowitPool {
         if self.inner.lock().evidence.contains_key(&key) {
             return Err("equivocation proof for this key already held".into());
         }
+        if view.poci.is_some() {
+            return Err("PoWit equivocation proof on a PoCI chain (PoCI evidence names its configuration)".into());
+        }
         let k = view.verify_evidence(&ev, core::node_chain_id(), &p)?;
         debug_assert_eq!(k, key);
-        self.inner.lock().insert_evidence(key, ev, weight)?;
+        self.inner.lock().insert_evidence_for(key, ev, None, weight)?;
+        Ok(key)
+    }
+
+    /// Admit PoCI evidence (ObenBlock) as the next block will check it: the
+    /// one-ban-at-a-time rule and the named configuration's membership
+    /// before the two signatures (`poci::check_evidence`), one proof per key.
+    pub fn admit_poci_evidence(&self, ev: PociEvidence, dag: &GhostDAG, store: &Storage) -> Result<KeyId, String> {
+        if ev.a.witness != ev.b.witness {
+            return Err("equivocation: different witnesses".into());
+        }
+        let key = ev.key_id();
+        let view = self.follow_tip(dag, store).ok_or("PoWit not active at the tip")?;
+        let pp = view.poci.ok_or("PoCI evidence on a chain without PoCI")?;
+        let st = view.state.poci.as_ref().ok_or("PoCI has no configuration in force yet")?;
+        let weight = st.find_config(&ev.config_id).and_then(|c| c.weight(&key)).ok_or(EVIDENCE_NOT_A_WITNESS)?;
+        st.may_ban(&pp, &key, &ev.config_id).map_err(|e| e.to_string())?;
+        if self.inner.lock().evidence.contains_key(&key) {
+            return Err("equivocation proof for this key already held".into());
+        }
+        let (a, b) = ev.votes();
+        poci::check_evidence(&pp, &a, &b, |id| st.find_config(id)).map_err(|e| e.to_string())?;
+        self.inner.lock().insert_evidence_for(key, Equivocation { a: ev.a, b: ev.b }, Some(ev.config_id), weight)?;
         Ok(key)
     }
 
@@ -851,6 +1035,15 @@ impl PowitPool {
     /// and a block holds 32 votes, so the votes that carry the most weight
     /// toward two thirds go first; proofs heaviest key first (then KeyId),
     /// by the weights of the tip they were admitted at.
+    /// Held proofs with the PoCI configuration each names (ObenBlock), in
+    /// the order of [`Self::snapshot`].
+    pub fn evidence_snapshot(&self) -> Vec<(Equivocation, Option<Hash>)> {
+        let g = self.inner.lock();
+        let mut ev: Vec<(&KeyId, &HeldEvidence)> = g.evidence.iter().collect();
+        ev.sort_by(|a, b| b.1.weight.cmp(&a.1.weight).then(a.0.cmp(b.0)));
+        ev.into_iter().map(|(_, h)| (h.ev.clone(), h.config_id)).collect()
+    }
+
     pub fn snapshot(&self) -> (Vec<WitnessShare>, Vec<Attestation>, Vec<Equivocation>) {
         let g = self.inner.lock();
         let mut held: Vec<(&Hash, &PendingAttestation)> = g.attestations.iter().collect();
@@ -881,15 +1074,17 @@ pub fn template_body(pool: &PowitPool, dag: &GhostDAG, store: &Storage, tip: Has
     let epoch = p.epoch(base.activation, height);
     let recent = selected_chain_since(dag, Some(tip), height.saturating_sub(SHARE_WINDOW));
     let Ok(included) = included_share_ids(store, &recent) else { return PowitBody::default() };
-    let (shares, atts, mut evidence) = pool.snapshot();
+    let (shares, atts, _) = pool.snapshot();
+    let mut evidence = pool.evidence_snapshot();
     if !evidence.is_empty() {
         let tip_h = dag.get_block_data(&tip).map(|d| d.height).unwrap_or(height.saturating_sub(1));
         let w = pool.view_of(&tip).unwrap_or_else(|| Arc::new(TipWitnesses::of_at(tip, tip_h, base.clone(), &p, h2)));
-        evidence.sort_by_cached_key(|e| {
+        evidence.sort_by_cached_key(|(e, _)| {
             let k = e.a.key_id();
             (std::cmp::Reverse(w.evidence_weight(&p, &k).unwrap_or(0)), k)
         });
     }
+    let poci_chain = PociParams::for_chain(chain).is_some();
 
     let mut body = PowitBody::default();
     let mut share_work = Vec::new();
@@ -909,15 +1104,26 @@ pub fn template_body(pool: &PowitPool, dag: &GhostDAG, store: &Storage, tip: Has
     let try_apply = |b: &PowitBody, sw: &[(KeyId, u128)]| {
         let input = BlockInput { height, hash: [0; 32], share_work: sw, attestations: &b.attestations,
                                  evidence: &b.evidence, exits: &b.exits };
-        base.apply_full(&p, chain, h2, live, &input, &view).is_ok()
+        base.apply_block(&p, chain, h2, live, &input, &b.poci_evidence, &view).is_ok()
     };
-    for ev in evidence {
-        if body.evidence.len() >= p.max_evidence_per_block {
+    for (ev, config_id) in evidence {
+        if body.evidence.len() + body.poci_evidence.len() >= p.max_evidence_per_block {
             break;
         }
-        body.evidence.push(ev);
-        if !try_apply(&body, &share_work) {
-            body.evidence.pop();
+        match (poci_chain, config_id) {
+            (true, Some(config_id)) => {
+                body.poci_evidence.push(PociEvidence { config_id, a: ev.a, b: ev.b });
+                if !try_apply(&body, &share_work) {
+                    body.poci_evidence.pop();
+                }
+            }
+            (false, None) => {
+                body.evidence.push(ev);
+                if !try_apply(&body, &share_work) {
+                    body.evidence.pop();
+                }
+            }
+            _ => {}
         }
     }
     if core::liveness::liveness_active_at(height) {
@@ -1104,6 +1310,14 @@ impl WitnessDuty {
             }
         }
         let source = st.justified;
+        // PoCI (ObenBlock): votes name the configuration in force, and only
+        // its keys vote; nothing to sign during the launch bootstrap.
+        let poci = PociParams::for_chain(core::node_chain_id());
+        let config = st.poci_config().cloned();
+        if poci.is_some() && config.is_none() {
+            return Ok(None);
+        }
+        let config_id = config.as_ref().map(|c| c.id());
         // The next block's view of the slot: its selected chain starts at tip.
         let view = DagChainView { dag, start: Some(tip) };
         let mut signer = self.signer.lock();
@@ -1115,9 +1329,10 @@ impl WitnessDuty {
             let te = p.epoch(act, slot);
             // A member under the rules of the block that will include the
             // vote (from the next block on: slot <= next).
-            let member = match regime {
-                Regime::V1 => st.witness_set(&p, te).iter().any(|(k, _)| *k == self.key_id),
-                Regime::Hardening2 => st.member_weight_h2(&p, te, &self.key_id).is_some(),
+            let member = match (&config, regime) {
+                (Some(c), _) => c.weight(&self.key_id).is_some(),
+                (None, Regime::V1) => st.witness_set(&p, te).iter().any(|(k, _)| *k == self.key_id),
+                (None, Regime::Hardening2) => st.member_weight_h2(&p, te, &self.key_id).is_some(),
             };
             // Not a member for this slot's epoch, no block for it, a conflict
             // with the record, or an epoch whose leaf is gone (forward
@@ -1131,7 +1346,7 @@ impl WitnessDuty {
                 // Signed: the guard returns the stored attestation once per
                 // process (persisted, maybe not released before a restart),
                 // then nothing while it waits to be included.
-                return match self.guard.sign_link(source, target, None, || Err("already signed".into()))? {
+                return match self.guard.sign_link(source, target, config_id, || Err("already signed".into()))? {
                     Signed::Stored { att, first_release: true } => Ok(Some(att)),
                     _ => Ok(None),
                 };
@@ -1143,7 +1358,7 @@ impl WitnessDuty {
             break;
         }
         let Some((target, te)) = chosen else { return Ok(None) };
-        let signed = self.guard.sign_link(source, target, None, || {
+        let signed = self.guard.sign_link(source, target, config_id, || {
             if te > signer.epoch() {
                 // Erase every earlier seed, ON DISK FIRST (durably), then in memory.
                 let password = password_str(&self.password);
@@ -1154,10 +1369,13 @@ impl WitnessDuty {
                 write_durable(&self.key_path, &json).map_err(|e| format!("kes save: {e}"))?;
                 *signer = next_state;
             }
-            // The message of the target's height (v2, committing this key,
-            // from the second hardening activation). PoCI (ObenBlock) signs
-            // the v3 message naming `config_id` here.
-            Attestation::sign_at(core::node_chain_id(), h2, source, target, &signer)
+            // PoCI (ObenBlock): the v3 message naming the configuration in
+            // force. GnB: the message of the target's height (v2, committing
+            // this key, from the second hardening activation).
+            match (poci, &config_id) {
+                (Some(pp), Some(cid)) => Attestation::sign_v3(pp.chain_id, cid, source, target, &signer),
+                _ => Attestation::sign_at(core::node_chain_id(), h2, source, target, &signer),
+            }
         })?;
         match signed {
             Signed::Fresh(att) | Signed::Stored { att, first_release: true } => Ok(Some(att)),
@@ -1204,8 +1422,22 @@ pub fn mine_share(attested: &Block, attested_hash: Hash, witness: KeyId, payout:
 }
 
 /// Equivocation proofs in the pool (for gossip).
+#[allow(dead_code)] // tests; gossip uses `pool_evidence_items`
 pub fn pool_evidence() -> Vec<Equivocation> {
     pool().snapshot().2
+}
+
+/// The pool's proofs as gossip items, by key: GnB equivocation proofs, or
+/// PoCI evidence on ObenBlock (`ITEM_EVIDENCE` carries `PociEvidence` there).
+pub fn pool_evidence_items() -> Vec<(KeyId, (Hash, u8, Vec<u8>))> {
+    pool().evidence_snapshot().into_iter().map(|(ev, cfg)| {
+        let key = ev.a.key_id();
+        let item = match cfg {
+            Some(config_id) => poci_evidence_item(&PociEvidence { config_id, a: ev.a, b: ev.b }),
+            None => evidence_item(&ev),
+        };
+        (key, item)
+    }).collect()
 }
 
 /// JSON summary for `getpowitinfo`.
@@ -1270,6 +1502,35 @@ pub fn info_json(dag: &GhostDAG, store: &Storage) -> serde_json::Value {
         // witness signers; `signer_halted` is the alert.
         "signer_halted": crate::powit_signer::any_halted(),
         "signers": crate::powit_signer::statuses(),
+        // PoCI (ObenBlock, DESIGN-obenblock-poci.md): the configuration in
+        // force (`null` on GnB and during the launch bootstrap).
+        "poci": poci_info_json(st.as_ref()),
+    })
+}
+
+/// The PoCI part of `getpowitinfo`: the configuration in force (epoch, id,
+/// exact total, entries, quorum threshold) and the bans.
+fn poci_info_json(st: Option<&PowitState>) -> serde_json::Value {
+    let Some(pp) = PociParams::for_chain(core::node_chain_id()) else { return serde_json::Value::Null };
+    let Some(ps) = st.and_then(|s| s.poci.as_ref()) else {
+        return serde_json::json!({ "active": false, "bootstrap_epochs": pp.bootstrap_epochs });
+    };
+    let c = ps.config();
+    let bans: Vec<serde_json::Value> = ps.bans.iter().flat_map(|(k, bl)| bl.iter().map(move |b| serde_json::json!({
+        "key": hex::encode(k), "config_id": hex::encode(b.config_id), "included_at": b.included_at,
+        "start": b.start, "end": b.end(pp.ban_epochs),
+    }))).collect();
+    serde_json::json!({
+        "active": true,
+        "config_epoch": c.epoch(),
+        "config_id": hex::encode(c.id()),
+        // u128 as a decimal string (JSON numbers lose precision).
+        "total": c.total().to_string(),
+        "entries": c.len(),
+        "params_digest": hex::encode(pp.digest()),
+        "previous_config_id": ps.previous().map(|p| hex::encode(p.id())),
+        "configurations": ps.history().count(),
+        "bans": bans,
     })
 }
 
@@ -1333,6 +1594,11 @@ pub fn admit_item(kind: u8, data: &[u8], dag: &GhostDAG, store: &Storage) -> Res
             done(&cur)?;
             pool().admit_attestation(a, dag, store).map(|_| ())
         }
+        ITEM_EVIDENCE if powit::poci_active() => {
+            let e = PociEvidence::read_wire(&mut cur)?;
+            done(&cur)?;
+            pool().admit_poci_evidence(e, dag, store).map(|_| ())
+        }
         ITEM_EVIDENCE => {
             let e = Equivocation::read_wire(&mut cur)?;
             done(&cur)?;
@@ -1359,6 +1625,12 @@ pub fn attestation_item(a: &Attestation) -> (Hash, u8, Vec<u8>) {
 }
 
 pub fn evidence_item(e: &Equivocation) -> (Hash, u8, Vec<u8>) {
+    let d = e.to_wire_bytes();
+    (item_id(ITEM_EVIDENCE, &d), ITEM_EVIDENCE, d)
+}
+
+/// PoCI evidence as a gossip item (ObenBlock: kind `ITEM_EVIDENCE`).
+pub fn poci_evidence_item(e: &PociEvidence) -> (Hash, u8, Vec<u8>) {
     let d = e.to_wire_bytes();
     (item_id(ITEM_EVIDENCE, &d), ITEM_EVIDENCE, d)
 }

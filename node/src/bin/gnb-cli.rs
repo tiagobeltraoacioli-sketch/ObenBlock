@@ -215,13 +215,17 @@ fn main() {
         // prints the stored attestation, the key's signer lock refuses a
         // second signer (a running node with this key), and the rollback
         // guard reads the key's votes from the node (`getpowitkeyvotes`;
-        // `--offline` skips it explicitly).
+        // `--offline` skips it explicitly). PoCI (ObenBlock): the vote names
+        // the configuration in force, `--config-id=<hex>` (`getpowitinfo`,
+        // `poci.config_id`), and signs the v3 message.
         "powitattest" => {
             let offline = params.contains(&"--offline");
-            let params: Vec<&str> = params.iter().copied().filter(|p| *p != "--offline").collect();
+            let config_arg = params.iter().find_map(|p| p.strip_prefix("--config-id="));
+            let params: Vec<&str> = params.iter().copied()
+                .filter(|p| *p != "--offline" && !p.starts_with("--config-id=")).collect();
             require_params(&params, 6,
                 "powitattest <witness-key.json> <mainnet|testnet|regtest> <src_slot> <src_hash> <tgt_slot> <tgt_hash> \
-                 [activation] [record-dir] [--offline]");
+                 [activation] [record-dir] [--offline] [--config-id=<hex>]");
             // CRY-4: wiping storage, as for witnesskeygen.
             let pw = match std::env::var("GNB_WALLET_PASSWORD") {
                 Ok(p) => zeroize::Zeroizing::new(p),
@@ -245,6 +249,17 @@ fn main() {
                 gnb::core::powit::Checkpoint { height: slot.parse().unwrap_or(0), hash }
             };
             let (src, tgt) = (cp(params[2], params[3]), cp(params[4], params[5]));
+            let poci = gnb::core::powit::poci::PociParams::for_chain(chain);
+            let config_id: Option<[u8; 32]> = config_arg.map(|h| {
+                hex::decode(h).ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                    .unwrap_or_else(|| die("--config-id must be 32 bytes hex"))
+            });
+            match (poci.is_some(), config_id.is_some()) {
+                (true, false) => die("PoCI chain: pass --config-id=<hex>, the configuration in force \
+                                      (getpowitinfo: poci.config_id)"),
+                (false, true) => die("--config-id is for PoCI (ObenBlock) chains only"),
+                _ => {}
+            }
             let act: u64 = params.get(6).and_then(|a| a.parse().ok()).unwrap_or(0);
             let p = gnb::core::powit::params_for(chain);
             if tgt.height < act { eprintln!("target below activation"); process::exit(1); }
@@ -283,7 +298,7 @@ fn main() {
             // schedule comes from the chain named here. PoCI (ObenBlock)
             // passes its config_id and signs the v3 message here.
             let h2 = gnb::core::activation::hardening2_activation_height_for_signer(chain);
-            let signed = guard.sign_link(src, tgt, None, || {
+            let signed = guard.sign_link(src, tgt, config_id, || {
                 let e = p.epoch(act, tgt.height);
                 if e > signer.epoch() {
                     // Erase earlier seeds on disk first (durably).
@@ -294,7 +309,10 @@ fn main() {
                 } else if e < signer.epoch() {
                     return Err(format!("epoch {} already erased (key is at {}): forward security", e, signer.epoch()));
                 }
-                gnb::core::powit::Attestation::sign_at(chain, h2, src, tgt, &signer)
+                match (poci, &config_id) {
+                    (Some(pp), Some(cid)) => gnb::core::powit::Attestation::sign_v3(pp.chain_id, cid, src, tgt, &signer),
+                    _ => gnb::core::powit::Attestation::sign_at(chain, h2, src, tgt, &signer),
+                }
             }).unwrap_or_else(|er| { eprintln!("{}", er); process::exit(1) });
             let att = match signed {
                 gnb::powit_signer::Signed::Fresh(a) => a,
