@@ -280,7 +280,7 @@ fn wire_roundtrip() {
     let k = Key::new(9);
     let a = k.attest(cp(0, ACT), cp(0, ACT + 5));
     let body = PowitBody {
-        shares: vec![WitnessShare { attested: [3; 32], witness: [5; 20], payout: vec![7; 20], bits: 0x1f00_ffff, nonce: 42 }],
+        shares: vec![WitnessShare { attested: [3; 32], witness: [5; 20], payout: vec![7; 20], bits: 0x1f00_ffff, nonce: 42, sha256d: None }],
         attestations: vec![a.clone()],
         evidence: vec![Equivocation { a: a.clone(), b: k.attest(cp(0, ACT), cp(1, ACT + 5)) }],
     };
@@ -319,4 +319,35 @@ fn a_leaf_from_another_epoch_is_refused() {
     // And once a signer has moved past epoch 2, it cannot produce one at all.
     assert!(k.signer.borrow_mut().evolve_to(2).is_err());
     let _ = keys;
+}
+
+/// ObenBlock's long window (docs/DESIGN-obenblock.md §6.2) on the short test
+/// clock: work credited in epoch 0 is weight in W(2) ..= W(113), 112 epochs,
+/// and leaves at W(114); the state prunes it one epoch later (it keeps
+/// `window + 2` epochs).
+#[test]
+fn obenblock_window_keeps_work_for_112_epochs() {
+    let p = obenblock_window(P);
+    assert_eq!((p.window_epochs, p.ban_epochs, p.epoch_len), (OBB_WINDOW_EPOCHS, OBB_WINDOW_EPOCHS, P.epoch_len));
+    assert_eq!(obenblock_window(MAINNET_PARAMS).window_epochs * MAINNET_PARAMS.epoch_len * 30, 28 * 24 * 3_600,
+               "112 six-hour epochs are 28 days");
+    let k: KeyId = [0x11; 20];
+    let mut st = PowitState::genesis(ACT, hash(0, ACT));
+    let last = ACT + (OBB_WINDOW_EPOCHS + 3) * p.epoch_len;
+    for h in ACT + 1..=last {
+        let sw = if h == ACT + 1 { vec![(k, 1_000u128)] } else { vec![] };
+        let input = BlockInput { height: h, hash: hash(0, h), share_work: &sw, attestations: &[], evidence: &[] };
+        st = st.apply_at(&p, CHAIN, 0, &input, &Chain { fork: 0, tip: h }).unwrap_or_else(|e| panic!("h={h}: {e}"));
+        let e = p.epoch(ACT, h);
+        let w = st.member_weight_h2(&p, e, &k);
+        let counts = (2..=OBB_WINDOW_EPOCHS + 1).contains(&e);
+        // No attestations: finality stalls and the decay starts after
+        // `leak_after_epochs`, so only presence is checked here.
+        assert_eq!(w.is_some(), counts, "h={h} e={e} w={w:?}");
+        assert_eq!(st.epoch_work.contains_key(&0), e <= OBB_WINDOW_EPOCHS + 2, "h={h} e={e}");
+        // GnB's window would have dropped it after 3 epochs.
+        if e == P.window_epochs + 2 {
+            assert!(st.member_weight_h2(&P, e, &k).is_none());
+        }
+    }
 }

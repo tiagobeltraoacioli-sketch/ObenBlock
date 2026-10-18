@@ -1075,17 +1075,27 @@ impl WitnessDuty {
 
 // ── Share mining ─────────────────────────────────────────────────────────────
 
+/// SHA-256d CPU share mining: header nonces per GnB-SMH attempt (one GnB-SMH
+/// v3 evaluation costs about as much as 2^18 SHA-256d ones).
+const SHA256D_ATTEMPTS_SHIFT: u32 = 18;
+
 /// Try `attempts` nonces for a share attesting `attested` (normally the
 /// current tip), crediting `witness` and paying `payout` (any valid script).
 /// GnB-SMH v3, 4 MiB. Takes no lock: the caller reads the tip first.
+/// Under the SHA-256d scheme: one job (`start_nonce` is its job nonce) and
+/// `attempts << SHA256D_ATTEMPTS_SHIFT` header nonces, about the same time.
 pub fn mine_share(attested: &Block, attested_hash: Hash, witness: KeyId, payout: &[u8], start_nonce: u64,
                   attempts: u64, stop: &std::sync::atomic::AtomicBool) -> Option<WitnessShare> {
+    if let Some(p) = core::pow_scheme::node_sha256d_params() {
+        let job = witness_share::sha256d::ShareJob::new(attested, witness, payout, start_nonce, &p)?;
+        return job.mine_cpu(0, attempts.saturating_mul(1 << SHA256D_ATTEMPTS_SHIFT), stop);
+    }
     let stream = witness_share::tx_stream(attested);
     let root = attested.witness_root();
     let target = witness_share::share_target(&gnb_smh::difficulty::bits_to_target(attested.header.bits));
     let mut sp = gnb_smh::v3::Scratchpad::new(gnb_smh::v3::LOG2_N);
     let mut share = WitnessShare { attested: attested_hash, witness, payout: payout.to_vec(),
-                                   bits: attested.header.bits, nonce: 0 };
+                                   bits: attested.header.bits, nonce: 0, sha256d: None };
     for i in 0..attempts {
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
             return None;

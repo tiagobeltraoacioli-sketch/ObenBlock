@@ -3013,3 +3013,45 @@ before the block) and the shielded tip, laid out in column family `shielded`
 and refuses to run if a non-empty state's tip differs from the UTXO tip.
 Applying a block costs O(outputs × 32 + nullifiers): the tree is incremental,
 and nothing is cloned.
+
+## Witness shares on SHA-256d (ObenBlock)
+
+Under the SHA-256d proof-of-work scheme (`core::pow_scheme`, ObenBlock,
+docs/DESIGN-obenblock.md §6) a witness share is an 80-byte SHA-256d header
+(`core::witness_share::sha256d`; normative reference `reference/obb_shares.py`,
+vectors `reference/obb_shares_vectors.json`). GnB's GnB-SMH shares, their wire
+encoding and their id are unchanged.
+
+```text
+stream(B)      = wire(tx_0, with witness) | wire(tx_1) | …            64-byte chunks, last zero-padded
+idx_k          = u64le(sha256d("OBB-WSHARE-v1/idx" | attested | sha256d(payout)
+                               | job_nonce u64le | k u8)[0..8]) mod n_chunks    k = 0..7
+job_commitment = sha256d("OBB-WSHARE-v1/job" | attested | witness | sha256d(payout)
+                         | job_nonce u64le | chunk[idx_0] | … | chunk[idx_7])
+share_header   = version u32le | attested | job_commitment | time u32le | bits u32le | nonce u32le
+valid         <=> le256(sha256d(share_header)) <= min(target(bits) × 16, 2^256 - 1)
+work           = floor(2^256 / (share_target + 1))
+share_id       = sha256d("OBB-WSHARE-v1/id" | attested | witness | sha256d(payout) | bits u32le
+                         | job_nonce u64le | version u32le | time u32le | nonce u32le)
+```
+
+The share's `nonce` field is `job_nonce`. Wire: GnB's encoding followed by
+`version u32le | time u32le | nonce u32le`; a node decodes the trailing
+fields exactly when it runs the SHA-256d scheme. A share is valid against
+its attested block `B` iff, in this order: the payout is at most 128 bytes;
+it carries the SHA-256d fields (a GnB-SMH share on this chain, or a SHA-256d
+share on GnB, is `WrongScheme`); `attested` is `B`'s SHA-256d id; `bits`
+equals `B`'s; `version` passes BIP 320 against the block version
+(`0x20000000`); `time` equals `B`'s timestamp; the target is nonzero; the
+header meets the share target. The window, slots, rewards and block rules
+are GnB's ("Witness shares" in docs/DESIGN-witness-shares.md).
+
+`time` is pinned to the attested block: a free `time` would give every job
+2^32 more attempts, so one job (one set of eight chunks) would feed an ASIC
+indefinitely and custody would no longer be checked per job. An ASIC still
+rolls the nonce and the BIP 320 bits, 2^48 attempts per job.
+
+Witness weight on ObenBlock is the share work above over a window of
+`OBB_WINDOW_EPOCHS` = 112 epochs (28 days of 6-hour epochs;
+`core::powit::obenblock_window`), with `ban_epochs` = 112 as well. The state
+keeps `window + 2` epochs of share work and of links per key.

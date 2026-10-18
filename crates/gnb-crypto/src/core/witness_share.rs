@@ -26,8 +26,16 @@
 //! pays its slot to the attester's `payout` script, minus an inclusion bonus
 //! (`INCLUSION_BONUS_BPS` of the slot) paid to the block miner. Empty slots
 //! are not issued, so the miner never gains by dropping other people's shares.
+//!
+//! Under the SHA-256d proof-of-work scheme (ObenBlock,
+//! `core::pow_scheme::PowScheme::Sha256d`) the share proof is an 80-byte
+//! SHA-256d header a Bitcoin ASIC mines, and the custody sampling is per job
+//! instead of per nonce: [`sha256d`]. Rewards, slots and the share window are
+//! the same.
 
-use super::{tokenomics, Block};
+pub mod sha256d;
+
+use super::{pow_scheme, tokenomics, Block};
 use gnb_smh::difficulty::{bits_to_target, meets_target, work, Target};
 use sha3::{Digest, Sha3_256};
 
@@ -63,7 +71,30 @@ pub struct WitnessShare {
     pub payout: Vec<u8>,
     /// Compact bits of the attested block (the share target derives from it).
     pub bits: u32,
+    /// GnB-SMH: the proof's nonce. SHA-256d: the job nonce (`job_nonce`),
+    /// which selects the sampled chunks of the job.
     pub nonce: u64,
+    /// SHA-256d only: the share header's fields an ASIC sets or rolls
+    /// ([`sha256d`]). `None` on GnB, whose wire encoding is unchanged; on the
+    /// wire it is present exactly when the process runs the SHA-256d scheme.
+    /// Not part of the serde encoding, so GnB's serde shape is unchanged in
+    /// both directions; the wire is the only encoding of a share that
+    /// travels or is stored, and a share that lost the field fails closed
+    /// (`ShareError::WrongScheme`).
+    #[serde(skip)]
+    pub sha256d: Option<Sha256dShareFields>,
+}
+
+/// The fields of a SHA-256d share header besides the attested block, the
+/// job commitment and `bits` (`sha256d::share_header`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct Sha256dShareFields {
+    /// BIP 320: the chain's block version with bits 13 to 28 rolled freely.
+    pub version: u32,
+    /// Must equal the attested block's timestamp (no ntime rolling).
+    pub time: u32,
+    /// The header nonce an ASIC rolls.
+    pub nonce: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,6 +107,13 @@ pub enum ShareError {
     OutsideWindow { attested_height: u64, block_height: u64 },
     TooMany(usize),
     Duplicate([u8; 32]),
+    /// The share's form does not match the chain's proof-of-work scheme
+    /// (SHA-256d header fields on a GnB-SMH chain, or missing on a SHA-256d one).
+    WrongScheme,
+    /// SHA-256d: the share header's version breaks BIP 320.
+    Version,
+    /// SHA-256d: the share header's time differs from the attested block's.
+    WrongTime,
 }
 
 impl std::fmt::Display for ShareError {
@@ -90,6 +128,9 @@ impl std::fmt::Display for ShareError {
                 f, "share attests height {attested_height}, outside the window of block {block_height}"),
             Self::TooMany(n) => write!(f, "{n} shares in one block (max {MAX_SHARES_PER_BLOCK})"),
             Self::Duplicate(id) => write!(f, "duplicate share {}", hex::encode(id)),
+            Self::WrongScheme => f.write_str("share form does not match the chain's proof-of-work scheme"),
+            Self::Version => f.write_str("share header version outside the BIP 320 rolling mask"),
+            Self::WrongTime => f.write_str("share header time differs from the attested block's timestamp"),
         }
     }
 }
@@ -174,25 +215,47 @@ pub fn share_target(block_target: &Target) -> Target {
 }
 
 impl WitnessShare {
-    /// Wire: attested 32 ‖ witness 20 ‖ varint len ‖ payout ‖ bits u32le ‖ nonce u64le.
+    /// Wire: attested 32 ‖ witness 20 ‖ varint len ‖ payout ‖ bits u32le ‖ nonce u64le,
+    /// then under SHA-256d ‖ version u32le ‖ time u32le ‖ header nonce u32le.
     pub fn to_wire_bytes(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(52 + 9 + self.payout.len() + 12);
+        let mut out = Vec::with_capacity(52 + 9 + self.payout.len() + 24);
         out.extend_from_slice(&self.attested);
         out.extend_from_slice(&self.witness);
         super::write_varint(&mut out, self.payout.len() as u64);
         out.extend_from_slice(&self.payout);
         out.extend_from_slice(&self.bits.to_le_bytes());
         out.extend_from_slice(&self.nonce.to_le_bytes());
+        if let Some(f) = &self.sha256d {
+            out.extend_from_slice(&f.version.to_le_bytes());
+            out.extend_from_slice(&f.time.to_le_bytes());
+            out.extend_from_slice(&f.nonce.to_le_bytes());
+        }
         out
     }
 
+    /// Decode under the process's proof-of-work scheme ([`Self::read_wire_in`]).
     pub fn read_wire(cur: &mut std::io::Cursor<&[u8]>) -> Result<Self, String> {
+        Self::read_wire_in(cur, pow_scheme::node_sha256d_params().is_some())
+    }
+
+    /// Decode a share of a GnB-SMH chain (`sha256d == false`, GnB's encoding)
+    /// or of a SHA-256d chain (the three header fields follow).
+    pub fn read_wire_in(cur: &mut std::io::Cursor<&[u8]>, sha256d: bool) -> Result<Self, String> {
         let attested = super::powit::read_array32(cur)?;
         let witness = super::powit::read_fixed::<20>(cur)?;
         let payout = super::powit::read_bytes(cur, MAX_PAYOUT_SCRIPT, "share payout")?;
         let bits = super::powit::read_u32(cur)?;
         let nonce = super::powit::read_u64(cur)?;
-        Ok(WitnessShare { attested, witness, payout, bits, nonce })
+        let sha256d = if sha256d {
+            Some(Sha256dShareFields {
+                version: super::powit::read_u32(cur)?,
+                time: super::powit::read_u32(cur)?,
+                nonce: super::powit::read_u32(cur)?,
+            })
+        } else {
+            None
+        };
+        Ok(WitnessShare { attested, witness, payout, bits, nonce, sha256d })
     }
 
     /// The witness this share credits.
@@ -211,21 +274,32 @@ pub fn smh_v3(pre: &[u8], nonce: u64) -> [u8; 32] {
     gnb_smh::hash_algo(gnb_smh::Algo::V3, pre, nonce)
 }
 
-/// Unique id of a share (duplicates are refused across a block).
+/// Unique id of a share (duplicates are refused across a block). It covers
+/// every field, so it also keys the node's cache of verified shares.
 pub fn share_id(share: &WitnessShare) -> [u8; 32] {
+    if let Some(f) = &share.sha256d {
+        return sha256d::share_id(share, f);
+    }
     sha3(&[DS_ID, &share.attested, &share.witness, &sha3(&[&share.payout]), &share.bits.to_le_bytes(),
            &share.nonce.to_le_bytes()])
 }
 
 /// Verify one share against the block it attests. `pow` is the GnB-SMH
 /// evaluation (`gnb_smh::hash_thread_local` in production; a stub in tests).
-/// Returns the share's work.
+/// Returns the share's work. Under the SHA-256d scheme the share is checked
+/// by [`sha256d::verify_share`] instead and `pow` is not used.
 pub fn verify_share<F>(share: &WitnessShare, attested: &Block, pow: F) -> Result<u128, ShareError>
 where
     F: Fn(&[u8], u64) -> [u8; 32],
 {
+    if let Some(p) = pow_scheme::node_sha256d_params() {
+        return sha256d::verify_share(share, attested, &p);
+    }
     if share.payout.len() > MAX_PAYOUT_SCRIPT {
         return Err(ShareError::PayoutTooLong);
+    }
+    if share.sha256d.is_some() {
+        return Err(ShareError::WrongScheme);
     }
     if share.attested != attested.block_hash() {
         return Err(ShareError::WrongAttestedBlock);
@@ -319,11 +393,28 @@ mod tests {
     }
 
     fn mine(b: &Block, payout: &[u8]) -> WitnessShare {
-        let mut s = WitnessShare { attested: b.block_hash(), witness: [9; 20], payout: payout.to_vec(), bits: b.header.bits, nonce: 0 };
+        let mut s = WitnessShare { attested: b.block_hash(), witness: [9; 20], payout: payout.to_vec(), bits: b.header.bits, nonce: 0,
+                                   sha256d: None };
         while verify_share(&s, b, stub).is_err() {
             s.nonce += 1;
         }
         s
+    }
+
+    /// The serde (bincode) shape of a GnB share is the five fields it had
+    /// before the SHA-256d fields existed.
+    #[test]
+    fn gnb_serde_shape_is_unchanged() {
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct Before { attested: [u8; 32], witness: [u8; 20], payout: Vec<u8>, bits: u32, nonce: u64 }
+        let s = WitnessShare { attested: [1; 32], witness: [2; 20], payout: vec![3; 25], bits: 0x1f00_ffff, nonce: 1 << 40,
+                               sha256d: None };
+        let old = Before { attested: s.attested, witness: s.witness, payout: s.payout.clone(), bits: s.bits, nonce: s.nonce };
+        let cfg = bincode::config::standard();
+        let bytes = bincode::serde::encode_to_vec(&s, cfg).unwrap();
+        assert_eq!(bytes, bincode::serde::encode_to_vec(&old, cfg).unwrap());
+        let (back, n): (WitnessShare, usize) = bincode::serde::decode_from_slice(&bytes, cfg).unwrap();
+        assert_eq!((back, n), (s, bytes.len()));
     }
 
     #[test]

@@ -3167,7 +3167,8 @@ pub fn powit_admit_error_fault(kind: u8, err: &str) -> Option<BlockFault> {
     let context_free = match kind {
         crate::powit::ITEM_SHARE => {
             err == POWIT_SHARE_BAD_PAYOUT
-                || [ShareError::InsufficientWork, ShareError::WrongBits, ShareError::BadTarget, ShareError::PayoutTooLong]
+                || [ShareError::InsufficientWork, ShareError::WrongBits, ShareError::BadTarget, ShareError::PayoutTooLong,
+                    ShareError::WrongScheme, ShareError::Version, ShareError::WrongTime]
                     .iter()
                     .any(|e| err == e.to_string())
         }
@@ -4125,7 +4126,7 @@ mod tests {
 
     fn share_frame(nonce: u64) -> ([u8; 32], u8, Vec<u8>) {
         let s = core::witness_share::WitnessShare {
-            attested: [7; 32], witness: [9; 20], payout: vec![0x51], bits: core::POW_LIMIT_BITS, nonce,
+            attested: [7; 32], witness: [9; 20], payout: vec![0x51], bits: core::POW_LIMIT_BITS, nonce, sha256d: None,
         };
         crate::powit::share_item(&s)
     }
@@ -4158,7 +4159,8 @@ mod tests {
         use crate::powit::{ITEM_ATTESTATION, ITEM_EVIDENCE, ITEM_SHARE};
         use crate::core::witness_share::ShareError;
         let cf = Some(BlockFault::ContextFree);
-        for e in [ShareError::InsufficientWork, ShareError::WrongBits, ShareError::BadTarget, ShareError::PayoutTooLong] {
+        for e in [ShareError::InsufficientWork, ShareError::WrongBits, ShareError::BadTarget, ShareError::PayoutTooLong,
+                  ShareError::WrongScheme, ShareError::Version, ShareError::WrongTime] {
             assert_eq!(powit_admit_error_fault(ITEM_SHARE, &e.to_string()), cf, "{e}");
         }
         assert_eq!(powit_admit_error_fault(ITEM_SHARE, POWIT_SHARE_BAD_PAYOUT), cf);

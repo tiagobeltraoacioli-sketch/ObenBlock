@@ -93,6 +93,13 @@ jobs:
           python3 reference/obb_pow_test.py -v
           python3 reference/obb_pow_vectors.py --check
           python3 reference/obb_job_test.py -v
+      # docs/DESIGN-obenblock.md §6 (SHA-256d witness shares, 112-epoch
+      # window); the Rust code checks the same file in
+      # crates/gnb-crypto/tests/obb_share_vectors.rs.
+      - name: ObenBlock SHA-256d witness shares reference and reproducible vectors
+        run: |
+          python3 reference/obb_shares_test.py -v
+          python3 reference/obb_shares.py --check
 
   rust:
     runs-on: ubuntu-latest

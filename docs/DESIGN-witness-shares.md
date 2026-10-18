@@ -77,6 +77,25 @@ Shares travel as `NewPowitItem` (kind 1). They are validated before relay,
 with the same per-peer budget as transactions, and wait in the node's PoWit
 pool until a template includes them.
 
+## ObenBlock: SHA-256d shares
+
+On a chain that runs the SHA-256d proof of work (ObenBlock,
+[DESIGN-obenblock.md](DESIGN-obenblock.md) §6) the share proof is an
+80-byte SHA-256d header a Bitcoin ASIC mines
+(`crates/gnb-crypto/src/core/witness_share/sha256d.rs`; reference
+`reference/obb_shares.py`). The eight chunks are sampled per *job*
+(`job_nonce`, the share's `nonce` field) and committed in the header; the
+ASIC rolls the 32-bit nonce and the BIP 320 version bits. The header's
+`time` must equal the attested block's timestamp, so no job outlives its
+2^48 attempts. Verification is about a dozen SHA-256d (under 1 KiB in all) plus
+assembling the stream. Rewards, slots, the share window (16 heights) and the
+block rules are the ones above. The witness weight window is 112 epochs
+(28 days) instead of 28; docs/CONSENSUS.md, "Witness shares on SHA-256d".
+
+A node runs the CPU share miner on SHA-256d too (`--witness-wallet`), one
+job per round; that is for regtest. Mainnet shares need an ASIC and a job
+server (`ShareJob`: the header template and the chunks it committed to).
+
 ## Open
 
 - Whether share work should also count in fork choice. Today shares pay and

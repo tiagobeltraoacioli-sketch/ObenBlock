@@ -140,6 +140,20 @@ pub const fn params_keep_the_frozen_window(p: &PowitParams) -> bool {
 const _: () = assert!(params_keep_the_frozen_window(&MAINNET_PARAMS));
 const _: () = assert!(params_keep_the_frozen_window(&TESTNET_PARAMS));
 
+/// ObenBlock's witness-weight window (docs/DESIGN-obenblock.md §6.2): 112
+/// epochs, 28 days of 6-hour epochs (GnB mainnet: 28 epochs, 7 days). To own
+/// two thirds of `W` an attacker must out-mine the honest share work for
+/// about four weeks.
+pub const OBB_WINDOW_EPOCHS: u64 = 112;
+
+/// `p` with ObenBlock's long window. The ban lasts as long as the window, as
+/// on GnB (28 and 28, testnet 3 and 3), so a barred key's earlier share work
+/// has left the window when the ban ends. The state then keeps
+/// `OBB_WINDOW_EPOCHS + 2` epochs of share work and of links per key.
+pub const fn obenblock_window(p: PowitParams) -> PowitParams {
+    PowitParams { window_epochs: OBB_WINDOW_EPOCHS, ban_epochs: OBB_WINDOW_EPOCHS, ..p }
+}
+
 /// The PoWit parameters of `chain`. ObenBlock mainnet uses the mainnet
 /// clock and its regtest the testnet one; ObenBlock's own window and leak
 /// (docs/DESIGN-obenblock.md §5.2, §6.2) are set by those packages.

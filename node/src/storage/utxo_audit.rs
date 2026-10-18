@@ -336,7 +336,7 @@ mod tests {
         for (i, n_shares) in [0usize, 5, witness_share::MAX_SHARES_PER_BLOCK].into_iter().enumerate() {
             let header_height = first + i as u64;
             let shares: Vec<WitnessShare> = (0..n_shares)
-                .map(|k| WitnessShare { attested: [0; 32], witness: [k as u8; 20], payout: vec![0x30 + k as u8; 20], bits: 0, nonce: 0 })
+                .map(|k| WitnessShare { attested: [0; 32], witness: [k as u8; 20], payout: vec![0x30 + k as u8; 20], bits: 0, nonce: 0, sha256d: None })
                 .collect();
             let outs = Block::coinbase_outputs(header_height, vec![0xCC; 20], 0, &shares);
             assert_eq!(outs.len(), 1 + n_shares, "miner output + one per share");

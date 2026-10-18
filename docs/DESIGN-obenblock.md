@@ -215,6 +215,11 @@ valid         <=> SHA-256d(share_header) <= target(bits) × SHARE_TARGET_FACTOR 
   the share-verification cost of initial sync (package G).
 - Rewards, slots, the window and the inclusion bonus are unchanged
   (`docs/DESIGN-witness-shares.md`).
+- Implemented (package O5): `core::witness_share::sha256d`, reference
+  `reference/obb_shares.py`. `idx_k` is the first 8 bytes of its digest,
+  little-endian, mod the chunk count. The share's `time` must equal the
+  attested block's timestamp (a free `time` would let one job run forever).
+  Its `version` follows BIP 320.
 
 ### 6.2 Witness weight: share work, long window
 
@@ -227,6 +232,9 @@ valid         <=> SHA-256d(share_header) <= target(bits) × SHARE_TARGET_FACTOR 
   steer finality from then on.
 - Cost: the PoWit state keeps `window + 2` epochs of share work per key.
   Package A3 stores it per epoch with per-block diffs.
+- Implemented (package O5): `core::powit::obenblock_window` (window and ban
+  of 112 epochs), for `powit::params_for` to select on the ObenBlock chain
+  ids (package O6a).
 
 ## 7. Reorg protection, together
 
