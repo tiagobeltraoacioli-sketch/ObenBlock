@@ -343,6 +343,38 @@ with under a third of the weight can neither justify alone nor stall
 finality (the honest keys justify without it). Numbers and tests:
 docs/CONSENSUS.md, "PoWit", "Safety and liveness from the activation".
 
+### 7.10 Storage of the PoWit state (package A3)
+
+Node-local, not consensus: the state a block's PoWit rules produce is the
+same, only how a node stores it changed. The state keeps `window + 2`
+epochs of share work per key. Stored whole per block it repeated every
+closed epoch in every block: up to 16 shares a block, 720 blocks an epoch
+and 30 (GnB) or 114 (ObenBlock, §6.2 of DESIGN-obenblock.md) epochs make
+that megabytes per block. The node (`node/src/powit/store.rs`) now splits
+it by how it changes:
+
+| Row | Contents | Written |
+| --- | --- | --- |
+| `powit/epoch/<digest>` | one frozen epoch's work map; digest = SHA3-256(`GNB-POWIT-STORE-v1/epoch` ‖ u64le(epoch) ‖ encoding) | once per distinct epoch contents, shared by every block and branch |
+| `powit/sw/<hash>` | anchor: the frozen epochs by digest (digest, key count and work sum checked on read) and the current epoch in full; diff: the current-epoch entries the block changed, against its selected parent's record | every block |
+| `powit/sc/<hash>` | everything else (checkpoints, votes, links, bans, decay, active keys) | every block |
+
+- A frozen epoch never changes again on a chain: shares are credited only
+  to the block's own epoch, and the epoch step only drops old epochs.
+- A block is an anchor at an epoch change, every 32 records
+  (`ANCHOR_EVERY`), and when its parent's record is not in this layout;
+  otherwise a diff. A diff or an inherited digest is written only when the
+  block's frozen epochs equal the parent record's exactly, so a fault in
+  that invariant stores an anchor, never a wrong state. A load reads at
+  most 32 work rows plus the segments (decoded segments are cached by
+  digest, verified on first read).
+- All rows of one block go into the batch that commits its DAG record, so
+  a crash leaves the whole state or none of it.
+- Data dirs of earlier releases keep their `powit/state/<hash>` rows, which
+  are read as before; the first child of such a block is an anchor. No
+  migration step; the layout is one-way (an earlier release does not read
+  the new rows).
+
 ## What it buys against a 51% attacker
 
 | Attacker | Bitcoin | PoW + PoWit |

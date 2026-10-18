@@ -30,6 +30,8 @@ use gnb_crypto::core::{self, activation, Block};
 
 type Hash = [u8; 32];
 
+mod store;
+
 /// The second hardening activation height the PoWit rules switch at
 /// (`core::powit::Regime`; process-wide, the node's chain schedule):
 /// consensus (`block_state`), the pool, templates and the witness duty all
@@ -90,25 +92,15 @@ pub fn selected_chain_since(dag: &GhostDAG, start: Option<Hash>, min_height: u64
 
 // ── Per-block state storage ──────────────────────────────────────────────────
 
-fn state_key(hash: &Hash) -> String {
-    format!("powit/state/{}", hex::encode(hash))
-}
+#[allow(unused_imports)] // docs and tests; the node binary compiles this module too
+pub use store::ANCHOR_EVERY;
 
 /// The state's witness exits (`PowitState::exited`, liveness activation),
 /// stored beside it only when there are any: the serde encoding of a state
-/// leaves them out, so every GnB state is stored exactly as before.
+/// leaves them out, so every GnB state is stored exactly as before. The
+/// per-epoch layout (`store`) stores the rest of the state.
 fn exited_key(hash: &Hash) -> String {
     format!("powit/exited/{}", hex::encode(hash))
-}
-
-pub fn load_state(store: &Storage, hash: &Hash) -> Option<PowitState> {
-    let bytes = store.get_meta(&state_key(hash)).ok().flatten()?;
-    let (mut st, _): (PowitState, _) =
-        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).ok()?;
-    if let Some(x) = store.get_meta(&exited_key(hash)).ok()? {
-        st.exited = bincode::serde::decode_from_slice(&x, bincode::config::standard()).ok()?.0;
-    }
-    Some(st)
 }
 
 fn encode_exited(state: &PowitState) -> Result<Option<Vec<u8>>, String> {
@@ -119,25 +111,28 @@ fn encode_exited(state: &PowitState) -> Result<Option<Vec<u8>>, String> {
         .map(Some).map_err(|e| format!("powit exits encode: {e}"))
 }
 
-fn encode_state(state: &PowitState) -> Result<Vec<u8>, String> {
-    bincode::serde::encode_to_vec(state, bincode::config::standard())
-        .map_err(|e| format!("powit state encode: {e}"))
+/// `hash`'s stored PoWit state (`store`: per-epoch segments plus per-block
+/// diffs, package A3; data dirs of earlier releases are read as written),
+/// with its witness exits.
+pub fn load_state(store: &Storage, hash: &Hash) -> Option<PowitState> {
+    let mut st = store::load(store, hash)?;
+    if let Some(x) = store.get_meta(&exited_key(hash)).ok()? {
+        st.exited = bincode::serde::decode_from_slice(&x, bincode::config::standard()).ok()?.0;
+    }
+    Some(st)
 }
 
-/// Write `hash`'s PoWit state on its own (and its finality row,
-/// [`finality_row`]). The acceptance pipeline uses [`stage_state`]
-/// (committed with the block's DAG record); this is for tools and tests.
+/// Write `hash`'s PoWit state on its own, as an anchor record (and its
+/// finality row, [`finality_row`]). The acceptance pipeline uses
+/// [`stage_state`] (committed with the block's DAG record); this is for
+/// tools and tests. Overwriting the state of a block that already has
+/// children stored as diffs of it changes theirs too.
 #[allow(dead_code)] // tools and tests; the node binary compiles this module too
 pub fn save_state(store: &Storage, hash: &Hash, state: &PowitState) -> Result<(), String> {
-    let bytes = encode_state(state)?;
-    if let Some(x) = encode_exited(state)? {
-        store.put_meta(&exited_key(hash), &x).map_err(|e| format!("storage: powit exits: {e}"))?;
-    }
-    store.put_meta(&state_key(hash), &bytes).map_err(|e| format!("storage: powit state: {e}"))?;
-    if let Some((key, row)) = finality_row(hash, state) {
-        store.put_meta(&key, &row).map_err(|e| format!("storage: powit finality row: {e}"))?;
-    }
-    Ok(())
+    let mut batch = rocksdb::WriteBatch::default();
+    stage_state(store, &mut batch, hash, None, state)?;
+    store.write_batch(batch).map_err(|e| format!("storage: powit state: {e}"))
+}
 }
 
 /// [`save_state`] into a caller-owned batch: the acceptance pipeline commits
@@ -146,18 +141,26 @@ pub fn save_state(store: &Storage, hash: &Hash, state: &PowitState) -> Result<()
 /// never recorded without its state and a refused block leaves none behind.
 /// The block's finality row ([`finality_row`]) goes into the same batch, so
 /// the finality index a restart rebuilds holds exactly the recorded blocks.
-pub fn stage_state(store: &Storage, batch: &mut rocksdb::WriteBatch, hash: &Hash, state: &PowitState)
-    -> Result<(), String>
+/// `parent` is the block's selected parent: when its state is stored in the
+/// same epoch, this block's record is a diff of it (`store`).
+pub fn stage_state(store: &Storage, batch: &mut rocksdb::WriteBatch, hash: &Hash, parent: Option<&Hash>,
+                   state: &PowitState) -> Result<(), String>
 {
-    let bytes = encode_state(state)?;
+    store::stage(store, batch, hash, parent, state)?;
     if let Some(x) = encode_exited(state)? {
         store.stage_meta(batch, &exited_key(hash), &x).map_err(|e| format!("storage: powit exits: {e}"))?;
     }
-    store.stage_meta(batch, &state_key(hash), &bytes).map_err(|e| format!("storage: powit state: {e}"))?;
     if let Some((key, row)) = finality_row(hash, state) {
         store.stage_meta(batch, &key, &row).map_err(|e| format!("storage: powit finality row: {e}"))?;
     }
     Ok(())
+}
+
+/// Whether `hash`'s state is stored as an anchor (`Some(true)`) or a diff
+/// (`Some(false)`) in the per-epoch layout; `None` if not in that layout.
+#[allow(dead_code)] // tests; the node binary compiles this module too
+pub fn state_record_is_anchor(store: &Storage, hash: &Hash) -> Option<bool> {
+    store::record_kind(store, hash)
 }
 
 /// State a child of `parent` builds on: the parent's stored state, or the

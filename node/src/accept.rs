@@ -1224,7 +1224,8 @@ fn stage_trigger_record(
     }
     let delta = stage_dag_record_for(dag, store, batch, &t.hash)?;
     if let Some(st) = t.powit {
-        crate::powit::stage_state(store, batch, &t.hash, st)?;
+        let sp = dag.read().get_block_data(&t.hash).and_then(|d| d.selected_parent);
+        crate::powit::stage_state(store, batch, &t.hash, sp.as_ref(), st)?;
     }
     Ok(Some(delta))
 }

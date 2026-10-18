@@ -200,3 +200,43 @@ fn a_chunked_powit_reorg_resumes_after_a_crash() {
     assert_eq!(applied_tip(&n), Some(more[0].block_hash()));
     assert!(accept::check_chain_state(&n.dag, &n.store).unwrap().is_empty());
 }
+
+/// Package A3: through the real acceptance pipeline, a block whose selected
+/// parent is in the same PoWit epoch stores its state as a diff of the
+/// parent's record (an anchor at each epoch change and every
+/// `powit::ANCHOR_EVERY` records), on the applied chain and on a fork-loser
+/// branch alike; every stored state equals a fresh replay of its block, also
+/// after a restart.
+#[test]
+fn powit_states_are_stored_as_epoch_anchors_and_diffs() {
+    activate();
+    let genesis = mk_genesis(unix_now() - 100_000);
+    let gh = genesis.block_hash();
+    let mut b = Builder::new(&genesis);
+    let main = b.chain(gh, 90, "m");
+    let side = b.chain(main[40].block_hash(), 12, "s");
+
+    let mut n = node_with(&genesis, &[]);
+    for blk in main.iter().chain(&side) {
+        accept(&n, blk).unwrap_or_else(|e| panic!("block h={} refused: {e}", blk.height));
+    }
+    assert_eq!(applied_tip(&n), Some(main[89].block_hash()));
+    let check = |n: &Node| {
+        let d = n.dag.read();
+        let (mut anchors, mut diffs) = (0, 0);
+        for blk in main.iter().chain(&side).filter(|x| x.height >= ACTIVATION) {
+            let h = blk.block_hash();
+            let replayed = powit::block_state(blk, &h, &d, &n.store).unwrap().expect("PoWit active");
+            assert_eq!(powit::load_state(&n.store, &h), Some(replayed), "h={}", blk.height);
+            match powit::state_record_is_anchor(&n.store, &h) {
+                Some(true) => anchors += 1,
+                Some(false) => diffs += 1,
+                None => panic!("h={} has no record in the per-epoch layout", blk.height),
+            }
+        }
+        assert!(anchors >= 2 && diffs > 4 * anchors, "{anchors} anchors, {diffs} diffs");
+    };
+    check(&n);
+    restart(&mut n);
+    check(&n);
+}
