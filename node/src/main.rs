@@ -2466,13 +2466,12 @@ async fn main() {
                     }
                 };
 
-                // GnB-SMH search. Short rounds (MINE_ROUND_ATTEMPTS nonces per
-                // thread, ~10-20 s on a typical core) so the template — tips,
-                // mempool, timestamp — is rebuilt often; a fresh random start
-                // nonce per round. Aborted early when a new tip arrives.
-                const MINE_ROUND_ATTEMPTS: u64 = 64;
-                let preimage = block.header.pow_preimage();
-                let bits = block.header.bits;
+                // Proof-of-work search under the process's scheme
+                // (`pow::mine_header_round`: GnB-SMH, or SHA-256d on ObenBlock).
+                // Short rounds so the template — tips, mempool, timestamp — is
+                // rebuilt often; a fresh random start nonce per round. Aborted
+                // early when a new tip arrives.
+                let header = block.header.clone();
                 let block_height = block.height;
                 let start_nonce: u64 = rand::random();
                 let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2485,8 +2484,8 @@ async fn main() {
                 });
                 let stop_m = stop.clone();
                 let mined = tokio::task::spawn_blocking(move || {
-                    pow::mine_parallel(&preimage, bits, block_height, start_nonce, MINE_ROUND_ATTEMPTS,
-                                       mine_threads, Some(&*stop_m))
+                    pow::mine_header_round(&header, block_height, start_nonce,
+                                           mine_threads, Some(&*stop_m))
                 }).await;
                 tip_watch.abort();
 

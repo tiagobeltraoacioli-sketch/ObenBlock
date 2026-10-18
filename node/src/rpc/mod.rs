@@ -872,7 +872,14 @@ fn template_cache_key(params: Option<&Value>, state: &AppState) -> String {
 /// template order) at header `height`.
 fn template_cache_key_for<'a>(params: Option<&Value>, parents: impl IntoIterator<Item = &'a [u8]>, height: u64) -> String {
     use sha3::{Digest as _, Sha3_256};
-    // Order kept: the first parent is the template's selected parent.
+    // Order kept: the first parent is the template's selected parent. Under
+    // SHA-256d the template sorts its parents (`template` module docs), so
+    // the key does too: the lookup key (selected parent first) must equal
+    // the stored key of the template built on the same parents.
+    let mut parents: Vec<&[u8]> = parents.into_iter().collect();
+    if crate::core::pow_scheme::node_sha256d_params().is_some() {
+        parents.sort_unstable();
+    }
     let mut h = Sha3_256::new();
     for p in parents {
         h.update(p);
@@ -1963,11 +1970,18 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 tmpl.powit.write_wire(&mut v);
                 hex::encode(v)
             };
+            // SHA-256d (ObenBlock): the 80-byte header fields, the Merkle-root
+            // inputs and an optional header job (`mining::sha256d`,
+            // docs/OBENBLOCK-MINING.md); `null` under GnB-SMH.
+            let sha256d = match crate::mining::sha256d::template_fields(&tmpl, params, now) {
+                Ok(v) => v,
+                Err(e) => return json!({ "error": e }),
+            };
             let coinbase_outputs: Vec<Value> = tmpl.coinbase_outputs(Vec::new()).iter().map(|o| json!({
                 "value": o.value.to_string(), "script_pubkey": hex::encode(&o.script_pubkey),
             })).collect();
 
-            json!({
+            let mut result = json!({
                 "hardening_active":     tmpl.hardened,
                 "hardening_activation_height": tmpl.activation_height,
                 "merkle_rule":          if tmpl.hardened { "gnb-tagged-v1" } else { "sha256d-duplicate-last" },
@@ -2010,10 +2024,13 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 // the 32-byte output, big-endian, is < target(bits).
                 // From powit_height the proof of work is GnB-SMH v3 (4 MiB);
                 // "pow" names the function for THIS height.
-                "pow":                  crate::core::pow_algo(tmpl.height).name(),
+                // Under the SHA-256d scheme "pow" is "sha256d" (no
+                // pow_log2_n) and the header is the `sha256d` object's.
+                "pow":                  if sha256d.is_null() { crate::core::pow_algo(tmpl.height).name() } else { "sha256d" },
                 "pow_log2_n":           match crate::core::pow_algo(tmpl.height) {
-                    gnb_smh::Algo::V1 => gnb_smh::LOG2_N,
-                    gnb_smh::Algo::V3 => gnb_smh::v3::LOG2_N,
+                    _ if !sha256d.is_null() => Value::Null,
+                    gnb_smh::Algo::V1 => json!(gnb_smh::LOG2_N),
+                    gnb_smh::Algo::V3 => json!(gnb_smh::v3::LOG2_N),
                 },
                 "target":               hex::encode(crate::core::bits_to_target(tmpl.bits)),
                 // This chain measures the block size on the wire encoding at
@@ -2033,7 +2050,12 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 "powit_height":         crate::core::powit_height().to_string(),
                 "powit":                powit_hex,
                 "coinbase_outputs":     coinbase_outputs,
-            })
+            });
+            // Only under SHA-256d: a GnB template keeps its exact key set.
+            if !sha256d.is_null() {
+                result["sha256d"] = sha256d;
+            }
+            result
         }
 
         "submitblock" => {
@@ -2042,10 +2064,15 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 Ok(b)  => b,
                 Err(_) => return json!({ "error": "invalid hex" }),
             };
-            let block = match crate::core::Block::from_wire_bytes(&bytes) {
+            let mut block = match crate::core::Block::from_wire_bytes(&bytes) {
                 Ok(b)  => b,
                 Err(e) => return json!({ "error": format!("deserialise failed: {}", e) }),
             };
+            // SHA-256d: an optional {version, time, nonce} share solution for
+            // the block of a header job (ignored under GnB-SMH, as before).
+            if let Err(e) = crate::mining::sha256d::apply_submit_solution(&mut block, params.and_then(|p| p.get(1))) {
+                return json!({ "error": e });
+            }
             match &state.submit_block {
                 None => json!({ "error": "submitblock not wired on this node (started without a block-submission hook)" }),
                 Some(hook) => match hook(block) {
