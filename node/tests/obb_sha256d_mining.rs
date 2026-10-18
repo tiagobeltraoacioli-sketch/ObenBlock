@@ -249,7 +249,7 @@ fn vector_cases(params: &Sha256dParams) -> Value {
                 "coinbase_merkle_branch": tmpl.coinbase_merkle_branch().iter().map(hex::encode).collect::<Vec<_>>(),
                 "merkle_root_rule": "gnb-body-v2",
                 "shielded_root": hex::encode(job::empty_shielded_root()),
-                "powit_root": hex::encode(tmpl.powit.root()),
+                "powit_root": hex::encode(job::powit_root(&tmpl)),
                 "version": block_version,
                 "bits": OBB_REGTEST_POW_LIMIT_BITS,
                 "time": time,
