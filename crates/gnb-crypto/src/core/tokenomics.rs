@@ -97,8 +97,23 @@ pub const SUBSIDY_HALVINGS: u64 = 64 - INITIAL_SUBSIDY_SAT.leading_zeros() as u6
 /// First height whose subsidy is zero.
 pub const LAST_SUBSIDY_HEIGHT_EXCLUSIVE: u64 = SUBSIDY_HALVINGS * HALVING_INTERVAL;
 
-/// Block subsidy in base units at `height`. Height 0 (genesis) pays nothing.
-pub const fn block_subsidy_sat(height: u64) -> u64 {
+/// Block subsidy in base units at `height` on the node's chain. Height 0
+/// (genesis) pays nothing. GnB: [`schedule_subsidy_sat`]. ObenBlock (both
+/// networks): the same schedule under the slow start of
+/// docs/DESIGN-obenblock.md §4.2, `floor(full × min(height, 5,760) / 5,760)`
+/// (`pow_scheme::slow_start_subsidy_sat`); the withheld part (about 3,080
+/// OBB) is never issued, so [`issued_through_sat`] stays an upper bound.
+pub fn block_subsidy_sat(height: u64) -> u64 {
+    let full = schedule_subsidy_sat(height);
+    match super::node_chain_id().chain() {
+        super::chain::Chain::Gnb => full,
+        super::chain::Chain::ObenBlock => super::pow_scheme::slow_start_subsidy_sat(full, height),
+    }
+}
+
+/// The halving schedule: `INITIAL_SUBSIDY_SAT >> (height / HALVING_INTERVAL)`,
+/// 0 at height 0 (genesis) and after 64 halvings.
+pub const fn schedule_subsidy_sat(height: u64) -> u64 {
     if height == 0 {
         return 0;
     }
@@ -109,7 +124,9 @@ pub const fn block_subsidy_sat(height: u64) -> u64 {
     INITIAL_SUBSIDY_SAT >> halvings
 }
 
-/// Total mining subsidy issued by blocks `0..=height` (excludes the carryover).
+/// Total mining subsidy issued by blocks `0..=height` under the halving
+/// schedule (excludes the carryover): exact on GnB, an upper bound on
+/// ObenBlock (slow start, [`block_subsidy_sat`]).
 pub fn issued_through_sat(height: u64) -> u64 {
     let mut total: u64 = 0;
     let mut epoch = 0u64;

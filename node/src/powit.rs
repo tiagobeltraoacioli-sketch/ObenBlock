@@ -118,12 +118,14 @@ pub fn stage_state(store: &Storage, batch: &mut rocksdb::WriteBatch, hash: &Hash
 }
 
 /// State a child of `parent` builds on: the parent's stored state, or the
-/// genesis state when the parent is below activation.
+/// genesis state when the parent is below activation or is the genesis
+/// block (PoWit from height 0, ObenBlock: the genesis is checkpoint slot 0,
+/// justified and final by definition, and stores no state of its own).
 fn base_state(dag: &GhostDAG, store: &Storage, parent: Option<Hash>) -> Result<PowitState, String> {
     let act = core::powit_height();
     let Some(p) = parent else { return Err("powit: block without a selected parent".into()) };
     let ph = dag.get_block_data(&p).map(|d| d.height).ok_or("powit: unknown selected parent")?;
-    if ph < act {
+    if ph < act || ph == 0 {
         return Ok(PowitState::genesis(act, p));
     }
     load_state(store, &p).ok_or_else(|| format!("storage: missing PoWit state of {}", hex::encode(&p[..8])))

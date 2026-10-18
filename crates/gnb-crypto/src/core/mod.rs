@@ -93,7 +93,7 @@ static NODE_CHAIN_ID: std::sync::OnceLock<ChainId> = std::sync::OnceLock::new();
 /// Returns `Err(existing)` if already set to a different value, or if the
 /// process chain was already fixed to the other chain.
 pub fn set_node_chain_id(id: ChainId) -> Result<(), ChainId> {
-    if chain::set_process_chain(id.chain()).is_err() {
+    if chain::set_process_chain(id.chain()).is_err() || genesis::bind_pow_scheme(id).is_err() { // ObenBlock: SHA-256d
         return Err(node_chain_id());
     }
     match NODE_CHAIN_ID.set(id) {
@@ -146,7 +146,7 @@ pub fn set_powit_height_override(height: u64) -> Result<(), u64> {
 }
 
 /// First height at which PoW + PoWit rules apply.
-pub fn powit_height() -> u64 {
+pub fn powit_height() -> u64 { if node_chain_id().chain() == chain::Chain::ObenBlock { return POWIT_HEIGHT_OBENBLOCK; } // no override on ObenBlock
     POWIT_HEIGHT_OVERRIDE.get().copied().unwrap_or(match node_chain_id() {
         ChainId::Mainnet => POWIT_HEIGHT_MAINNET,
         ChainId::Testnet => POWIT_HEIGHT_TESTNET,
@@ -793,14 +793,14 @@ pub const WITNESS_COMMITMENT_HEIGHT: u64 = 5_000;
 /// (`block_rules::check_coinbase_commitment`, which also commits to the
 /// witness root) replaces it.
 pub fn suffix_witness_commitment_required(height: u64) -> bool {
-    height >= WITNESS_COMMITMENT_HEIGHT
+    height >= genesis::witness_commitment_height()
         && !activation::is_active_at(height, activation::hardening_activation_height())
 }
 
 /// Whether the block id commits to every witness at `height` (either
 /// commitment): a witness failure is then a verdict on the block.
 pub fn witnesses_committed(height: u64) -> bool {
-    height >= WITNESS_COMMITMENT_HEIGHT
+    height >= genesis::witness_commitment_height()
 }
 /// Marker before the 32-byte witness root at the end of the coinbase script_sig.
 pub const WITNESS_COMMITMENT_TAG: &[u8; 4] = b"|wc:";
@@ -2398,9 +2398,9 @@ pub fn create_genesis_block_with(timestamp: u64, bits: u32, nonce: u64) -> Block
     }
 }
 
-/// The canonical GnB genesis block. Shared by mainnet and testnet; the two
-/// networks are separated by chain id (sighash domain) and P2P identity.
-pub fn genesis_block() -> Block {
+/// The canonical genesis block of the node's chain: GnB's, shared by its
+/// mainnet and testnet (separated by chain id and P2P identity), or ObenBlock's.
+pub fn genesis_block() -> Block { if node_chain_id().chain() == chain::Chain::ObenBlock { return genesis::chain_genesis(node_chain_id()).block(); } // ObenBlock
     create_genesis_block_with(GENESIS_TIMESTAMP, GENESIS_BITS, GENESIS_NONCE)
 }
 
@@ -3183,3 +3183,8 @@ impl Block {
 /// (ObenBlock, docs/DESIGN-obenblock.md §4). Declared at the end of the file
 /// (audit WAL-5).
 pub mod pow_scheme;
+
+/// Genesis block per chain and the ObenBlock rules bound to it
+/// (docs/DESIGN-obenblock.md §3). Declared at the end of the file (audit
+/// WAL-5).
+pub mod genesis;

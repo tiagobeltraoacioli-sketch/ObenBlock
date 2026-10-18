@@ -91,6 +91,10 @@ jobs:
         run: |
           python3 reference/obb_pow_test.py -v
           python3 reference/obb_pow_vectors.py --check
+      # docs/OBENBLOCK-GENESIS.md (ObenBlock genesis); the Rust code checks
+      # the same file in crates/gnb-crypto/tests/obb_genesis_vectors.rs.
+      - name: ObenBlock genesis reference and vectors
+        run: python3 reference/obb_genesis.py --check
 
   rust:
     runs-on: ubuntu-latest
