@@ -26,6 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 UNITS = {
     "node": os.path.join(HERE, "gnb-node.service"),
     "explorer-api": os.path.join(HERE, "explorer-api", "gnb-explorer-api.service"),
+    "obenblock-explorer-api": os.path.join(HERE, "explorer-api", "obenblock-explorer-api.service"),
     "cloudflared": os.path.join(HERE, "explorer-api", "cloudflared-gnb-explorer.service"),
     "bloch-anchor": os.path.join(HERE, "bloch-anchor", "bloch-anchor.service"),
     "obenblock-anchor": os.path.join(HERE, "obenblock-anchor", "obenblock-anchor.service"),
@@ -124,13 +125,35 @@ class UnitHardening(unittest.TestCase):
         self.assertNotIn(users["bloch-anchor"], (users["node"], users["explorer-api"]),
                          "the anchoring wallet must not be readable by the node or the API")
         self.assertNotIn(users["obenblock-anchor"], (users["node"], users["explorer-api"], users["bloch-anchor"]))
+        # The ObenBlock API has its own user too: not the ObenBlock node's
+        # (`obenblock`), not GnB's API's, not an anchoring wallet's.
+        self.assertEqual(users["obenblock-explorer-api"], "obenblock-api")
+        self.assertNotIn(users["obenblock-explorer-api"], ("obenblock", users["node"], users["explorer-api"],
+                                                           users["bloch-anchor"], users["obenblock-anchor"]))
 
     def test_the_explorer_api_writes_nothing_and_reaches_loopback_only(self):
-        svc = self.service("explorer-api")
-        self.assertNotIn("ReadWritePaths", svc)
-        self.assertEqual(svc.get("IPAddressDeny"), ["any"])
-        self.assertEqual(svc.get("IPAddressAllow"), ["localhost"])
-        self.assertEqual(svc.get("Environment", []).count("GNB_API_BIND=127.0.0.1"), 1)
+        for name, bind in (("explorer-api", "GNB_API_BIND=127.0.0.1"), ("obenblock-explorer-api", "OBB_API_BIND=127.0.0.1")):
+            with self.subTest(unit=name):
+                svc = self.service(name)
+                self.assertNotIn("ReadWritePaths", svc)
+                self.assertEqual(svc.get("IPAddressDeny"), ["any"])
+                self.assertEqual(svc.get("IPAddressAllow"), ["localhost"])
+                self.assertEqual(svc.get("Environment", []).count(bind), 1)
+        env = self.service("obenblock-explorer-api").get("Environment", [])
+        self.assertIn("OBB_CHAIN=obenblock", env)
+        self.assertIn("OBB_RPC_URL=http://127.0.0.1:18210/", env, "ObenBlock's RPC port (DESIGN-obenblock §2)")
+
+    def test_the_obenblock_tls_drop_in_only_opens_the_tls_port(self):
+        path = os.path.join(HERE, "explorer-api", "obenblock-explorer-api.tls.conf.example")
+        svc = parse_unit(path)["Service"]
+        self.assertEqual(set(svc), {"Environment", "IPAddressDeny", "IPAddressAllow"})
+        self.assertEqual(svc["IPAddressDeny"], [""])
+        self.assertEqual(svc["IPAddressAllow"], [""])
+        env = svc["Environment"]
+        self.assertIn("OBB_API_BIND=0.0.0.0", env)
+        self.assertIn("OBB_API_PORT=2087", env)
+        self.assertTrue(any(e.startswith("OBB_API_TLS_CERT=") for e in env))
+        self.assertTrue(any(e.startswith("OBB_API_TLS_KEY=") for e in env))
 
     def test_readme_installs_the_api_for_its_own_user(self):
         with open(os.path.join(HERE, "explorer-api", "README.md"), encoding="utf-8") as fh:
@@ -138,6 +161,8 @@ class UnitHardening(unittest.TestCase):
         self.assertIn("useradd --system", readme)
         self.assertIn("-g gnb-api", readme)
         self.assertNotIn("-g gnb ", readme)
+        self.assertIn("-g obenblock-api", readme)
+        self.assertNotIn("-g obenblock ", readme)
 
     def test_systemd_analyze_security_rates_every_unit_sandboxed(self):
         sa = tool("systemd-analyze")

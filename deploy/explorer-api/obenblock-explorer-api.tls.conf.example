@@ -1,0 +1,21 @@
+# Direct-TLS layout of obenblock-explorer-api.service (the ObenBlock launch):
+#   /etc/systemd/system/obenblock-explorer-api.service.d/tls.conf
+#
+# The API serves HTTPS on 0.0.0.0:2087 (a port Cloudflare Workers may fetch)
+# with a publicly trusted certificate for this host's sslip.io name, e.g.
+# 136-244-93-186.sslip.io for 136.244.93.186 (a Worker cannot fetch a bare IP
+# address). Let's Encrypt keeps its files root-only, so a renewal deploy hook
+# copies them for the API user (README.md, "ObenBlock mainnet"):
+#   install -m 0640 -o root -g obenblock-api fullchain.pem /etc/obenblock/explorer-api.crt
+#   install -m 0640 -o root -g obenblock-api privkey.pem   /etc/obenblock/explorer-api.tls.key
+# Then restrict the port to Cloudflare's edge:
+#   sudo sh firewall-cloudflare.sh 2087 cloudflare-ips-v4.txt
+[Service]
+Environment=OBB_API_BIND=0.0.0.0
+Environment=OBB_API_PORT=2087
+Environment=OBB_API_TLS_CERT=/etc/obenblock/explorer-api.crt
+Environment=OBB_API_TLS_KEY=/etc/obenblock/explorer-api.tls.key
+# Peers are no longer loopback only: the nftables rule of
+# firewall-cloudflare.sh admits Cloudflare's ranges on 2087.
+IPAddressDeny=
+IPAddressAllow=

@@ -2,14 +2,72 @@
 
 `gnb_explorer_api.py` sits between the Cloudflare Worker (`worker/index.js`)
 and the node's loopback JSON-RPC. The Worker only talks to `https://` origins
-listed in its `GNB_ORIGINS` variable and authenticates with the `X-GnB-Key`
-shared secret, so the origin must be reachable over TLS. Two supported
-layouts (audit findings WAL-2 and WAL-4):
+listed in its `OBB_ORIGINS` (or `GNB_ORIGINS`) variable and authenticates
+with the `X-GnB-Key` shared secret, so the origin must be reachable over TLS.
+Two supported layouts (audit findings WAL-2 and WAL-4) follow the ObenBlock
+section.
+
+## ObenBlock mainnet (obenblock.xyz)
+
+The same program serves ObenBlock (`OBB_CHAIN=obenblock`, the default) and
+GnB (`OBB_CHAIN=gnb`). Every `GNB_*` variable below may also be written
+`OBB_*`, which wins. On ObenBlock it:
+
+- reads the node's RPC on `127.0.0.1:18210` (DESIGN-obenblock §2);
+- accepts `obb1q`/`obb1t`/`obb1m`/`obb1n` and v2 `obb1z`/`tobb1z` addresses,
+  and the GnB and Bloch forms of the same script, and shows every legacy
+  `gnb1…` string in an answer as its `obb1…` form;
+- adds SHA-256d fields: `difficulty` on Bitcoin's scale (1 = bits
+  `0x1d00ffff`, the pow limit), `pow: "sha256d"` and `pow_hash` (the block id
+  in the byte order Bitcoin tools display; `hash` stays the lookup key);
+- adds PoWit finality: `finality` (`finalized` / `pending` / `off-chain`) on
+  blocks, chain pages, transactions and address history, from the finalized
+  checkpoint of the node's `getpowitinfo`, and `finalized_height`,
+  `finalized_hash`, `justified_height` on `getdaginfo`; `getfinalityinfo` is
+  served too.
+
+Unit: `obenblock-explorer-api.service` (user `obenblock-api`, after
+`obenblock-node.service`). The launch layout is direct TLS behind the
+Cloudflare-only firewall (layout B), because Cloudflare Workers cannot fetch a
+bare IP address: each host is named by its sslip.io host name, which resolves
+to the address written in it, and gets a Let's Encrypt certificate for it.
+
+| Host | Origin for `OBB_ORIGINS` |
+| --- | --- |
+| 136.244.93.186 | `https://136-244-93-186.sslip.io:2087` |
+| 209.250.236.240 | `https://209-250-236-240.sslip.io:2087` |
+| 152.236.5.112 | `https://152-236-5-112.sslip.io:2087` |
+
+On each host (as root; the owner or the launch kit runs this, nothing here
+is run by the repository):
+
+    useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin obenblock-api
+    install -d -m 0755 /opt/obenblock/bin /etc/obenblock
+    install -m 0755 gnb_explorer_api.py /opt/obenblock/bin/
+    gunzip -c ../../genesis/bloch-g3-carryover.tsv.gz > /opt/obenblock/carryover.tsv
+    install -m 0640 -o root -g obenblock-api /dev/stdin /etc/obenblock/explorer-api.key   # the shared secret, >= 32 chars
+    install -m 0644 obenblock-explorer-api.service /etc/systemd/system/
+    install -d /etc/systemd/system/obenblock-explorer-api.service.d
+    install -m 0644 obenblock-explorer-api.tls.conf.example /etc/systemd/system/obenblock-explorer-api.service.d/tls.conf
+
+Certificate (HTTP-01 needs port 80 reachable while it is issued; the
+firewall script only filters the API port):
+
+    certbot certonly --standalone -d 136-244-93-186.sslip.io \
+      --deploy-hook 'install -m 0640 -o root -g obenblock-api $RENEWED_LINEAGE/fullchain.pem /etc/obenblock/explorer-api.crt && install -m 0640 -o root -g obenblock-api $RENEWED_LINEAGE/privkey.pem /etc/obenblock/explorer-api.tls.key && systemctl restart obenblock-explorer-api'
+
+Then `sudo sh firewall-cloudflare.sh 2087 cloudflare-ips-v4.txt` (refresh
+the list from https://www.cloudflare.com/ips-v4 first) and
+`systemctl enable --now obenblock-explorer-api`. Check from the host:
+`curl -s -H "x-gnb-key: $(cat /etc/obenblock/explorer-api.key)" https://136-244-93-186.sslip.io:2087/v1/health`
+(answers only from a Cloudflare address once the firewall is on; test
+before applying it, or through the Worker). The Worker side is
+`worker/README.md`.
 
 ## Users and sandboxing (audit OPS-3)
 
-The API runs as its own system user, `gnb-api`, never as the node's `gnb`
-user: it faces the internet through the Worker, and a compromise of it must
+The API runs as its own system user, `gnb-api` (ObenBlock: `obenblock-api`),
+never as the node's `gnb` (`obenblock`) user: it faces the internet through the Worker, and a compromise of it must
 not reach the node's data dir or keys. `cloudflared` runs as `cloudflared`.
 Both units carry the node unit's sandbox (no capabilities, read-only system,
 private devices, kernel and proc protections, `@system-service` system-call
@@ -107,5 +165,7 @@ Run `--archive` on the nodes behind the explorer if possible: wallets verify
 UTXO values against the creating transaction (`getrawtransaction`), which a
 pruning node cannot serve for old outputs.
 
-Tests: `python3 deploy/explorer-api/test_gnb_explorer_api.py` and
+Tests: `python3 deploy/explorer-api/test_gnb_explorer_api.py`,
+`python3 deploy/explorer-api/test_obenblock_explorer_api.py`,
+`python3 deploy/explorer-api/test_address_v2.py` and
 `python3 deploy/test_deploy_files.py`.
