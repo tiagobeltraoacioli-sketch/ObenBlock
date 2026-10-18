@@ -296,11 +296,14 @@ signatures assumed valid" when it applies.
 
 ### The Bloch anchor (`--bloch-rpc`)
 
-`--bloch-rpc <URL of your own Bloch node>` makes the newest ObenBlock
-checkpoint that Bloch has finalized in its anchor registry a
-weak-subjectivity checkpoint: fork choice is pinned to it and chains that
-contradict it are refused. An anchor that contradicts the node's own PoWit
-finality changes nothing and is reported as `conflict` by `getblochanchor`.
+`--bloch-rpc <URL of your own Bloch node>` (`https://`, or `http://` to a
+loopback host only) compares the newest ObenBlock checkpoint that Bloch has
+finalized in its anchor registry with the node's chain. It is advisory: it
+never pins or refuses a block. Agreement is reported as corroboration; a
+contradiction, or an anchor naming a block the node does not have, raises
+the conflict alert (`getblochanchor`, `getfinalityinfo.bloch_anchor`, metric
+`gnb_bloch_anchor_conflict`, an error log line) and you decide with
+`setfinalitycheckpoint` / `ignorefinalized`.
 Node-local, not consensus; details, the registry interface and the
 `obenblock-anchor` publisher in [OBB-ANCHOR.md](OBB-ANCHOR.md).
 

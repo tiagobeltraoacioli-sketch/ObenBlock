@@ -266,9 +266,17 @@ mutual anchoring. **Both directions are used** (owner, 2026-10-17).
 - **Use, phase 1 (node-local)**:
   - a node started with `--bloch-rpc URL` reads the anchors that its own
     Bloch node has finalized;
-  - it treats the newest one as its weak-subjectivity anchor
-    (`setfinalitycheckpoint`, automatic);
-  - it refuses any chain that contradicts it.
+  - **advisory only** (owner, 2026-10-18): a record carries no proof that W
+    finalized it, and anyone with a Bloch account can publish first. So an
+    anchor never sets a checkpoint by itself. When the newest anchor
+    contradicts the node's own finality, or names a block the node does not
+    have, the node raises the conflict alert (`getfinalityinfo`, the A2
+    alert) and the operator decides with `setfinalitycheckpoint` /
+    `ignorefinalized`. An anchor that agrees is reported as corroboration.
+  - `--bloch-rpc` must be `https://`, or `http://` to a loopback host.
+  - Automatic use needs a finality certificate in the record (≥ 2/3 of W
+    signing, or a succinct proof of it), checked by the node against the W of
+    the candidate chain. Not planned now.
   This is the same trust model as the bridge signers (docs/SIDECHAIN-BLOCH.md:
   "each signer reads … from its own follower").
 - **Phase 2**: a Bloch light client in the node (header sync of Bloch

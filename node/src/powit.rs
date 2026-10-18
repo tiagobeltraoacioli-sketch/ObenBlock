@@ -1929,6 +1929,9 @@ pub fn finality_info_json(dag: &GhostDAG, max: usize) -> serde_json::Value {
         "recorded_checkpoints": idx.candidates(),
         "recorded_sources": idx.sources(),
         "minimum_chain_work": crate::ingress::minimum_chain_work().to_string(),
+        // The advisory Bloch anchor (`--bloch-rpc`, DESIGN-obenblock §8): its
+        // conflict alert never changes the pin; the operator decides.
+        "bloch_anchor": crate::anchoring::status_json(),
     })
 }
 
