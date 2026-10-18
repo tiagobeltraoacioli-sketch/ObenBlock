@@ -122,15 +122,15 @@ pub const OBB_REGTEST_GENESIS_TIMESTAMP: u64 = 1_792_281_600;
 /// Header version of the regtest genesis.
 pub const OBB_REGTEST_GENESIS_VERSION: u32 = OBB_BLOCK_VERSION;
 /// Nonce of the regtest genesis (`gnb-mine-genesis --chain obenblock --regtest`).
-pub const OBB_REGTEST_GENESIS_NONCE: u64 = 3;
+pub const OBB_REGTEST_GENESIS_NONCE: u64 = 0;
 /// Block id of the regtest genesis (raw SHA-256d digest;
-/// 66820eb398ceafc9bf0e0df05ba2b8a668a6e7c24dfa77ba9cc77c1809848f9e in
+/// 5c6e33060eaabb32cc2f9ac72e0551e96ae69c75189bbd6c0914cb4c6f3ac188 in
 /// Bitcoin's display order).
 pub const OBB_REGTEST_GENESIS_HASH: [u8; 32] = [
-    0x9e, 0x8f, 0x84, 0x09, 0x18, 0x7c, 0xc7, 0x9c,
-    0xba, 0x77, 0xfa, 0x4d, 0xc2, 0xe7, 0xa6, 0x68,
-    0xa6, 0xb8, 0xa2, 0x5b, 0xf0, 0x0d, 0x0e, 0xbf,
-    0xc9, 0xaf, 0xce, 0x98, 0xb3, 0x0e, 0x82, 0x66,
+    0x88, 0xc1, 0x3a, 0x6f, 0x4c, 0xcb, 0x14, 0x09,
+    0x6c, 0xbd, 0x9b, 0x18, 0x75, 0x9c, 0xe6, 0x6a,
+    0xe9, 0x51, 0x05, 0x2e, 0xc7, 0x9a, 0x2f, 0xcc,
+    0x32, 0xbb, 0xaa, 0x0e, 0x06, 0x33, 0x6e, 0x5c,
 ];
 /// Header bits of the regtest genesis: the regtest pow limit.
 pub const OBB_REGTEST_GENESIS_BITS: u32 = OBB_REGTEST_POW_LIMIT_BITS;
@@ -241,9 +241,13 @@ pub fn obenblock_genesis_coinbase(text: &str) -> Transaction {
     cb
 }
 
+// The genesis root includes the liveness exits section (height 0).
+const _: () = assert!(super::liveness::OBENBLOCK_LIVENESS_ACTIVATION_HEIGHT == 0, "the genesis root assumes it");
+
 /// The header Merkle root of an ObenBlock genesis with coinbase `cb`: the v2
 /// body root over the one-leaf legacy transaction root (the coinbase txid),
-/// the empty shielded section and the empty PoWit section. Equal to
+/// the empty shielded section and the empty PoWit section (with its exits
+/// list: liveness applies from height 0). Equal to
 /// `Block::body_merkle_root()` of the genesis in a process running
 /// ObenBlock (`tests/obb_genesis_regtest.rs`), computed here without the
 /// process-wide heights so tools and other chains' processes get it too.
@@ -261,7 +265,10 @@ pub fn obenblock_genesis_merkle_root(cb: &Transaction) -> MerkleRoot {
     c.update(b"gnb:block:body:v2");
     c.update(tx_root.0);
     c.update(shell.shielded_root());
-    c.update(shell.powit.root());
+    // The liveness rules (exits in the PoWit section) apply from height 0
+    // on both ObenBlock networks, so the genesis root is the one the node
+    // computes for height 0 (`Block::body_merkle_root`).
+    c.update(shell.powit.root_with(true));
     MerkleRoot(c.finalize().into())
 }
 

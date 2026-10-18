@@ -14,8 +14,9 @@ checks the Rust code against.
                  (the genesis is outside the hardening block rules: h >= 1)
     body_root  = SHA3-256("gnb:block:body:v2" || tx_root
                           || SHA3-256("gnb:block:shielded:v1")
-                          || SHA3-256("GNB-POWIT-v1/body" || 00 00 00))
-                 (PoWit from height 0: the v2 body root, empty sections)
+                          || SHA3-256("GNB-POWIT-v1/body" || 00 00 00 00))
+                 (PoWit and liveness from height 0: the v2 body root, empty
+                 shares, attestations, evidence and exits)
     header     = pow_header(version, parents_commitment([]), body_root, time, bits, nonce)   80 bytes
     block_id   = SHA-256d(header)
 
@@ -65,14 +66,14 @@ NETWORKS = {
     # (the constants gnb-mine-genesis printed) and run --write.
     "mainnet": {"bits": o.POW_LIMIT_BITS},
     "regtest": {"bits": o.REGTEST_POW_LIMIT_BITS,
-                "timestamp": 1_792_281_600, "version": o.BLOCK_VERSION, "nonce": 3},
+                "timestamp": 1_792_281_600, "version": o.BLOCK_VERSION, "nonce": 0},
 }
 # A mainnet solution at an example timestamp (2026-10-18 00:00 UTC), found by
 # the launch tool; NOT the mainnet genesis.
-MAINNET_REHEARSAL = {"timestamp": 1_792_281_600, "version": o.BLOCK_VERSION, "nonce": 2_189_063_790}
+MAINNET_REHEARSAL = {"timestamp": 1_792_281_600, "version": o.BLOCK_VERSION, "nonce": 1_492_736_395}
 
 EMPTY_SHIELDED_ROOT = hashlib.sha3_256(b"gnb:block:shielded:v1").digest()
-EMPTY_POWIT_ROOT = hashlib.sha3_256(b"GNB-POWIT-v1/body" + b"\x00\x00\x00").digest()
+EMPTY_POWIT_ROOT = hashlib.sha3_256(b"GNB-POWIT-v1/body" + b"\x00\x00\x00\x00").digest()
 
 
 def coinbase(text: str) -> m.Tx:

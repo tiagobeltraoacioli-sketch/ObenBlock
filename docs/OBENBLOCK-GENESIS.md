@@ -19,8 +19,8 @@ pin both.
 | ASERT anchor | genesis height and time, launch bits `0x19009d69` (1 EH/s) | genesis height and time, `0x207fffff` |
 | timestamp | **set at launch** | 1,792,281,600 (2026-10-18 00:00 UTC) |
 | version | `0x20000000` + rolled BIP 320 bits, **set at launch** | `0x20000000` |
-| nonce | **set at launch** | 3 |
-| block id (display order) | **set at launch** | `66820eb3…09848f9e` |
+| nonce | **set at launch** | 0 |
+| block id (display order) | **set at launch** | `5c6e3306…6f3ac188` |
 
 The header is the 80-byte SHA-256d header (§4.1). It has no parents, so the
 parent commitment is `SHA-256d("OBB-PARENTS-v1" ‖ 00000000)`. The Merkle
@@ -79,7 +79,7 @@ mainnet and prints the command below.
    cargo run --release -p gnb --bin gnb-mine-genesis -- --chain obenblock --timestamp T
    ```
 
-   The search needs about 2^32 SHA-256d. The rehearsal took 26 s on 6 cores
+   The search needs about 2^32 SHA-256d. The rehearsal took 10 s on 32 threads
    of the build host. When a version's 2^32 nonces are exhausted, the search
    rolls the BIP 320 version bits and keeps `T` as given. It prints
    `OBB_MAINNET_GENESIS_TIMESTAMP`, `_VERSION`, `_NONCE` and `_HASH`.
@@ -114,9 +114,9 @@ mainnet and prints the command below.
 The vectors include this run as `mainnet.rehearsal`, with
 `T = 1,792,281,600`. It is not the mainnet genesis.
 
-- nonce: 2,189,063,790;
+- nonce: 1,492,736,395;
 - version: `0x20000000`;
-- id: `00000000b090141404e8456049d58a9858beb60077774bab7f505657652be529`.
+- id: `00000000721a9cb402747bea3f34d0ecc7095952173a5606cd50711230c74d6d`.
 
 ## Regtest
 
