@@ -169,6 +169,26 @@ pub fn reference_target(tip_h: u64, now_unix: u64) -> [u8; 32] {
     }
 }
 
+/// [`reference_target`] for a tip stamped `tip_ts`: from the liveness
+/// activation an honest child of the tip stamped up to `now_unix +
+/// MAX_FUTURE_SECS` may carry the stall relief over the tip's timestamp
+/// (`core::liveness::relieved_reference`), easier than the plain reference
+/// once the tip is late. Below it (GnB): [`reference_target`].
+pub fn reference_target_with_tip(tip_h: u64, tip_ts: u64, now_unix: u64) -> [u8; 32] {
+    let plain = reference_target(tip_h, now_unix);
+    let height = tip_h.saturating_add(1);
+    if !core::liveness::liveness_active_at(height) {
+        return plain;
+    }
+    let child = match core::expected_bits(tip_ts, height) {
+        Ok(bits) => core::bits_to_target(bits),
+        Err(_) => return plain,
+    };
+    let relieved = core::liveness::relieved_reference(&child, tip_ts, height,
+                                                      now_unix.saturating_add(core::MAX_FUTURE_SECS));
+    plain.max(relieved)
+}
+
 /// `target × 2^shift`, saturating at the pow limit of a block at `height`
 /// (`core::Block::pow_limit_target_for_height`, i.e. `core::block_rules::
 /// pow_limit_bits_at` under the process-wide activation height).
@@ -1648,7 +1668,7 @@ impl OrphanPool {
             if b.height != max_h.saturating_add(1) {
                 continue;
             }
-            match crate::pow::expected_bits(max_ts, b.height) {
+            match crate::pow::expected_block_bits(max_ts, b.height, b.header.timestamp) {
                 Ok(bits) if bits == b.header.bits => {}
                 _ => continue,
             }
@@ -2485,7 +2505,7 @@ pub fn passes_pre_pow_checks(block: &core::Block, dag: &GhostDAG, activation: u6
     if block.height != max_h.saturating_add(1) {
         return false;
     }
-    match crate::pow::expected_bits(max_ts, block.height) {
+    match crate::pow::expected_block_bits(max_ts, block.height, block.header.timestamp) {
         Ok(bits) if bits == block.header.bits => {}
         _ => return false,
     }
@@ -2782,8 +2802,8 @@ impl BlockIngress {
     }
 
     /// The reference target of the orphan floor and the IBD evidence.
-    fn reference(&self, tip_h: u64, now_unix: u64) -> [u8; 32] {
-        self.reference_override.unwrap_or_else(|| reference_target(tip_h, now_unix))
+    fn reference(&self, tip_h: u64, tip_ts: u64, now_unix: u64) -> [u8; 32] {
+        self.reference_override.unwrap_or_else(|| reference_target_with_tip(tip_h, tip_ts, now_unix))
     }
 
     /// Handle one inbound block, evaluating its proof of work inline (see
@@ -2850,9 +2870,10 @@ impl BlockIngress {
         if self.orphans.contains(&hash) {
             return Gated::Done(BlockOutcome::Known);
         }
-        let (tip_h, missing, lb) = {
+        let (tip_h, tip_ts, missing, lb) = {
             let d = ctx.dag.read();
-            let tip_h = d.selected_tip().and_then(|t| d.get_block_data(&t).map(|x| x.height)).unwrap_or(0);
+            let tip = d.selected_tip().and_then(|t| d.get_block_data(&t).map(|x| (x.height, x.timestamp)));
+            let (tip_h, tip_ts) = tip.unwrap_or((0, 0));
             let missing: Vec<[u8; 32]> = block.header.parents.iter().filter(|p| !d.has_block(p)).copied().collect();
             let lb = block_work_lower_bound(&d, &block.header.parents, block.header.bits, block.height);
             // POW-3 (Phase 4): the unrequested-block rule, before anything
@@ -2863,7 +2884,7 @@ impl BlockIngress {
                     return Gated::Done(BlockOutcome::Dropped(r));
                 }
             }
-            (tip_h, missing, lb)
+            (tip_h, tip_ts, missing, lb)
         };
         // Cheap structural validation (merkle, coinbase format, duplicates,
         // dust, size, parent count) — NO PoW yet.
@@ -2887,7 +2908,7 @@ impl BlockIngress {
             // one its proof is checked against), not the tip's next height.
             // Across the GnB-SMH v1 -> v3 switch the reference is first
             // re-expressed in the orphan's own algorithm (equal work).
-            let reference = reference_for_height(&self.reference(tip_h, now_unix), tip_h.saturating_add(1), block.height);
+            let reference = reference_for_height(&self.reference(tip_h, tip_ts, now_unix), tip_h.saturating_add(1), block.height);
             let floor = orphan_floor_from(&reference, block.height);
             if !bits_meet_floor(block.header.bits, &floor) {
                 return Gated::Done(BlockOutcome::Dropped(DropReason::OrphanBelowFloor));
@@ -3140,6 +3161,7 @@ pub fn powit_item_precheck(claimed: &[u8; 32], kind: u8, data: &[u8]) -> Result<
         crate::powit::ITEM_SHARE => core::witness_share::WitnessShare::read_wire(&mut cur).map(|_| ()),
         crate::powit::ITEM_ATTESTATION => core::powit::Attestation::read_wire(&mut cur).map(|_| ()),
         crate::powit::ITEM_EVIDENCE => core::powit::Equivocation::read_wire(&mut cur).map(|_| ()),
+        crate::powit::ITEM_EXIT => core::powit::WitnessExit::read_wire(&mut cur).map(|_| ()),
         k => Err(format!("unknown PoWit item kind {k}")),
     }
     .map_err(|e| format!("malformed PoWit item: {e}"))?;
@@ -3174,6 +3196,7 @@ pub fn powit_admit_error_fault(kind: u8, err: &str) -> Option<BlockFault> {
         }
         crate::powit::ITEM_ATTESTATION => err == POWIT_BAD_ATTESTATION_SIGNATURE,
         crate::powit::ITEM_EVIDENCE => err.starts_with("equivocation: "),
+        crate::powit::ITEM_EXIT => err == crate::powit::POWIT_BAD_EXIT_SIGNATURE,
         _ => false,
     };
     context_free.then_some(BlockFault::ContextFree)

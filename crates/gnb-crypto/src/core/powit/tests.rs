@@ -72,7 +72,7 @@ fn run(fork: u8, to: u64,
     for h in ACT + 1..=to {
         let sw = shares(h);
         let a = atts(h, &st);
-        let input = BlockInput { height: h, hash: hash(fork, h), share_work: &sw, attestations: &a, evidence: &[] };
+        let input = BlockInput { height: h, hash: hash(fork, h), share_work: &sw, attestations: &a, evidence: &[], exits: &[] };
         st = st.apply(&P, CHAIN, &input, &Chain { fork, tip: h }).unwrap_or_else(|e| panic!("h={h}: {e}"));
         states.insert(h, st.clone());
     }
@@ -140,7 +140,7 @@ fn one_third_is_not_enough() {
 }
 
 fn apply_one(st: &PowitState, h: u64, atts: &[Attestation], ev: &[Equivocation]) -> Result<PowitState, String> {
-    let input = BlockInput { height: h, hash: hash(0, h), share_work: &[], attestations: atts, evidence: ev };
+    let input = BlockInput { height: h, hash: hash(0, h), share_work: &[], attestations: atts, evidence: ev, exits: &[] };
     st.apply(&P, CHAIN, &input, &Chain { fork: 0, tip: h })
 }
 
@@ -214,7 +214,7 @@ fn equivocations_are_proven_and_bar_the_key() {
     assert!(apply_one(&barred, ACT + 47, &[], &[double]).is_err());
     // Shares paying it are invalid while barred.
     let input = BlockInput { height: ACT + 47, hash: hash(0, ACT + 47), share_work: &[(k.id(), 5)],
-                             attestations: &[], evidence: &[] };
+                             attestations: &[], evidence: &[], exits: &[] };
     assert!(barred.apply(&P, CHAIN, &input, &Chain { fork: 0, tip: ACT + 47 }).is_err());
 }
 
@@ -283,6 +283,7 @@ fn wire_roundtrip() {
         shares: vec![WitnessShare { attested: [3; 32], witness: [5; 20], payout: vec![7; 20], bits: 0x1f00_ffff, nonce: 42, sha256d: None }],
         attestations: vec![a.clone()],
         evidence: vec![Equivocation { a: a.clone(), b: k.attest(cp(0, ACT), cp(1, ACT + 5)) }],
+        exits: Vec::new(),
     };
     let mut buf = Vec::new();
     body.write_wire(&mut buf);

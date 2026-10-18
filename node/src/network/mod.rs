@@ -703,7 +703,7 @@ fn validate_wire_bounds(msg: &NetworkMessage) -> Result<(), WireDecodeError> {
             if data.len() > MAX_WIRE_POWIT_ITEM {
                 return Err(Bounds("PoWit item larger than MAX_WIRE_POWIT_ITEM"));
             }
-            if !(1..=3).contains(kind) {
+            if !(1..=crate::powit::ITEM_KIND_MAX).contains(kind) {
                 return Err(Bounds("unknown PoWit item kind"));
             }
         }
@@ -4954,6 +4954,7 @@ mod tests {
                     .collect(),
                 attestations: Vec::new(),
                 evidence: Vec::new(),
+                exits: Vec::new(),
             };
             let txs = vec![Transaction {
                 version: 1,
@@ -5046,7 +5047,7 @@ mod tests {
         let tx = NetworkMessage::NewTransaction { txid: [2; 32], tx_data: vec![] };
         assert_eq!(novel_kind(&block), Some(true));
         assert_eq!(novel_kind(&tx), Some(false));
-        for kind in 1..=3u8 {
+        for kind in 1..=crate::powit::ITEM_KIND_MAX {
             let item = NetworkMessage::NewPowitItem { id: [3; 32], kind, data: vec![0; 8] };
             assert_eq!(gossip_disposition(&item, true, false), GossipDisposition::DeliverDeferred);
             assert_eq!(novel_kind(&item), None, "a PoWit item (kind {kind}) earns no eviction protection");

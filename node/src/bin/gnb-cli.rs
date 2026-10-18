@@ -164,7 +164,7 @@ fn main() {
         }
 
         "submitpowit" => {
-            require_params(params, 2, "submitpowit <kind 1|2|3> <hex>");
+            require_params(params, 2, "submitpowit <kind 1|2|3|4> <hex>");
             let kind: u64 = params[0].parse().unwrap_or(0);
             ("submitpowititem", serde_json::json!([kind, params[1]]))
         }
@@ -255,6 +255,39 @@ fn main() {
             let att = gnb::core::powit::Attestation::sign_at(chain, h2, src, tgt, &signer)
                 .unwrap_or_else(|er| { eprintln!("{}", er); process::exit(1) });
             println!("{}", hex::encode(att.to_wire_bytes()));
+            return;
+        }
+        // Sign a witness exit (liveness activation, ObenBlock): the key's
+        // weight leaves the witness set from the epoch after the block that
+        // includes it. Prints the exit hex (kind 4). `chain` is mainnet,
+        // testnet or a raw chain id (0x...). Evolves the key file.
+        "powitexit" => {
+            require_params(params, 3, "powitexit <witness-key.json> <mainnet|testnet|0xCHAINID> <epoch>");
+            let pw = match std::env::var("GNB_WALLET_PASSWORD") {
+                Ok(p) => zeroize::Zeroizing::new(p),
+                Err(_) => read_password("Witness key password: "),
+            };
+            let path = std::path::Path::new(params[0]);
+            let file = gnb::core::kes::KesKeyFile::load(path).unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
+            let mut signer = file.open(&pw).unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
+            let chain_id = match params[1] {
+                "mainnet" => gnb::core::ChainId::Mainnet.to_u32(),
+                "testnet" => gnb::core::ChainId::Testnet.to_u32(),
+                raw => u32::from_str_radix(raw.trim_start_matches("0x"), 16)
+                    .unwrap_or_else(|_| { eprintln!("chain must be mainnet, testnet or 0xCHAINID"); process::exit(1) }),
+            };
+            let e: u64 = params[2].parse().unwrap_or_else(|_| { eprintln!("epoch must be a number"); process::exit(1) });
+            if e > signer.epoch() {
+                signer.evolve_to(e).unwrap_or_else(|er| { eprintln!("{}", er); process::exit(1) });
+                gnb::core::kes::KesKeyFile::seal(&signer, &pw).and_then(|f| f.save(path))
+                    .unwrap_or_else(|er| { eprintln!("{}", er); process::exit(1) });
+            } else if e < signer.epoch() {
+                eprintln!("epoch {} already erased (key is at {}): forward security", e, signer.epoch());
+                process::exit(1);
+            }
+            let x = gnb::core::powit::WitnessExit::sign(chain_id, &signer)
+                .unwrap_or_else(|er| { eprintln!("{}", er); process::exit(1) });
+            println!("{}", hex::encode(x.to_wire_bytes()));
             return;
         }
         "getpowitinfo" | "powit" => {

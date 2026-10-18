@@ -45,6 +45,15 @@ pub fn expected_bits(parent_timestamp: u64, height: u64) -> Result<u32, String> 
     gnb_crypto::core::expected_bits(parent_timestamp, height)
 }
 
+/// Expected `bits` of a block stamped `time`: [`expected_bits`] relaxed by
+/// the stall relief from the liveness activation (ObenBlock; never on GnB,
+/// where this is `expected_bits` bit for bit). CONSENSUS-CRITICAL: the
+/// validator checks a block's bits with this.
+#[inline]
+pub fn expected_block_bits(parent_timestamp: u64, height: u64, time: u64) -> Result<u32, String> {
+    gnb_crypto::core::liveness::expected_block_bits(parent_timestamp, height, time)
+}
+
 /// The proof-of-work check of a block whose id is ALREADY in the DAG: a body
 /// restored for it (`accept::accept_block`'s body replacement: a body pruned
 /// and needed again, audit DAG-6, or one rejected for a witness-dependent

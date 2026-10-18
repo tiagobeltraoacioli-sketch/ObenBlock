@@ -346,10 +346,10 @@ pub fn asert_next_bits(
 
 /// Number of 64-bit limbs of the ASERT intermediate: 320 bits hold
 /// `target * factor` < 2^256 * 2^17.
-const WIDE_LIMBS: usize = 5;
+pub(crate) const WIDE_LIMBS: usize = 5;
 
 /// `t * factor` exactly, as little-endian 64-bit limbs. `factor` < 2^17.
-fn mul_wide(t: &[u8; 32], factor: u64) -> [u64; WIDE_LIMBS] {
+pub(crate) fn mul_wide(t: &[u8; 32], factor: u64) -> [u64; WIDE_LIMBS] {
     let mut out = [0u64; WIDE_LIMBS];
     let mut carry: u128 = 0;
     for (i, limb) in out.iter_mut().take(4).enumerate() {
@@ -366,7 +366,7 @@ fn mul_wide(t: &[u8; 32], factor: u64) -> [u64; WIDE_LIMBS] {
 
 /// `floor(v * 2^net)` as a 256-bit big-endian integer, or `None` when the
 /// result is 2^256 or more. A right shift of 320 bits or more yields zero.
-fn shift_to_u256(v: &[u64; WIDE_LIMBS], net: i128) -> Option<[u8; 32]> {
+pub(crate) fn shift_to_u256(v: &[u64; WIDE_LIMBS], net: i128) -> Option<[u8; 32]> {
     const BITS: i128 = 64 * WIDE_LIMBS as i128;
     let len = v
         .iter()

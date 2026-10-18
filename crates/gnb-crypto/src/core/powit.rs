@@ -29,7 +29,11 @@
 //!   and the key is barred from the witness set and from shares.
 //! - **Inactivity decay**: when nothing has finalized for `leak_after_epochs`,
 //!   members whose attestations were not included in the previous epoch lose
-//!   1/16 of their weight per epoch until finality resumes.
+//!   1/16 of their weight per epoch until finality resumes (half, on a chain
+//!   whose [`PowitParams::leak`] is [`InactivityLeak::Half`]).
+//! - **Witness exits** (from the liveness activation, `core::liveness`): a
+//!   witness signs an exit with its KES key ([`WitnessExit`]) and its weight
+//!   leaves `W` from the next epoch.
 //!
 //! # Second hardening activation ([`Regime::Hardening2`])
 //!
@@ -95,6 +99,22 @@ pub struct PowitParams {
     pub leak_after_epochs: u64,
     /// Epochs an equivocating key stays barred.
     pub ban_epochs: u64,
+    /// What one inactivity-decay step takes from a weight.
+    pub leak: InactivityLeak,
+}
+
+/// The weight one inactivity-decay step takes (`docs/DESIGN-obenblock.md`
+/// §5.2). A constant of the chain, never height-gated: `PowitState::decay`
+/// stores step counts, which mean one thing per chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InactivityLeak {
+    /// GnB: `w -= w / 16` per step, at most 64 steps ([`decayed`]).
+    Sixteenth,
+    /// ObenBlock: half per step, `ceil(w / 2^n)` after `n` steps (at most
+    /// 128, which leaves every weight at 1 or 0; [`decayed_half`]). After a
+    /// fraction `a` of the weight left, finality resumes after at most
+    /// `24 h + 6 h × ceil(log2(2a / (1 - a)))` on 6-hour epochs.
+    Half,
 }
 
 /// Mainnet: 6 h epochs (720 blocks at 30 s), checkpoints every 30 min, a
@@ -109,6 +129,7 @@ pub const MAINNET_PARAMS: PowitParams = PowitParams {
     vote_ttl: 720,
     leak_after_epochs: 4,
     ban_epochs: 28,
+    leak: InactivityLeak::Sixteenth,
 };
 
 /// Testnet: the same rules on a short clock, so a test network reaches
@@ -123,6 +144,7 @@ pub const TESTNET_PARAMS: PowitParams = PowitParams {
     vote_ttl: 20,
     leak_after_epochs: 4,
     ban_epochs: 3,
+    leak: InactivityLeak::Sixteenth,
 };
 
 /// The parameter relation the frozen-window retention of the second
@@ -153,6 +175,14 @@ pub const OBB_WINDOW_EPOCHS: u64 = 112;
 pub const fn obenblock_window(p: PowitParams) -> PowitParams {
     PowitParams { window_epochs: OBB_WINDOW_EPOCHS, ban_epochs: OBB_WINDOW_EPOCHS, ..p }
 }
+
+/// ObenBlock mainnet (`docs/DESIGN-obenblock.md` §5.2): GnB mainnet's clock
+/// and bounds with the half leak. Package O6a's ObenBlock chain ids select it
+/// in [`params_for`]; until then no chain id maps here.
+pub const OBENBLOCK_MAINNET_PARAMS: PowitParams = PowitParams { leak: InactivityLeak::Half, ..MAINNET_PARAMS };
+
+/// ObenBlock regtest: the short test clock with the half leak.
+pub const OBENBLOCK_REGTEST_PARAMS: PowitParams = PowitParams { leak: InactivityLeak::Half, ..TESTNET_PARAMS };
 
 /// The PoWit parameters of `chain`. ObenBlock mainnet uses the mainnet
 /// clock and its regtest the testnet one; ObenBlock's own window and leak
@@ -410,6 +440,62 @@ impl Equivocation {
     }
 }
 
+/// A witness's clean exit (`docs/DESIGN-obenblock.md` §5.2): signed with the
+/// KES leaf of `epoch` over `liveness::exit_message`. A block of epoch `E`
+/// may carry it iff `epoch <= E <= epoch + 1` (`liveness::exit_epoch_ok`);
+/// the key's weight then leaves `W` from epoch `E + 1`
+/// ([`PowitState::apply_full`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessExit {
+    pub witness: KesPublic,
+    pub epoch: u64,
+    pub sig: KesSignature,
+}
+
+impl WitnessExit {
+    pub fn key_id(&self) -> KeyId {
+        self.witness.witness_id()
+    }
+
+    /// The forward-secure signature of the leaf of `epoch` over the exit
+    /// message of `chain_id` (raw u32 chain id: `liveness::exit_message_raw`).
+    pub fn verify_signature(&self, chain_id: u32) -> bool {
+        kes::verify(&self.witness, self.epoch, &super::liveness::exit_message_raw(chain_id, &self.witness, self.epoch),
+                    &self.sig)
+    }
+
+    /// Sign an exit with a KES signer evolved to `epoch` (its current epoch).
+    pub fn sign(chain_id: u32, signer: &KesSigner) -> Result<Self, String> {
+        let witness = signer.public();
+        let epoch = signer.epoch();
+        let sig = signer.sign(&super::liveness::exit_message_raw(chain_id, &witness, epoch))?;
+        Ok(WitnessExit { witness, epoch, sig })
+    }
+
+    /// Wire: u8 depth ‖ root[32] ‖ u64le epoch ‖ KES signature.
+    pub fn to_wire_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(9_000);
+        out.push(self.witness.depth);
+        out.extend_from_slice(&self.witness.root);
+        out.extend_from_slice(&self.epoch.to_le_bytes());
+        self.sig.write_wire(&mut out);
+        out
+    }
+
+    pub fn read_wire(cur: &mut std::io::Cursor<&[u8]>) -> Result<Self, String> {
+        let depth = read_fixed::<1>(cur)?[0];
+        let root = read_array32(cur)?;
+        let epoch = read_u64(cur)?;
+        let sig = KesSignature::read_wire(cur)?;
+        Ok(WitnessExit { witness: KesPublic { depth, root }, epoch, sig })
+    }
+
+    /// Unique id (gossip and pool dedup).
+    pub fn id(&self) -> [u8; 32] {
+        Sha3_256::digest(self.to_wire_bytes()).into()
+    }
+}
+
 // ── The PoWit section of a block ─────────────────────────────────────────────
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -417,14 +503,55 @@ pub struct PowitBody {
     pub shares: Vec<WitnessShare>,
     pub attestations: Vec<Attestation>,
     pub evidence: Vec<Equivocation>,
+    /// Witness exits: on the wire and in the root only from the liveness
+    /// activation ([`Self::write_wire_with`]); empty below it.
+    #[serde(default)]
+    pub exits: Vec<WitnessExit>,
 }
 
 impl PowitBody {
     pub fn is_empty(&self) -> bool {
-        self.shares.is_empty() && self.attestations.is_empty() && self.evidence.is_empty()
+        self.shares.is_empty() && self.attestations.is_empty() && self.evidence.is_empty() && self.exits.is_empty()
     }
 
-    /// Wire: varint n ‖ shares, varint n ‖ attestations, varint n ‖ evidence.
+    /// The section's encoding for a block where exits are (`with_exits`) or
+    /// are not part of it: below the liveness activation the GnB encoding
+    /// ([`Self::write_wire`], bit for bit), from it the same followed by
+    /// `varint n ‖ exits`.
+    pub fn write_wire_with(&self, out: &mut Vec<u8>, with_exits: bool) {
+        self.write_wire(out);
+        if with_exits {
+            write_varint(out, self.exits.len() as u64);
+            for x in &self.exits {
+                out.extend_from_slice(&x.to_wire_bytes());
+            }
+        }
+    }
+
+    /// Inverse of [`Self::write_wire_with`].
+    pub fn read_wire_with(cur: &mut std::io::Cursor<&[u8]>, with_exits: bool) -> Result<Self, String> {
+        let mut b = Self::read_wire(cur)?;
+        if with_exits {
+            let n = read_count(cur, super::liveness::MAX_EXITS_PER_BLOCK, "exits")?;
+            for _ in 0..n {
+                b.exits.push(WitnessExit::read_wire(cur)?);
+            }
+        }
+        Ok(b)
+    }
+
+    /// [`Self::root`] of the encoding [`Self::write_wire_with`].
+    pub fn root_with(&self, with_exits: bool) -> [u8; 32] {
+        let mut buf = Vec::new();
+        self.write_wire_with(&mut buf, with_exits);
+        let mut h = Sha3_256::new();
+        h.update(DS_BODY);
+        h.update(&buf);
+        h.finalize().into()
+    }
+
+    /// GnB wire (no exits): varint n ‖ shares, varint n ‖ attestations,
+    /// varint n ‖ evidence. Exits are not part of it.
     pub fn write_wire(&self, out: &mut Vec<u8>) {
         write_varint(out, self.shares.len() as u64);
         for s in &self.shares {
@@ -456,7 +583,7 @@ impl PowitBody {
         for _ in 0..n {
             evidence.push(Equivocation::read_wire(cur)?);
         }
-        Ok(PowitBody { shares, attestations, evidence })
+        Ok(PowitBody { shares, attestations, evidence, exits: Vec::new() })
     }
 
     /// Commitment folded into the block's body Merkle root.
@@ -534,6 +661,8 @@ pub struct BlockInput<'a> {
     pub share_work: &'a [(KeyId, u128)],
     pub attestations: &'a [Attestation],
     pub evidence: &'a [Equivocation],
+    /// Witness exits (from the liveness activation only).
+    pub exits: &'a [WitnessExit],
 }
 
 /// The including block's selected chain, for target checks.
@@ -571,6 +700,13 @@ pub struct PowitState {
     /// Keys whose attestations were included in the current epoch.
     pub active_this_epoch: BTreeSet<KeyId>,
     pub epoch: u64,
+    /// Witnesses that exited: key -> first epoch whose `W` leaves them out
+    /// (liveness activation only). A key has an entry only while it has share
+    /// work in `epoch_work`. Not part of the serde encoding, so the stored
+    /// encoding of every GnB state is unchanged; the node stores it beside
+    /// the state (`node/src/powit.rs`).
+    #[serde(skip)]
+    pub exited: BTreeMap<KeyId, u64>,
 }
 
 impl PowitState {
@@ -592,11 +728,17 @@ impl PowitState {
             decay: BTreeMap::new(),
             active_this_epoch: BTreeSet::new(),
             epoch: 0,
+            exited: BTreeMap::new(),
         }
     }
 
     pub fn is_banned(&self, key: &KeyId, epoch: u64) -> bool {
         self.banned.get(key).is_some_and(|&until| epoch < until)
+    }
+
+    /// Whether `key` exited before `epoch` (it is not a member of `W(epoch)`).
+    pub fn has_exited(&self, key: &KeyId, epoch: u64) -> bool {
+        self.exited.get(key).is_some_and(|&from| from <= epoch)
     }
 
     /// Witness set for `epoch` under the rules before the second hardening
@@ -655,8 +797,8 @@ impl PowitState {
         }
         total
             .into_iter()
-            .filter(|(k, _)| !self.is_banned(k, bar_epoch))
-            .map(|(k, w)| (k, decayed(w, self.decay.get(&k).copied().unwrap_or(0))))
+            .filter(|(k, _)| !self.is_banned(k, bar_epoch) && !self.has_exited(k, bar_epoch))
+            .map(|(k, w)| (k, decayed_with(p.leak, w, self.decay.get(&k).copied().unwrap_or(0))))
             .filter(|(_, w)| *w > 0)
             .collect()
     }
@@ -766,7 +908,7 @@ impl PowitState {
     /// The window is the one of [`h2_window_epoch`](Self::h2_window_epoch)
     /// (finalized history, PoWit finding 3); bars apply at `epoch`.
     pub fn member_weight_h2(&self, p: &PowitParams, epoch: u64, key: &KeyId) -> Option<u128> {
-        if self.is_banned(key, epoch) {
+        if self.is_banned(key, epoch) || self.has_exited(key, epoch) {
             return None;
         }
         let we = self.h2_window_epoch(p, epoch);
@@ -778,7 +920,7 @@ impl PowitState {
         let w = self.epoch_work.range(lo..=hi)
             .filter_map(|(_, m)| m.get(key))
             .fold(0u128, |acc, w| acc.saturating_add(*w));
-        let w = decayed(w, self.decay.get(key).copied().unwrap_or(0));
+        let w = decayed_with(p.leak, w, self.decay.get(key).copied().unwrap_or(0));
         (w > 0).then_some(w)
     }
 
@@ -830,6 +972,28 @@ impl PowitState {
     pub fn apply_at(&self, p: &PowitParams, chain: ChainId, hardening2_height: u64, b: &BlockInput<'_>,
                     view: &dyn ChainView) -> Result<PowitState, String>
     {
+        self.apply_full(p, chain, hardening2_height, super::liveness::liveness_activation_height(), b, view)
+    }
+
+    /// [`Self::apply_at`] with an explicit liveness activation height. From `liveness_height` a block may
+    /// carry witness exits (`b.exits`), checked after the equivocation proofs
+    /// and before the shares: at most `liveness::MAX_EXITS_PER_BLOCK`; each
+    /// signed for this block's epoch or the one before; by a key with share
+    /// work in the kept epochs that has not exited (nor earlier in the block);
+    /// signature last. It records `exited[k] = epoch + 1`. While the record
+    /// lives, shares credited to `k` are invalid and an equivocation proof
+    /// against `k` stays valid; the record goes at the first epoch boundary
+    /// that leaves `k` without share work.
+    pub fn apply_full(&self, p: &PowitParams, chain: ChainId, hardening2_height: u64, liveness_height: u64,
+                      b: &BlockInput<'_>, view: &dyn ChainView) -> Result<PowitState, String>
+    {
+        let exits_on = activation::is_active_at(b.height, liveness_height);
+        if !b.exits.is_empty() && !exits_on {
+            return Err("powit: witness exit before the liveness activation".into());
+        }
+        if b.exits.len() > super::liveness::MAX_EXITS_PER_BLOCK {
+            return Err("powit: too many witness exits".into());
+        }
         let regime = Regime::at(b.height, hardening2_height);
         let act = self.activation;
         if b.height < act {
@@ -875,13 +1039,17 @@ impl PowitState {
                 kept.extend(std::mem::take(&mut s.epoch_work).into_iter().filter(|(e, _)| (lo..=hi).contains(e)));
             }
             s.epoch_work = kept;
-            if h2 {
-                // Every share key with weight is a member (and decays while
-                // finality stalls): a decay entry outlives the key's work
-                // only until here, so `decay` holds at most the keys of
-                // `epoch_work` instead of every key a stall ever touched.
+            if h2 || !s.exited.is_empty() {
                 let live: BTreeSet<KeyId> = s.epoch_work.values().flat_map(|m| m.keys().copied()).collect();
-                s.decay.retain(|k, _| live.contains(k));
+                if h2 {
+                    // Every share key with weight is a member (and decays while
+                    // finality stalls): a decay entry outlives the key's work
+                    // only until here, so `decay` holds at most the keys of
+                    // `epoch_work` instead of every key a stall ever touched.
+                    s.decay.retain(|k, _| live.contains(k));
+                }
+                // An exit record lives while its key has work (bounded the same way).
+                s.exited.retain(|k, _| live.contains(k));
             }
             s.banned.retain(|_, until| *until > epoch);
             let link_floor = b.height.saturating_sub((p.window_epochs + 2) * p.epoch_len);
@@ -903,7 +1071,8 @@ impl PowitState {
                 if s.is_banned(&k, epoch) {
                     return Err("powit: equivocation for an already barred key".into());
                 }
-                if !s.may_be_proven_h2(p, epoch, &k) {
+                // An exited witness stays provable while its record lives.
+                if !s.may_be_proven_h2(p, epoch, &k) && !s.exited.contains_key(&k) {
                     return Err("powit: equivocation proof against a key that is not a member of the \
                                 witness sets of epochs E-1..=E+1".into());
                 }
@@ -920,10 +1089,31 @@ impl PowitState {
             }
         }
 
+        // ── Witness exits (liveness activation) ──────────────────────────
+        for x in b.exits {
+            if !super::liveness::exit_epoch_ok(epoch, x.epoch) {
+                return Err("powit: witness exit not signed for this block's epoch or the one before".into());
+            }
+            let k = x.key_id();
+            if s.exited.contains_key(&k) {
+                return Err("powit: witness already exited".into());
+            }
+            if !s.epoch_work.values().any(|m| m.contains_key(&k)) {
+                return Err("powit: witness exit by a key without share work".into());
+            }
+            if !x.verify_signature(chain.to_u32()) {
+                return Err("powit: invalid witness exit signature (KES leaf must be the exit's epoch)".into());
+            }
+            s.exited.insert(k, epoch + 1);
+        }
+
         // ── Shares: custody work for the current epoch ───────────────────
         for (k, w) in b.share_work {
             if s.is_banned(k, epoch) {
                 return Err("powit: share paid to a barred key".into());
+            }
+            if s.exited.contains_key(k) {
+                return Err("powit: share credited to a witness that exited".into());
             }
             let e = s.epoch_work.entry(epoch).or_default().entry(*k).or_insert(0);
             *e = e.saturating_add(*w);
@@ -1024,6 +1214,27 @@ pub fn two_thirds(got: u128, total: u128) -> bool {
     total != 0 && got.saturating_mul(3) >= total.saturating_mul(2)
 }
 
+/// A weight after `steps` inactivity-decay steps under `leak`.
+pub fn decayed_with(leak: InactivityLeak, w: u128, steps: u32) -> u128 {
+    match leak {
+        InactivityLeak::Sixteenth => decayed(w, steps),
+        InactivityLeak::Half => decayed_half(w, steps),
+    }
+}
+
+/// [`InactivityLeak::Half`]: `ceil(w / 2^min(steps, 128))`, the same as
+/// `steps` rounds of `w -= w / 2`.
+pub fn decayed_half(w: u128, steps: u32) -> u128 {
+    let s = steps.min(128);
+    if s == 0 {
+        return w;
+    }
+    if s == 128 {
+        return u128::from(w != 0);
+    }
+    (w >> s) + u128::from(w & ((1u128 << s) - 1) != 0)
+}
+
 /// A weight after `steps` inactivity-decay steps (each keeps 15/16, integer
 /// division; at most 64 steps count).
 pub fn decayed(w: u128, steps: u32) -> u128 {
@@ -1040,3 +1251,4 @@ mod tests;
 mod hardening2_tests;
 #[cfg(test)]
 mod finalized_history_tests;
+mod liveness_tests;
