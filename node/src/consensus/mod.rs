@@ -996,6 +996,12 @@ pub struct GhostDAG {
     /// Closure of `invalid_all_edges_roots` under "child" (any parent edge).
     /// A subset of `invalid`; `add_block` keeps it closed for later arrivals.
     invalid_all_edges: HashSet<BlockHash>,
+    /// Bumped whenever the disqualification of blocks already in the DAG
+    /// may change (`propagate_invalid`, `propagate_all_edges`,
+    /// `recompute_invalid`; `add_block` and `remove_block` only change the
+    /// block they add or remove, a leaf): the finality pin's cache keys on it
+    /// (package O2, `finality::PinCache`).
+    invalid_gen: u64,
     /// Blocks waiting for a (different) body, in memory only: their stored
     /// body failed a rule that depends on bytes the block id does not commit
     /// to (non-coinbase `script_sig`s below the hardening activation), or the
@@ -1068,6 +1074,7 @@ impl GhostDAG {
             invalid_roots: HashSet::new(),
             invalid_all_edges_roots: HashSet::new(),
             invalid_all_edges: HashSet::new(),
+            invalid_gen: 0,
             body_pending: HashMap::new(),
             reach_hint: None,
             query_visits: std::sync::atomic::AtomicU64::new(0),
@@ -2896,6 +2903,7 @@ impl GhostDAG {
     /// Mark `hash` and its selected-chain descendants in `invalid` (no root
     /// bookkeeping). Returns the blocks newly marked.
     fn propagate_invalid(&mut self, hash: BlockHash) -> Vec<BlockHash> {
+        self.invalid_gen = self.invalid_gen.wrapping_add(1);
         let mut newly = Vec::new();
         let mut stack = vec![hash];
         while let Some(h) = stack.pop() {
@@ -2950,6 +2958,7 @@ impl GhostDAG {
     }
 
     fn propagate_all_edges(&mut self, hash: BlockHash) -> Vec<BlockHash> {
+        self.invalid_gen = self.invalid_gen.wrapping_add(1);
         let mut newly = Vec::new();
         let mut stack = vec![hash];
         while let Some(h) = stack.pop() {
@@ -3355,6 +3364,7 @@ impl GhostDAG {
     /// selected-chain (or, for all-edges roots, any-edge) descendants.
     fn recompute_invalid(&mut self) {
         self.invalid_recomputes += 1;
+        self.invalid_gen = self.invalid_gen.wrapping_add(1);
         self.invalid.clear();
         self.invalid_all_edges.clear();
         let mut all_edges: Vec<BlockHash> = self.invalid_all_edges_roots.iter().copied().collect();
