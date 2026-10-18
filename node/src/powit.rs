@@ -1602,7 +1602,10 @@ pub enum FinalityOp {
     /// finality, which a checkpoint that conflicted with the one set aside
     /// may now advance; the most work decides above it).
     Ignore(Hash),
-    /// Undo [`FinalityOp::Ignore`] for this block.
+    /// Remove [`FinalityOp::Ignore`] for this block: its checkpoints count
+    /// again. Not an undo of a move: if setting it aside let a conflicting
+    /// finality become the node's own, the node keeps that one (the way back
+    /// is [`FinalityOp::SetAnchor`] on the original chain).
     Reconsider(Hash),
     /// Trust this block, which the node holds, as final (an operator
     /// weak-subjectivity checkpoint): it replaces the release checkpoint as

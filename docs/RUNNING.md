@@ -739,7 +739,8 @@ rules) before it is stored.
 From the PoWit activation the node never leaves a finalized checkpoint it
 has reached (docs/CONSENSUS.md, "Selected parent and fork choice"):
 `gnb-cli finality` (RPC `getfinalityinfo`) shows the pin, its `origin`
-(`finalized` or `anchor`), the node's `own_finality`, the anchor and the
+(`finalized`, `anchor`, or `held` while the anchor is unknown), the node's
+`own_finality`, the anchor and the
 finalized checkpoints it counts. It learns finality from every block it
 stores, also from a chain it has not applied, but such a finality only
 advances its own: after a partition heals, the side without new finality
@@ -765,6 +766,12 @@ GNB_RPC_API_KEY=<key> gnb-cli ignorefinalized [checkpoint-hash]   # default: the
 GNB_RPC_API_KEY=<key> gnb-cli reconsiderfinalized <checkpoint-hash>
 GNB_RPC_API_KEY=<key> gnb-cli setfinalitycheckpoint none|default
 ```
+
+`reconsiderfinalized` lets a checkpoint you set aside count again, but it
+does not move the node back: if setting it aside let the other chain's
+finality become the node's own, the node keeps that one (the reconsidered
+checkpoint now conflicts with it). To go back, run `setfinalitycheckpoint`
+with a block of the original chain.
 
 `setfinalitycheckpoint` makes the block a weak-subjectivity anchor: every
 finalized checkpoint that conflicts with it stops counting (the node's own
@@ -794,7 +801,14 @@ gnb --finalitycheckpoint <block-hash>:<dag-height> ...
 the block from nodes you trust (`getblockdag`). While the anchor is unknown,
 no finalized checkpoint above its height counts and none at or below it is
 decided, so a node eclipsed on a fork during sync is never pinned to the
-fork's finality.
+fork's finality. A node that already had a pin holds it meanwhile
+(`origin: held` in `getfinalityinfo`; the persisted pin is kept), instead of
+falling back to the most work. If the node's chain passes the anchor's
+height and the block still has not arrived, it alerts: an error log line
+("PoWit finality anchor ... is UNKNOWN"), `anchor_overdue: true`, and the
+metric `gnb_finality_anchor_unknown` = 1. Check the hash and height you
+gave, and that your peers serve that chain; `setfinalitycheckpoint
+default` or `none` removes the setting.
 
 ## Chain-state check at start-up
 

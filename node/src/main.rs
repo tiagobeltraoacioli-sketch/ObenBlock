@@ -244,7 +244,11 @@ struct Cli {
     /// selectable. Replaces the release finality checkpoint for this run
     /// (`powit::MAINNET_FINALITY_CHECKPOINT`); `none` removes it. An
     /// operator setting made with `setfinalitycheckpoint` takes precedence.
-    /// Non-consensus, node-local (docs/RUNNING.md).
+    /// Until the block arrives no finalized checkpoint above its height
+    /// counts; a node that had a pin holds it, and once its chain is above
+    /// that height it alerts (`anchor_overdue`, error log, metric
+    /// `gnb_finality_anchor_unknown`). Non-consensus, node-local
+    /// (docs/RUNNING.md).
     #[arg(long = "finalitycheckpoint")]                  finality_checkpoint: Option<String>,
 
 }

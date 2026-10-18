@@ -862,13 +862,34 @@ given block): no finalized checkpoint at or above it on its selected chain
 counts any more, so the node's own finality falls back to the highest
 remaining one, which a checkpoint that conflicted with the one set aside may
 now advance, and the most work decides above the pin; `reconsiderfinalized
-<hash>` takes such a setting back; `setfinalitycheckpoint <hash> [height]|none|default`
+<hash>` removes that setting (the checkpoint counts again; see below for
+what it does not undo); `setfinalitycheckpoint <hash> [height]|none|default`
 sets the operator's weak-subjectivity anchor (every candidate that conflicts
 with it stops counting, the node's own finality included; with the block's
 DAG height, also for a block the node does not hold yet), removes every
-anchor, or goes back to the release one (or `--finalitycheckpoint`'s). `getfinalityinfo` reports the pin,
-its origin (`anchor` or `finalized`), the node's own finality, the anchor,
-the candidates and the conflict alert.
+anchor, or goes back to the release one (or `--finalitycheckpoint`'s).
+`getfinalityinfo` reports the pin, its origin (`anchor`, `finalized`, or
+`held` while the anchor is unknown), the node's own finality, the anchor,
+the candidates and the conflict alert. `reconsiderfinalized` is not an undo
+once the node has moved: if setting a
+checkpoint aside let a conflicting finality advance the node's own (the
+node moved to that chain and pinned it), the reconsidered checkpoint
+counts again but conflicts with the node's finality, which it keeps; the
+way back is `setfinalitycheckpoint` on a block of the original chain.
+
+While a configured anchor (release, `--finalitycheckpoint` or
+`setfinalitycheckpoint <hash> <height>`) is unknown, the node holds the
+finalized checkpoint it pinned last (`origin: held`): it neither clears nor
+replaces the persisted pin, so an anchor it never receives does not take
+its finality away. Once its applied tip is above the anchor's height it
+alerts (`anchor_overdue` in `getfinalityinfo`, an error log line, the
+metric `gnb_finality_anchor_unknown`). The pinned checkpoint is persisted
+after each change of pin, outside the block's own write: if that write were
+lost and the chain state then rebuilt from genesis during a conflict, the
+node's own finality would fall back to the highest checkpoint of the
+rebuilt part, and conflicting checkpoints above it would resolve by work
+(a narrow window: a crash right after a change of pin, followed by a
+`--carryover-snapshot` rebuild).
 
 ### Blue work
 
@@ -1129,37 +1150,65 @@ bound of B's blue work:
    From the activation no orphan vouches: B's own chain cannot come within
    the 360-block window, so B is below the merge-depth root of every block
    that builds on the tip and merging it is a `MergeDepthViolation`; or
-4. B is FINALITY-BACKED (review of the PoWit finality pin, HIGH 2): a
-   lighter chain wins fork choice when it carries a finality newer than the
-   node's ("Selected parent and fork choice"), and the node learns that
-   finality only from blocks it stores, so the rule above split a healed
-   partition for good once the side without new finality was more than 360
-   blocks of work ahead. A block whose PoWit section claims a newer finality
-   — an attestation whose source checkpoint lies more than one checkpoint
-   interval above the node's pin (its slot; with no pin, the PoWit
-   activation): consensus requires the source to be the including chain's
-   justified checkpoint, so a chain that finalized `F` beyond the pin links
-   from `F` + one interval or later, and the node's own chain links from at
-   most its pin + one interval — marks itself, when buffered as an orphan,
-   and the missing parents the node then requests; each marked block it
-   requested in turn marks its own. A marked block (the claiming orphan, or
-   an ancestor of it the node requested) that extends the pinned
-   checkpoint's chain (its selected parent is the pin or descends from it:
-   a chain that forks below the pin cannot advance it) is admitted below
-   `T`, after
-   every cheap check and its proof of work, and charged, once, to the peer
-   that delivered it (at most 1,440 admissions, refilled at one a minute)
-   and to the node (at most 2,880, refilled at one per 30 s; about two
-   mainnet epochs, more than an honest side needs to reach the block whose
-   state carries its newer finality, and a side that finalized only through
-   inactivity decay is fetched at the refill rate); a spent budget drops the
-   block without penalty (it is requested again). At most 8,192 blocks are
-   marked at once. A claim is only a reason to fetch: the claimed finality
-   counts once the blocks are stored and their PoWit states computed, like
-   any other; a false one costs its senders their budgets and leaves stored
-   fork-loser blocks, pruned like any other. Once the node pins the claimed
-   finality, its selected tip is on that chain and the rest of it is within
-   the window (`node/tests/fix_powit_finality_heal_ingress.rs`).
+4. B is FINALITY-BACKED (review of the PoWit finality pin, HIGH 2, and its
+   second round, H1, M2, L3): a lighter chain wins fork choice when it
+   carries a finality newer than the node's ("Selected parent and fork
+   choice"), and the node learns that finality only from blocks it stores,
+   so the rule above split a healed partition for good once the side
+   without new finality was more than 360 blocks of work ahead. A buffered
+   orphan carries a FINALITY CLAIM when one of its attestations
+   - links from a source checkpoint more than one checkpoint interval above
+     the node's pin (its slot; with no pin, the PoWit activation): consensus
+     requires the source to be the including chain's justified checkpoint,
+     so a chain that finalized `F` beyond the pin links from `F` + one
+     interval or later, and the node's own chain from at most its pin + one
+     interval;
+   - is signed, under the message of the orphan's rules, by a key with
+     weight in the witness set the node's own selected-tip state derives for
+     the attestation's target epoch (at most two signatures are checked per
+     orphan, membership first). From the second hardening activation a chain
+     that shares the node's finality reads the same frozen finalized window
+     ("Witness set from finalized history"); before it, the node's own share
+     history of that window.
+
+   The claim is recorded in the orphan's pool entry once the orphan is
+   buffered (and in its skeleton if it is evicted): the pool's bounds per
+   delivering peer and its eviction rules bound the claims, and no claim
+   displaces another. B (its parents all known) is backed when, in the
+   closure of the buffered orphans and skeletons waiting on B, B itself
+   included, one carries a claim whose attestation targets B, a block of
+   that closure, or a stored block on B's selected chain (at most 4,096
+   blocks of the closure are visited, nearest first). The target binds the
+   claim to the chain it reaches the node along: an authentic attestation
+   is public, and copied onto another chain it targets a block that chain
+   does not contain. The backing is recomputed at each admission, so a block
+   requested again while orphans above it still wait is backed again. A
+   backed B is admitted below `T` only if it also extends the pinned
+   checkpoint's chain (its selected parent is the pin or descends from it: a
+   chain that forks below the pin cannot advance it; with no pin, only when
+   no weak-subjectivity anchor is configured, since while a configured
+   anchor is unknown no finality above it counts), its own bits meet the
+   orphan bits floor above (at least 1/16 of a block's work at the tip, so a
+   cheap deep fork cannot ride on a claim), it passes the checks
+   `accept_block` runs before the proof, and its proof of work. Each
+   admission is then charged, once, to the peer that delivered the block
+   (at most 1,440, refilled at one a minute) and to the node (at most 2,880,
+   refilled at one per 30 s; about two mainnet epochs, more than an honest
+   side needs to reach the block whose state carries its newer finality; a
+   side that finalized only through inactivity decay is fetched at the
+   refill rate). A spent budget drops the block without penalty: the
+   parent tracker requests it again with back-off for up to 15 minutes or 8
+   attempts, after which the orphans above it are dropped and the side is
+   fetched again when it is next announced. The DAG-7 merge-backed budget
+   (item 3) is not charged: it rations deep insertions an unauthenticated
+   orphan can make needed, and would hold a heal of hundreds of blocks for
+   hours. An attacker with no witness key spends none of these budgets; a
+   witness signing links to a chain of its own spends at most them, at the
+   floor's work per block. A claim is only a reason to fetch: the claimed
+   finality counts once the blocks are stored and their PoWit states
+   computed, like any other. Once the node pins the claimed finality, its
+   selected tip is on that chain and the rest of it is within the window
+   (`node/tests/fix_powit_finality_heal_ingress.rs`).
 
 Otherwise B is ignored without penalty (a refused block is not re-evaluated
 until the orphan pool, the DAG or the selected tip changes). A chain that
