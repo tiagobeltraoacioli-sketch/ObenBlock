@@ -1553,6 +1553,16 @@ pub fn refresh_finality_pin(dag: &parking_lot::RwLock<GhostDAG>, store: &Storage
                 outcome.conflicting, hex::encode(&a[..8]), hex::encode(&b[..8])),
         }
     }
+    crate::metrics::set_finality_anchor_unknown(outcome.anchor_overdue);
+    if outcome.anchor_overdue && !previous.anchor_overdue {
+        let a = anchor_in_force(dag.read().finality_index().anchor_setting);
+        log::error!("PoWit finality anchor {} (DAG height {}) is UNKNOWN while this node's chain is above that \
+            height: no finalized checkpoint above it counts until the block arrives. The node holds its pin ({}) \
+            instead of following the most work. Check the checkpoint (`getfinalityinfo`; `--finalitycheckpoint`, \
+            `setfinalitycheckpoint`) and its peers: the block is on a chain it has not received, or on none",
+            a.map(|a| hex::encode(a.hash)).unwrap_or_default(), a.map(|a| a.height).unwrap_or(0),
+            outcome.pin.map(|(h, _)| hex::encode(&h[..8])).unwrap_or_else(|| "none".into()));
+    }
     if outcome.anchor != previous.anchor && matches!(outcome.anchor,
         crate::consensus::finality::AnchorStatus::Invalid | crate::consensus::finality::AnchorStatus::HeightMismatch)
     {
@@ -1689,6 +1699,9 @@ pub fn finality_info_json(dag: &GhostDAG, max: usize) -> serde_json::Value {
             AnchorSetting::Operator(_) => "operator",
         },
         "anchor_status": format!("{:?}", o.anchor).to_lowercase(),
+        // Round 2, M3: the anchor is unknown while the applied tip is above
+        // its height (the pin is held, `origin: held`).
+        "anchor_overdue": o.anchor_overdue,
         "finalized": o.counted.iter().take(max).map(|(h, height, slot)| serde_json::json!({
             "hash": hex::encode(h), "block_height": height, "slot": slot })).collect::<Vec<_>>(),
         "finalized_count": o.counted.len(),
