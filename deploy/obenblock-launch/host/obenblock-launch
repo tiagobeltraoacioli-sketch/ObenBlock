@@ -1,0 +1,83 @@
+#!/bin/sh
+# Launcher of obenblock-node.service: turns /etc/obenblock/obenblock.env into
+# the node's arguments (the node binary is still named gnb in the source).
+#
+# Every value is validated before it becomes an argument: the payout address
+# is alphanumeric, the thread count decimal, every peer a multiaddr, and the
+# peer list is split on whitespace only with pathname expansion off, so no
+# value can smuggle options or file names into the command line (as
+# deploy/gnb-launch, audit OPS-3).
+#
+# The OBB_BIN, OBB_DATA_DIR, OBB_P2P_PORT, OBB_RPC_PORT and OBB_LISTEN_IP
+# overrides exist for the regtest rehearsal (rehearse-regtest.sh); the
+# installed env file sets none of them.
+set -euf
+die() { echo "obenblock-launch: $*" >&2; exit 64; }
+
+num() { case $2 in ''|*[!0-9]*) die "$1 must be a decimal number, got '$2'" ;; esac; }
+
+OBB_BIN=${OBB_BIN:-/opt/obenblock/current/obenblock}
+OBB_DATA_DIR=${OBB_DATA_DIR:-/var/lib/obenblock}
+OBB_NETWORK=${OBB_NETWORK:-mainnet}
+[ -n "${OBB_CARRYOVER:-}" ] || die "OBB_CARRYOVER is not set"
+[ -r "$OBB_CARRYOVER" ] || die "carryover snapshot $OBB_CARRYOVER is not readable"
+
+case $OBB_NETWORK in
+  mainnet) p2p=18110; rpc=18210; set -- --chain obenblock ;;
+  regtest) p2p=18111; rpc=18211; set -- --chain obenblock --regtest ;;
+  *) die "OBB_NETWORK must be mainnet or regtest" ;;
+esac
+p2p=${OBB_P2P_PORT:-$p2p}; rpc=${OBB_RPC_PORT:-$rpc}
+num OBB_P2P_PORT "$p2p"; num OBB_RPC_PORT "$rpc"
+listen_ip=${OBB_LISTEN_IP:-0.0.0.0}
+case $listen_ip in *[!0-9.]*|'') die "OBB_LISTEN_IP must be an IPv4 address" ;; esac
+
+# Archive: every node keeps every body, so a fresh node can always sync.
+set -- "$@" --data-dir "$OBB_DATA_DIR" --carryover-snapshot "$OBB_CARRYOVER" \
+       --listen "/ip4/$listen_ip/tcp/$p2p" --rpc-port "$rpc" --archive
+
+if [ -n "${OBB_RPC_KEY_FILE:-}" ]; then
+  set -- "$@" --rpc-api-key-file "$OBB_RPC_KEY_FILE"
+fi
+
+case ${OBB_MINE_THREADS:-auto} in
+  auto) ;;
+  *) num OBB_MINE_THREADS "$OBB_MINE_THREADS" ;;
+esac
+if [ -n "${OBB_MINER_ADDRESS:-}" ]; then
+  case $OBB_MINER_ADDRESS in
+    *[!A-Za-z0-9]*) die "OBB_MINER_ADDRESS must be alphanumeric" ;;
+  esac
+  threads=${OBB_MINE_THREADS:-auto}
+  if [ "$threads" = auto ]; then
+    threads=$(( $(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN) - 1 ))
+    [ "$threads" -ge 1 ] || threads=1
+  fi
+  num OBB_MINE_THREADS "$threads"
+  set -- "$@" --mine --miner-address "$OBB_MINER_ADDRESS" --mine-threads "$threads"
+fi
+
+case ${OBB_DNS_SEED:-none} in
+  none) set -- "$@" --no-default-dns-seed ;;
+  default) ;;
+  *) die "OBB_DNS_SEED must be none or default" ;;
+esac
+
+[ "${OBB_ALLOW_PRIVATE_PEERS:-0}" = 1 ] && set -- "$@" --allow-private-peers
+
+old_ifs=$IFS
+IFS=$(printf ' \t\nx'); IFS=${IFS%x}
+for p in ${OBB_PEERS:-}; do
+  case $p in
+    /*) ;;
+    *) die "OBB_PEERS entry '$p' is not a multiaddr (must start with /)" ;;
+  esac
+  case $p in
+    *[!A-Za-z0-9./:_-]*) die "OBB_PEERS entry '$p' contains characters outside a multiaddr" ;;
+  esac
+  set -- "$@" --peer "$p"
+done
+IFS=$old_ifs
+
+[ "${OBB_LAUNCH_PRINT:-0}" = 1 ] && { printf '%s\n' "$OBB_BIN $*"; exit 0; }
+exec "$OBB_BIN" "$@"

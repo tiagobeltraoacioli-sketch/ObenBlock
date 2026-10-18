@@ -286,6 +286,7 @@ impl MetricsState {
                   "Highest slot of a Bloch anchor that this node's finalized chain contains (0 until one does)"),
             registry
         ).expect("register bloch_anchor_corroborated_slot");
+
         let stratum_sessions_total = register_int_counter_vec_with_registry!(
             opts!("gnb_stratum_sessions_total", "Stratum connections accepted (by protocol)"),
             &["protocol"],

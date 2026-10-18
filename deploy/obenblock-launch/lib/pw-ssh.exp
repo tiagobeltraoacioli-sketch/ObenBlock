@@ -1,0 +1,53 @@
+#!/usr/bin/expect -f
+# Password login for the hosts that refuse keys (ObenBlock launch kit).
+#
+#   pw-ssh.exp run  <user@host> <password-file> <command>
+#   pw-ssh.exp put  <user@host> <password-file> <local-file> <remote-path>
+#   pw-ssh.exp get  <user@host> <password-file> <remote-path> <local-file>
+#
+# The password is the 'senha:' line of <password-file>. It answers the SSH
+# password prompt and any later sudo prompt of the same session ('run' uses
+# ssh -tt). It is never printed. The exit status is the remote command's.
+log_user 1
+set timeout -1
+if {[llength $argv] < 4} {
+    puts stderr "usage: pw-ssh.exp run|put|get <user@host> <password-file> ..."
+    exit 64
+}
+set mode [lindex $argv 0]
+set target [lindex $argv 1]
+set pwfile [lindex $argv 2]
+set fh [open $pwfile r]
+set pw ""
+while {[gets $fh line] >= 0} {
+    if {[regexp -nocase {^senha:\s*(\S+)} $line -> value]} { set pw $value; break }
+}
+close $fh
+if {$pw eq ""} { puts stderr "pw-ssh.exp: no 'senha:' line in $pwfile"; exit 64 }
+
+set opts [list -o PubkeyAuthentication=no -o PreferredAuthentications=password,keyboard-interactive \
+              -o ConnectTimeout=15 -o ServerAliveInterval=30 -o NumberOfPasswordPrompts=1]
+switch -- $mode {
+    run { spawn -noecho ssh -tt {*}$opts $target [lindex $argv 3] }
+    put { spawn -noecho scp -q {*}$opts [lindex $argv 3] "$target:[lindex $argv 4]" }
+    get { spawn -noecho scp -q {*}$opts "$target:[lindex $argv 3]" [lindex $argv 4] }
+    default { puts stderr "pw-ssh.exp: unknown mode $mode"; exit 64 }
+}
+set logins 0
+set sudos 0
+expect {
+    -re {\[sudo\] password for [^:]*: ?$} {
+        incr sudos
+        if {$sudos > 3} { puts stderr "\npw-ssh.exp: sudo keeps asking"; exit 65 }
+        send -- "$pw\r"; exp_continue
+    }
+    -re {(?i)password: ?$} {
+        incr logins
+        if {$logins > 1} { puts stderr "\npw-ssh.exp: password refused"; exit 65 }
+        send -- "$pw\r"; exp_continue
+    }
+    -re {Permission denied} { puts stderr "\npw-ssh.exp: permission denied"; exit 65 }
+    eof
+}
+set result [wait]
+exit [lindex $result 3]

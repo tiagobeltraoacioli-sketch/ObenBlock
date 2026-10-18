@@ -1,0 +1,51 @@
+# Stratum V1 endpoint for the ASICs that mine ObenBlock (STRATUM_HOST only,
+# port 3333 open in ufw). It asks the local node for header jobs over the
+# loopback RPC (getblocktemplate header_job, submitblock; docs/OBENBLOCK-MINING.md)
+# with the node's API key /etc/obenblock/rpc.key (group obenblock-rpc).
+# Runs as its own user: it faces the internet.
+[Unit]
+Description=ObenBlock Stratum V1 proxy (ASICs)
+After=obenblock-node.service
+Wants=obenblock-node.service
+
+[Service]
+User=obenblock-pool
+Group=obenblock-pool
+SupplementaryGroups=obenblock-rpc
+EnvironmentFile=/etc/obenblock/stratum.env
+ExecStart=/opt/obenblock/current/obenblock-stratum-launch
+Restart=always
+RestartPreventExitStatus=64
+RestartSec=5
+LimitNOFILE=65536
+MemoryMax=4G
+UMask=0077
+StateDirectory=obenblock-stratum
+StateDirectoryMode=0750
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
