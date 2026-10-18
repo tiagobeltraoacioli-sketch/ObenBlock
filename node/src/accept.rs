@@ -3982,11 +3982,16 @@ pub fn invalidate_block(
 /// node's own PoWit finality (a weak-subjectivity checkpoint: the newest
 /// Bloch anchor, `anchoring`), then move the applied chain to the best block
 /// whose selected chain passes through it, committed in chunks like
-/// [`invalidate_block`]. `GhostDAG::set_finalized` only moves the pin
-/// forward, so a checkpoint at or below the current pin changes nothing.
-/// The caller checks that `hash` does not contradict the node's own
-/// finality (`anchoring::decide`). The pin lives in memory; the caller
-/// restores it at start-up.
+/// [`invalidate_block`]. The checkpoint becomes the finality pin's anchor
+/// (`consensus::finality::AnchorSetting::Operator`, as `setfinalitycheckpoint`
+/// sets it, but in memory only: the operator's persisted setting is left as
+/// it is), because the pin is recomputed from the anchor after every block
+/// (`powit::refresh_finality_pin`). It only moves forward: a checkpoint at
+/// or below the current pin or anchor changes nothing, and one above the
+/// anchor must descend from it. An operator who disabled the anchor
+/// (`setfinalitycheckpoint none`) is not overridden. The caller checks that
+/// `hash` does not contradict the node's own finality (`anchoring::decide`)
+/// and restores the checkpoint at start-up.
 #[allow(clippy::too_many_arguments)]
 pub fn set_finality_checkpoint(
     hash: BlockHash,
@@ -4012,9 +4017,29 @@ pub fn set_finality_checkpoint(
                                hex::encode(hash), hex::encode(fh)).into());
         }
     }
-    dag.write().set_finalized(hash, height);
+    let below_pin = dag.read().finalized().is_some_and(|(_, fheight)| fheight >= height);
+    if !below_pin {
+        use crate::consensus::finality::{Anchor, AnchorSetting};
+        let current = match dag.read().finality_index().anchor_setting {
+            AnchorSetting::Disabled => return Err(
+                "the operator disabled the finality anchor (setfinalitycheckpoint none)".to_string().into()),
+            AnchorSetting::Operator(a) => Some(a),
+            AnchorSetting::Release => crate::powit::release_finality_checkpoint()
+                .map(|c| Anchor { hash: c.hash, height: c.height }),
+        };
+        match current {
+            Some(a) if a.height >= height => {}
+            Some(a) if !dag.read().is_on_selected_chain_of(&a.hash, &hash) => {
+                return Err(format!("block {} does not descend from the finality anchor {}",
+                                   hex::encode(hash), hex::encode(a.hash)).into());
+            }
+            _ => dag.write().finality_index_mut().anchor_setting = AnchorSetting::Operator(Anchor { hash, height }),
+        }
+    }
+    let before = dag.read().finalized();
+    let after = crate::powit::refresh_finality_pin(dag, store).pin;
     apply_operator_override(dag, store, mempool, node_state, tip_tx, shielded, Vec::new(),
-                            MarkClears::default(), 0)
+                            MarkClears::default(), usize::from(before != after))
 }
 
 /// Operator `reconsiderblock` (Bitcoin Core's `ReconsiderBlock`): consider
