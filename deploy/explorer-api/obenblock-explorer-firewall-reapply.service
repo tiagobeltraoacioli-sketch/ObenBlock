@@ -1,0 +1,27 @@
+# Re-applies the table of obenblock-explorer-firewall.service (idempotent,
+# atomic, only `inet gnb_explorer`); started by
+# obenblock-explorer-firewall-reapply.timer. See that unit.
+[Unit]
+Description=Re-apply the ObenBlock explorer API firewall table
+After=obenblock-explorer-firewall.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh /opt/obenblock/bin/firewall-cloudflare.sh 2087 /etc/obenblock/cloudflare-ips-v4.txt
+CapabilityBoundingSet=CAP_NET_ADMIN
+RestrictAddressFamilies=AF_NETLINK AF_UNIX
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+SystemCallArchitectures=native

@@ -1,0 +1,12 @@
+# Every 5 minutes: puts the explorer API firewall table back if another tool
+# flushed the ruleset (obenblock-explorer-firewall.service).
+[Unit]
+Description=Re-apply the ObenBlock explorer API firewall table every 5 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

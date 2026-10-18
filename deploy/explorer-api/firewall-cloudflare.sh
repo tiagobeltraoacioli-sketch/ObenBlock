@@ -8,8 +8,14 @@
 # Applies an nftables table `gnb_explorer` that accepts PORT/tcp only from the
 # IPv4 ranges in IP-LIST (default: cloudflare-ips-v4.txt next to this script)
 # and drops it from everywhere else; IPv6 to PORT is dropped. Idempotent:
-# the table is replaced as a whole. Refresh the list from
-# https://www.cloudflare.com/ips-v4 before applying.
+# the table is replaced as a whole, and no other table is touched. Refresh
+# the list from https://www.cloudflare.com/ips-v4 before applying.
+#
+# Persistence: run it through obenblock-explorer-firewall.service (boot, every
+# nftables restart/reload) and obenblock-explorer-firewall-reapply.timer
+# (every 5 minutes), never only by hand. Another filter (ufw, iptables-nft, a
+# default-drop input chain in another table) must ALSO allow PORT/tcp from
+# the same ranges: an accept here does not override a drop elsewhere.
 set -eu
 PORT=${1:-2087}
 LIST=${2:-$(dirname "$0")/cloudflare-ips-v4.txt}

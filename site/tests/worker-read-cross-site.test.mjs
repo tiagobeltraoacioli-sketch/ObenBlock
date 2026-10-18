@@ -18,21 +18,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import worker, { isCrossSite } from "../../worker/index.js";
+import { installOrigins, envFor, N1 } from "./fake-origin.mjs";
 
 const ctx = { waitUntil: (p) => p };
-const assets = { fetch: async () => new Response("<!doctype html>") };
-const env = { ASSETS: assets, OBB_ORIGINS: "https://origin.example.net", OBB_API_KEY: "k" };
+const env = envFor({ OBB_ORIGINS: N1 });
 const ADDRESS = "gnb1q0000000000000000000000000000000000000000335d2ee7";
 
 /** A fake origin and an always-missing edge cache; returns forwarded requests. */
 function fakeOrigin() {
-  const seen = [];
-  globalThis.caches = { default: { match: async () => undefined, put: async () => {} } };
-  globalThis.fetch = async (url, init) => {
-    seen.push({ url: String(url), init });
-    return new Response('{"result":{"utxos":[]}}', { status: 200 });
-  };
-  return seen;
+  return installOrigins({ [N1]: { handler: () => ({ status: 200, body: '{"result":{"utxos":[]}}' }) } }).seen;
 }
 
 function read(n, headers) {
