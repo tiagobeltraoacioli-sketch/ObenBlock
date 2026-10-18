@@ -84,6 +84,12 @@ jobs:
         run: |
           python3 reference/powit_reference_test.py -v
           python3 reference/powit_reference.py --check
+      # docs/DESIGN-obenblock-poci.md (ObenBlock O11, PoCI): configurations,
+      # v3 messages, strict quorum, handoff, bans and finality certificates.
+      - name: PoCI reference and reproducible vectors
+        run: |
+          python3 reference/poci_reference_test.py -v
+          python3 reference/poci_reference.py --check
 
   rust:
     runs-on: ubuntu-latest
