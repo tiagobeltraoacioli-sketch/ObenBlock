@@ -84,6 +84,26 @@ The top-level `merkle_rule` is `bitcoin-sha256d` too, and
 32 bytes are the body commitment, which also covers the template's PoWit
 section, so a pool must carry `powit` into the block exactly as listed).
 
+`powit` is the hex of the PoWit section in the block's own wire format, the
+bytes the block carries after its transactions and the bytes the body
+commitment hashes. On ObenBlock (PoCI, docs/DESIGN-obenblock-poci.md) that
+is:
+
+```text
+varint n ‖ n × witness share
+varint n ‖ n × attestation (v3 vote)
+varint n ‖ n × PoCI evidence (config_id ‖ two attestations)
+varint n ‖ n × (u8 tag ‖ item)     membership list: exits (tag 0), then rejoins (tag 1)
+```
+
+An empty section is `00 00 00 00`. Copy the bytes verbatim; a pool that
+re-encodes the section must use this layout (GnB's layout, without the PoCI
+evidence list and the tags, produces a block whose body commitment fails).
+The template's size budget counts the section in this same format.
+(Fixed 2026-10-18: `powit` used to be the pre-PoCI encoding, so a block
+built from it with PoCI evidence, a rejoin or an exit in the template was
+invalid; header jobs were not affected. `node/tests/poci_template.rs`.)
+
 ### 3.2 Header jobs
 
 ```text

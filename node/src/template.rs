@@ -222,6 +222,13 @@ impl BlockTemplate {
         Some(core::block_rules::expected_coinbase_commitment(&shell))
     }
 
+    /// The PoWit section's bytes as the block carries them
+    /// (`getblocktemplate`'s `powit`): [`powit_section_bytes`] of
+    /// [`Self::powit`] at [`Self::height`].
+    pub fn powit_wire(&self) -> Vec<u8> {
+        powit_section_bytes(&self.powit, self.height)
+    }
+
     /// The sibling hashes from the coinbase leaf to the header Merkle root,
     /// under the rule of the template's height ([`Self::header_tree_is_tagged`]).
     pub fn coinbase_merkle_branch(&self) -> Vec<[u8; 32]> {
@@ -427,6 +434,18 @@ pub fn chain_move_incomplete(d: &GhostDAG, store: &Storage) -> Option<(BlockHash
     (best != applied).then_some((applied, best))
 }
 
+/// The wire bytes of a PoWit section in a block at `height`: the block's own
+/// format (`BodyFormat::at`; on ObenBlock the PoCI evidence list and the
+/// membership list of tagged exits and rejoins), the bytes `submitblock`
+/// decodes (`PowitBody::read_wire_for`) and the coinbase body commitment
+/// hashes (`PowitBody::root_for`). The template's byte budget and
+/// `getblocktemplate`'s `powit` both use it.
+pub fn powit_section_bytes(body: &core::powit::PowitBody, height: u64) -> Vec<u8> {
+    let mut v = Vec::new();
+    body.write_wire_for(&mut v, core::powit::BodyFormat::at(height));
+    v
+}
+
 /// Build a template on the current DAG / UTXO / mempool state.
 ///
 /// `coinbase_reserve` is the number of bytes kept free for the coinbase
@@ -500,11 +519,9 @@ pub fn build_block_template_with(
         let d = dag.read();
         crate::powit::template_body_with_bits(crate::powit::pool(), &d, store, parents[0], height, bits)
     };
-    let powit_bytes = {
-        let mut v = Vec::new();
-        powit_body.write_wire_with(&mut v, core::liveness::liveness_active_at(height));
-        v.len()
-    };
+    // Measured in the block's own wire format (on ObenBlock with the PoCI
+    // evidence and the tagged membership list), the bytes the block carries.
+    let powit_bytes = powit_section_bytes(&powit_body, height).len();
     // One coinbase output per witness share: value (8) + script length
     // varint (1) + the share's payout script.
     let share_outputs: usize = powit_body.shares.iter().map(|s| 9 + s.payout.len()).sum();
