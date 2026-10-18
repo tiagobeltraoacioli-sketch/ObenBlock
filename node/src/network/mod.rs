@@ -703,7 +703,7 @@ fn validate_wire_bounds(msg: &NetworkMessage) -> Result<(), WireDecodeError> {
             if data.len() > MAX_WIRE_POWIT_ITEM {
                 return Err(Bounds("PoWit item larger than MAX_WIRE_POWIT_ITEM"));
             }
-            if !(1..=crate::powit::ITEM_KIND_MAX).contains(kind) {
+            if !(1..=crate::powit::item_kind_max()).contains(kind) {
                 return Err(Bounds("unknown PoWit item kind"));
             }
         }
@@ -4954,7 +4954,7 @@ mod tests {
                     .collect(),
                 attestations: Vec::new(),
                 evidence: Vec::new(),
-                exits: Vec::new(), poci_evidence: Vec::new(),
+                exits: Vec::new(), poci_evidence: Vec::new(), rejoins: Vec::new(),
             };
             let txs = vec![Transaction {
                 version: 1,

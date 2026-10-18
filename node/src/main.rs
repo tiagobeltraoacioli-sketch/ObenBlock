@@ -2230,7 +2230,7 @@ async fn main() {
                         // chain, and the persistent vote record would then
                         // bar this key's vote on the real one).
                         if ingress::below_minimum_chain_work(&d, ingress::minimum_chain_work()) {
-                            return (None, powit::pool_evidence_items());
+                            return (None, powit::pool_evidence_items(), None);
                         }
                         let att = match duty_b.maybe_attest(&d, &store_b) {
                             Ok(Some(a)) => {
@@ -2240,9 +2240,24 @@ async fn main() {
                             Ok(None) => None,
                             Err(e) => { warn!("witness: {}", e); None }
                         };
-                        (att, powit::pool_evidence_items())
+                        // PoCI (ObenBlock): pruned for absence, online again: rejoin.
+                        let rejoin = match duty_b.maybe_rejoin(&d, &store_b) {
+                            Ok(Some(r)) => powit::pool().admit_rejoin(r.clone(), &d, &store_b)
+                                .map_err(|e| warn!("witness rejoin: {}", e)).ok().map(|_| r),
+                            Ok(None) => None,
+                            Err(e) => { warn!("witness rejoin: {}", e); None }
+                        };
+                        if let Some(r) = rejoin {
+                            info!("🛡  witness key pruned for absence: rejoin for epoch {} published", r.epoch);
+                            let (id, kind, data) = powit::rejoin_item(&r);
+                            return (att, powit::pool_evidence_items(), Some((id, kind, data)));
+                        }
+                        (att, powit::pool_evidence_items(), None)
                     }).await;
-                    let Ok((att, evidence)) = out else { continue };
+                    let Ok((att, evidence, rejoin)) = out else { continue };
+                    if let Some((id, kind, data)) = rejoin {
+                        let _ = otx_w.try_send(network::NetworkMessage::NewPowitItem { id, kind, data });
+                    }
                     if let Some(a) = att {
                         info!("🛡  attested checkpoint slot {} ({})", a.target.height, hex::encode(&a.target.hash[..8]));
                         let (id, kind, data) = powit::attestation_item(&a);

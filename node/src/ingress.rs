@@ -3166,6 +3166,8 @@ pub fn powit_item_precheck(claimed: &[u8; 32], kind: u8, data: &[u8]) -> Result<
             core::powit::poci::PociEvidence::read_wire(&mut cur).map(|_| ()),
         crate::powit::ITEM_EVIDENCE => core::powit::Equivocation::read_wire(&mut cur).map(|_| ()),
         crate::powit::ITEM_EXIT => core::powit::WitnessExit::read_wire(&mut cur).map(|_| ()),
+        crate::powit::ITEM_REJOIN if core::powit::poci_active() =>
+            core::powit::WitnessRejoin::read_wire(&mut cur).map(|_| ()),
         k => Err(format!("unknown PoWit item kind {k}")),
     }
     .map_err(|e| format!("malformed PoWit item: {e}"))?;
@@ -3201,6 +3203,7 @@ pub fn powit_admit_error_fault(kind: u8, err: &str) -> Option<BlockFault> {
         crate::powit::ITEM_ATTESTATION => err == POWIT_BAD_ATTESTATION_SIGNATURE,
         crate::powit::ITEM_EVIDENCE => err.starts_with("equivocation: "),
         crate::powit::ITEM_EXIT => err == crate::powit::POWIT_BAD_EXIT_SIGNATURE,
+        crate::powit::ITEM_REJOIN => err == crate::powit::POWIT_BAD_REJOIN_SIGNATURE,
         _ => false,
     };
     context_free.then_some(BlockFault::ContextFree)

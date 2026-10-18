@@ -896,6 +896,40 @@ gnb-cli powitsignerclear <witness-key.json> <data-dir>
   node (`getpowitkeyvotes`, `--rpc-url`/`--rpc-port`) for the rollback
   guard; without a node it refuses unless `--offline` is given.
 
+## ObenBlock: absence pruning and rejoin (PoCI)
+
+On ObenBlock, finality weight never decays (docs/DESIGN-obenblock-poci.md
+§4.1; there is no inactivity leak). Instead the committee in force removes
+dead weight at a handoff: a key of the configuration in force whose votes
+were not included in any block of the finalized history during the last 4
+epochs (24 hours) is left out of the next configuration. A key that has been
+in the configuration for less than 4 epochs is not pruned. Pruning is not a
+punishment: the key keeps its share rewards and may come back.
+
+- `getpowitinfo` → `poci.absent_weight` lists, per recent epoch, the weight
+  of the configuration in force with no vote included in a block of that
+  epoch, and `over_a_third` when it exceeds a third (finality then halts
+  until that weight returns). `poci.pruned` lists the pruned keys, the epoch
+  their pruning started, and where a pending rejoin was included.
+- Keys whose votes only return after a halt longer than 4 epochs are pruned
+  at the handoff their own votes enable (those votes are in blocks above the
+  finalized checkpoint); they rejoin like any other pruned key.
+- A node running the witness duty (`--witness-key`) publishes the rejoin
+  itself when it finds its key pruned at the tip (log line "witness key
+  pruned for absence: rejoin ... published"). Once the block that includes
+  it is final, the key's share work counts again from the next handoff.
+- Without the duty, sign a rejoin with the witness key for the current epoch
+  and submit it (item kind 5):
+
+```sh
+gnb-cli powitrejoin <witness-key.json> obenblock <current-epoch>
+```
+
+  then `submitpowititem [5, "<hex>"]`. The epoch must be the current one or
+  the one before when the block is mined; the command evolves the key file
+  (forward security: older epochs are erased). Stop the node's witness duty
+  first if it uses the same key file.
+
 ## Chain-state check at start-up
 
 Before anything else the node verifies the integrity chain over its stored

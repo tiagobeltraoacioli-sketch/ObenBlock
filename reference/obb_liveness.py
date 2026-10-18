@@ -17,7 +17,10 @@ and testnet: never; ObenBlock: 0). Stall relief applies to a block at header
 height h iff h >= L; a block may carry witness exits iff h >= L, and only then
 does its PoWit section carry the exits list on the wire. The leak rule is a
 PoWit parameter of the chain (GnB: 1/16, ObenBlock: 1/2), because decay
-steps are stored as counts.
+steps are stored as counts. (ObenBlock finality runs PoCI, which never
+decays finality weight: DESIGN-obenblock-poci.md §4.1. The 1/2 rule stays
+specified here and is not applied on ObenBlock; there the PoCI body format
+tags each exit in the membership list, DESIGN-obenblock-poci.md §13.)
 
 Stall relief (5.1). For a block stamped `time` whose ASERT bits are
 `base_bits` (from `parent_time`, the latest timestamp over its parents):

@@ -145,6 +145,45 @@ quorum**, never by a local timeout:
   (DESIGN-obenblock.md §6.3).
 - `getpowitinfo` reports the absent weight of `C_e` per epoch, so operators
   see it grow long before it reaches a third.
+
+Normative reading (package B2; reference `reference/poci_reference.py`,
+`PociChain`, vectors `sequences` 8 to 10 of `reference/poci_vectors.json`):
+
+- **Included at.** A vote, rejoin or evidence in a block at height `h` sits
+  at ledger height `h + 1` (§12, "Heights"): it is in the history finalized
+  by `F` iff `h + 1 <= F.height`.
+- **Order at the handoff** triggered by finalizing `F` under `C_e`, with
+  `x = epoch(F) > e`: (1) pending bans whose evidence `F` finalizes start at
+  `x` (§5); (2) pending rejoins that `F` finalizes end their key's pruning
+  (the key is not excluded at `x`); (3) every key `k` of `C_e` is pruned from
+  `x` on iff it is *eligible*, walking the configurations in force newest
+  first `k` is an entry of each until one whose epoch is `<= x - 4` (a key
+  that entered later is in its grace period), and *absent*, no vote of `k`
+  was included at a ledger height `h` with `opening(x - 4) < h <= F.height`;
+  (4) `C_x` = the provider's candidate weights minus the keys banned, pruned
+  or exited at `x`.
+- **Votes above `F` do not count**, including the votes of the link that
+  finalizes `F`: every node that finalized `F` then computes the same `C_x`.
+  Consequence: keys whose votes return only after a halt longer than four
+  epochs are pruned at the handoff their votes enable, and rejoin.
+- **Rejoin message**, signed with the KES leaf of `epoch`:
+
+  ```text
+  rejoin_msg = SHA3-256( u32le(18) ‖ "OBB-POCI-v1/rejoin" ‖ u32le(chain_id)
+                         ‖ u8(depth) ‖ root[32] ‖ u64le(epoch) )            // 67-byte preimage
+  ```
+
+  A block of epoch `E` may carry it iff, first failure wins: it is above the
+  finalized checkpoint, `epoch <= E <= epoch + 1`, the key is pruned, it has
+  no rejoin pending, the signature verifies (last). At most 4 per block.
+  The key is not excluded from the handoff that finalizing the rejoin's
+  block triggers (or the next one); under the growth cap its share work
+  then competes as new weight.
+- **Forgotten.** A pruned key the provider gives no weight (no share work
+  left in its window) is forgotten at a handoff: its later share work counts
+  as a new key's, with a new grace period.
+- **Rule constant.** `PRUNE_AFTER = 4` is not part of `params_digest`
+  (configuration ids are unchanged); changing it is a new rule set.
 - What it covers: weight that fades out (operators going offline over
   hours or days). What it cannot cover: more than a third of `C_e` vanishing
   at once. Then `C_e` has no quorum to authorize anything and finality halts
@@ -355,8 +394,8 @@ tests.
   votes of the configuration in force only, strict quorum, handoff on
   finalization, PoCI evidence, no inactivity decay. The configuration
   weights come from a `ConfigWeights` provider (default `WindowWeights`, to
-  be replaced by the growth cap of DESIGN-obenblock.md §6.3 and the absence
-  pruning of §4.1).
+  be replaced by the growth cap of DESIGN-obenblock.md §6.3); the absence
+  pruning of §4.1 is the ledger's (§13).
 - `PowitState::poci` is not part of the serde encoding (GnB states are
   stored as before); the node stores it beside the state
   (`powit/poci/<block>`, `powit/pocicfg/<config id>`).
@@ -366,3 +405,44 @@ tests.
   The gossip item `ITEM_EVIDENCE` carries `PociEvidence` on ObenBlock.
 - The witness duty and `gnb-cli powitattest --config-id=<hex>` sign v3 with
   the configuration in force, recorded in the vote record (§8).
+
+## 13. Implementation (package B2: handoff, no leak, pruning, rejoin, ban)
+
+- Ledger (`core::powit::poci::PociState`): `pruned` (key -> `Prune { start }`),
+  `rejoins` (key -> included at), `seen` (key -> block epoch -> lowest
+  `included_at`; the lowest inclusion of each block epoch answers §4.1's
+  question exactly, `PociState::present`). A handoff is two calls:
+  `begin_handoff` (ban starts, rejoins, pruning; returns `x`) and `enter`
+  (candidate weights minus bans, pruning and exits; forgetting; `C_x` in
+  force). `finalized` does both for ledger-only callers.
+  `crates/gnb-crypto/tests/poci_vectors.rs` reproduces every pruning and
+  rejoin sequence of the reference.
+- Bounds: `trim_seen` keeps the included votes of the last `PRUNE_AFTER + 3`
+  block epochs per key (a block of epoch `E` finalizes a checkpoint of epoch
+  `>= E - 2`, `params_bound_the_finalized_lag`), and only for keys of the
+  configuration in force. A block carries at most 4 rejoins.
+- `PowitState::apply_poci` records every included vote, admits rejoins
+  (`PowitBody::rejoins`, `PociItems`), and hands off through the ledger with
+  a `ConfigWeights` provider. The provider contract is on `ConfigWeights`:
+  it is called mid-handoff (`state.poci.config()` is still `C_e`; this
+  handoff's bans and pruning are recorded, `PowitState::poci_excluded_at`
+  answers for every epoch the handoff covers), reads finalized history only,
+  and returns every key with weight, excluded ones included. ObenBlock uses
+  `ObbConfigWeights` (an alias of `WindowWeights` until the growth cap
+  replaces it: one line).
+- No inactivity leak: `apply_poci` never decays (the O4 half leak and the
+  GnB 1/16 leak stay in `apply_full`, GnB's path, unchanged); exits and bans
+  take effect at the next handoff. `getpowitinfo` reports
+  `inactivity_leak: "none (PoCI)"` on ObenBlock.
+- Body: in the PoCI format the exits list is the membership list,
+  `varint n ‖ n × (u8 tag ‖ item)`, exits (tag 0) then rejoins (tag 1); an
+  empty one is the same byte as before, so genesis roots are unchanged.
+- Node: rejoins are pool items (one per key, checked as the next block
+  will, signature last), gossip item kind 5 (`ITEM_REJOIN`, ObenBlock only:
+  on GnB kind 5 stays unknown), `submitpowititem [5, hex]`, templates after
+  the exits, `gnb-cli powitrejoin`; the witness duty publishes the rejoin
+  of its own key when the tip shows it pruned (`WitnessDuty::maybe_rejoin`). The ledger is stored per block
+  (`powit/poci/<block>`: head, bans, pruned, rejoins, seen); configurations
+  as history nodes `powit/pocihist/<node id>` whose id commits to the whole
+  history, so two branches with the same `C_x` after different predecessors
+  each reload their own (tests `node/tests/poci_state_store.rs`).

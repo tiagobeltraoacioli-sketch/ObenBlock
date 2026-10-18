@@ -2163,7 +2163,8 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         }
 
         // submitpowititem [kind, hex]: kind 1 = witness share, 2 = attestation,
-        // 3 = equivocation proof, 4 = witness exit (liveness activation).
+        // 3 = equivocation proof, 4 = witness exit (liveness activation),
+        // 5 = PoCI rejoin (ObenBlock only).
         // Validated like a gossiped item, then relayed.
         "submitpowititem" => {
             let kind = params.and_then(|p| p.get(0)).and_then(|v| v.as_u64()).unwrap_or(0);
@@ -2171,7 +2172,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 Some(Ok(d)) => d,
                 _ => return json!({ "error": "usage: submitpowititem [kind, hex]" }),
             };
-            if !(1..=u64::from(crate::powit::ITEM_KIND_MAX)).contains(&kind) || data.len() > crate::network::MAX_WIRE_POWIT_ITEM {
+            if !(1..=u64::from(crate::powit::item_kind_max())).contains(&kind) || data.len() > crate::network::MAX_WIRE_POWIT_ITEM {
                 return json!({ "error": "bad kind or item too large" });
             }
             let kind = kind as u8;

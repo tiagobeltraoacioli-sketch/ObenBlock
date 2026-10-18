@@ -362,6 +362,48 @@ fn main() {
             println!("{}", hex::encode(x.to_wire_bytes()));
             return;
         }
+        // Sign a PoCI rejoin (ObenBlock, DESIGN-obenblock-poci.md §4.1): a
+        // witness pruned for absence asks to count again; once the block that
+        // includes it is final, its share work counts from the next handoff.
+        // Prints the rejoin hex (kind 5, submitpowititem). `chain` is
+        // obenblock, obenblock-regtest or a raw ObenBlock chain id (0x...).
+        // Evolves the key file.
+        "powitrejoin" => {
+            require_params(params, 3, "powitrejoin <witness-key.json> <obenblock|obenblock-regtest|0xCHAINID> <epoch>");
+            let chain = match params[1] {
+                "obenblock" => gnb::core::ChainId::ObenBlockMainnet,
+                "obenblock-regtest" => gnb::core::ChainId::ObenBlockRegtest,
+                raw => match u32::from_str_radix(raw.trim_start_matches("0x"), 16) {
+                    Ok(v) if v == gnb::core::ChainId::ObenBlockMainnet.to_u32() => gnb::core::ChainId::ObenBlockMainnet,
+                    Ok(v) if v == gnb::core::ChainId::ObenBlockRegtest.to_u32() => gnb::core::ChainId::ObenBlockRegtest,
+                    _ => { eprintln!("chain must be obenblock, obenblock-regtest or an ObenBlock 0xCHAINID"); process::exit(1) }
+                },
+            };
+            let Some(pp) = gnb::core::powit::poci::PociParams::for_chain(chain) else {
+                eprintln!("rejoin messages exist on ObenBlock (PoCI) chains only");
+                process::exit(1)
+            };
+            let pw = match std::env::var("GNB_WALLET_PASSWORD") {
+                Ok(p) => zeroize::Zeroizing::new(p),
+                Err(_) => read_password("Witness key password: "),
+            };
+            let path = std::path::Path::new(params[0]);
+            let file = gnb::core::kes::KesKeyFile::load(path).unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
+            let mut signer = file.open(&pw).unwrap_or_else(|e| { eprintln!("{}", e); process::exit(1) });
+            let e: u64 = params[2].parse().unwrap_or_else(|_| { eprintln!("epoch must be a number"); process::exit(1) });
+            if e > signer.epoch() {
+                signer.evolve_to(e).unwrap_or_else(|er| { eprintln!("{}", er); process::exit(1) });
+                gnb::core::kes::KesKeyFile::seal(&signer, &pw).and_then(|f| f.save(path))
+                    .unwrap_or_else(|er| { eprintln!("{}", er); process::exit(1) });
+            } else if e < signer.epoch() {
+                eprintln!("epoch {} already erased (key is at {}): forward security", e, signer.epoch());
+                process::exit(1);
+            }
+            let r = gnb::core::powit::WitnessRejoin::sign(pp.chain_id, &signer)
+                .unwrap_or_else(|er| { eprintln!("{}", er); process::exit(1) });
+            println!("{}", hex::encode(r.to_wire_bytes()));
+            return;
+        }
         // Clear a persisted signer-protection alert (the rollback guard
         // halted the signer). Stop every other instance of the key first; the
         // lock refuses while one runs. Votes adopted from the chain stay in
