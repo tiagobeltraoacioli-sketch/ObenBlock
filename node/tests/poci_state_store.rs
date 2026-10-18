@@ -61,27 +61,28 @@ fn absence_pruning_ledger_round_trips_through_the_store() {
     let pp = OBB_REGTEST_POCI;
     let mut st = PowitState::genesis(0, [0; 32]);
     let mut ledger = PociState::launch(&pp, &weights(4, 100)).unwrap();
-    // Keys 1..=3 vote in every epoch; key 4 never does.
+    // Keys 2..=4 vote in every epoch; key 1 never does. The present keys hold
+    // a strict quorum of C_e (900 of 1000), so the absent key is pruned (§4.1).
     for e in 4..=8u64 {
-        for k in 1..=3u8 {
+        for k in 2..=4u8 {
             ledger.record_vote(&pp, &[k; 20], pp.opening(e) + 2);
         }
         assert!(ledger.finalized(&pp, &cp(pp.opening(e + 1)), |_, _| weights(4, 100)).unwrap());
     }
     assert_eq!(ledger.config().epoch(), 9);
-    assert_eq!(ledger.pruned.get(&[4; 20]).map(|p| p.start), Some(8), "an entry since 4, nothing included");
-    assert!(ledger.config().weight(&[4; 20]).is_none());
+    assert_eq!(ledger.pruned.get(&[1; 20]).map(|p| p.start), Some(8), "an entry since 4, nothing included");
+    assert!(ledger.config().weight(&[1; 20]).is_none());
     // A pending rejoin and some included votes above the finalized checkpoint.
     let at = pp.opening(9) + 3;
-    ledger.admit_rejoin(at, pp.opening(9), 9, &[4; 20], 9, || true).unwrap();
-    ledger.record_vote(&pp, &[1; 20], at);
+    ledger.admit_rejoin(at, pp.opening(9), 9, &[1; 20], 9, || true).unwrap();
+    ledger.record_vote(&pp, &[2; 20], at);
     assert!(!ledger.seen.is_empty());
     st.poci = Some(ledger.clone());
     gnb::powit::save_state(&store, &[7; 32], &st).unwrap();
     let back = gnb::powit::load_state(&store, &[7; 32]).unwrap();
     assert_eq!(back, st, "pruned keys, rejoins and included votes reload");
     let bl = back.poci.unwrap();
-    assert_eq!(bl.rejoins.get(&[4; 20]), Some(&at));
+    assert_eq!(bl.rejoins.get(&[1; 20]), Some(&at));
     assert_eq!(bl.seen, ledger.seen);
     // The reloaded ledger goes on exactly as the one in memory.
     let (mut a, mut b) = (ledger, bl);
@@ -89,7 +90,7 @@ fn absence_pruning_ledger_round_trips_through_the_store() {
         assert!(l.finalized(&pp, &cp(pp.opening(10)), |_, _| weights(4, 100)).unwrap());
     }
     assert_eq!(a, b);
-    assert_eq!(a.config().weight(&[4; 20]), Some(400), "back after the rejoin is final");
+    assert_eq!(a.config().weight(&[1; 20]), Some(100), "back after the rejoin is final");
 }
 
 /// Two branches reach the same configuration through different handoffs:
