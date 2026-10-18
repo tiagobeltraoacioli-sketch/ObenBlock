@@ -170,6 +170,11 @@ expected_bits(B) = canonical bits of target_eff(B)
 
 ### 5.2 Faster inactivity leak (finality)
 
+> **Superseded for finality by PoCI** (`docs/DESIGN-obenblock-poci.md` §4, owner
+> 2026-10-18): absence no longer changes the finality weight, so a partition
+> cannot finalize on both sides; without a quorum, finality halts until the
+> weight returns or a coordinated recovery. The exit message stays.
+
 When no checkpoint finalizes for `leak_after_epochs` (4 epochs, 24 h), every
 member of W whose votes were not included in an epoch loses **half** of its
 weight for that epoch (GnB: 1/16). If a fraction `a` of the witness weight
@@ -340,6 +345,7 @@ mutual anchoring. **Both directions are used** (owner, 2026-10-17).
 | O7 | Rebrand | names, docs, site (obenblock.xyz), binaries, CLI texts; crates last |
 | O8 | Bloch anchoring | §8 phase 1 (ObenBlock side + anchor daemon) |
 | O9 | A3 storage | PoWit state per epoch + diffs (now without the CPU part) |
+| O11 | PoCI (Proof of Corruption or Integrity) | `docs/DESIGN-obenblock-poci.md`: frozen configuration per epoch, strict > 2/3 quorum, handoff, no leak for finality, 100-epoch ban on evidence, finality certificate, signer protection, partition tests |
 | O10 | Finality hardening | §6.3 growth cap on W (reference + vectors); §8 anchors advisory only (no automatic checkpoint) |
 
 Each package follows the audit's process: reproduce first, references and
