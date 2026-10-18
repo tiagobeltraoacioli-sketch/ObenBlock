@@ -18,6 +18,7 @@ use gnb_crypto::core::powit::poci::{
     verify_certificate_with_proof, Configuration, DecodeError, PociParams, PociState, PociVote, Reader,
     RegistryProof, VoteScheme, OBB_MAINNET_POCI, OBB_REGTEST_POCI,
 };
+use gnb_crypto::core::powit::growth_cap::{CapLedger, EpochMap};
 use gnb_crypto::core::powit::{two_thirds, Checkpoint, KeyId};
 use serde_json::Value;
 
@@ -154,6 +155,10 @@ fn constants() {
     assert_eq!(c["ds_rejoin"].as_str().unwrap().as_bytes(), poci::DS_REJOIN);
     assert_eq!(u(&c["prune_after_epochs"]), poci::POCI_PRUNE_AFTER_EPOCHS);
     assert_eq!(u(&c["rejoin_preimage_len"]) as usize, poci::REJOIN_PREIMAGE_LEN);
+    // §9: C_4 enters into force once the slot opening epoch 4 is buried by one epoch.
+    assert_eq!(u(&c["launch_height"]["mainnet"]), OBB_MAINNET_POCI.launch_height());
+    assert_eq!(u(&c["launch_height"]["regtest"]), OBB_REGTEST_POCI.launch_height());
+    assert_eq!(OBB_MAINNET_POCI.launch_height(), 5 * 720);
 }
 
 #[test]
@@ -174,6 +179,7 @@ fn params_digests() {
             max_evidence_per_block: u(&vals["max_evidence_per_block"]),
             ban_epochs: u(&vals["ban_epochs"]),
             bootstrap_epochs: u(&vals["bootstrap_epochs"]),
+            launch_bury: u(&vals["launch_bury"]),
             growth_div: u(&vals["growth_div"]),
             g_min_epoch_div: u(&vals["g_min_epoch_div"]),
             quorum_num: u(&vals["quorum_num"]) as u32,
@@ -325,6 +331,37 @@ struct Chain {
     justified: Checkpoint,
     finalized: Checkpoint,
     state: PociState,
+    cap: Option<GrowthCap>,
+}
+
+/// The reference's `GrowthCapProvider` (a sequence's `growth_cap`): the
+/// growth cap ledger over a fixed share-work history, run at the launch and
+/// at each handoff mid-handoff, with the ledger's exclusions.
+struct GrowthCap {
+    ledger: CapLedger,
+    work: BTreeMap<u64, EpochMap>,
+    bits: BTreeMap<u64, u32>,
+}
+
+impl GrowthCap {
+    fn of(v: &Value) -> Option<GrowthCap> {
+        let g = v.get("growth_cap")?;
+        assert_eq!(g["params"], "obenblock");
+        let work = g["share_work"].as_object().unwrap().iter().map(|(n, m)| {
+            (n.parse().unwrap(), m.as_object().unwrap().iter().map(|(k, w)| (key(&Value::String(k.clone())), u128s(w)))
+                .collect())
+        }).collect();
+        let bits = g["first_block_bits"].as_object().unwrap().iter()
+            .map(|(n, b)| (n.parse().unwrap(), u(b) as u32)).collect();
+        Some(GrowthCap { ledger: CapLedger::empty(), work, bits })
+    }
+
+    fn step(&mut self, p: &PociParams, x: u64, excluded: &dyn Fn(&KeyId, u64) -> bool) -> BTreeMap<KeyId, u128> {
+        let (work, bits) = (&self.work, &self.bits);
+        self.ledger = self.ledger.advance(x, p.epoch_len, p.window_epochs, p.growth_div, p.g_min_epoch_div,
+                                          &|n| work.get(&n), &|n| bits.get(&n).copied(), excluded).unwrap();
+        self.ledger.weights()
+    }
 }
 
 fn cp_hash(height: u64, branch: u32) -> [u8; 32] {
@@ -345,12 +382,17 @@ impl Chain {
         w.clone()
     }
 
-    fn launch(p: PociParams, provider: BTreeMap<u64, (Checkpoint, BTreeMap<KeyId, u128>)>) -> Chain {
+    fn launch(p: PociParams, provider: BTreeMap<u64, (Checkpoint, BTreeMap<KeyId, u128>)>, mut cap: Option<GrowthCap>)
+        -> Chain
+    {
         let c = cph(p.opening(p.bootstrap_epochs));
         let (f, w) = provider[&p.bootstrap_epochs].clone();
         assert_eq!(f, c);
+        if let Some(g) = cap.as_mut() {
+            assert_eq!(g.step(&p, p.bootstrap_epochs, &|_, _| false), w, "growth cap provider at the launch");
+        }
         let state = PociState::launch(&p, &w).unwrap();
-        Chain { p, provider, justified: c, finalized: c, state }
+        Chain { p, provider, justified: c, finalized: c, state, cap }
     }
 
     fn votes(&mut self, target: Checkpoint, votes: &[PociVote<TestSig>], included_at: Option<u64>) -> Value {
@@ -368,7 +410,15 @@ impl Chain {
         if let Some(f) = step.finalized {
             self.finalized = f;
             let w = self.state.handoff_epoch(&self.p, &f).map(|e| self.weights(e, &f));
-            handoff = self.state.finalized(&self.p, &f, |_, _| w.unwrap()).unwrap();
+            let (p, cap) = (self.p, &mut self.cap);
+            handoff = self.state.finalized(&p, &f, |st, x| {
+                let w = w.unwrap();
+                if let Some(g) = cap.as_mut() {
+                    // Mid-handoff: this handoff's bans and prunings are recorded.
+                    assert_eq!(g.step(&p, x, &|k, y| st.excluded_at(&p, k, y)), w, "growth cap provider at {x}");
+                }
+                w
+            }).unwrap();
         }
         serde_json::json!({"weight": got.to_string(), "total": cfg.total().to_string(), "quorum": q,
                            "justified": step.justified, "finalized": step.finalized.is_some(), "handoff": handoff})
@@ -404,7 +454,7 @@ impl Chain {
 fn sequences() {
     let d = doc();
     let seqs = d["sequences"].as_array().unwrap();
-    assert_eq!(seqs.len(), 11);
+    assert_eq!(seqs.len(), 16);
     for sq in seqs {
         let name = sq["name"].as_str().unwrap();
         let p = params(sq["params"].as_str().unwrap());
@@ -416,7 +466,7 @@ fn sequences() {
         let provider = sq["provider_calls"].as_object().unwrap().iter().map(|(e, v)| {
             (e.parse::<u64>().unwrap(), (cp(&v["finalized"]), entries(&v["weights"]).into_iter().collect()))
         }).collect();
-        let mut ch = Chain::launch(p, provider);
+        let mut ch = Chain::launch(p, provider, GrowthCap::of(sq));
         assert_eq!(ch.state_json(), sq["initial"], "{name}: initial");
         for (i, st) in sq["steps"].as_array().unwrap().iter().enumerate() {
             match st["op"].as_str().unwrap() {
@@ -491,7 +541,13 @@ fn sequences() {
         let again = PociState::from_history(ch.state.history().cloned().collect(), ch.state.bans.clone()).unwrap()
             .with_ledger(ch.state.pruned.clone(), ch.state.rejoins.clone(), ch.state.seen.clone());
         assert_eq!(again, ch.state, "{name}: from_history");
+        assert_eq!(ch.cap.is_some(), name == "growth_cap_pruned_then_rejoin", "{name}");
     }
+    // §4 (review MEDIUM): one C_x per epoch, whichever checkpoint of x was
+    // finalized first.
+    let last = |n: &str| seqs.iter().find(|s| s["name"] == n).unwrap()["configs"].as_array().unwrap().last().unwrap()
+        ["config_id"].clone();
+    assert_eq!(last("handoff_unique_per_epoch_a"), last("handoff_unique_per_epoch_b"));
 }
 
 // ── Proof of Integrity ───────────────────────────────────────────────────────

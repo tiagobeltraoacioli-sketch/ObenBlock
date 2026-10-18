@@ -6,7 +6,8 @@
 //! votes; nothing is synthetic.
 //!
 //! Two nodes share a chain until epoch 7 (PoW only for epochs 0..=3, `C_4`
-//! from the first block of epoch 4, then a handoff per finalized epoch).
+//! from the first block at `launch_height`, the slot opening epoch 4 buried
+//! by one epoch, then a handoff per finalized epoch).
 //! Then each side builds its own branch with its own witnesses (honest
 //! signers: a monotone record, §8), and finally every block is delivered to
 //! both nodes (the heal) and all witnesses vote on the chain the nodes
@@ -24,6 +25,10 @@
 //!   configuration in force at the split when nothing was finalized
 //!   meanwhile; both nodes keep and serve the same certificate, which
 //!   verifies against the trusted `config_id` with its registry proof.
+//!
+//! Plus a fork at the epoch-4 boundary (§9, buried launch): no finality on
+//! either branch until `launch_height`, so the nodes converge on the branch
+//! with the most work and launch on it together.
 //!
 //! Plus exits and bans during a stall (40 % offline): the same configuration
 //! and denominators on every node through the stall, the exit and the
@@ -572,6 +577,73 @@ fn certificate_rpc_refuses_what_is_not_finalized() {
         }
         f -= IV;
     }
-    // Every slot from the launch on finalizes (all witnesses vote at once).
-    assert_eq!(kept, (st.finalized.height - PP.opening(PP.bootstrap_epochs)) / IV, "a certificate per finalization");
+    // Every slot from the first one the launch block can vote for
+    // (`launch_height`) on finalizes (all witnesses vote at once).
+    assert_eq!(kept, (st.finalized.height - PP.launch_height()) / IV + 1, "a certificate per finalization");
+}
+
+// ── Launch (§9) ──────────────────────────────────────────────────────────────
+
+/// Review HIGH (§9, decision D2): a fork at the epoch-4 boundary used to be
+/// a permanent split, because each branch made its own slot `opening(4)`
+/// final one block deep and the sticky pin never gives a finalized
+/// checkpoint up. Now `C_4` enters into force only at `launch_height`
+/// (`opening(4)` buried by one epoch): below it neither branch carries a
+/// finalized checkpoint, so nothing is pinned, the node on the lighter
+/// branch follows the heavier one, and both launch on it together.
+#[test]
+fn a_fork_at_the_epoch_4_boundary_is_settled_by_work() {
+    setup();
+    let ws = witnesses(DEPTH_SHORT, 4);
+    let all: Vec<usize> = (0..ws.len()).collect();
+    let genesis = mk_genesis(unix_now() - 40_000);
+    let (na, nb) = (node_with(&genesis, &[]), node_with(&genesis, &[]));
+    let boundary = PP.opening(PP.bootstrap_epochs);
+    assert_eq!(PP.launch_height(), boundary + EL);
+    let common = extend(&na, Some(&nb), genesis.block_hash(), &ws, &all, &all, Votes::EverySlot, boundary - 3, "c",
+                        |_, _| {});
+    let fork = common.last().unwrap().block_hash();
+    let pre_launch = |b: &Block, st: &PowitState| {
+        assert!(b.height < PP.launch_height());
+        assert!(st.poci.is_none(), "h={}: no configuration before the launch", b.height);
+        assert_eq!(st.finalized.height, 0, "h={}: no finalized checkpoint to pin", b.height);
+    };
+    // A is past the boundary on node a; B, longer, on node b. Both below
+    // launch_height.
+    let (blocks_a, blocks_b) = std::thread::scope(|s| {
+        let ha = s.spawn(|| extend(&na, None, fork, &ws, &all, &all, Votes::EverySlot, 18, "fa", pre_launch));
+        let hb = s.spawn(|| extend(&nb, None, fork, &ws, &all, &all, Votes::EverySlot, 21, "fb", pre_launch));
+        (ha.join().unwrap(), hb.join().unwrap())
+    });
+    let (tip_a, tip_b) = (blocks_a.last().unwrap().block_hash(), blocks_b.last().unwrap().block_hash());
+    assert!(height_of(&na, &tip_a) > boundary && height_of(&nb, &tip_b) > boundary, "both cross the boundary");
+    for n in [&na, &nb] {
+        assert!(n.dag.read().finality_outcome().pin.is_none_or(|(_, h)| h == 0), "nothing pinned");
+    }
+    deliver(&na, &blocks_b);
+    deliver(&nb, &blocks_a);
+    for n in [&na, &nb] {
+        assert_eq!(sel_tip(n), Some(tip_b), "both nodes follow the branch with the most work");
+        assert_eq!(applied_tip(n), Some(tip_b));
+        assert!(n.dag.read().finality_outcome().conflict.is_none());
+    }
+    // Both launch on B: the same launch checkpoint, then finality runs.
+    let launched: std::cell::RefCell<Option<Checkpoint>> = Default::default();
+    let blocks = extend(&nb, Some(&na), tip_b, &ws, &all, &all, Votes::EverySlot, 2 * EL, "l", |b, st| {
+        if b.height >= PP.launch_height() && launched.borrow().is_none() {
+            *launched.borrow_mut() = Some(st.finalized);
+        }
+    });
+    let lc = launched.into_inner().expect("launched");
+    let b_slot = DagChainView { dag: &nb.dag.read(), start: Some(tip_b) }.selected_at(boundary).unwrap();
+    assert_eq!(lc, Checkpoint { height: boundary, hash: b_slot }, "the launch checkpoint is B's");
+    let end = blocks.last().unwrap().block_hash();
+    let (sa, sb) = (state(&na, &end), state(&nb, &end));
+    assert_eq!(sa.finalized, sb.finalized);
+    assert!(sa.finalized.height > PP.launch_height(), "PoCI finality after the launch: {:?}", sa.finalized);
+    assert_eq!(sa.poci_config().unwrap().id(), sb.poci_config().unwrap().id());
+    for n in [&na, &nb] {
+        assert_eq!(sel_tip(n), Some(end));
+        assert!(n.dag.read().finality_outcome().conflict.is_none(), "no conflicting finality");
+    }
 }

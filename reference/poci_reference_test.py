@@ -30,7 +30,10 @@ def cp(h, branch=0):
 
 class Configuration(unittest.TestCase):
     def test_layouts(self):
-        self.assertEqual(len(r.params_preimage(P)), 110)
+        self.assertEqual(len(r.params_preimage(P)), 118)
+        pp = r.params_preimage(P)
+        self.assertEqual(pp[78:86], (4).to_bytes(8, "little"), "bootstrap_epochs")
+        self.assertEqual(pp[86:94], (720).to_bytes(8, "little"), "launch_bury = epoch_len")
         c = r.make_config("mainnet", 4, {keys(1)[0].key_id: 7})
         pre = c.preimage()
         self.assertEqual(len(pre), 110)
@@ -73,6 +76,7 @@ class Configuration(unittest.TestCase):
         self.assertEqual(len(ids), 5)
         p2 = dict(P, ban_epochs=99)
         self.assertNotEqual(r.params_digest(p2), r.params_digest(P))
+        self.assertNotEqual(r.params_digest(dict(P, launch_bury=60)), r.params_digest(P))
 
     def test_entries_rules(self):
         a, b = sorted(k.key_id for k in keys(2))
@@ -171,6 +175,8 @@ def votes(ch, ks, target, config=None, source=None):
 
 class Finality(unittest.TestCase):
     def test_launch(self):
+        self.assertEqual(r.launch_height(P), 5 * L, "opening(4) buried by one epoch")
+        self.assertEqual(r.launch_height(r.PARAMS["regtest"]), 100)
         ks = keys(3)
         ch = chain(lambda e: {k.key_id: 1 for k in ks})
         self.assertEqual(ch.config.epoch, 4)
@@ -357,19 +363,113 @@ class Pruning(unittest.TestCase):
         self.assertIsNone(ch.config.weight(quiet.key_id), "an entry since 4 with nothing included")
         self.assertEqual(ch.pruned[quiet.key_id].start, 8)
 
-    def test_only_finalized_inclusions_count(self):
+    def test_only_inclusions_in_the_window_below_the_opening_count(self):
         ks = keys(6, "fin")
-        ch = chain(lambda e: {k.key_id: 100 for k in ks})
         k5 = ks[5].key_id
-        # Included exactly at opening(x - 4) is outside (lo, F]; one above is inside.
-        for h, pruned in ((5 * L, True), (5 * L + 1, False)):
+        core = [k.key_id for k in ks[:5]]
+        # The window is (opening(x - 4), opening(x)]: exactly opening(5) is
+        # outside, one above inside; exactly opening(9) inside, one above
+        # (the blocks of epoch 9, the finalizing links among them) outside.
+        for h, pruned in ((5 * L, True), (5 * L + 1, False), (9 * L, False), (9 * L + 1, True)):
             c = chain(lambda e: {k.key_id: 100 for k in ks})
+            c.include(6 * L, core)
             c.include(h, [k5])
             self.handoff(c, ks[:5], 9)
             self.assertEqual(c.config.weight(k5) is None, pruned, h)
-        # A vote included above F (the finalizing link) does not count.
+        # A vote in the finalizing link does not count either.
+        ch = chain(lambda e: {k.key_id: 100 for k in ks})
+        ch.include(6 * L, core)
         self.handoff(ch, ks[:5], 9, last=ks)
         self.assertIsNone(ch.config.weight(k5))
+
+    def test_a_stall_longer_than_the_window_ends_without_pruning(self):
+        # Review HIGH: every key is silent for more than PRUNE_AFTER epochs,
+        # then the committee returns. Its votes are above opening(x), so no
+        # key of C_4 is present: no quorum of C_4 present, nobody pruned, and
+        # the returning committee stays in C_x (it is not pruned by the
+        # handoff it authorizes). Same with 60 % online through the stall.
+        ks = keys(5, "stall")
+        for online in ([], ks[:3]):
+            ch = chain(lambda e: {k.key_id: 100 for k in ks})
+            for h in range(4 * L + I, 20 * L, I):
+                t = ch.cp(h)
+                ch.votes(t, votes(ch, online, t))
+            self.assertEqual(ch.config.epoch, 4)
+            self.handoff(ch, ks, 20)
+            self.assertEqual((ch.config.total, ch.pruned), (500, {}), len(online))
+            # Finality goes on, and pruning resumes once a committee is present.
+            self.handoff(ch, ks[:4], 21)
+            self.handoff(ch, ks[:4], 22)
+            self.assertEqual(ch.config.total, 500, "key 4: an entry of C_20 only, in its grace period")
+            for x in (23, 24, 25):
+                self.handoff(ch, ks[:4], x)
+            self.assertEqual(sorted(ch.pruned), [ks[4].key_id])
+
+    def test_a_handoff_never_leaves_an_empty_configuration(self):
+        ks = keys(4, "empty")
+        ch = chain(lambda e: {} if e == 6 else {k.key_id: 100 for k in ks})
+        self.handoff(ch, ks, 5)
+        c5 = ch.config
+        self.handoff(ch, ks, 6)
+        self.assertEqual((ch.config.epoch, ch.config.entries), (6, c5.entries))
+        self.assertNotEqual(ch.config.id, c5.id)
+        self.handoff(ch, ks, 7)
+        self.assertEqual(ch.config.total, 400)
+
+    def test_one_configuration_per_epoch(self):
+        # Review MEDIUM: two chains with the same history up to opening(9)
+        # finalize different checkpoints of epoch 9 first, and differ above
+        # opening(9) (a rejoin, evidence, votes of a returning key). C_9 is
+        # the same on both.
+        ks = keys(6, "uniq")
+        w = lambda e: {k.key_id: 100 for k in ks}  # noqa: E731
+        out = []
+        for skip in (False, True):
+            ch = chain(w)
+            for x in (5, 6, 7, 8):
+                self.handoff(ch, ks[:5], x)
+            self.assertTrue(ch.pruned_at(ks[5].key_id, 8))
+            self.assertEqual(ch.rejoin(8 * L + I + 1, 8, r.sign_rejoin(r.CHAIN_OBB_MAINNET, ks[5], 8)), "ok")
+            if not skip:
+                self.handoff(ch, ks[:5], 9)
+            else:
+                t = ch.cp(9 * L)
+                ch.votes(t, votes(ch, ks[:3], t))
+                cfg = ch.config
+                a = r.sign_vote(cfg.chain, P, cfg.id, ks[4], ch.justified, ch.cp(9 * L))
+                b = r.sign_vote(cfg.chain, P, cfg.id, ks[4], ch.justified, cp(9 * L, 1))
+                self.assertEqual(ch.evidence(9 * L + 5, a, b), "ok")
+                self.assertEqual(ch.rejoin(9 * L + 6, 9, r.sign_rejoin(r.CHAIN_OBB_MAINNET, ks[5], 9)), "pending")
+                for h in (9 * L + I, 9 * L + 2 * I):
+                    t = ch.cp(h)
+                    ch.votes(t, votes(ch, ks[:5], t))
+                self.assertEqual(ch.finalized[0], 9 * L + I)
+                self.assertIsNone(ch.bans[ks[4].key_id][0].start, "above opening(9): pending")
+            self.assertEqual(ch.config.epoch, 9)
+            out.append(ch.config.id)
+        self.assertEqual(out[0], out[1])
+
+    def test_pruned_then_rejoin_under_the_growth_cap(self):
+        ks = keys(6, "gcap")
+        hist = {"share_work": {n: {k.key_id: 400 for k in ks} for n in range(16)},
+                "first_block_bits": {n: r.gc.EASY_BITS for n in range(16)}}
+        prov = r.GrowthCapProvider(hist, r.gc.PARAMS["obenblock"])
+        ch = r.PociChain("mainnet", prov, r.cp_hash)
+        ch.launch()
+        prov.chain = ch
+        q = ks[5].key_id
+        for x in (5, 6, 7, 8):
+            self.handoff(ch, ks[:5], x)
+        self.assertIsNone(ch.config.weight(q))
+        held = r.gc.ledger_weights(prov.ledger)[q]
+        self.assertEqual(ch.rejoin(9 * L + 1, 9, r.sign_rejoin(r.CHAIN_OBB_MAINNET, ks[5], 9)), "ok")
+        self.handoff(ch, ks[:5], 9)
+        self.assertIsNone(ch.config.weight(q), "the rejoin is above opening(9)")
+        self.assertEqual(r.gc.ledger_weights(prov.ledger)[q], held, "no credit while pruned")
+        self.handoff(ch, ks[:5], 10)
+        wq, w0 = ch.config.weight(q), ch.config.weight(ks[0].key_id)
+        self.assertLess(held, wq)
+        self.assertLess(wq, w0, "back as new weight under the cap, without the credits it missed")
 
     def test_a_key_that_entered_later_has_its_grace(self):
         ks = keys(6, "late")

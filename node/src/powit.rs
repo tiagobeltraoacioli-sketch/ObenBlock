@@ -1646,7 +1646,8 @@ pub fn info_json(dag: &GhostDAG, store: &Storage) -> serde_json::Value {
         "rules": match regime { Regime::V1 => "v1", Regime::Hardening2 => "hardening2" },
         "params": {
             "epoch_len": p.epoch_len, "checkpoint_interval": p.checkpoint_interval,
-            "window_epochs": p.window_epochs,
+            // On ObenBlock the PoCI window (params_digest) is the chain's window.
+            "window_epochs": PociParams::for_chain(core::node_chain_id()).map_or(p.window_epochs, |pp| pp.window_epochs),
             // The 64-key cap applies only before the second hardening activation.
             "max_witnesses": p.max_witnesses,
         },
@@ -1708,7 +1709,8 @@ pub fn poci_finality_json(dag: &GhostDAG, store: &Storage) -> serde_json::Value 
 fn poci_info_json(dag: &GhostDAG, store: &Storage, st: Option<&PowitState>) -> serde_json::Value {
     let Some(pp) = PociParams::for_chain(core::node_chain_id()) else { return serde_json::Value::Null };
     let Some((s, ps)) = st.and_then(|s| s.poci.as_ref().map(|p| (s, p))) else {
-        return serde_json::json!({ "active": false, "bootstrap_epochs": pp.bootstrap_epochs });
+        return serde_json::json!({ "active": false, "bootstrap_epochs": pp.bootstrap_epochs,
+                                   "launch_height": pp.launch_height() });
     };
     let c = ps.config();
     // The weight of C_e with no vote included in a block of each recent

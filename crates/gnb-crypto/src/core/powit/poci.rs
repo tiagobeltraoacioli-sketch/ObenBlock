@@ -16,7 +16,7 @@
 //! every case of `reference/poci_vectors.json`.
 //!
 //! ```text
-//! params_digest = SHA-256d("OBB-POCI-v1/params" ‖ u32le(chain_id) ‖ u64le × 10 ‖ u32le(2) ‖ u32le(3))
+//! params_digest = SHA-256d("OBB-POCI-v1/params" ‖ u32le(chain_id) ‖ u64le × 11 ‖ u32le(2) ‖ u32le(3))
 //! leaf(k, w)    = tagged("OBB-POCI-v1/leaf", key_id[20] ‖ u128le(w))
 //! node(l, r)    = tagged("OBB-POCI-v1/node", l ‖ r)        odd last node carried up
 //! merkle_root   = tagged("OBB-POCI-v1/root", u32le(n) ‖ tree_root)
@@ -85,7 +85,7 @@ pub const V3_PREIMAGE_LEN: usize = 171;
 /// Length of the configuration id preimage.
 pub const CONFIG_PREIMAGE_LEN: usize = 110;
 /// Length of the parameters digest preimage.
-pub const PARAMS_PREIMAGE_LEN: usize = 110;
+pub const PARAMS_PREIMAGE_LEN: usize = 118;
 
 // ── Hash primitives ──────────────────────────────────────────────────────────
 
@@ -128,6 +128,10 @@ pub struct PociParams {
     pub max_evidence_per_block: u64,
     pub ban_epochs: u64,
     pub bootstrap_epochs: u64,
+    /// §9: blocks that must bury the launch checkpoint (the slot opening
+    /// `bootstrap_epochs`) before `C_bootstrap` enters into force
+    /// ([`Self::launch_height`]): one epoch, `epoch_len`.
+    pub launch_bury: u64,
     pub growth_div: u64,
     pub g_min_epoch_div: u64,
     pub quorum_num: u32,
@@ -146,6 +150,7 @@ pub const OBB_MAINNET_POCI: PociParams = PociParams {
     max_evidence_per_block: 4,
     ban_epochs: POCI_BAN_EPOCHS,
     bootstrap_epochs: POCI_BOOTSTRAP_EPOCHS,
+    launch_bury: 720,
     growth_div: POCI_GROWTH_DIV,
     g_min_epoch_div: POCI_G_MIN_EPOCH_DIV,
     quorum_num: 2,
@@ -159,8 +164,17 @@ pub const OBB_REGTEST_POCI: PociParams = PociParams {
     epoch_len: 20,
     checkpoint_interval: 5,
     vote_ttl: 20,
+    launch_bury: 20,
     ..OBB_MAINNET_POCI
 };
+
+/// §9: the launch checkpoint is buried by exactly one epoch.
+pub const fn launch_bury_is_one_epoch(p: &PociParams) -> bool {
+    p.launch_bury == p.epoch_len
+}
+
+const _: () = assert!(launch_bury_is_one_epoch(&OBB_MAINNET_POCI));
+const _: () = assert!(launch_bury_is_one_epoch(&OBB_REGTEST_POCI));
 
 /// What [`PociState::trim_seen`] relies on: a checkpoint finalized by a
 /// block lies less than two epochs below it (`vote_ttl + checkpoint_interval
@@ -182,14 +196,14 @@ impl PociParams {
         }
     }
 
-    /// The 110-byte preimage of [`Self::digest`].
+    /// The 118-byte preimage of [`Self::digest`].
     pub fn preimage(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(PARAMS_PREIMAGE_LEN);
         out.extend_from_slice(DS_PARAMS);
         out.extend_from_slice(&self.chain_id.to_le_bytes());
         for v in [self.epoch_len, self.checkpoint_interval, self.window_epochs, self.vote_ttl,
                   self.max_attestations_per_block, self.max_evidence_per_block, self.ban_epochs,
-                  self.bootstrap_epochs, self.growth_div, self.g_min_epoch_div] {
+                  self.bootstrap_epochs, self.launch_bury, self.growth_div, self.g_min_epoch_div] {
             out.extend_from_slice(&v.to_le_bytes());
         }
         out.extend_from_slice(&self.quorum_num.to_le_bytes());
@@ -214,6 +228,16 @@ impl PociParams {
     /// The checkpoint slot that opens `epoch`.
     pub fn opening(&self, epoch: u64) -> u64 {
         epoch.saturating_mul(self.epoch_len)
+    }
+
+    /// §9: the first block at or above this height puts `C_bootstrap` in
+    /// force, with the slot opening `bootstrap_epochs` justified and final:
+    /// that checkpoint is then buried by `launch_bury` blocks on the block's
+    /// selected chain. Below it no state carries a finalized checkpoint
+    /// above genesis, so nothing is pinned and a fork at the boundary of
+    /// epoch `bootstrap_epochs` is settled by work.
+    pub fn launch_height(&self) -> u64 {
+        self.opening(self.bootstrap_epochs).saturating_add(self.launch_bury)
     }
 }
 
@@ -1107,7 +1131,9 @@ impl Eq for PociState {}
 
 /// The weights of a new configuration (DESIGN-obenblock.md §6.3, package
 /// O10, the growth cap): candidate weights of `C_epoch` computed from the
-/// finalized history up to `finalized`, of every key with weight, including
+/// finalized history up to `opening(epoch)` (never above it, even though
+/// `finalized` may lie higher: §4, one configuration per epoch), of every
+/// key with weight, including
 /// the keys the ledger excludes at that epoch (bans, absence pruning); the
 /// ledger leaves those out.
 pub trait WeightProvider {
@@ -1214,14 +1240,23 @@ impl PociState {
     }
 
     /// §4.1: a vote of `key` was included at a height `h` with
-    /// `opening(x - PRUNE_AFTER) < h <= f.height` (in the history finalized by
-    /// `f`, within the last `PRUNE_AFTER` epochs before `x`). The lowest
+    /// `opening(x - PRUNE_AFTER) < h <= opening(x)`: in the blocks of epochs
+    /// `x - PRUNE_AFTER ..= x - 1`, history that every checkpoint of epoch
+    /// `x` finalizes (§4: `C_x` reads nothing above `opening(x)`). The lowest
     /// inclusion of each block epoch decides: a block epoch `y` holds heights
     /// in `(opening(y), opening(y + 1)]`, so an inclusion of `y` inside the
     /// bounds exists iff its lowest one is inside them.
-    pub fn present(&self, params: &PociParams, key: &KeyId, x: u64, f: &Checkpoint) -> bool {
+    pub fn present(&self, params: &PociParams, key: &KeyId, x: u64) -> bool {
         let lo = params.opening(x.saturating_sub(POCI_PRUNE_AFTER_EPOCHS));
-        self.seen.get(key).is_some_and(|m| m.values().any(|&h| lo < h && h <= f.height))
+        let hi = params.opening(x);
+        self.seen.get(key).is_some_and(|m| m.values().any(|&h| lo < h && h <= hi))
+    }
+
+    /// §4.1: the weight of the configuration in force whose keys are
+    /// [`present`](Self::present) for a handoff to `x`.
+    pub fn present_weight(&self, params: &PociParams, x: u64) -> u128 {
+        self.config().entries().iter().filter(|(k, _)| self.present(params, k, x))
+            .fold(0u128, |a, (_, w)| a.saturating_add(*w))
     }
 
     /// §4.1: `key` has been an entry of every configuration in force since
@@ -1264,35 +1299,43 @@ impl PociState {
     }
 
     /// The first half of a handoff (§4, §4.1, §5): `f` was finalized under
-    /// the configuration in force. If it hands off to `x`
-    /// ([`Self::handoff_epoch`]): every pending ban whose evidence `f`
-    /// finalizes starts at `x`; every pending rejoin `f` finalizes ends its
-    /// key's pruning at `x`; every key of the configuration in force that has
-    /// been an entry since `x - PRUNE_AFTER` or earlier with no vote included
-    /// in `(opening(x - PRUNE_AFTER), f.height]` is pruned from `x`. Returns
-    /// `x`; the caller computes the candidate weights (with this state) and
-    /// calls [`Self::enter`].
+    /// the configuration in force `C_e`. If it hands off to `x`
+    /// ([`Self::handoff_epoch`]), from the history up to `cut = opening(x)
+    /// <= f.height` only, so that every chain finalizing any checkpoint of
+    /// epoch `x` first (with the same `C_e` and the same history up to
+    /// `opening(x)`) computes the same `C_x`: every pending ban included at
+    /// or below `cut` starts at `x`; every pending rejoin included at or
+    /// below `cut` ends its key's pruning at `x`; and, if the keys of `C_e`
+    /// [`present`](Self::present) for `x` hold a strict quorum of `C_e`,
+    /// every key of `C_e` that has been an entry since `x - PRUNE_AFTER` or
+    /// earlier and is not present is pruned from `x`. Without that quorum
+    /// (a finality stall covered the window: the committee that ends it has
+    /// no votes there) nobody is pruned. Returns `x`; the caller computes the
+    /// candidate weights (with this state) and calls [`Self::enter`].
     pub fn begin_handoff(&mut self, params: &PociParams, f: &Checkpoint) -> Option<u64> {
         let x = self.handoff_epoch(params, f)?;
+        let cut = params.opening(x);
         for bl in self.bans.values_mut() {
             for b in bl.iter_mut() {
-                if b.start.is_none() && b.included_at <= f.height {
+                if b.start.is_none() && b.included_at <= cut {
                     b.start = Some(x);
                 }
             }
         }
-        let done: Vec<KeyId> = self.rejoins.iter().filter(|(_, h)| **h <= f.height).map(|(k, _)| *k).collect();
+        let done: Vec<KeyId> = self.rejoins.iter().filter(|(_, h)| **h <= cut).map(|(k, _)| *k).collect();
         for k in done {
             self.rejoins.remove(&k);
             if let Some(p) = self.pruned.get_mut(&k) {
                 p.until = Some(x);
             }
         }
-        let absent: Vec<KeyId> = self.config().entries().iter().map(|(k, _)| *k)
-            .filter(|k| !self.pruned.contains_key(k) && self.prune_eligible(k, x) && !self.present(params, k, x, f))
-            .collect();
-        for k in absent {
-            self.pruned.insert(k, Prune { start: x, until: None });
+        if self.config().quorum(self.present_weight(params, x)) {
+            let absent: Vec<KeyId> = self.config().entries().iter().map(|(k, _)| *k)
+                .filter(|k| !self.pruned.contains_key(k) && self.prune_eligible(k, x) && !self.present(params, k, x))
+                .collect();
+            for k in absent {
+                self.pruned.insert(k, Prune { start: x, until: None });
+            }
         }
         Some(x)
     }
@@ -1301,7 +1344,10 @@ impl PociState {
     /// provider's `candidates`, without the keys banned or pruned at `x` and
     /// those `also_excluded` (exits, which the PoWit state keeps). A pruned
     /// key without candidate weight (no share work left) is forgotten; the
-    /// included votes are kept for the keys of `C_x` only.
+    /// included votes are kept for the keys of `C_x` only. Never empty
+    /// (§4.1): if nothing is left, `C_x` holds the entries of `C_e`
+    /// unchanged and the prunings this handoff started are void (a
+    /// configuration that can reach no quorum would halt finality for good).
     pub fn enter(&mut self, params: &PociParams, x: u64, candidates: &BTreeMap<KeyId, u128>,
                  also_excluded: &dyn Fn(&KeyId) -> bool) -> Result<(), ConfigError>
     {
@@ -1312,9 +1358,13 @@ impl PociState {
             self.pruned.remove(&k);
             self.rejoins.remove(&k);
         }
-        let w: BTreeMap<KeyId, u128> = candidates.iter()
+        let mut w: BTreeMap<KeyId, u128> = candidates.iter()
             .filter(|(k, w)| **w > 0 && !self.excluded_at(params, k, x) && !also_excluded(k))
             .map(|(k, w)| (*k, *w)).collect();
+        if w.is_empty() {
+            self.pruned.retain(|_, p| !(p.start == x && p.until.is_none()));
+            w = self.config().entries().iter().copied().collect();
+        }
         let config = Configuration::from_weights(params, x, &w)?;
         self.head = Arc::new(HistoryNode { config: Arc::new(config), prev: Some(self.head.clone()) });
         self.pruned.retain(|_, p| p.until.is_none());

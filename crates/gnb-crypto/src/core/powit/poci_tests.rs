@@ -111,7 +111,10 @@ impl Harness {
     /// Votes at every slot up to the one after the opening of `x`, which
     /// finalizes it: the handoff to `C_x`.
     fn handoff_to(&mut self, keys: &[&Key], x: u64) {
-        let mut slot = self.st.justified.height.max(self.h - self.h % PP.checkpoint_interval);
+        // Right after the launch (block `launch_height`) the slot at the tip
+        // is still open for votes.
+        let open = (self.h - self.h % PP.checkpoint_interval).saturating_sub(PP.checkpoint_interval);
+        let mut slot = self.st.justified.height.max(open);
         while slot < PP.opening(x) + PP.checkpoint_interval {
             slot += PP.checkpoint_interval;
             self.slot(keys, slot);
@@ -130,6 +133,14 @@ impl Harness {
         while self.h < h {
             self.block(&[], &[]);
         }
+    }
+
+    /// Up to the block that launches PoCI (§9: `launch_height`).
+    fn launch(&mut self) {
+        self.to(PP.launch_height() - 1);
+        assert!(self.st.poci.is_none());
+        self.block(&[], &[]);
+        assert_eq!(self.config().epoch(), PP.bootstrap_epochs);
     }
 
     fn config(&self) -> std::sync::Arc<Configuration> {
@@ -190,9 +201,20 @@ fn launch_bootstrap_then_strict_quorum_handoff_and_v3_only() {
     let early = k[0].vote(&[0; 32], cp(0 + 5), cp(10));
     assert!(c.try_block(&[early], &[]).unwrap_err().contains("bootstrap"));
     assert!(c.st.poci.is_none());
-    c.to(PP.opening(PP.bootstrap_epochs) - 1);
-    assert!(c.st.poci.is_none());
-    // The first block of epoch 4 launches C_4 from the history below slot 80.
+    // Nor during epoch 4: the launch checkpoint (slot 80) is not buried yet,
+    // and no state carries a finalized checkpoint above genesis (nothing to pin).
+    assert_eq!(PP.launch_height(), 100);
+    while c.h < PP.launch_height() - 1 {
+        if c.h == 96 {
+            let early = k[0].vote(&[0; 32], cp(80), cp(95));
+            assert!(c.try_block(&[early], &[]).unwrap_err().contains("bootstrap"));
+        }
+        c.block(&[], &[]);
+        assert!(c.st.poci.is_none(), "block {}", c.h);
+        assert_eq!((c.st.finalized.height, c.st.justified.height), (0, 0), "block {}", c.h);
+    }
+    // The block at launch_height launches C_4 from the history below slot 80,
+    // now buried by one epoch.
     c.block(&[], &[]);
     let launch = cp(80);
     assert_eq!((c.st.justified, c.st.finalized), (launch, launch));
@@ -205,39 +227,39 @@ fn launch_bootstrap_then_strict_quorum_handoff_and_v3_only() {
     assert!(c4.entries().iter().all(|(_, w)| *w == 30));
     assert_eq!(c4.total(), 120);
     assert_eq!(c.st.cap.as_ref().unwrap().ledger.epoch(), 4);
-    c.to(85);
+    assert_eq!(c.st.finalized_at, 100);
+    c.to(105);
 
     // Half the weight justifies nothing; a third key (75 %) does.
-    let two = c.votes(&k[..2], 85);
+    let two = c.votes(&k[..2], 105);
     c.block(&two, &[]);
     assert_eq!(c.st.justified, launch);
     // A PoWit v2 vote of a member does not verify on PoCI.
-    let v2 = Attestation::sign_at(CHAIN, 0, launch, cp(85), &k[2].0.borrow()).unwrap();
+    let v2 = Attestation::sign_at(CHAIN, 0, launch, cp(105), &k[2].0.borrow()).unwrap();
     assert!(c.try_block(&[v2], &[]).unwrap_err().contains("invalid attestation signature"));
     // A key outside the configuration cannot vote.
-    let out = outsider.vote(&c4.id(), launch, cp(85));
+    let out = outsider.vote(&c4.id(), launch, cp(105));
     assert!(c.try_block(&[out], &[]).unwrap_err().contains("not in the PoCI configuration"));
     // A vote naming another configuration is refused.
-    let wrong = k[2].vote(&[0xEE; 32], launch, cp(85));
+    let wrong = k[2].vote(&[0xEE; 32], launch, cp(105));
     assert!(c.try_block(&[wrong], &[]).is_err());
-    let third = c.votes(&k[2..3], 85);
+    let third = c.votes(&k[2..3], 105);
     c.block(&third, &[]);
-    assert_eq!(c.st.justified, cp(85));
-    // Finalizing the launch checkpoint again hands off nothing.
+    assert_eq!(c.st.justified, cp(105));
+    // Not a direct child of the launch checkpoint: nothing finalized.
     assert_eq!(c.st.finalized, launch);
     assert_eq!(c.config().epoch(), 4);
 
-    // Advance slot by slot into epoch 5; the slot opening it finalized hands off.
-    let mut slot = 85;
-    while slot < 105 {
+    // The next slot finalizes 105, in epoch 5: the handoff to C_5.
+    let mut slot = 105;
+    while slot < 115 {
         slot += 5;
         c.to(slot);
         let v = c.votes(&k[..3], slot);
         c.block(&v, &[]);
         assert_eq!(c.st.justified, cp(slot));
         assert_eq!(c.st.finalized, cp(slot - 5));
-        let e = if slot - 5 >= 100 { 5 } else { 4 };
-        assert_eq!(c.config().epoch(), e, "slot {slot}");
+        assert_eq!(c.config().epoch(), 5, "slot {slot}");
     }
     let c5 = c.config();
     assert_ne!(c5.id(), c4.id());
@@ -245,8 +267,8 @@ fn launch_bootstrap_then_strict_quorum_handoff_and_v3_only() {
     assert!(c5.entries().iter().all(|(_, w)| *w == 40));
     assert_eq!(c.st.poci.as_ref().unwrap().previous().unwrap().id(), c4.id());
     // Votes under the old configuration are refused now.
-    c.to(110);
-    let old = k[0].vote(&c4.id(), c.st.justified, cp(110));
+    c.to(120);
+    let old = k[0].vote(&c4.id(), c.st.justified, cp(120));
     assert!(c.try_block(&[old], &[]).unwrap_err().contains("invalid attestation signature"));
     // No inactivity leak: the GnB decay and bans stay empty.
     assert!(c.st.decay.is_empty() && c.st.banned.is_empty());
@@ -257,14 +279,15 @@ fn exactly_two_thirds_never_justifies() {
     let keys: Vec<Key> = (11..=13).map(Key::new).collect();
     let k: Vec<&Key> = keys.iter().collect();
     let mut c = Harness::new(&k);
-    c.to(85);
+    c.launch();
+    c.to(105);
     // Three equal keys: two of them are exactly two thirds.
-    let two = c.votes(&k[..2], 85);
+    let two = c.votes(&k[..2], 105);
     c.block(&two, &[]);
     assert_eq!(c.st.justified, cp(80), "3 got > 2 total is strict");
-    let three = c.votes(&k[2..], 85);
+    let three = c.votes(&k[2..], 105);
     c.block(&three, &[]);
-    assert_eq!(c.st.justified, cp(85));
+    assert_eq!(c.st.justified, cp(105));
 }
 
 #[test]
@@ -272,11 +295,12 @@ fn evidence_bans_from_the_next_handoff_and_keeps_the_configuration_in_force() {
     let keys: Vec<Key> = (21..=24).map(Key::new).collect();
     let k: Vec<&Key> = keys.iter().collect();
     let mut c = Harness::new(&k);
-    c.to(85);
+    c.launch();
+    c.to(105);
     let c4 = c.config();
     // Key 3 signs two different targets at the same height under C_4.
-    let a = k[3].vote(&c4.id(), cp(80), cp(85));
-    let mut fake = cp(85);
+    let a = k[3].vote(&c4.id(), cp(80), cp(105));
+    let mut fake = cp(105);
     fake.hash[0] ^= 0xFF;
     let b = k[3].vote(&c4.id(), cp(80), fake);
     let ev = PociEvidence { config_id: c4.id(), a: a.clone(), b: b.clone() };
@@ -298,22 +322,27 @@ fn evidence_bans_from_the_next_handoff_and_keeps_the_configuration_in_force() {
     assert!(c.try_block(&[], &[ev.clone()]).unwrap_err().contains("already_banned_for_config"));
     // The configuration in force is unchanged: key 3 still counts.
     assert_eq!(c.config().id(), c4.id());
-    // Finalize through the opening of epoch 5 with keys 0..=2.
-    let mut slot = 80;
-    while slot < 105 {
-        slot += 5;
+    // Keys 0..=2 justify 105 and finalize it: the handoff to C_5. The
+    // evidence (included at 107) is above opening(5) = 100, so C_5, which
+    // reads the history up to opening(5) only (§4), does not see it: the
+    // ban stays pending and key 3 is still an entry of C_5.
+    for slot in [105, 110] {
         c.to(slot.max(c.h));
         let v = c.votes(&k[..3], slot);
         c.block(&v, &[]);
     }
-    assert_eq!(c.st.finalized, cp(100));
+    assert_eq!((c.st.finalized, c.config().epoch()), (cp(105), 5));
+    assert_eq!(c.st.poci.as_ref().unwrap().bans[&k[3].id()][0].start, None);
+    assert!(c.config().weight(&k[3].id()).is_some());
+    // The next handoff (opening(6) = 120 >= 107) starts it.
+    c.handoff_to(&k[..3], 6);
     let st = c.st.poci.as_ref().unwrap();
-    assert_eq!(st.bans[&k[3].id()][0].start, Some(5));
-    assert_eq!(st.bans[&k[3].id()][0].end(PP.ban_epochs), Some(105));
-    assert!(st.banned_at(&PP, &k[3].id(), 5) && st.banned_at(&PP, &k[3].id(), 104));
-    assert!(!st.banned_at(&PP, &k[3].id(), 105));
-    // Left out of C_5; its shares are refused while banned.
-    assert_eq!(c.config().epoch(), 5);
+    assert_eq!(st.bans[&k[3].id()][0].start, Some(6));
+    assert_eq!(st.bans[&k[3].id()][0].end(PP.ban_epochs), Some(106));
+    assert!(st.banned_at(&PP, &k[3].id(), 6) && st.banned_at(&PP, &k[3].id(), 105));
+    assert!(!st.banned_at(&PP, &k[3].id(), 106) && !st.banned_at(&PP, &k[3].id(), 5));
+    // Left out of C_6; its shares are refused while banned.
+    assert_eq!(c.config().epoch(), 6);
     assert!(c.config().weight(&k[3].id()).is_none());
     assert_eq!(c.config().len(), 3);
     assert!(c.try_block(&[], &[]).unwrap_err().contains("barred"));
@@ -359,7 +388,7 @@ fn gnb_state_encoding_is_unchanged_by_the_poci_field() {
     let keys: Vec<Key> = (41..=42).map(Key::new).collect();
     let k: Vec<&Key> = keys.iter().collect();
     let mut c = Harness::new(&k);
-    c.to(81);
+    c.to(PP.launch_height() + 1);
     assert!(c.st.poci.is_some());
     let with = bincode::serde::encode_to_vec(&c.st, bincode::config::standard()).unwrap();
     let mut without = c.st.clone();
@@ -407,8 +436,7 @@ fn absent_keys_are_pruned_at_the_handoff_and_rejoin_from_the_next() {
     let k: Vec<&Key> = keys.iter().collect();
     let (core, quiet) = (&k[..4], k[4]);
     let mut c = Harness::new(&k);
-    c.to(PP.opening(4));
-    c.block(&[], &[]);
+    c.launch();
     assert_eq!(c.config().len(), 5);
     // Epochs 5..=7: the quiet key is in its grace period.
     for x in 5..=7 {
@@ -474,11 +502,10 @@ fn a_stall_never_changes_the_configuration_and_nobody_is_pruned() {
     let keys: Vec<Key> = (71..=75).map(Key::new).collect();
     let k: Vec<&Key> = keys.iter().collect();
     let mut c = Harness::new(&k);
-    c.to(PP.opening(4));
-    c.block(&[], &[]);
+    c.launch();
     let c4 = c.config();
     // 40 % vanish at once: three keys out of five are not a strict quorum.
-    let mut slot = PP.opening(4);
+    let mut slot = PP.launch_height();
     while slot < PP.opening(14) {
         slot += 5;
         c.slot(&k[..3], slot);
@@ -495,13 +522,166 @@ fn a_stall_never_changes_the_configuration_and_nobody_is_pruned() {
     c.slot(&k, slot + 5);
     assert_eq!(c.st.finalized, cp(slot));
     assert_eq!(c.config().epoch(), 14);
-    // The keys that came back have no vote in the finalized history of the
-    // last four epochs (theirs are in the blocks above F): pruned at this
-    // handoff, they rejoin. The keys that kept voting stay.
+    // Review HIGH (§4.1): the stall lasted more than PRUNE_AFTER epochs and
+    // the keys that came back have no vote in the blocks of epochs 10..=13
+    // (theirs are above opening(14)). The present keys (60 %) hold no strict
+    // quorum of C_4, so the handoff the returning committee authorizes
+    // prunes nobody: they stay in C_14.
     let st = c.st.poci.as_ref().unwrap();
-    assert_eq!(st.pruned.keys().copied().collect::<Vec<_>>(),
-               { let mut v = vec![k[3].id(), k[4].id()]; v.sort(); v });
-    assert_eq!(c.config().len(), 3);
+    assert!(st.pruned.is_empty());
+    assert_eq!(c.config().len(), 5);
+    assert_eq!(c.config().total(), c.st.cap.as_ref().unwrap().ledger.weights().values().sum::<u128>());
+    // Finality goes on under C_14 with every key.
+    c.handoff_to(&k, 15);
+    assert_eq!(c.config().len(), 5);
+}
+
+/// Review HIGH: nobody votes for more than PRUNE_AFTER epochs (24 h on
+/// mainnet), then the whole committee returns. The handoff it authorizes
+/// keeps it (no key of C_4 is present in the window, so no quorum is
+/// present and nobody is pruned): finality never halts for good.
+#[test]
+fn a_total_stall_ends_with_the_returning_committee_in_force() {
+    let keys: Vec<Key> = (76..=79).map(Key::new).collect();
+    let k: Vec<&Key> = keys.iter().collect();
+    let mut c = Harness::new(&k);
+    c.launch();
+    c.to(PP.opening(12));
+    assert_eq!((c.st.finalized, c.config().epoch()), (cp(80), 4));
+    c.handoff_to(&k, 12);
+    let st = c.st.poci.as_ref().unwrap();
+    assert!(st.pruned.is_empty());
+    assert_eq!(c.config().len(), 4);
+    c.handoff_to(&k, 13);
+    assert_eq!(c.config().len(), 4);
+}
+
+/// Review MEDIUM (§4): two chains share the history up to opening(9) and
+/// then finalize different checkpoints of epoch 9 first; above opening(9)
+/// one of them carries evidence and votes the other does not. Both hold the
+/// same C_9 (with the rejoin included in epoch 8 on both), so an
+/// equivocation across them names one config_id.
+#[test]
+fn compatible_chains_finalizing_different_checkpoints_of_an_epoch_hold_the_same_configuration() {
+    let keys: Vec<Key> = (91..=95).map(Key::new).collect();
+    let k: Vec<&Key> = keys.iter().collect();
+    let (core, quiet) = (&k[..4], k[4]);
+    let mut c = Harness::new(&k);
+    c.launch();
+    for x in 5..=8 {
+        c.handoff_to(core, x);
+    }
+    assert!(c.st.poci.as_ref().unwrap().pruned.contains_key(&quiet.id()));
+    let rj8 = quiet.rejoin(8);
+    c.block_with(&[], &[rj8]);
+    c.to(PP.opening(9));
+    // The two chains share every block up to here (heights < opening(9)).
+    let mut b = Harness { st: c.st.clone(), h: c.h, shares: c.shares.clone(), extra: c.extra.clone() };
+    // Chain a: finalizes the opening of epoch 9.
+    c.handoff_to(core, 9);
+    assert_eq!(c.st.finalized, cp(PP.opening(9)));
+    // Chain b: no quorum for opening(9); evidence against key 3 and votes
+    // above it; finalizes opening(9) + 5 instead.
+    let v = b.votes(&core[..2], 180);
+    b.block(&v, &[]);
+    let cfg8 = b.config();
+    let (j, t) = (b.st.justified, cp(185));
+    let mut fake = t;
+    fake.hash[0] ^= 1;
+    let ev = PociEvidence { config_id: cfg8.id(), a: k[3].vote(&cfg8.id(), j, t), b: k[3].vote(&cfg8.id(), j, fake) };
+    b.block(&[], &[ev]);
+    for slot in [185, 190] {
+        b.to(slot);
+        let v = b.votes(core, slot);
+        b.block(&v, &[]);
+    }
+    assert_eq!(b.st.finalized, cp(185));
+    assert_eq!(b.config().epoch(), 9);
+    assert_eq!(b.st.poci.as_ref().unwrap().bans[&k[3].id()][0].start, None, "above opening(9): pending");
+    assert_eq!(b.config().id(), c.config().id(), "one C_9");
+    assert!(c.config().weight(&quiet.id()).is_some(), "the rejoin at or below opening(9) counts on both");
+    assert_eq!(b.st.poci.as_ref().unwrap().pruned, c.st.poci.as_ref().unwrap().pruned);
+}
+
+/// §4.1 (review HIGH, the worst case): a handoff never leaves an empty
+/// configuration. Every key of C_5 equivocates; the handoff to 6 bans them
+/// all, so the candidates leave nothing: C_6 carries C_5's entries forward
+/// and finality goes on.
+#[test]
+fn a_handoff_never_leaves_an_empty_configuration() {
+    let keys: Vec<Key> = (101..=103).map(Key::new).collect();
+    let k: Vec<&Key> = keys.iter().collect();
+    let mut c = Harness::new(&k);
+    c.launch();
+    c.handoff_to(&k, 5);
+    let c5 = c.config();
+    let (j, t) = (c.st.justified, cp(c.st.justified.height + 10));
+    let mut fake = t;
+    fake.hash[0] ^= 1;
+    let ev: Vec<PociEvidence> = k.iter()
+        .map(|key| PociEvidence { config_id: c5.id(), a: key.vote(&c5.id(), j, t), b: key.vote(&c5.id(), j, fake) })
+        .collect();
+    c.to(t.height);
+    c.block(&[], &ev);
+    // No share work from here on (banned keys may not be paid).
+    c.shares.clear();
+    c.handoff_to(&k, 6);
+    let st = c.st.poci.as_ref().unwrap();
+    assert!(k.iter().all(|key| st.banned_at(&PP, &key.id(), 6)));
+    assert_eq!(c.config().epoch(), 6);
+    assert_eq!(c.config().entries(), c5.entries());
+    assert_ne!(c.config().id(), c5.id());
+    c.handoff_to(&k, 7);
+    assert_eq!(c.config().entries(), c5.entries());
+}
+
+/// Review HIGH (§9): a fork at the epoch-4 boundary. Below launch_height no
+/// state carries a finalized checkpoint above genesis on either branch, so
+/// the finality pin has no candidate and work settles the fork; the branch
+/// that reaches launch_height launches on its own slot 80.
+#[test]
+fn a_fork_at_the_launch_boundary_carries_no_finality_until_buried() {
+    let keys: Vec<Key> = (111..=113).map(Key::new).collect();
+    let ids: Vec<KeyId> = keys.iter().map(Key::id).collect();
+    /// Block `h` of branch `br` (the branches share blocks below 78).
+    fn bh(br: u8, h: u64) -> [u8; 32] {
+        let mut x = hash(h);
+        if h >= 78 {
+            x[30] = br;
+        }
+        x
+    }
+    struct Branch(u8, u64);
+    impl ChainView for Branch {
+        fn selected_at(&self, slot: u64) -> Option<[u8; 32]> {
+            (slot >= 1 && slot <= self.1).then(|| bh(self.0, slot - 1))
+        }
+    }
+    let mut common = PowitState::genesis(0, hash(0));
+    let sw: Vec<(KeyId, u128)> = ids.iter().map(|k| (*k, W)).collect();
+    let step = |st: &PowitState, br: u8, h: u64| {
+        let input = BlockInput { height: h, hash: bh(br, h), share_work: &sw, attestations: &[], evidence: &[], exits: &[] };
+        st.apply_block(&P, CHAIN, 0, 0, &input, BITS, PociItems::default(), &Branch(br, h)).unwrap()
+    };
+    for h in 1..78 {
+        common = step(&common, 0, h);
+    }
+    let mut tips = Vec::new();
+    for br in [1u8, 2] {
+        let mut st = common.clone();
+        for h in 78..PP.launch_height() {
+            st = step(&st, br, h);
+            assert!(st.poci.is_none(), "branch {br} block {h}");
+            assert_eq!(st.finalized.height, 0, "branch {br} block {h}: no pin candidate");
+        }
+        st = step(&st, br, PP.launch_height());
+        tips.push(st);
+    }
+    for (br, st) in [1u8, 2].into_iter().zip(&tips) {
+        assert_eq!(st.finalized, Checkpoint { height: 80, hash: bh(br, 79) }, "branch {br}");
+    }
+    assert_eq!(tips[0].poci_config().unwrap().id(), tips[1].poci_config().unwrap().id(),
+               "same weights: the branches differ only in where slot 80 lies");
 }
 
 #[test]
@@ -575,7 +755,7 @@ fn handoffs_run_the_growth_cap() {
     c.to(79);
     // From epoch 4 on, a newcomer brings 1000 times the members' work.
     c.extra.push((newcomer, 1_000 * W));
-    c.block(&[], &[]);
+    c.launch();
     assert_eq!(c.config().epoch(), 4);
     let mut slot = 80;
     let mut seen = BTreeMap::new();
@@ -615,4 +795,10 @@ fn handoffs_run_the_growth_cap() {
     let cap = c.st.cap.as_ref().unwrap();
     assert!(cap.first_bits.keys().all(|e| *e + 1 >= cap.ledger.epoch()));
     assert!(cap.first_bits.values().all(|b| *b == BITS));
+    // One window (§2, merge item): apply_poci keeps share work and links for
+    // the PoCI window (112 + 2 epochs, part of params_digest), not the short
+    // PoWit regtest window (3), so nothing of the first epochs is dropped yet.
+    assert_eq!((P.window_epochs, PP.window_epochs), (3, 112));
+    assert!(c.st.epoch_work.contains_key(&0));
+    assert!(c.st.links.values().all(|v| v.iter().any(|(_, th, _)| *th <= 100)));
 }
