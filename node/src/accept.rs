@@ -1481,7 +1481,7 @@ fn commit_chunk(
             Ok(()) => Ok(()),
             Err(ConnectFailure::Invalid(e)) => {
                 witness_failure.set(e.witness_dependent.then(|| {
-                    (b.block_hash(), core::block_rules::witness_root(&b.transactions).0)
+                    (b.block_hash(), core::block_rules::body_commitment_root(&b).0)
                 }));
                 Err(ValidationFailure::Invalid(e.reason))
             }
@@ -2144,7 +2144,7 @@ pub fn accept_block_tracking(
                 hex::encode(block_hash)
             ));
         }
-        let witness_root = core::block_rules::witness_root(&block.transactions).0;
+        let witness_root = core::block_rules::body_commitment_root(block).0;
         if dag.read().body_rejected_before(&block_hash, &witness_root) {
             return Err(format!(
                 "consensus rejection: block already in DAG: {} (this body was already rejected; \
@@ -2262,7 +2262,12 @@ pub fn accept_block_tracking(
     //    only the cheap checks run again (`pow::proof_recorded_in_dag`, P5-G).
     let proof_ok = if replacing { pow::proof_recorded_in_dag(block) } else { block.validate_pow() };
     if !proof_ok {
-        return Err("consensus rejection: invalid GnB-SMH proof of work".into());
+        // Name the scheme the block was judged under (ObenBlock: SHA-256d).
+        return Err(if core::pow_scheme::node_sha256d_params().is_some() {
+            "consensus rejection: invalid SHA-256d proof of work".into()
+        } else {
+            "consensus rejection: invalid GnB-SMH proof of work".into()
+        });
     }
 
     // ── Context-free consensus checks (VAL-11 MoneyRange, VAL-12 canonical
@@ -2828,7 +2833,7 @@ pub fn recheck_stored_blocks_under_hardening(
                 }
                 warn!("stored body of {} fails the hardening rules only by its witnesses ({}); \
                        dropped, waiting for another copy", hex::encode(&h[..8]), reason);
-                let wr = core::block_rules::witness_root(&body.transactions).0;
+                let wr = core::block_rules::body_commitment_root(&body).0;
                 dag.write().mark_body_pending(h, Some(wr));
                 store.delete_block_body(&h).map_err(|e| e.to_string())?;
                 report.bodies_dropped.push(h);

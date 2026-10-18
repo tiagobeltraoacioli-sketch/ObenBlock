@@ -207,7 +207,10 @@ mod tests {
         let job = Arc::new(Job {
             template, block, header: [0; 80], coinb1: vec![], coinb2: vec![], extranonce: [0; 8],
             version: 0x2000_0000, time: 0, bits: 0x1d00_ffff, parents_commitment: [0; 32],
-            merkle_branch: vec![], shielded_root: [0; 32], powit_root: [0; 32],
+            merkle_branch: vec![],
+            window: crate::mining::sha256d::TimeWindow { curtime: 0, mintime: 0, maxtime: 0, bits: 0x1d00_ffff,
+                                                         relief_step: 0, next_bits_time: None },
+            stratum: serde_json::Value::Null,
         });
         Sv2CachedJob { job_id, job, merkle_root: [0; 32] }
     }

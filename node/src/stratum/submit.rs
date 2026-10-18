@@ -141,20 +141,6 @@ fn submit_inner(session: &Arc<Session>, req: &StratumRequest, accept_block: &Acc
     let net_diff = difficulty_from_bits(job.bits);
     let share_target = difficulty::easier(&target_from_difficulty(session.share_difficulty().min(net_diff)), &block_target);
     if !sha256d::meets_target(&solved.id, &share_target) {
-        if !session.obb_merkle() {
-            let btc_root = job.bitcoin_tree_root_for(&extranonce);
-            let btc_header = super::jobs::header_bytes(version, &job.parents_commitment, &btc_root, ntime, job.bits, nonce);
-            if sha256d::meets_target(&sha256d::block_id(&btc_header), &share_target) {
-                if session.note_bitcoin_tree_share() {
-                    warn!("stratum: session {} ({}) hashes headers with Bitcoin's Merkle tree: its shares can \
-                           never be ObenBlock blocks (docs/STRATUM.md, \"V1 and the header root\")",
-                          session.id, session.authorized_name().unwrap_or_default());
-                }
-                return err(id, ErrorCode::LowDifficulty,
-                    "share uses Bitcoin's Merkle root; ObenBlock's header root is the body root \
-                     (mining.configure obb-merkle-root, or use Stratum V2)");
-            }
-        }
         return err(id, ErrorCode::LowDifficulty, "share above target");
     }
     if let Some(d) = session.record_share_and_maybe_retarget(net_diff) {

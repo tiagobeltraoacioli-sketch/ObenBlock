@@ -8,9 +8,9 @@
 //!   shared work feed, rebuilt by the session itself on every publication
 //!   (tip change, refresh, stall-relief step);
 //! * `mining.configure` accepts BIP 310 version rolling with the BIP 320 mask
-//!   `1fffe000` (the legacy server declined it), and offers the
-//!   `obb-merkle-root` extension that tells an ObenBlock-aware client how to
-//!   compute the header root (sent as a tenth `mining.notify` parameter);
+//!   `1fffe000` (the legacy server declined it);
+//! * `mining.notify` is the header job's `stratum` object (Bitcoin's Merkle
+//!   tree: stock firmware mines it unmodified);
 //! * the worker name is an `obb1…` address ([`super::payout`]).
 //!
 //! ```text
@@ -26,7 +26,7 @@
 
 use std::collections::{HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -112,10 +112,6 @@ pub const WRITE_TIMEOUT_SECS: u64 = 10;
 /// Teardown wait for the writer task before it is aborted.
 pub const WRITER_JOIN_TIMEOUT_SECS: u64 = 2;
 
-/// Name of the vendor extension of `mining.configure` that carries the
-/// ObenBlock header-root rule.
-pub const OBB_MERKLE_EXTENSION: &str = "obb-merkle-root";
-
 fn env_f64(key: &str, default: f64) -> f64 {
     std::env::var(key).ok().and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v > 0.0).unwrap_or(default)
@@ -155,10 +151,6 @@ pub struct Session {
     job_counter: AtomicU64,
     /// Negotiated BIP 310 version-rolling mask (0 = none).
     version_mask: AtomicU32,
-    /// The client negotiated the `obb-merkle-root` extension.
-    obb_merkle: AtomicBool,
-    /// A share met its target only under Bitcoin's Merkle tree (logged once).
-    warned_bitcoin_tree: AtomicBool,
     share_difficulty: Mutex<f64>,
     last_sent_difficulty: Mutex<f64>,
     share_window_start: Mutex<Instant>,
@@ -185,8 +177,6 @@ impl Session {
             submitted: Mutex::new(HashSet::new()),
             job_counter: AtomicU64::new(0),
             version_mask: AtomicU32::new(0),
-            obb_merkle: AtomicBool::new(false),
-            warned_bitcoin_tree: AtomicBool::new(false),
             share_difficulty: Mutex::new(start_share_diff()),
             last_sent_difficulty: Mutex::new(0.0),
             share_window_start: Mutex::new(Instant::now()),
@@ -213,8 +203,6 @@ impl Session {
 
     pub fn version_mask(&self) -> u32 { self.version_mask.load(Ordering::Relaxed) }
     pub fn set_version_mask(&self, m: u32) { self.version_mask.store(m, Ordering::Relaxed) }
-    pub fn obb_merkle(&self) -> bool { self.obb_merkle.load(Ordering::Relaxed) }
-    pub fn set_obb_merkle(&self, on: bool) { self.obb_merkle.store(on, Ordering::Relaxed) }
 
     /// The full 8-byte extranonce of a share with `en2`.
     pub fn extranonce(&self, en2: &[u8; EXTRANONCE2_BYTES]) -> [u8; EXTRANONCE_BYTES] {
@@ -267,12 +255,6 @@ impl Session {
             }
         }
         s.insert(key)
-    }
-
-    /// Note a share that only Bitcoin's Merkle tree explains; true the
-    /// first time (log once per session).
-    pub fn note_bitcoin_tree_share(&self) -> bool {
-        !self.warned_bitcoin_tree.swap(true, Ordering::Relaxed)
     }
 
     fn install_writer(&self, tx: mpsc::Sender<String>) { *self.tx_out.lock() = Some(tx); }
@@ -387,32 +369,15 @@ pub fn stratum_prevhash(prev: &[u8; 32]) -> [u8; 32] {
     out
 }
 
-/// `mining.notify` params of `job` under id `job_id`:
+/// `mining.notify` params of `job` under id `job_id`, straight from the
+/// header job's `stratum` object:
 /// `[job_id, prevhash, coinb1, coinb2, merkle_branch, version, nbits, ntime, clean_jobs]`
-/// (integers as big-endian hex, as in Bitcoin stratum), plus, for a client
-/// that negotiated `obb-merkle-root`, a tenth object with the header-root
-/// rule and its two section roots.
-pub fn notify_params(job: &Job, job_id: &str, clean_jobs: bool, obb_merkle: bool) -> Value {
-    let branch: Vec<String> = job.merkle_branch.iter().map(hex::encode).collect();
-    let mut p = vec![
-        json!(job_id),
-        json!(hex::encode(stratum_prevhash(&job.parents_commitment))),
-        json!(hex::encode(&job.coinb1)),
-        json!(hex::encode(&job.coinb2)),
-        json!(branch),
-        json!(format!("{:08x}", job.version)),
-        json!(format!("{:08x}", job.bits)),
-        json!(format!("{:08x}", job.time)),
-        json!(clean_jobs),
-    ];
-    if obb_merkle {
-        p.push(json!({
-            "merkle_root_rule": "gnb-body-v2",
-            "shielded_root": hex::encode(job.shielded_root),
-            "powit_root": hex::encode(job.powit_root),
-        }));
-    }
-    Value::Array(p)
+/// (`prevhash` word-swapped, integers as big-endian hex, as Bitcoin pools
+/// send them: stock firmware builds the header from these alone).
+pub fn notify_params(job: &Job, job_id: &str, clean_jobs: bool) -> Value {
+    let s = &job.stratum;
+    json!([job_id, s["prevhash"], s["coinb1"], s["coinb2"], s["merkle_branch"], s["version"], s["nbits"], s["ntime"],
+           clean_jobs])
 }
 
 fn now_secs() -> u64 {
@@ -444,7 +409,7 @@ pub async fn install_job(session: &Arc<Session>, work: &Arc<Work>, params: Sha25
     if last <= 0.0 || (cur - last).abs() > f64::EPSILON {
         let _ = session.send_set_difficulty(cur);
     }
-    let _ = session.notify(methods::NOTIFY, notify_params(&job, &job_id, clean, session.obb_merkle()));
+    let _ = session.notify(methods::NOTIFY, notify_params(&job, &job_id, clean));
     info!("stratum: session {} job {job_id} h={} bits={:08x} clean={clean} {} txs",
           session.id, job.template.height, job.bits, job.template.transactions.len());
     Ok(())
@@ -685,8 +650,8 @@ pub fn handle_authorize(session: &Arc<Session>, req: &StratumRequest, fallback: 
 }
 
 /// `mining.configure [extensions, params]` (BIP 310): version rolling with
-/// the BIP 320 mask (`1fffe000`, intersected with the miner's mask), and the
-/// `obb-merkle-root` vendor extension. Other extensions are declined.
+/// the BIP 320 mask (`1fffe000`, intersected with the miner's mask). Other
+/// extensions are declined.
 pub fn handle_configure(session: &Arc<Session>, req: &StratumRequest) -> StratumResponse {
     let arr = req.params.as_array();
     let exts: Vec<&str> = arr.and_then(|a| a.first()).and_then(Value::as_array)
@@ -704,11 +669,6 @@ pub fn handle_configure(session: &Arc<Session>, req: &StratumRequest) -> Stratum
                 result.insert("version-rolling".into(), json!(mask != 0));
                 result.insert("version-rolling.mask".into(), json!(format!("{mask:08x}")));
                 info!("stratum: session {} version rolling mask {mask:08x}", session.id);
-            }
-            OBB_MERKLE_EXTENSION => {
-                session.set_obb_merkle(true);
-                result.insert(OBB_MERKLE_EXTENSION.into(), json!(true));
-                result.insert(format!("{OBB_MERKLE_EXTENSION}.rule"), json!("gnb-body-v2"));
             }
             other => {
                 result.insert(other.to_string(), json!(false));
@@ -832,10 +792,6 @@ mod tests {
         let resp = handle_configure(&s, &req(10, methods::CONFIGURE,
             json!([["version-rolling"], {"version-rolling.mask": "00ffe000"}])));
         assert_eq!(resp.result["version-rolling.mask"], json!("00ffe000"));
-        assert!(!s.obb_merkle());
-        let resp = handle_configure(&s, &req(11, methods::CONFIGURE, json!([[OBB_MERKLE_EXTENSION], {}])));
-        assert_eq!(resp.result[OBB_MERKLE_EXTENSION], json!(true));
-        assert!(s.obb_merkle());
     }
 
     #[test]

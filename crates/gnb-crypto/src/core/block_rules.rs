@@ -294,7 +294,7 @@ pub fn coinbase_commitment(height: u64, parents: &[[u8; 32]], witness_root: &Mer
 /// The commitment `block` must carry (computed from its height, its header
 /// parents and its non-coinbase transactions).
 pub fn expected_coinbase_commitment(block: &Block) -> [u8; COINBASE_COMMITMENT_LEN] {
-    coinbase_commitment(block.height, &block.header.parents, &witness_root(&block.transactions))
+    coinbase_commitment(block.height, &block.header.parents, &body_commitment_root(block))
 }
 
 /// The coinbase `script_sig` for a commitment and arbitrary miner bytes.
@@ -325,7 +325,7 @@ pub fn check_coinbase_commitment(block: &Block) -> Result<(), &'static str> {
     if ss[16..48] != parents_commitment(&block.header.parents) {
         return Err("bad coinbase parents commitment");
     }
-    if ss[48..80] != witness_root(&block.transactions).0 {
+    if ss[48..80] != body_commitment_root(block).0 {
         return Err("bad witness commitment (witness root mismatch)");
     }
     Ok(())
@@ -415,12 +415,12 @@ pub fn check_hardened_body(block: &Block) -> Result<(), &'static str> {
 /// witnesses were altered in transit (same block id, different `script_sig`
 /// bytes) is rejected without being stored or marked invalid.
 pub fn check_block_hardened_at(block: &Block, activation_height: u64) -> Result<(), &'static str> {
-    if !rules_active_at(block.height, activation_height) {
+    if !rules_apply(block.height, activation_height) {
         return Ok(());
     }
     check_block_size_at(block, activation_height)?;
     if !block.validate_merkle_at(activation_height) {
-        return Err("invalid merkle root");
+        return Err(super::pow_scheme::merkle_error(block));
     }
     if !block.validate_coinbase_format() {
         return Err("invalid coinbase format");
@@ -443,6 +443,35 @@ pub fn check_parents_distinct(parents: &[[u8; 32]]) -> Result<(), &'static str> 
         return Err("duplicate parent");
     }
     Ok(())
+}
+
+// ── ObenBlock (SHA-256d scheme) ─────────────────────────────────────────────
+
+/// Whether the hardening block rules apply to a block at header height
+/// `height`: [`rules_active_at`], and under the SHA-256d scheme (ObenBlock)
+/// at every height from 1 whatever `activation_height` says. ObenBlock's
+/// activation height is 0 on both its networks; this makes the coinbase
+/// commitment (and so the commitment of every witness and section byte,
+/// which its header root no longer covers) mandatory from the first block
+/// even under a test override of the activation height.
+pub fn rules_apply(height: u64, activation_height: u64) -> bool {
+    rules_active_at(height, activation_height)
+        || (height >= 1 && super::pow_scheme::node_sha256d_params().is_some())
+}
+
+/// The 32 bytes at offset 48 of the coinbase commitment: GnB's
+/// [`witness_root`] (unchanged), or under the SHA-256d scheme the ObenBlock
+/// body commitment (`pow_scheme::obb_body_commitment`: witness root,
+/// shielded section root and PoWit section root), since there the header
+/// root is Bitcoin's transaction tree and covers no other part of the body.
+/// Also the key under which a node remembers a rejected body of a block id
+/// (`accept_block`).
+pub fn body_commitment_root(block: &Block) -> MerkleRoot {
+    if super::pow_scheme::node_sha256d_params().is_some() {
+        super::pow_scheme::obb_body_commitment(block)
+    } else {
+        witness_root(&block.transactions)
+    }
 }
 
 #[cfg(test)]

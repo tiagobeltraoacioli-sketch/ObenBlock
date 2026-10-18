@@ -8,7 +8,7 @@ docs/OBENBLOCK-MINING.md).
 
 | Server | Flag | Default bind | Transport | Use |
 | --- | --- | --- | --- | --- |
-| Stratum V1 | `--stratum` | `0.0.0.0:3333` | plaintext JSON lines | ObenBlock-aware V1 clients and proxies (see 1.3) |
+| Stratum V1 | `--stratum` | `0.0.0.0:3333` | plaintext JSON lines | stock Bitcoin ASIC firmware, MiningRigRentals, V1 proxies |
 | Stratum V2 | `--stratum-v2` | `0.0.0.0:3334` | Noise NX, encrypted | SV2 firmware and SRI proxies, standard channels |
 
 Both are off by default, run only on SHA-256d chains (ObenBlock mainnet and
@@ -33,8 +33,10 @@ new template:
   late, the expected `bits` change every 60 s. A job keeps the bits it was
   built with, so the feed republishes as soon as the bits for the current
   time change, and every miner gets a job with the easier target within a
-  second of the step. A share whose time leaves its job's step is refused
-  (V1 error 21, V2 `stale-share`), because its block would need other bits.
+  second of the step. Each job carries its `ntime` window (`mintime` to
+  `maxtime` of the header job: one relief step, at or after the parents,
+  at most 600 s ahead); a share outside it is refused (V1 error 21 when the
+  step changed, else 20; V2 `stale-share` / `invalid-time`).
 
 Each session turns the template into its own job: exactly the RPC header job
 (`getblocktemplate [{"header_job": {...}}]`, `mining::sha256d::header_job`)
@@ -48,7 +50,7 @@ u32le version ‖ parents_commitment ‖ merkle_root ‖ u32le time ‖ u32le bi
 
 `node/tests/stratum_e2e.rs` checks this byte identity, and every share is
 rebuilt into its block with two checks before anything is submitted: the
-root derived from the extranonce equals the block's own body root, and the
+root derived from the extranonce equals the block's own root, and the
 header hashed equals the block's serialized header. Found blocks go to the
 same hook as RPC `submitblock` (dedup, minimum chain work, structure, then
 `accept_block` and gossip); the node's verdict is the answer to the miner.
@@ -60,51 +62,25 @@ same hook as RPC `submitblock` (dedup, minimum chain work, structure, then
 - `parents_commitment`: in the previous-block slot (V1 sends it with each
   32-bit word byte-swapped, as Bitcoin pools do; V2 `SetNewPrevHash.prev_hash`
   carries the header bytes).
-- `merkle_root`: ObenBlock's body root (OBENBLOCK-MINING.md §3.3), not
-  Bitcoin's transaction tree.
-- `time`: at least the parents' time, at most 600 s ahead of the node's
-  clock, and inside the job's stall-relief step.
+- `merkle_root`: Bitcoin's SHA-256d transaction tree over the wire txids
+  (OBENBLOCK-MINING.md §3.3); the rest of the body (witnesses, shielded and
+  PoWit sections) is committed in the coinbase's 80-byte commitment, which
+  sits in `coinb1`.
+- `time`: inside the job's window (1.1).
 - `bits`: the job's.
 
-### 1.3 V1 and the header root
+### 1.3 V1 with stock firmware
 
-A Stratum V1 miner computes the header root itself from
-`coinb1 ‖ extranonce1 ‖ extranonce2 ‖ coinb2` and the branch. Bitcoin
-firmware (Antminer, Whatsminer, cgminer, every rig rented on
-MiningRigRentals) folds the branch with Bitcoin's SHA-256d tree. ObenBlock's
-header root is the tagged body root, so **a Bitcoin-only V1 miner hashes
-headers no ObenBlock node can accept**, whatever server or proxy sits in
-front of it. This is the open point of package O3b
-(OBENBLOCK-MINING.md §4): either such hashrate comes through SV2, or the
-consensus header root changes to Bitcoin's tree with the body roots
-committed in the coinbase. The server does not hide this:
-
-- when a share misses its target but meets it with Bitcoin's root, the
-  answer is error 23 with the message `share uses Bitcoin's Merkle root …`,
-  and the log names the session once;
-- `gnb_stratum_shares_submitted_total{protocol="v1",result="low_diff"}` rises.
-
-The V1 server is useful for clients that compute ObenBlock's root: the
-`tools/obenblock-stratum` port, test miners, and proxies that drive devices
-by header (getwork-style). They opt in with the vendor extension
-`obb-merkle-root` of `mining.configure`; `mining.notify` then carries a
-tenth parameter:
-
-```json
-{"merkle_root_rule": "gnb-body-v2", "shielded_root": "<hex>", "powit_root": "<hex>"}
-```
-
-and the root is
-
-```text
-txid    = SHA-256d(coinb1 ‖ extranonce1 ‖ extranonce2 ‖ coinb2)
-tx_root = cur = leaf(txid); cur = node(cur, s) for s in merkle_branch
-          leaf(x) = tagged("GnB/merkle/leaf", x), node(l, r) = tagged("GnB/merkle/node", l ‖ r)
-          tagged(t, m) = SHA-256(SHA-256(t) ‖ SHA-256(t) ‖ m)
-root    = SHA3-256("gnb:block:body:v2" ‖ tx_root ‖ shielded_root ‖ powit_root)
-```
-
-Without the extension the notify is the standard nine parameters.
+`mining.notify` is the header job's `stratum` object field for field:
+`prevhash` (`parents_commitment` with each 4-byte word byte-swapped, as
+Bitcoin pools send the previous hash), `coinb1`, `coinb2`, the Bitcoin
+`merkle_branch`, and `version` / `nbits` / `ntime` as big-endian hex. An
+unmodified Bitcoin miner (Antminer, Whatsminer, Braiins OS, cgminer, every
+rig rented on MiningRigRentals) builds the header exactly as for Bitcoin:
+`coinbase = coinb1 ‖ extranonce1 ‖ extranonce2 ‖ coinb2`, the root is
+`SHA-256d(coinbase)` folded with `SHA-256d(root ‖ s)` over the branch. The
+server rebuilds the same coinbase for every share, so V1, V2,
+`getblocktemplate` and the node's proof check see the same 80 bytes.
 
 ## 2. Running the servers
 
@@ -164,8 +140,7 @@ ASIC or proxy configuration:
 
 Supported methods: `mining.subscribe` (extranonce1 4 bytes, extranonce2 4
 bytes), `mining.authorize`, `mining.configure` (`version-rolling` with mask
-`1fffe000` intersected with the miner's, `obb-merkle-root`; others are
-declined), `mining.submit` (with the BIP 310 sixth parameter, the rolled
+`1fffe000` intersected with the miner's; others are declined), `mining.submit` (with the BIP 310 sixth parameter, the rolled
 version bits), `mining.suggest_difficulty`, `mining.extranonce.subscribe`,
 `mining.ping`.
 
@@ -182,12 +157,12 @@ authorize; an authorized miner is never dropped for being quiet.
 MRR rigs are Bitcoin SHA-256 ASICs that speak Stratum V1. In MRR, add a pool
 with host `stratum+tcp://<node-host>:3333` (or the ParallelismLinux proxy's
 port, 4.1), worker `obb1q….mrr` and password `x`, then point a rental at it.
-Read 1.3 first: under the current header-root rule such a rental computes
-Bitcoin's root, so the node answers its shares with error 23 ("share uses
-Bitcoin's Merkle root") and no block can come from it. Use MRR against this
-node only for connectivity checks until rentals can reach the node over
-Stratum V2 or the header-root rule changes. If MRR offers a Stratum V2 pool
-URL for the rig, use the V2 URL of section 4.
+The rental mines unmodified (1.3); its blocks pay the address in the
+worker name. The server's vardiff starts at difficulty 0.01 and adapts
+within about 90 s (capped at the network difficulty); set the rental's
+minimum difficulty in MRR if needed, and keep `--stratum-max-sessions`
+above the number of rigs. MRR checks a pool with a short test connection
+before a rental starts; it shows as a session that authorizes and closes.
 
 ## 4. Stratum V2 (port 3334)
 
@@ -261,17 +236,16 @@ outside this package:
 
 - **ParallelismLinux stratum proxy** (`pool/proxy.py`, port 3336): accepts
   miners (MRR rentals, farm ASICs) and forwards them to this node's 3333,
-  adding connection accounting and monitoring. It forwards V1 as it is, so
-  section 1.3 applies to everything behind it: it does not make
-  Bitcoin-only firmware mine ObenBlock. A proxy that terminates V1 and
-  drives the devices by header could, but only for devices that take a
-  header (not ones that compute the root from the coinbase).
+  adding connection accounting and monitoring. It forwards V1 as it is:
+  the worker names (obb1 addresses) and the share answers pass through
+  unchanged, and the stock-firmware path of 1.3 works behind it.
 - **`tools/obenblock-stratum`** (Rust port of the job server): a standalone
   pool built on `getblocktemplate` header jobs and `submitblock` with the
   share solution (OBENBLOCK-MINING.md §3), for operators who run the job
-  server on another host than the node. It should keep the same V1
-  extension (`obb-merkle-root`) and the same SV2 messages, so a miner can
-  move between it and the built-in servers by changing only the URL.
+  server on another host than the node. Built on the same header job
+  (`stratum` object, `extranonce` in `submitblock`) and the same SV2
+  messages, a miner can move between it and the built-in servers by
+  changing only the URL.
 
 ## 7. Monitoring
 
@@ -299,11 +273,11 @@ stratum: work #13 h=4523 stall-relief step: bits 1c3fffc0 -> 1c41756d
 ## 8. Differences from the legacy Bloch servers
 
 - Jobs are `getblocktemplate` header jobs on one shared work feed, with
-  ObenBlock's parents commitment and body root; the stall-relief step is a
-  job event.
-- V1 accepts BIP 310 version rolling (the legacy server declined it) and
-  offers the `obb-merkle-root` extension; payout is the `obb1…` worker name
-  or the operator's label fallback.
+  ObenBlock's parents commitment; the stall-relief step is a job event and
+  bounds the job's `ntime` window.
+- V1 accepts BIP 310 version rolling (the legacy server declined it); the
+  notify is the header job's `stratum` object; payout is the `obb1…` worker
+  name or the operator's label fallback.
 - V2 uses SRI's message types and the spec's framing (the legacy server's
   hand-written codecs sent the target big-endian, never sent
   `SetNewPrevHash`, encrypted whole frames as one message and dropped a

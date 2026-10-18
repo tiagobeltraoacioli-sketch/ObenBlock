@@ -12,16 +12,15 @@
 //! u32le version ‖ parents_commitment ‖ merkle_root ‖ u32le time ‖ u32le bits ‖ u32le nonce
 //! ```
 //!
-//! (docs/DESIGN-obenblock.md §4.1). The Merkle root is ObenBlock's body root
-//! (docs/OBENBLOCK-MINING.md §3.3), not Bitcoin's transaction tree:
+//! (docs/DESIGN-obenblock.md §4.1). The Merkle root is Bitcoin's SHA-256d
+//! transaction tree over the wire txids (docs/OBENBLOCK-MINING.md §3.3; the
+//! rest of the body is committed in the coinbase commitment), so:
 //!
-//! * V2 standard channels receive it ready-made (`NewMiningJob.merkle_root`):
-//!   the server computes it for the channel's extranonce;
-//! * V1 sends `coinb1`, `coinb2` and the tagged-tree branch; a V1 client
-//!   computes the root with ObenBlock's rule (the `obb-merkle-root`
-//!   extension of `mining.configure` tells it the rule and the two section
-//!   roots). Firmware that folds the branch with Bitcoin's SHA-256d tree
-//!   computes a header no ObenBlock node accepts (docs/STRATUM.md).
+//! * V1 sends the header job's `stratum` object as it is (`coinb1`, `coinb2`,
+//!   the Bitcoin branch, word-swapped `prevhash`, big-endian hex fields):
+//!   stock Bitcoin firmware computes the root itself;
+//! * V2 standard channels receive the root ready-made
+//!   (`NewMiningJob.merkle_root`), computed for the channel's extranonce.
 //!
 //! [`Job::solve`] rebuilds the block of a share and checks, before anything
 //! is submitted, that the root it derived from the extranonce is the block's
@@ -33,7 +32,7 @@
 use std::sync::Arc;
 
 use crate::core::{self, pow_scheme::Sha256dParams, Block, MerkleRoot};
-use crate::mining::sha256d::{self as job_rpc, EXTRANONCE_LEN};
+use crate::mining::sha256d::{self as job_rpc, TimeWindow, EXTRANONCE_LEN};
 use crate::template::BlockTemplate;
 use gnb_smh::difficulty::{bits_to_target, Target};
 use gnb_smh::sha256d;
@@ -62,17 +61,18 @@ pub struct Job {
     /// The extranonce the candidate block carries.
     pub extranonce: [u8; EXTRANONCE_BYTES],
     /// Header fields of the job (the miner rolls nonce, the BIP 320 bits of
-    /// `version`, and `time` inside the job's stall-relief step).
+    /// `version`, and `time` inside [`Self::window`]).
     pub version: u32,
     pub time: u32,
     pub bits: u32,
     /// Header bytes 4..36: `parents_commitment`.
     pub parents_commitment: [u8; 32],
-    /// Siblings from the coinbase leaf to the transaction root (tagged tree).
+    /// Siblings of the coinbase in Bitcoin's tree, bottom-up.
     pub merkle_branch: Vec<[u8; 32]>,
-    /// The two other inputs of the body root.
-    pub shielded_root: [u8; 32],
-    pub powit_root: [u8; 32],
+    /// The `ntime` window that keeps `bits` (one stall-relief step).
+    pub window: TimeWindow,
+    /// The header job's `stratum` object (the V1 notify fields).
+    pub stratum: serde_json::Value,
 }
 
 /// Why a share could not be turned into a block of its job.
@@ -80,9 +80,10 @@ pub struct Job {
 pub enum SolveError {
     /// The version changes bits outside the BIP 320 mask.
     BadVersion(u32),
-    /// The time is before the template's latest parent time.
+    /// The time is before the job's window (`mintime`).
     TimeTooOld { time: u32, min: u64 },
-    /// The time is more than `MAX_FUTURE_SECS` ahead of this node's clock.
+    /// The time is after the job's window (`maxtime`) in the same step, or
+    /// more than `MAX_FUTURE_SECS` ahead of this node's clock.
     TimeTooNew { time: u32, max: u64 },
     /// At this time the block needs other bits than the job's (the share
     /// rolled `time` into another stall-relief step): take the newer job.
@@ -96,8 +97,8 @@ impl std::fmt::Display for SolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BadVersion(v) => write!(f, "version {v:#010x} changes bits outside the BIP 320 mask 0x1fffe000"),
-            Self::TimeTooOld { time, min } => write!(f, "time {time} is before the parents' time {min}"),
-            Self::TimeTooNew { time, max } => write!(f, "time {time} is more than 600 s ahead (max {max})"),
+            Self::TimeTooOld { time, min } => write!(f, "time {time} is before the job's mintime {min}"),
+            Self::TimeTooNew { time, max } => write!(f, "time {time} is after the job's maxtime {max}"),
             Self::BitsChanged { job_bits, bits_at_time } => write!(
                 f, "at this time the block needs bits {bits_at_time:08x}, the job has {job_bits:08x} \
                     (stall-relief step changed): take the new job"),
@@ -155,6 +156,7 @@ impl Job {
         now: u64,
     ) -> Result<Job, String> {
         let hj = job_rpc::header_job(&template, params, script_pubkey, extranonce, now)?;
+        let stratum = hj.stratum_json();
         let h = &hj.block.header;
         let time = u32::try_from(h.timestamp).map_err(|_| "job time does not fit u32".to_string())?;
         let mut parents_commitment = [0u8; 32];
@@ -164,9 +166,9 @@ impl Job {
             time,
             bits: h.bits,
             parents_commitment,
-            merkle_branch: template.coinbase_merkle_branch(),
-            shielded_root: job_rpc::empty_shielded_root(),
-            powit_root: job_rpc::powit_root(&template),
+            merkle_branch: hj.merkle_branch,
+            window: hj.window,
+            stratum,
             header: hj.header,
             coinb1: hj.coinb1,
             coinb2: hj.coinb2,
@@ -190,24 +192,10 @@ impl Job {
         b
     }
 
-    /// The header Merkle root (ObenBlock's body root) for `extranonce`.
+    /// The header Merkle root (Bitcoin's tree) for `extranonce`.
     pub fn merkle_root_for(&self, extranonce: &[u8; EXTRANONCE_BYTES]) -> Result<[u8; 32], String> {
         let txid = sha256d::sha256d(&self.coinbase_bytes(extranonce));
         job_rpc::header_merkle_root(&self.template, &txid).map(|r| r.0)
-    }
-
-    /// The Merkle root a miner computes when it folds the branch with
-    /// Bitcoin's SHA-256d tree instead (diagnostics only: a share that meets
-    /// its target only with this root comes from Bitcoin-only firmware).
-    pub fn bitcoin_tree_root_for(&self, extranonce: &[u8; EXTRANONCE_BYTES]) -> [u8; 32] {
-        let mut h = sha256d::sha256d(&self.coinbase_bytes(extranonce));
-        for s in &self.merkle_branch {
-            let mut buf = [0u8; 64];
-            buf[..32].copy_from_slice(&h);
-            buf[32..].copy_from_slice(s);
-            h = sha256d::sha256d(&buf);
-        }
-        h
     }
 
     /// The 80-byte header of a share of this job.
@@ -229,17 +217,19 @@ impl Job {
         if !sha256d::version_ok(version, self.version & !sha256d::BIP320_VERSION_MASK) {
             return Err(SolveError::BadVersion(version));
         }
-        let min = self.template.parent_timestamp;
+        // The job's window: one stall-relief step, at or after the parents,
+        // at most MAX_FUTURE_SECS ahead (of the clock at the job, and now).
+        let (min, max) = (self.window.mintime, self.window.maxtime);
         if (time as u64) < min {
             return Err(SolveError::TimeTooOld { time, min });
-        }
-        let max = now_secs().saturating_add(core::MAX_FUTURE_SECS);
-        if time as u64 > max {
-            return Err(SolveError::TimeTooNew { time, max });
         }
         let bits_at_time = bits_at(&self.template, time as u64);
         if bits_at_time != self.bits {
             return Err(SolveError::BitsChanged { job_bits: self.bits, bits_at_time });
+        }
+        let max = max.min(now_secs().saturating_add(core::MAX_FUTURE_SECS));
+        if time as u64 > max {
+            return Err(SolveError::TimeTooNew { time, max });
         }
         let root = self.merkle_root_for(extranonce).map_err(SolveError::Internal)?;
         let header = header_bytes(version, &self.parents_commitment, &root, time, self.bits, nonce);
@@ -259,7 +249,7 @@ impl Job {
         block.header.merkle_root = MerkleRoot(root);
         // Byte identity: the root from the extranonce is the block's own body
         // root, and the header hashed is the one the block serializes.
-        let body_root = block.body_merkle_root_at(self.template.activation_height);
+        let body_root = block.body_merkle_root();
         if body_root.0 != root {
             return Err(SolveError::Internal("derived Merkle root differs from the block's body root".into()));
         }

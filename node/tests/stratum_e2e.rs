@@ -6,10 +6,11 @@
 //!   the RPC header job (`getblocktemplate [{"header_job": …}]`) and the
 //!   header the node's own proof check hashes (`BlockHeader::sha256d_pow_bytes`)
 //!   are byte-identical for one template, payout script, extranonce and time.
-//! * A V1 test client (subscribe, configure version rolling and
-//!   `obb-merkle-root`, authorize with an `obb1t…` address, compute the
-//!   header root with ObenBlock's rule from the notify alone, roll the
-//!   version, search the nonce, submit) finds a block the node accepts.
+//! * A V1 test client that works exactly like stock Bitcoin firmware
+//!   (subscribe, configure version rolling, authorize with an `obb1t…`
+//!   address, build the header from the nine notify fields with Bitcoin's
+//!   SHA-256d Merkle tree, roll the version, search the nonce, submit)
+//!   finds a block the node accepts.
 //! * An SV2 test client built from SRI's own types (noise_sv2 `Initiator`,
 //!   codec_sv2 `NoiseEncoder` / `StandardNoiseDecoder`, common_messages_sv2
 //!   and mining_sv2 messages) pins the authority key, opens a standard
@@ -44,7 +45,6 @@ use gnb::{genesis_init, ingress, template, tip};
 use parking_lot::RwLock;
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
-use sha3::Sha3_256;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::sync::broadcast;
@@ -112,39 +112,26 @@ fn ctx(n: &Node) -> Arc<NodeContext> {
     Arc::new(NodeContext { dag: n.dag.clone(), store: n.store.clone(), mempool: n.mempool.clone(), min_chain_work: 0 })
 }
 
-// ── An independent client-side ObenBlock header root ─────────────────────────
-
-fn tagged(tag: &[u8], parts: &[&[u8]]) -> [u8; 32] {
-    let t: [u8; 32] = Sha256::digest(tag).into();
-    let mut h = Sha256::new();
-    h.update(t);
-    h.update(t);
-    for p in parts {
-        h.update(p);
-    }
-    h.finalize().into()
-}
+// ── An independent client-side header root (what stock firmware does) ───────
 
 fn dsha(b: &[u8]) -> [u8; 32] {
     Sha256::digest(Sha256::digest(b)).into()
 }
 
-/// docs/OBENBLOCK-MINING.md §3.3, written from the document, not the node.
-fn client_header_root(coinb1: &[u8], extranonce: &[u8], coinb2: &[u8], branch: &[[u8; 32]],
-                      shielded_root: &[u8; 32], powit_root: &[u8; 32]) -> [u8; 32] {
+/// Bitcoin's stratum root: `cur = SHA-256d(coinbase); cur = SHA-256d(cur ‖ s)`
+/// for each branch entry (written from the stratum convention, not the node).
+fn client_header_root(coinb1: &[u8], extranonce: &[u8], coinb2: &[u8], branch: &[[u8; 32]]) -> [u8; 32] {
     let mut cb = coinb1.to_vec();
     cb.extend_from_slice(extranonce);
     cb.extend_from_slice(coinb2);
-    let mut cur = tagged(b"GnB/merkle/leaf", &[&dsha(&cb)]);
+    let mut cur = dsha(&cb);
     for s in branch {
-        cur = tagged(b"GnB/merkle/node", &[&cur, s]);
+        let mut buf = [0u8; 64];
+        buf[..32].copy_from_slice(&cur);
+        buf[32..].copy_from_slice(s);
+        cur = dsha(&buf);
     }
-    let mut h = Sha3_256::new();
-    h.update(b"gnb:block:body:v2");
-    h.update(cur);
-    h.update(shielded_root);
-    h.update(powit_root);
-    h.finalize().into()
+    cur
 }
 
 fn hex32(v: &Value) -> [u8; 32] {
@@ -167,11 +154,10 @@ fn v1_client_header(notify: &Value, en1: &[u8], en2: &[u8], rolled_version: Opti
     let version = u32::from_str_radix(p[5].as_str().unwrap(), 16).unwrap();
     let bits = u32::from_str_radix(p[6].as_str().unwrap(), 16).unwrap();
     let ntime = u32::from_str_radix(p[7].as_str().unwrap(), 16).unwrap();
-    let ext = &p[9];
-    assert_eq!(ext["merkle_root_rule"], json!("gnb-body-v2"));
+    assert_eq!(p.len(), 9, "the standard nine notify parameters");
     let mut en = en1.to_vec();
     en.extend_from_slice(en2);
-    let root = client_header_root(&coinb1, &en, &coinb2, &branch, &hex32(&ext["shielded_root"]), &hex32(&ext["powit_root"]));
+    let root = client_header_root(&coinb1, &en, &coinb2, &branch);
     (header(rolled_version.unwrap_or(version), &prev, &root, ntime, bits, 0), bits)
 }
 
@@ -187,7 +173,7 @@ fn v1_v2_rpc_and_node_headers_are_byte_identical() {
     let n = regtest_node();
     let params = params();
     let tmpl = Arc::new(template::build_block_template(&n.dag, &n.store, &n.mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap());
-    assert!(core::liveness::liveness_active_at(tmpl.height), "the exits list is part of the root from height 0");
+    assert!(core::liveness::liveness_active_at(tmpl.height), "stall relief from height 0");
     let payout = payout::parse_payout_address(&obb_address(0x5A)).unwrap();
     assert_eq!(payout.script_pubkey, vec![0x5A; 20]);
     let en: [u8; 8] = [0xA1, 0xB2, 0xC3, 0xD4, 0x01, 0x02, 0x03, 0x04];
@@ -198,14 +184,19 @@ fn v1_v2_rpc_and_node_headers_are_byte_identical() {
         "coinbase_script_pubkey": hex::encode(&payout.script_pubkey), "extranonce": hex::encode(en),
     }}])), now).unwrap();
     let rpc_header: [u8; 80] = hex::decode(fields["header_job"]["header"].as_str().unwrap()).unwrap().try_into().unwrap();
-    assert_eq!(fields["powit_root"].as_str().unwrap(), hex::encode(gnb::mining::sha256d::powit_root(&tmpl)));
 
     // V1: the job a session with extranonce1 = en[..4] builds, read back from
     // mining.notify by an ObenBlock-aware client that rolls en2 = en[4..].
     let mut en1_job = [0u8; 8];
     en1_job[..4].copy_from_slice(&en[..4]);
     let v1 = Job::build(tmpl.clone(), &params, &payout.script_pubkey, en1_job, now).unwrap();
-    let notify = stratum::session::notify_params(&v1, "job-1", true, true);
+    let notify = stratum::session::notify_params(&v1, "job-1", true);
+    // The notify is getblocktemplate's `stratum` object field for field (the
+    // extranonce sits between coinb1 and coinb2, so they do not depend on it).
+    let rpc_stratum = &fields["header_job"]["stratum"];
+    for (i, k) in ["prevhash", "coinb1", "coinb2", "merkle_branch", "version", "nbits", "ntime"].iter().enumerate() {
+        assert_eq!(notify[i + 1], rpc_stratum[*k], "notify field {k}");
+    }
     let (v1_header, _) = v1_client_header(&notify, &en[..4], &en[4..], None);
     assert_eq!(v1_header, rpc_header, "V1 header == getblocktemplate header job");
     assert_eq!(v1.share_header(&en, v1.version, v1.time, 0).unwrap(), rpc_header);
@@ -289,10 +280,9 @@ async fn v1_client_mines_a_block_the_node_accepts() {
     let en1 = hex::decode(sub["result"][1].as_str().unwrap()).unwrap();
     assert_eq!(sub["result"][2], json!(4));
     send_line(&mut wr, json!({"id": 2, "method": "mining.configure",
-        "params": [["version-rolling", "obb-merkle-root"], {"version-rolling.mask": "1fffe000"}]})).await;
+        "params": [["version-rolling"], {"version-rolling.mask": "1fffe000"}]})).await;
     let conf = read_msg(&mut rd).await;
     assert_eq!(conf["result"]["version-rolling"], json!(true));
-    assert_eq!(conf["result"]["obb-merkle-root"], json!(true));
 
     // A Bitcoin address is refused; the obb1t address is accepted.
     send_line(&mut wr, json!({"id": 3, "method": "mining.authorize", "params": ["bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq", "x"]})).await;
