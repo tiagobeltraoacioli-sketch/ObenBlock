@@ -354,9 +354,9 @@ tests.
   dispatch to it by chain id): launch at the first block of epoch 4, v3
   votes of the configuration in force only, strict quorum, handoff on
   finalization, PoCI evidence, no inactivity decay. The configuration
-  weights come from a `ConfigWeights` provider (default `WindowWeights`, to
-  be replaced by the growth cap of DESIGN-obenblock.md §6.3 and the absence
-  pruning of §4.1).
+  weights come from a `ConfigWeights` provider: on ObenBlock
+  `GrowthCapWeights`, the growth cap of DESIGN-obenblock.md §6.3 (package
+  B3, below); the absence pruning of §4.1 filters on top of it.
 - `PowitState::poci` is not part of the serde encoding (GnB states are
   stored as before); the node stores it beside the state
   (`powit/poci/<block>`, `powit/pocicfg/<config id>`).
@@ -366,3 +366,41 @@ tests.
   The gossip item `ITEM_EVIDENCE` carries `PociEvidence` on ObenBlock.
 - The witness duty and `gnb-cli powitattest --config-id=<hex>` sign v3 with
   the configuration in force, recorded in the vote record (§8).
+
+## 13. Implementation (package B3, growth cap)
+
+- `core::powit::growth_cap` (`crates/gnb-crypto/src/core/powit/growth_cap.rs`):
+  `reference/obb_growth_cap.py` in Rust. `share_work`, `g_min`, `cap_step`
+  (renewal first with `R_k` = the expiring admitted credit, pro rata with
+  exact 256-bit `S` and `x_k × G / S`, the rest dropped), the ledger
+  `CapLedger` (credits per window epoch, `advance` over skipped epochs,
+  `configuration`), `epochs_to_grow`. `crates/gnb-crypto/tests/growth_cap_vectors.rs`
+  reproduces every case of `reference/obb_growth_cap_vectors.json` and the
+  flood traces (k = 2: never; k = 10, 100: exactly 71 epochs), and checks
+  that no flood up to `k = 2^64` gets strictly more than 2/3 before 71
+  epochs.
+- `GrowthCapWeights` is the `ConfigWeights` provider of `apply_block` on
+  ObenBlock. At the launch (C_1 -> C_4) and at every handoff (C_e -> C_epoch(F))
+  it advances the ledger kept in `PowitState::cap` from finalized history
+  only: share work of epoch `n = x - 2` (`epoch_work`), the first-block bits
+  of `n` (`G_min`), and the keys excluded at each `x` (bans in force at `x`,
+  counting the pending bans this handoff starts; witness exits from `x` on).
+  The configuration is the ledger's weights without the keys excluded at
+  `epoch(F)`. The provider trait takes `&mut PowitState` for this.
+- `b_n` (the block whose bits give `G_min(n)`) is the first block of epoch
+  `n` on the chain's selected chain that has a PoWit state: the block at
+  height `n × epoch_len` when the selected chain has it, and for `n = 0` the
+  block at height 1 (the genesis block has no PoWit state). `apply_block`
+  takes the block's compact bits for this; GnB ignores them.
+- On ObenBlock the state keeps share work from epoch `ledger.epoch - 1`
+  even when that is older than `window + 2` epochs, so a handoff after a
+  finality stall longer than the window reads the same finalized history
+  on every chain (memory grows by one epoch of share work per stalled
+  epoch, bounded by the share slots: at most 11,520 entries).
+- `PowitState::cap` is not part of the serde encoding. The node stores the
+  admitted credits per key per window epoch as content-addressed segments
+  of the per-epoch store (`powit/epoch/<digest>`), each ledger once
+  (`powit/capl/<ledger id>`), and per block the ledger id and the bits
+  (`powit/cap/<block>`). `getpowitinfo` reports, under `poci.growth_cap`,
+  the last step's `W`, `G`, `sum(x)`, admitted, admitted to new keys and
+  dropped.

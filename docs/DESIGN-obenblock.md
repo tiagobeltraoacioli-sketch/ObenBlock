@@ -297,7 +297,10 @@ weight_k(e) gains renew_k + admit_k
 - **`G_min(n) = floor(720 × 16 × share_work(n) / 8)`**: `16` share slots per
   block, `share_work(n)` the work of the share target of epoch `n`'s first
   block (`min(floor(2^256 / (share_target + 1)), 2^128 - 1)`), saturating at
-  `2^128 - 1`. This is 1/8 of the share work one epoch can carry.
+  `2^128 - 1`. This is 1/8 of the share work one epoch can carry. The
+  first block of epoch `n` is the first block of that epoch on the
+  chain's selected chain that has a PoWit state (for `n = 0` the block at
+  height 1: the genesis block has none).
 - **Exclusions.** A key barred at `x` (PoCI ban, exit) gets no credit at `x`
   and its work does not count in `sum(x)`; its earlier credits stay and expire
   on schedule, so it returns with the unexpired ones.

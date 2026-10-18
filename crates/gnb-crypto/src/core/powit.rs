@@ -66,7 +66,9 @@ use super::witness_share::WitnessShare;
 use super::kes::{self, KesPublic, KesSignature, KesSigner};
 use super::{read_varint, write_varint, ChainId};
 
+pub mod growth_cap;
 pub mod poci;
+use growth_cap::CapState;
 use poci::{PociEvidence, PociParams, PociState};
 
 /// 20-byte key id: SHA3-256(public key)[0..20], the same hash a
@@ -820,6 +822,12 @@ pub struct PowitState {
     /// `exited`: the node stores it beside the state.
     #[serde(skip)]
     pub poci: Option<PociState>,
+    /// The growth cap (ObenBlock, `docs/DESIGN-obenblock.md` §6.3): the
+    /// credit ledger of the configuration in force and the first-block bits
+    /// the next handoff needs; `None` on GnB. Not part of the serde encoding,
+    /// like `poci`: the node stores it beside the state.
+    #[serde(skip)]
+    pub cap: Option<CapState>,
 }
 
 impl PowitState {
@@ -843,6 +851,7 @@ impl PowitState {
             epoch: 0,
             exited: BTreeMap::new(),
             poci: None,
+            cap: None,
         }
     }
 
@@ -1103,7 +1112,7 @@ impl PowitState {
     {
         if let Some(pp) = PociParams::for_chain(chain) {
             // ObenBlock: PoCI from genesis (its evidence comes through `apply_block`).
-            return self.apply_poci(&pp, p, chain, liveness_height, b, &[], view, &mut WindowWeights);
+            return self.apply_poci(&pp, p, chain, liveness_height, b, None, &[], view, &mut GrowthCapWeights);
         }
         let exits_on = activation::is_active_at(b.height, liveness_height);
         if !b.exits.is_empty() && !exits_on {
@@ -1326,16 +1335,18 @@ impl PowitState {
 
 impl PowitState {
     /// One block under the rules of `chain`: PoCI on ObenBlock
-    /// ([`Self::apply_poci`] with the block's `poci_evidence` and the default
-    /// configuration weights, [`WindowWeights`]); PoWit on GnB
-    /// ([`Self::apply_full`]), where a block carries no PoCI evidence.
+    /// ([`Self::apply_poci`] with the block's compact `bits`, its
+    /// `poci_evidence` and the configuration weights of the growth cap,
+    /// [`GrowthCapWeights`]); PoWit on GnB ([`Self::apply_full`]), where a
+    /// block carries no PoCI evidence and `bits` are not used.
     #[allow(clippy::too_many_arguments)]
     pub fn apply_block(&self, p: &PowitParams, chain: ChainId, hardening2_height: u64, liveness_height: u64,
-                       b: &BlockInput<'_>, poci_evidence: &[PociEvidence], view: &dyn ChainView)
+                       b: &BlockInput<'_>, bits: u32, poci_evidence: &[PociEvidence], view: &dyn ChainView)
         -> Result<PowitState, String>
     {
         match PociParams::for_chain(chain) {
-            Some(pp) => self.apply_poci(&pp, p, chain, liveness_height, b, poci_evidence, view, &mut WindowWeights),
+            Some(pp) => self.apply_poci(&pp, p, chain, liveness_height, b, Some(bits), poci_evidence, view,
+                                        &mut GrowthCapWeights),
             None if !poci_evidence.is_empty() => Err("powit: PoCI evidence on a chain without PoCI".into()),
             None => self.apply_full(p, chain, hardening2_height, liveness_height, b, view),
         }
@@ -1370,9 +1381,16 @@ impl PowitState {
     /// - **No inactivity leak**: absence never changes a weight in force
     ///   (`decay` and `banned` stay empty). Exits and bans take effect at
     ///   the next handoff (the weights provider leaves exited keys out).
+    /// - **Growth cap** (DESIGN-obenblock.md §6.3): `bits` are the block's
+    ///   compact bits; the first block of each epoch on the chain records
+    ///   them (`G_min` of that epoch; `None`, as from [`Self::apply_full`],
+    ///   records nothing and that epoch's `G_min` is 0). Share work is kept
+    ///   from the epoch the next handoff starts at (`ledger.epoch - 1`) even
+    ///   past the window, so a handoff after a long finality stall still
+    ///   reads the finalized history it needs.
     #[allow(clippy::too_many_arguments)]
     pub fn apply_poci(&self, pp: &PociParams, p: &PowitParams, chain: ChainId, liveness_height: u64,
-                      b: &BlockInput<'_>, poci_evidence: &[PociEvidence], view: &dyn ChainView,
+                      b: &BlockInput<'_>, bits: Option<u32>, poci_evidence: &[PociEvidence], view: &dyn ChainView,
                       weights: &mut dyn ConfigWeights) -> Result<PowitState, String>
     {
         if self.activation != 0 {
@@ -1401,12 +1419,19 @@ impl PowitState {
         }
         let mut s = self.clone();
         let epoch = p.epoch(0, b.height);
+        if s.cap.is_none() {
+            if s.poci.is_some() {
+                return Err("powit: PoCI state without its growth cap ledger".into());
+            }
+            s.cap = Some(CapState::default());
+        }
+        let cap_from = s.cap.as_ref().map_or(0, |c| c.ledger.epoch().saturating_sub(1));
 
         // ── Epoch boundary: prune old history (no inactivity decay) ───────
         if epoch > s.epoch {
             s.active_this_epoch.clear();
             s.epoch = epoch;
-            let keep_from = epoch.saturating_sub(p.window_epochs + 2);
+            let keep_from = epoch.saturating_sub(p.window_epochs + 2).min(cap_from);
             s.epoch_work = s.epoch_work.split_off(&keep_from);
             if !s.exited.is_empty() {
                 let live: BTreeSet<KeyId> = s.epoch_work.values().flat_map(|m| m.keys().copied()).collect();
@@ -1419,12 +1444,14 @@ impl PowitState {
             s.links.retain(|_, v| !v.is_empty());
         }
 
+        s.cap.as_mut().expect("set above").note_block(epoch, bits);
+
         // ── Launch (§9) ──────────────────────────────────────────────────
         if s.poci.is_none() && epoch >= pp.bootstrap_epochs {
             let height = pp.opening(pp.bootstrap_epochs);
             let hash = view.selected_at(height).ok_or("powit: PoCI launch checkpoint is not on the selected chain")?;
             let cp = Checkpoint { height, hash };
-            let w = weights.weights(&s, pp, pp.bootstrap_epochs, &cp);
+            let w = weights.weights(&mut s, pp, pp.bootstrap_epochs, &cp)?;
             s.poci = Some(PociState::launch(pp, &w).map_err(|e| format!("powit: {e}"))?);
             s.justified = cp;
             s.finalized = cp;
@@ -1528,7 +1555,7 @@ impl PowitState {
                 s.finalized = f;
                 s.finalized_at = b.height;
                 if let Some(e) = s.poci.as_ref().and_then(|st| st.handoff_epoch(pp, &f)) {
-                    let w = weights.weights(&s, pp, e, &f);
+                    let w = weights.weights(&mut s, pp, e, &f)?;
                     s.poci.as_mut().expect("in force").finalized(pp, &f, |_| w).map_err(|e| format!("powit: {e}"))?;
                 }
             }
@@ -1545,25 +1572,88 @@ impl PowitState {
 /// applied by [`PociState`]; the provider applies everything else that
 /// decides who is in (the window, the growth cap of DESIGN-obenblock.md
 /// §6.3, absence pruning of DESIGN-obenblock-poci.md §4.1, exits).
+///
+/// The provider may update the part of `state` it derives the weights from
+/// (the growth cap's credit ledger, [`GrowthCapWeights`]): it runs exactly
+/// once per launch or handoff, on the state of the block that performs it.
 pub trait ConfigWeights {
-    fn weights(&mut self, state: &PowitState, params: &PociParams, epoch: u64, finalized: &Checkpoint)
-        -> BTreeMap<KeyId, u128>;
+    fn weights(&mut self, state: &mut PowitState, params: &PociParams, epoch: u64, finalized: &Checkpoint)
+        -> Result<BTreeMap<KeyId, u128>, String>;
 }
 
-/// The default provider until the growth cap (package O10) lands: every key's
-/// share work over epochs `epoch - window_epochs ..= epoch - 1` (history
-/// entirely below the slot opening `epoch`, as far as the state keeps it),
-/// keys that exited by `epoch` left out.
+/// The consensus provider on ObenBlock: the growth cap of DESIGN-obenblock.md
+/// §6.3 ([`growth_cap`], reference `reference/obb_growth_cap.py`). It runs
+/// the cap step for every epoch from the ledger's (the configuration in
+/// force) to `epoch`, from the finalized history of the state: share work
+/// of epoch `n = x - 2` (`epoch_work`), the first-block bits of `n`
+/// (`G_min`), and the keys excluded at each `x`. Excluded at `x`: a ban in
+/// force at `x` (counting the pending bans this handoff starts at `epoch`,
+/// as [`PociState::finalized`] will), or a witness exit from `x` on. Every
+/// input is finalized history: `n <= epoch - 2`, and an exit recorded for
+/// `x <= epoch` was included in an epoch below `epoch`, below `finalized`.
+/// It stores the new ledger in `state.cap` and returns the ledger's
+/// weights without the keys excluded at `epoch`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GrowthCapWeights;
+
+impl ConfigWeights for GrowthCapWeights {
+    fn weights(&mut self, state: &mut PowitState, params: &PociParams, epoch: u64, finalized: &Checkpoint)
+        -> Result<BTreeMap<KeyId, u128>, String>
+    {
+        let mut cap = state.cap.take().ok_or("powit: growth cap ledger missing")?;
+        let result = {
+            let st: &PowitState = state;
+            let excluded = |k: &KeyId, x: u64| -> bool {
+                if st.has_exited(k, x) {
+                    return true;
+                }
+                st.poci.as_ref().is_some_and(|p| {
+                    p.banned_at(params, k, x)
+                        || p.bans.get(k).is_some_and(|bl| bl.iter().any(|b| {
+                            b.start.is_none() && b.included_at <= finalized.height
+                                && epoch <= x && x < epoch.saturating_add(params.ban_epochs)
+                        }))
+                })
+            };
+            let work = |n: u64| st.epoch_work.get(&n);
+            let bits = |n: u64| cap.first_bits.get(&n).copied();
+            cap.ledger.advance(epoch, params.epoch_len, params.window_epochs, params.growth_div,
+                               params.g_min_epoch_div, &work, &bits, &excluded)
+                .map(|ledger| {
+                    let w = ledger.configuration(&excluded);
+                    (ledger, w)
+                })
+        };
+        match result {
+            Ok((ledger, w)) => {
+                cap.ledger = ledger;
+                cap.prune();
+                state.cap = Some(cap);
+                Ok(w)
+            }
+            Err(e) => {
+                state.cap = Some(cap);
+                Err(format!("powit: {e}"))
+            }
+        }
+    }
+}
+
+/// Plain window weights, without the growth cap (tests and comparisons; not
+/// a consensus provider): every key's share work over epochs
+/// `epoch - window_epochs ..= epoch - 1` (history entirely below the slot
+/// opening `epoch`, as far as the state keeps it), keys that exited by
+/// `epoch` left out.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WindowWeights;
 
 impl ConfigWeights for WindowWeights {
-    fn weights(&mut self, state: &PowitState, params: &PociParams, epoch: u64, _finalized: &Checkpoint)
-        -> BTreeMap<KeyId, u128>
+    fn weights(&mut self, state: &mut PowitState, params: &PociParams, epoch: u64, _finalized: &Checkpoint)
+        -> Result<BTreeMap<KeyId, u128>, String>
     {
         let mut out: BTreeMap<KeyId, u128> = BTreeMap::new();
         if epoch == 0 {
-            return out;
+            return Ok(out);
         }
         let lo = epoch.saturating_sub(params.window_epochs);
         for (_, m) in state.epoch_work.range(lo..epoch) {
@@ -1574,7 +1664,7 @@ impl ConfigWeights for WindowWeights {
                 }
             }
         }
-        out
+        Ok(out)
     }
 }
 

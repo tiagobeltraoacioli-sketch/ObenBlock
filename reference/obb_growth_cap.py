@@ -40,7 +40,9 @@ is n = x-2, the one leaving it is o = x-2-window (none while o < 0):
 
     G_min(n) = floor(epoch_len * MAX_SHARES_PER_BLOCK * share_work(b_n) / 8)
                (saturating at 2^128-1), b_n = the compact bits of the first
-               block of epoch n (height act + n * epoch_len), share_work(b) =
+               block of epoch n (height act + n * epoch_len; on a chain, the
+               first block of epoch n on its selected chain that has a PoWit
+               state, so for n = 0 the block at height 1), share_work(b) =
                min(floor(2^256 / (share_target + 1)), 2^128-1), share_target =
                min(target(b) * 16, 2^256-1), malformed bits -> 0 work.
                That is 1/8 of the share work an epoch can carry (16 slots per

@@ -13,6 +13,9 @@ const CHAIN: ChainId = ChainId::ObenBlockRegtest;
 const P: PowitParams = OBENBLOCK_REGTEST_PARAMS;
 const PP: PociParams = OBB_REGTEST_POCI;
 const W: u128 = 1_000;
+/// Every block's compact bits: share work 1 at the share target, so the
+/// growth cap's `G_min` is `20 × 16 × 1 / 8 = 40` per epoch.
+const BITS: u32 = 0x207F_FFFF;
 
 struct Key(std::cell::RefCell<KesSigner>);
 
@@ -64,18 +67,22 @@ struct Harness {
     st: PowitState,
     h: u64,
     shares: Vec<KeyId>,
+    /// Share work of other keys in every block.
+    extra: Vec<(KeyId, u128)>,
 }
 
 impl Harness {
     fn new(keys: &[&Key]) -> Harness {
-        Harness { st: PowitState::genesis(0, hash(0)), h: 0, shares: keys.iter().map(|k| k.id()).collect() }
+        Harness { st: PowitState::genesis(0, hash(0)), h: 0, shares: keys.iter().map(|k| k.id()).collect(),
+                  extra: Vec::new() }
     }
 
     fn try_block(&self, atts: &[Attestation], ev: &[PociEvidence]) -> Result<PowitState, String> {
         let h = self.h + 1;
-        let sw: Vec<(KeyId, u128)> = self.shares.iter().map(|k| (*k, W)).collect();
+        let mut sw: Vec<(KeyId, u128)> = self.shares.iter().map(|k| (*k, W)).collect();
+        sw.extend(self.extra.iter().copied());
         let input = BlockInput { height: h, hash: hash(h), share_work: &sw, attestations: atts, evidence: &[], exits: &[] };
-        self.st.apply_block(&P, CHAIN, 0, 0, &input, ev, &Chain(h))
+        self.st.apply_block(&P, CHAIN, 0, 0, &input, BITS, ev, &Chain(h))
     }
 
     fn block(&mut self, atts: &[Attestation], ev: &[PociEvidence]) {
@@ -156,9 +163,12 @@ fn launch_bootstrap_then_strict_quorum_handoff_and_v3_only() {
     let c4 = c.config();
     assert_eq!(c4.epoch(), 4);
     assert_eq!(c4.len(), 4);
-    // Shares of heights 1..=79 (epochs 0..=3), 1000 each.
-    assert!(c4.entries().iter().all(|(_, w)| *w == 79 * W));
-    assert_eq!(c4.total(), 4 * 79 * W);
+    // The growth cap (DESIGN-obenblock.md §6.3) from W = 0: the cap steps
+    // for C_2, C_3, C_4 (epochs 0, 1, 2 entering the window) each admit
+    // G_min = 40, pro rata over four equal keys, 10 each.
+    assert!(c4.entries().iter().all(|(_, w)| *w == 30));
+    assert_eq!(c4.total(), 120);
+    assert_eq!(c.st.cap.as_ref().unwrap().ledger.epoch(), 4);
     c.to(85);
 
     // Half the weight justifies nothing; a third key (75 %) does.
@@ -195,8 +205,8 @@ fn launch_bootstrap_then_strict_quorum_handoff_and_v3_only() {
     }
     let c5 = c.config();
     assert_ne!(c5.id(), c4.id());
-    // C_5 from the history below slot 100 (epochs 0..=4), weights frozen while in force.
-    assert!(c5.entries().iter().all(|(_, w)| *w == 99 * W));
+    // C_5: one more cap step (epoch 3 entering; G = max(120 / 64, 40) = 40).
+    assert!(c5.entries().iter().all(|(_, w)| *w == 40));
     assert_eq!(c.st.poci.as_ref().unwrap().previous().unwrap().id(), c4.id());
     // Votes under the old configuration are refused now.
     c.to(110);
@@ -237,7 +247,7 @@ fn evidence_bans_from_the_next_handoff_and_keeps_the_configuration_in_force() {
     // Not GnB's equivocation proofs on a PoCI chain.
     let gnb = BlockInput { height: c.h + 1, hash: hash(c.h + 1), share_work: &[], attestations: &[],
                            evidence: &[Equivocation { a: a.clone(), b: b.clone() }], exits: &[] };
-    assert!(c.st.apply_block(&P, CHAIN, 0, 0, &gnb, &[], &Chain(c.h + 1)).is_err());
+    assert!(c.st.apply_block(&P, CHAIN, 0, 0, &gnb, BITS, &[], &Chain(c.h + 1)).is_err());
     // Identical votes and unknown configurations are not evidence.
     let same = PociEvidence { config_id: c4.id(), a: a.clone(), b: a.clone() };
     assert!(c.try_block(&[], &[same]).unwrap_err().contains("identical"));
@@ -304,7 +314,7 @@ fn poci_body_format() {
     // GnB rejects PoCI evidence.
     let st = PowitState::genesis(0, hash(0));
     let input = BlockInput { height: 1, hash: hash(1), share_work: &[], attestations: &[], evidence: &[], exits: &[] };
-    assert!(st.apply_block(&TESTNET_PARAMS, ChainId::Testnet, 0, 0, &input, &[ev], &Chain(1)).is_err());
+    assert!(st.apply_block(&TESTNET_PARAMS, ChainId::Testnet, 0, 0, &input, BITS, &[ev], &Chain(1)).is_err());
 }
 
 #[test]
@@ -352,4 +362,59 @@ fn kes_certificates_and_registry_proofs() {
     let ev = PociEvidence { config_id: cfg.id(), a, b };
     let (va, vb) = ev.votes();
     assert_eq!(check_evidence(&PP, &va, &vb, |id| (*id == cfg.id()).then_some(&cfg)), Ok(EvidenceKind::Double));
+}
+
+/// The growth cap at the PoCI handoff (DESIGN-obenblock.md §6.3): a newcomer
+/// whose share work dwarfs the members' gets only the budget `G` of each cap
+/// step, members that keep mining renew their credits first, and every
+/// configuration's weights are the ledger's credits.
+#[test]
+fn handoffs_run_the_growth_cap() {
+    let keys: Vec<Key> = (61..=64).map(Key::new).collect();
+    let k: Vec<&Key> = keys.iter().collect();
+    let newcomer: KeyId = [0x77; 20];
+    let mut c = Harness::new(&k);
+    c.to(79);
+    // From epoch 4 on, a newcomer brings 1000 times the members' work.
+    c.extra.push((newcomer, 1_000 * W));
+    c.block(&[], &[]);
+    assert_eq!(c.config().epoch(), 4);
+    let mut slot = 80;
+    let mut seen = BTreeMap::new();
+    while slot < 145 {
+        slot += 5;
+        c.to(slot);
+        // All four members: the newcomer's capped weight is in the totals.
+        let v = c.votes(&k, slot);
+        c.block(&v, &[]);
+        let cfg = c.config();
+        if seen.insert(cfg.epoch(), cfg.id()).is_none() && cfg.epoch() > 4 {
+            let cap = c.st.cap.as_ref().unwrap();
+            assert_eq!(cap.ledger.epoch(), cfg.epoch());
+            let r = *cap.ledger.report().unwrap();
+            assert_eq!(r.epoch, cfg.epoch());
+            // The configuration is the ledger's weights.
+            let w: Vec<(KeyId, u128)> = cap.ledger.weights().into_iter().collect();
+            assert_eq!(cfg.entries(), &w[..]);
+            // The newcomer gets at most G per step, whatever its work.
+            let prev = c.st.poci.as_ref().unwrap().previous().unwrap().weight(&newcomer).unwrap_or(0);
+            let now = cfg.weight(&newcomer).unwrap_or(0);
+            assert!(now - prev <= r.g, "epoch {}: {now} - {prev} > {}", cfg.epoch(), r.g);
+            assert!(r.dropped > primitive_types::U256::zero() || now == 0);
+        }
+    }
+    // C_5 (epoch 3 entering) has no newcomer work yet; C_6 and C_7 do.
+    assert_eq!(c.config().epoch(), 7);
+    let c7 = c.config();
+    let nw = c7.weight(&newcomer).unwrap();
+    assert!(nw > 0 && 3 * nw < c7.total(), "capped: {nw} of {}", c7.total());
+    // Members keep every credit they renew.
+    for key in &k {
+        assert!(c7.weight(&key.id()).unwrap() >= 40);
+    }
+    // Skipped bits never stop the cap: every epoch's first block recorded its bits
+    // (kept only from the ledger's epoch - 1).
+    let cap = c.st.cap.as_ref().unwrap();
+    assert!(cap.first_bits.keys().all(|e| *e + 1 >= cap.ledger.epoch()));
+    assert!(cap.first_bits.values().all(|b| *b == BITS));
 }
