@@ -1,0 +1,49 @@
+# systemd unit for the ObenBlock stratum server (solo pool), next to the node.
+#   /opt/obenblock/bin/obenblock-stratum      server binary (tools/obenblock-stratum)
+#   /etc/obenblock/stratum.env                OBB_STRATUM_* settings (stratum.env.example)
+#   /etc/obenblock/rpc.key                    the node's RPC API key (first line), 0640 root:obb-stratum
+# Miners connect to TCP 3333 (OBB_STRATUM_LISTEN); metrics on 127.0.0.1:9333.
+[Unit]
+Description=ObenBlock stratum server (Stratum V1, solo pool)
+After=network-online.target gnb-node.service
+Wants=network-online.target
+
+[Service]
+User=obb-stratum
+Group=obb-stratum
+EnvironmentFile=/etc/obenblock/stratum.env
+ExecStart=/opt/obenblock/bin/obenblock-stratum
+Restart=always
+RestartSec=5
+# One socket per miner connection.
+LimitNOFILE=65536
+MemoryMax=1G
+UMask=0077
+
+# ── Sandboxing (as gnb-node.service; deploy/test_deploy_files.py) ───────────
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
