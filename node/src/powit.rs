@@ -1438,6 +1438,57 @@ fn anchor_in_force(setting: AnchorSetting) -> Option<Anchor> {
     }
 }
 
+/// Review round 2 of the PoWit finality pin, H1: the target of a vote of
+/// `block` that authentically claims a finality newer than the node's: its
+/// source lies above `floor` (`ingress::finality_claim_floor`), and it is
+/// signed, under the message of `block`'s rules, by a key with weight in the
+/// witness set `state` (the node's selected tip's PoWit state) derives for
+/// the vote's target epoch under those rules. From the second hardening
+/// activation a chain that shares the node's finality reads the same frozen
+/// finalized window (`PowitState::h2_window_epoch`); before it, the node's
+/// own share history of the target's window. At most `max_checks`
+/// signatures are verified (membership is checked first). Whether the
+/// target lies on the chain the vote reaches the node along is checked by
+/// `ingress::OrphanPool::claim_backs`.
+pub fn authenticated_finality_claim(block: &Block, floor: u64, state: &PowitState, max_checks: usize) -> Option<Hash> {
+    let p = powit::params();
+    let chain = core::node_chain_id();
+    let act = state.activation;
+    let h2 = hardening2_height();
+    let regime = Regime::at(block.height, h2);
+    let msg_h2 = if regime == Regime::Hardening2 { h2 } else { activation::NEVER };
+    let mut v1_sets: Vec<(u64, Vec<(KeyId, u128)>)> = Vec::new();
+    let mut checks = 0usize;
+    for a in &block.powit.attestations {
+        if a.source.height <= floor || a.target.height <= a.source.height || a.target.height < act {
+            continue;
+        }
+        let te = p.epoch(act, a.target.height);
+        let key = a.key_id();
+        let member = match regime {
+            Regime::Hardening2 => state.member_weight_h2(&p, te, &key).is_some(),
+            Regime::V1 => {
+                if !v1_sets.iter().any(|(e, _)| *e == te) {
+                    v1_sets.push((te, state.witness_set(&p, te)));
+                }
+                v1_sets.iter().find(|(e, _)| *e == te)
+                    .is_some_and(|(_, set)| set.iter().any(|(k, w)| *k == key && *w > 0))
+            }
+        };
+        if !member {
+            continue;
+        }
+        if checks >= max_checks {
+            return None;
+        }
+        checks += 1;
+        if a.verify_signature_at(chain, &p, act, msg_h2) {
+            return Some(a.target.hash);
+        }
+    }
+    None
+}
+
 /// The applied tip: the block the UTXO set sits on (the persisted tip
 /// pointer), else, for a store without one the DAG knows (fixtures), the
 /// selected tip.
