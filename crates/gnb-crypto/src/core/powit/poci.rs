@@ -74,6 +74,12 @@ pub const POCI_G_MIN_EPOCH_DIV: u64 = 8;
 /// Absence pruning (§4.1): a key of `C_e` with no included vote in the
 /// finalized history of the last this many epochs leaves the next configuration.
 pub const POCI_PRUNE_AFTER_EPOCHS: u64 = 4;
+/// Domain of the rejoin message (§4.1).
+pub const DS_REJOIN: &[u8] = b"OBB-POCI-v1/rejoin";
+/// Rejoin messages one block may carry.
+pub const MAX_REJOINS_PER_BLOCK: usize = 4;
+/// Length of the rejoin message preimage.
+pub const REJOIN_PREIMAGE_LEN: usize = 67;
 /// Length of the v3 message preimage.
 pub const V3_PREIMAGE_LEN: usize = 171;
 /// Length of the configuration id preimage.
@@ -155,6 +161,16 @@ pub const OBB_REGTEST_POCI: PociParams = PociParams {
     vote_ttl: 20,
     ..OBB_MAINNET_POCI
 };
+
+/// What [`PociState::trim_seen`] relies on: a checkpoint finalized by a
+/// block lies less than two epochs below it (`vote_ttl + checkpoint_interval
+/// < 2 epoch_len`), so a block of epoch `E` hands off to an epoch `>= E - 2`.
+pub const fn params_bound_the_finalized_lag(p: &PociParams) -> bool {
+    p.vote_ttl + p.checkpoint_interval < 2 * p.epoch_len && p.checkpoint_interval > 0 && p.epoch_len > 0
+}
+
+const _: () = assert!(params_bound_the_finalized_lag(&OBB_MAINNET_POCI));
+const _: () = assert!(params_bound_the_finalized_lag(&OBB_REGTEST_POCI));
 
 impl PociParams {
     /// The PoCI parameters of `chain`; `None` for GnB, which keeps PoWit.
@@ -524,6 +540,28 @@ pub fn attestation_message_v3(chain_id: u32, config_id: &[u8; 32], witness: &Kes
     Sha3_256::digest(attestation_message_v3_preimage(chain_id, config_id, witness, source, target)).into()
 }
 
+/// The 67-byte preimage of [`rejoin_message`].
+pub fn rejoin_message_preimage(chain_id: u32, witness: &KesPublic, epoch: u64) -> Vec<u8> {
+    let mut out = Vec::with_capacity(REJOIN_PREIMAGE_LEN);
+    out.extend_from_slice(&(DS_REJOIN.len() as u32).to_le_bytes());
+    out.extend_from_slice(DS_REJOIN);
+    out.extend_from_slice(&chain_id.to_le_bytes());
+    out.push(witness.depth);
+    out.extend_from_slice(&witness.root);
+    out.extend_from_slice(&epoch.to_le_bytes());
+    out
+}
+
+/// The digest a pruned key signs, with the KES leaf of `epoch`, to return
+/// (§4.1):
+///
+/// ```text
+/// SHA3-256( u32le(18) ‖ "OBB-POCI-v1/rejoin" ‖ u32le(chain_id) ‖ u8(depth) ‖ root[32] ‖ u64le(epoch) )
+/// ```
+pub fn rejoin_message(chain_id: u32, witness: &KesPublic, epoch: u64) -> [u8; 32] {
+    Sha3_256::digest(rejoin_message_preimage(chain_id, witness, epoch)).into()
+}
+
 /// Strictly more than two thirds (§3): `3 got > 2 total`, exact. With
 /// `got <= total` it is `got > 2 (total - got)`, false when that overflows;
 /// `got > total` (never for a registry) is `got > 0`. An empty
@@ -763,27 +801,36 @@ impl Attestation {
     }
 }
 
-/// Weight of the distinct keys of `config` with a valid vote for
-/// `source -> target` naming `config.id()`; a vote naming another
-/// configuration counts nowhere (reference `counted_weight`).
-pub fn counted_weight<S: VoteScheme>(params: &PociParams, config: &Configuration, votes: &[PociVote<S>],
-                                     source: &Checkpoint, target: &Checkpoint) -> u128 {
+/// The distinct keys of `config` with a valid vote for `source -> target`
+/// naming `config.id()`, in vote order (reference `counted_keys`); a vote
+/// naming another configuration counts nowhere.
+pub fn counted_keys<S: VoteScheme>(params: &PociParams, config: &Configuration, votes: &[PociVote<S>],
+                                   source: &Checkpoint, target: &Checkpoint) -> Vec<KeyId> {
     let id = config.id();
     let mut seen = std::collections::BTreeSet::new();
-    let mut got: u128 = 0;
+    let mut out = Vec::new();
     for v in votes {
         if v.config_id != id || v.source != *source || v.target != *target {
             continue;
         }
         let k = v.key_id();
-        let Some(w) = config.weight(&k) else { continue };
-        if seen.contains(&k) || !v.verify(params) {
+        if config.weight(&k).is_none() || seen.contains(&k) || !v.verify(params) {
             continue;
         }
         seen.insert(k);
-        got = got.saturating_add(w); // distinct entries: never above the total
+        out.push(k);
     }
-    got
+    out
+}
+
+/// Weight of the distinct keys of `config` with a valid vote for
+/// `source -> target` naming `config.id()`; a vote naming another
+/// configuration counts nowhere (reference `counted_weight`).
+pub fn counted_weight<S: VoteScheme>(params: &PociParams, config: &Configuration, votes: &[PociVote<S>],
+                                     source: &Checkpoint, target: &Checkpoint) -> u128 {
+    // Distinct entries: never above the total.
+    counted_keys(params, config, votes, source, target).iter()
+        .fold(0u128, |got, k| got.saturating_add(config.weight(k).unwrap_or(0)))
 }
 
 // ── Casper FFG under one configuration ───────────────────────────────────────
@@ -971,6 +1018,55 @@ impl Ban {
     }
 }
 
+/// Absence pruning (§4.1): the key is left out of every configuration from
+/// epoch `start` on, until a finalized rejoin ends it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Prune {
+    pub start: u64,
+    /// Set only while the handoff that a finalized rejoin ends it at computes
+    /// its configuration (the key is not excluded from that epoch on); never
+    /// stored.
+    pub until: Option<u64>,
+}
+
+impl Prune {
+    pub fn covers(&self, epoch: u64) -> bool {
+        self.start <= epoch && self.until.is_none_or(|u| epoch < u)
+    }
+}
+
+/// Why a rejoin message is invalid (reference verdict strings, [`Self::as_str`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RejoinReject {
+    /// The including block is at or below the finalized checkpoint.
+    BelowFinality,
+    /// Not signed for the block's epoch or the one before.
+    Epoch,
+    /// The key is not pruned.
+    NotPruned,
+    /// The key already has a rejoin waiting for finality.
+    Pending,
+    Signature,
+}
+
+impl RejoinReject {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RejoinReject::BelowFinality => "below_finality",
+            RejoinReject::Epoch => "epoch",
+            RejoinReject::NotPruned => "not_pruned",
+            RejoinReject::Pending => "pending",
+            RejoinReject::Signature => "signature",
+        }
+    }
+}
+
+impl std::fmt::Display for RejoinReject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "poci rejoin: {}", self.as_str())
+    }
+}
+
 /// The configurations a chain has had in force, newest first; shared
 /// between the states of one chain (each handoff adds one node).
 #[derive(Debug)]
@@ -980,26 +1076,40 @@ struct HistoryNode {
 }
 
 /// PoCI state of one chain (reference `PociChain`, without the checkpoints,
-/// which `PowitState` keeps): the configuration in force, the ones before it
-/// and the bans. The checkpoints and the vote tally are the caller's.
+/// which `PowitState` keeps): the configuration in force, the ones before it,
+/// the bans, and the absence-pruning ledger (§4.1). The checkpoints and the
+/// vote tally are the caller's.
 #[derive(Clone, Debug)]
 pub struct PociState {
     head: Arc<HistoryNode>,
     /// key -> its bans, latest last.
     pub bans: BTreeMap<KeyId, Vec<Ban>>,
+    /// Keys pruned for absence (§4.1), until a finalized rejoin.
+    pub pruned: BTreeMap<KeyId, Prune>,
+    /// Pruned keys with a rejoin included (at that height) and not yet final.
+    pub rejoins: BTreeMap<KeyId, u64>,
+    /// Included votes of the configuration's keys: key -> (epoch of the
+    /// including block -> the lowest `included_at` in it). The reference keeps
+    /// every height; the lowest per epoch answers the same question
+    /// ([`Self::present`]), and [`Self::trim_seen`] drops the epochs no later
+    /// handoff can read.
+    pub seen: BTreeMap<KeyId, BTreeMap<u64, u64>>,
 }
 
 impl PartialEq for PociState {
     fn eq(&self, o: &Self) -> bool {
-        self.bans == o.bans && self.history().map(|c| c.id()).eq(o.history().map(|c| c.id()))
+        self.bans == o.bans && self.pruned == o.pruned && self.rejoins == o.rejoins && self.seen == o.seen
+            && self.history().map(|c| c.id()).eq(o.history().map(|c| c.id()))
     }
 }
 
 impl Eq for PociState {}
 
 /// The weights of a new configuration (DESIGN-obenblock.md §6.3, package
-/// O10, the growth cap; §4.1 absence pruning): candidate weights of `C_epoch`
-/// computed from the finalized history up to `finalized`, before bans.
+/// O10, the growth cap): candidate weights of `C_epoch` computed from the
+/// finalized history up to `finalized`, of every key with weight, including
+/// the keys the ledger excludes at that epoch (bans, absence pruning); the
+/// ledger leaves those out.
 pub trait WeightProvider {
     fn weights(&mut self, epoch: u64, finalized: &Checkpoint) -> BTreeMap<KeyId, u128>;
 }
@@ -1016,17 +1126,28 @@ impl PociState {
     /// epoch `bootstrap_epochs`).
     pub fn launch(params: &PociParams, weights: &BTreeMap<KeyId, u128>) -> Result<Self, ConfigError> {
         let config = Configuration::from_weights(params, params.bootstrap_epochs, weights)?;
-        Ok(PociState { head: Arc::new(HistoryNode { config: Arc::new(config), prev: None }), bans: BTreeMap::new() })
+        Ok(PociState { head: Arc::new(HistoryNode { config: Arc::new(config), prev: None }), bans: BTreeMap::new(),
+                       pruned: BTreeMap::new(), rejoins: BTreeMap::new(), seen: BTreeMap::new() })
     }
 
     /// A state from its configurations (newest first, the one in force at
-    /// index 0) and bans: what the node stores.
+    /// index 0) and bans, with an empty pruning ledger ([`Self::with_ledger`]
+    /// sets it): what the node stores.
     pub fn from_history(history: Vec<Arc<Configuration>>, bans: BTreeMap<KeyId, Vec<Ban>>) -> Option<Self> {
         let mut head: Option<Arc<HistoryNode>> = None;
         for config in history.into_iter().rev() {
             head = Some(Arc::new(HistoryNode { config, prev: head }));
         }
-        Some(PociState { head: head?, bans })
+        Some(PociState { head: head?, bans, pruned: BTreeMap::new(), rejoins: BTreeMap::new(), seen: BTreeMap::new() })
+    }
+
+    /// `self` with the absence-pruning ledger of a stored state.
+    pub fn with_ledger(mut self, pruned: BTreeMap<KeyId, Prune>, rejoins: BTreeMap<KeyId, u64>,
+                       seen: BTreeMap<KeyId, BTreeMap<u64, u64>>) -> Self {
+        self.pruned = pruned;
+        self.rejoins = rejoins;
+        self.seen = seen;
+        self
     }
 
     /// The configuration in force.
@@ -1061,6 +1182,19 @@ impl PociState {
         })
     }
 
+    /// `key` is excluded from `C_epoch` by absence pruning (§4.1).
+    pub fn pruned_at(&self, key: &KeyId, epoch: u64) -> bool {
+        self.pruned.get(key).is_some_and(|p| p.covers(epoch))
+    }
+
+    /// Banned or pruned at `epoch`: what a [`WeightProvider`] (or
+    /// `ConfigWeights`) leaves out of the epochs a handoff covers, e.g. the
+    /// growth cap's excluded keys. Valid for every epoch up to the one a
+    /// handoff in progress enters.
+    pub fn excluded_at(&self, params: &PociParams, key: &KeyId, epoch: u64) -> bool {
+        self.banned_at(params, key, epoch) || self.pruned_at(key, epoch)
+    }
+
     /// The epoch of the configuration that finalizing `f` under the one in
     /// force hands off to, if any (§4: `epoch(f) > e`).
     pub fn handoff_epoch(&self, params: &PociParams, f: &Checkpoint) -> Option<u64> {
@@ -1068,25 +1202,139 @@ impl PociState {
         (e > self.config().epoch()).then_some(e)
     }
 
-    /// §4 + §5: `f` was finalized under the configuration in force. If it
-    /// hands off ([`Self::handoff_epoch`]), every pending ban whose evidence
-    /// `f` finalizes starts at the new epoch, and `C_epoch(f)` enters into
-    /// force from `weights` (the provider's, for that epoch and `f`) minus
-    /// the keys banned in it. Returns whether it handed off.
-    pub fn finalized(&mut self, params: &PociParams, f: &Checkpoint, weights: impl FnOnce(u64) -> BTreeMap<KeyId, u128>)
-        -> Result<bool, ConfigError>
-    {
-        let Some(e) = self.handoff_epoch(params, f) else { return Ok(false) };
+    /// Record that a block included a vote of `key` at `included_at` (module
+    /// docs, "Heights"). Only keys of the configuration in force can have one.
+    pub fn record_vote(&mut self, params: &PociParams, key: &KeyId, included_at: u64) {
+        if self.config().weight(key).is_none() {
+            return;
+        }
+        let bucket = params.epoch_of(included_at.saturating_sub(1));
+        let m = self.seen.entry(*key).or_default().entry(bucket).or_insert(included_at);
+        *m = (*m).min(included_at);
+    }
+
+    /// §4.1: a vote of `key` was included at a height `h` with
+    /// `opening(x - PRUNE_AFTER) < h <= f.height` (in the history finalized by
+    /// `f`, within the last `PRUNE_AFTER` epochs before `x`). The lowest
+    /// inclusion of each block epoch decides: a block epoch `y` holds heights
+    /// in `(opening(y), opening(y + 1)]`, so an inclusion of `y` inside the
+    /// bounds exists iff its lowest one is inside them.
+    pub fn present(&self, params: &PociParams, key: &KeyId, x: u64, f: &Checkpoint) -> bool {
+        let lo = params.opening(x.saturating_sub(POCI_PRUNE_AFTER_EPOCHS));
+        self.seen.get(key).is_some_and(|m| m.values().any(|&h| lo < h && h <= f.height))
+    }
+
+    /// §4.1: `key` has been an entry of every configuration in force since
+    /// epoch `x - PRUNE_AFTER` or earlier (a key that entered later is in its
+    /// grace period).
+    pub fn prune_eligible(&self, key: &KeyId, x: u64) -> bool {
+        for c in self.history() {
+            if c.weight(key).is_none() {
+                return false;
+            }
+            if c.epoch().saturating_add(POCI_PRUNE_AFTER_EPOCHS) <= x {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The weight of the configuration in force with no vote included in a
+    /// block of `epoch` (`getpowitinfo`, §4.1: operators see absent weight
+    /// grow long before it reaches a third). Not final: blocks above the
+    /// finalized checkpoint count too.
+    pub fn absent_weight(&self, epoch: u64) -> u128 {
+        self.config().entries().iter()
+            .filter(|(k, _)| !self.seen.get(k).is_some_and(|m| m.contains_key(&epoch)))
+            .fold(0u128, |a, (_, w)| a.saturating_add(*w))
+    }
+
+    /// Drop the included votes no later handoff reads, for a chain whose
+    /// blocks are now in epoch `block_epoch`: such a block finalizes a
+    /// checkpoint of epoch `>= block_epoch - 2`
+    /// ([`params_bound_the_finalized_lag`]), whose handoff reads inclusions
+    /// above `opening(block_epoch - 2 - PRUNE_AFTER)` only. Never changes a
+    /// verdict; it bounds the ledger at `PRUNE_AFTER + 3` epochs per key.
+    pub fn trim_seen(&mut self, block_epoch: u64) {
+        let keep = block_epoch.saturating_sub(2 + POCI_PRUNE_AFTER_EPOCHS);
+        for m in self.seen.values_mut() {
+            m.retain(|y, _| *y >= keep);
+        }
+        self.seen.retain(|_, m| !m.is_empty());
+    }
+
+    /// The first half of a handoff (§4, §4.1, §5): `f` was finalized under
+    /// the configuration in force. If it hands off to `x`
+    /// ([`Self::handoff_epoch`]): every pending ban whose evidence `f`
+    /// finalizes starts at `x`; every pending rejoin `f` finalizes ends its
+    /// key's pruning at `x`; every key of the configuration in force that has
+    /// been an entry since `x - PRUNE_AFTER` or earlier with no vote included
+    /// in `(opening(x - PRUNE_AFTER), f.height]` is pruned from `x`. Returns
+    /// `x`; the caller computes the candidate weights (with this state) and
+    /// calls [`Self::enter`].
+    pub fn begin_handoff(&mut self, params: &PociParams, f: &Checkpoint) -> Option<u64> {
+        let x = self.handoff_epoch(params, f)?;
         for bl in self.bans.values_mut() {
             for b in bl.iter_mut() {
                 if b.start.is_none() && b.included_at <= f.height {
-                    b.start = Some(e);
+                    b.start = Some(x);
                 }
             }
         }
-        let w: BTreeMap<KeyId, u128> = weights(e).into_iter().filter(|(k, _)| !self.banned_at(params, k, e)).collect();
-        let config = Configuration::from_weights(params, e, &w)?;
+        let done: Vec<KeyId> = self.rejoins.iter().filter(|(_, h)| **h <= f.height).map(|(k, _)| *k).collect();
+        for k in done {
+            self.rejoins.remove(&k);
+            if let Some(p) = self.pruned.get_mut(&k) {
+                p.until = Some(x);
+            }
+        }
+        let absent: Vec<KeyId> = self.config().entries().iter().map(|(k, _)| *k)
+            .filter(|k| !self.pruned.contains_key(k) && self.prune_eligible(k, x) && !self.present(params, k, x, f))
+            .collect();
+        for k in absent {
+            self.pruned.insert(k, Prune { start: x, until: None });
+        }
+        Some(x)
+    }
+
+    /// The second half of a handoff: `C_x` enters into force from the
+    /// provider's `candidates`, without the keys banned or pruned at `x` and
+    /// those `also_excluded` (exits, which the PoWit state keeps). A pruned
+    /// key without candidate weight (no share work left) is forgotten; the
+    /// included votes are kept for the keys of `C_x` only.
+    pub fn enter(&mut self, params: &PociParams, x: u64, candidates: &BTreeMap<KeyId, u128>,
+                 also_excluded: &dyn Fn(&KeyId) -> bool) -> Result<(), ConfigError>
+    {
+        let forgotten: Vec<KeyId> = self.pruned.iter()
+            .filter(|(k, p)| p.until.is_none() && candidates.get(*k).is_none_or(|w| *w == 0))
+            .map(|(k, _)| *k).collect();
+        for k in forgotten {
+            self.pruned.remove(&k);
+            self.rejoins.remove(&k);
+        }
+        let w: BTreeMap<KeyId, u128> = candidates.iter()
+            .filter(|(k, w)| **w > 0 && !self.excluded_at(params, k, x) && !also_excluded(k))
+            .map(|(k, w)| (*k, *w)).collect();
+        let config = Configuration::from_weights(params, x, &w)?;
         self.head = Arc::new(HistoryNode { config: Arc::new(config), prev: Some(self.head.clone()) });
+        self.pruned.retain(|_, p| p.until.is_none());
+        let cfg = self.head.config.clone();
+        let keep_from = x.saturating_sub(3);
+        self.seen.retain(|k, m| {
+            m.retain(|y, _| *y >= keep_from);
+            cfg.weight(k).is_some() && !m.is_empty()
+        });
+        Ok(())
+    }
+
+    /// §4 + §4.1 + §5 in one call ([`Self::begin_handoff`], then
+    /// [`Self::enter`] with `weights(self, x)`). Returns whether it handed off.
+    pub fn finalized(&mut self, params: &PociParams, f: &Checkpoint,
+                     weights: impl FnOnce(&PociState, u64) -> BTreeMap<KeyId, u128>) -> Result<bool, ConfigError>
+    {
+        let Some(x) = self.begin_handoff(params, f) else { return Ok(false) };
+        let w = weights(self, x);
+        self.enter(params, x, &w, &|_| false)?;
         Ok(true)
     }
 
@@ -1094,7 +1342,7 @@ impl PociState {
     pub fn finalized_with(&mut self, params: &PociParams, f: &Checkpoint, provider: &mut dyn WeightProvider)
         -> Result<bool, ConfigError>
     {
-        self.finalized(params, f, |e| provider.weights(e, f))
+        self.finalized(params, f, |_, e| provider.weights(e, f))
     }
 
     /// Admit evidence included at `included_at` above the finalized
@@ -1126,6 +1374,43 @@ impl PociState {
                 _ => return Err(EvidenceReject::BanPendingOrActive),
             }
         }
+        Ok(())
+    }
+
+    /// What a block checks of a rejoin before its signature (reference
+    /// `PociChain.rejoin`, first failure wins): included above the finalized
+    /// checkpoint, signed for the block's epoch or the one before, the key
+    /// pruned and without a rejoin pending.
+    pub fn may_rejoin(&self, included_at: u64, finalized_height: u64, block_epoch: u64, key: &KeyId, epoch: u64)
+        -> Result<(), RejoinReject>
+    {
+        if included_at <= finalized_height {
+            return Err(RejoinReject::BelowFinality);
+        }
+        if !(epoch <= block_epoch && block_epoch <= epoch.saturating_add(1)) {
+            return Err(RejoinReject::Epoch);
+        }
+        if !self.pruned.get(key).is_some_and(|p| p.until.is_none()) {
+            return Err(RejoinReject::NotPruned);
+        }
+        if self.rejoins.contains_key(key) {
+            return Err(RejoinReject::Pending);
+        }
+        Ok(())
+    }
+
+    /// Admit a rejoin of `key` signed for `epoch` in a block of `block_epoch`
+    /// included at `included_at` ([`Self::may_rejoin`], then `verify`, the
+    /// signature check, last). It ends the pruning at the handoff its
+    /// finalization triggers, or the next one.
+    pub fn admit_rejoin(&mut self, included_at: u64, finalized_height: u64, block_epoch: u64, key: &KeyId,
+                        epoch: u64, verify: impl FnOnce() -> bool) -> Result<(), RejoinReject>
+    {
+        self.may_rejoin(included_at, finalized_height, block_epoch, key, epoch)?;
+        if !verify() {
+            return Err(RejoinReject::Signature);
+        }
+        self.rejoins.insert(*key, included_at);
         Ok(())
     }
 }

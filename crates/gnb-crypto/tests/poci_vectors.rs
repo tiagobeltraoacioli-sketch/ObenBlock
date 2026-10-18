@@ -13,8 +13,8 @@ use std::collections::BTreeMap;
 
 use gnb_crypto::core::kes::KesPublic;
 use gnb_crypto::core::powit::poci::{
-    self, attestation_message_v3, attestation_message_v3_preimage, check_entries, check_evidence, counted_weight,
-    ffg_step, leaf_hash, merkle_path, path_root, quorum, tree_root, verify_certificate,
+    self, attestation_message_v3, attestation_message_v3_preimage, check_entries, check_evidence, counted_keys,
+    counted_weight, ffg_step, rejoin_message, rejoin_message_preimage, leaf_hash, merkle_path, path_root, quorum, tree_root, verify_certificate,
     verify_certificate_with_proof, Configuration, DecodeError, PociParams, PociState, PociVote, Reader,
     RegistryProof, VoteScheme, OBB_MAINNET_POCI, OBB_REGTEST_POCI,
 };
@@ -151,6 +151,9 @@ fn constants() {
     assert_eq!(u(&c["v3_preimage_len"]) as usize, poci::V3_PREIMAGE_LEN);
     assert_eq!(u(&c["config_preimage_len"]) as usize, poci::CONFIG_PREIMAGE_LEN);
     assert_eq!(u(&c["params_preimage_len"]) as usize, poci::PARAMS_PREIMAGE_LEN);
+    assert_eq!(c["ds_rejoin"].as_str().unwrap().as_bytes(), poci::DS_REJOIN);
+    assert_eq!(u(&c["prune_after_epochs"]), poci::POCI_PRUNE_AFTER_EPOCHS);
+    assert_eq!(u(&c["rejoin_preimage_len"]) as usize, poci::REJOIN_PREIMAGE_LEN);
 }
 
 #[test]
@@ -258,6 +261,24 @@ fn v3_messages() {
 }
 
 #[test]
+fn rejoin_messages() {
+    let d = doc();
+    let list = d["rejoin_messages"].as_array().unwrap();
+    assert_eq!(list.len(), 12);
+    for v in list {
+        let k = kes_key(v);
+        assert_eq!(k.witness_id(), key(&v["key_id"]));
+        let (chain, epoch) = (u(&v["chain_id"]) as u32, u(&v["epoch"]));
+        let pre = rejoin_message_preimage(chain, &k, epoch);
+        assert_eq!(pre.len(), poci::REJOIN_PREIMAGE_LEN);
+        assert_eq!(pre, bytes(&v["preimage"]));
+        let msg = rejoin_message(chain, &k, epoch);
+        assert_eq!(msg, h32(&v["rejoin_msg"]));
+        assert_eq!(test_sign(&k, epoch, &msg), bytes(&v["test_sig"]));
+    }
+}
+
+#[test]
 fn strict_quorum() {
     let d = doc();
     let list = d["quorum"].as_array().unwrap();
@@ -332,17 +353,22 @@ impl Chain {
         Chain { p, provider, justified: c, finalized: c, state }
     }
 
-    fn votes(&mut self, target: Checkpoint, votes: &[PociVote<TestSig>]) -> Value {
+    fn votes(&mut self, target: Checkpoint, votes: &[PociVote<TestSig>], included_at: Option<u64>) -> Value {
         let src = self.justified;
         let cfg = self.state.config().clone();
         let got = counted_weight(&self.p, &cfg, votes, &src, &target);
+        // §4.1: the counted votes are included at `included_at` (default target + 1).
+        let at = included_at.unwrap_or(target.height + 1);
+        for k in counted_keys(&self.p, &cfg, votes, &src, &target) {
+            self.state.record_vote(&self.p, &k, at);
+        }
         let q = quorum(got, cfg.total());
         let step = ffg_step(&self.p, &mut self.justified, &target, q);
         let mut handoff = false;
         if let Some(f) = step.finalized {
             self.finalized = f;
             let w = self.state.handoff_epoch(&self.p, &f).map(|e| self.weights(e, &f));
-            handoff = self.state.finalized(&self.p, &f, |_| w.unwrap()).unwrap();
+            handoff = self.state.finalized(&self.p, &f, |_, _| w.unwrap()).unwrap();
         }
         serde_json::json!({"weight": got.to_string(), "total": cfg.total().to_string(), "quorum": q,
                            "justified": step.justified, "finalized": step.finalized.is_some(), "handoff": handoff})
@@ -353,6 +379,14 @@ impl Chain {
         serde_json::json!({"config_epoch": c.epoch(), "config_id": hex::encode(c.id()), "total": c.total().to_string(),
                            "justified": {"height": self.justified.height, "hash": hex::encode(self.justified.hash)},
                            "finalized": {"height": self.finalized.height, "hash": hex::encode(self.finalized.hash)}})
+    }
+
+    fn pruned_json(&self) -> Value {
+        Value::Object(self.state.pruned.iter().map(|(k, p)| (hex::encode(k), serde_json::json!(p.start))).collect())
+    }
+
+    fn rejoins_json(&self) -> Value {
+        Value::Object(self.state.rejoins.iter().map(|(k, h)| (hex::encode(k), serde_json::json!(h))).collect())
     }
 
     fn bans_json(&self) -> Value {
@@ -370,7 +404,7 @@ impl Chain {
 fn sequences() {
     let d = doc();
     let seqs = d["sequences"].as_array().unwrap();
-    assert_eq!(seqs.len(), 8);
+    assert_eq!(seqs.len(), 11);
     for sq in seqs {
         let name = sq["name"].as_str().unwrap();
         let p = params(sq["params"].as_str().unwrap());
@@ -401,7 +435,35 @@ fn sequences() {
                         }
                         v
                     }).collect();
-                    assert_eq!(ch.votes(target, &votes), st["result"], "{name} step {i}");
+                    let at = st.get("included_at").map(u);
+                    assert_eq!(ch.votes(target, &votes, at), st["result"], "{name} step {i}");
+                }
+                "include" => {
+                    let mut got = Vec::new();
+                    for ix in st["voters"].as_array().unwrap() {
+                        let k = keys[u(ix) as usize].witness_id();
+                        if ch.state.config().weight(&k).is_some() {
+                            got.push(serde_json::json!(hex::encode(k)));
+                        }
+                        ch.state.record_vote(&p, &k, u(&st["height"]));
+                    }
+                    assert_eq!(Value::Array(got), st["result"], "{name} step {i}");
+                }
+                "rejoin" => {
+                    let rj = &st["rejoin"];
+                    let k = kes_key(rj);
+                    assert_eq!(k, keys[u(&st["key"]) as usize], "{name} step {i}");
+                    let (epoch, sig) = (u(&rj["epoch"]), bytes(&rj["sig"]));
+                    // The signature the step names, recomputed with the test scheme.
+                    let chain = if st["other_chain"] == true { OBB_REGTEST_POCI.chain_id } else { p.chain_id };
+                    let want = if st["bad_sig"] == true { vec![0; 32] }
+                               else { test_sign(&k, epoch, &rejoin_message(chain, &k, epoch)) };
+                    assert_eq!(sig, want, "{name} step {i}: rejoin signature");
+                    let fin = ch.finalized.height;
+                    let r = ch.state.admit_rejoin(u(&st["height"]), fin, u(&st["block_epoch"]), &k.witness_id(), epoch,
+                        || TestSig::verify(&k, epoch, &rejoin_message(p.chain_id, &k, epoch), &sig));
+                    let r = r.map(|_| "ok").unwrap_or_else(|e| e.as_str());
+                    assert_eq!(r, st["result"].as_str().unwrap(), "{name} step {i}");
                 }
                 "evidence" => {
                     let (a, b) = (vote(&st["a"]), vote(&st["b"]));
@@ -414,6 +476,8 @@ fn sequences() {
             }
             assert_eq!(ch.state_json(), st["state"], "{name} step {i}: state");
             assert_eq!(ch.bans_json(), st["bans"], "{name} step {i}: bans");
+            assert_eq!(ch.pruned_json(), st["pruned"], "{name} step {i}: pruned");
+            assert_eq!(ch.rejoins_json(), st["rejoins"], "{name} step {i}: rejoins");
         }
         // The configurations in order of entry into force.
         let hist: Vec<_> = ch.state.history().cloned().collect::<Vec<_>>().into_iter().rev().collect();
@@ -424,7 +488,8 @@ fn sequences() {
             assert_eq!(c.entries(), config_of(v).1.entries());
         }
         // The node's stored form rebuilds the same state.
-        let again = PociState::from_history(ch.state.history().cloned().collect(), ch.state.bans.clone()).unwrap();
+        let again = PociState::from_history(ch.state.history().cloned().collect(), ch.state.bans.clone()).unwrap()
+            .with_ledger(ch.state.pruned.clone(), ch.state.rejoins.clone(), ch.state.seen.clone());
         assert_eq!(again, ch.state, "{name}: from_history");
     }
 }

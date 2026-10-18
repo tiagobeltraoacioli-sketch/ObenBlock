@@ -17,6 +17,11 @@ const W: u128 = 1_000;
 struct Key(std::cell::RefCell<KesSigner>);
 
 impl Key {
+    fn rejoin(&self, e: u64) -> WitnessRejoin {
+        self.evolve(e);
+        WitnessRejoin::sign(PP.chain_id, &self.0.borrow()).unwrap()
+    }
+
     fn new(seed: u8) -> Key {
         Key(std::cell::RefCell::new(KesSigner::generate(6, [seed; 32], |_| {}).unwrap()))
     }
@@ -72,10 +77,41 @@ impl Harness {
     }
 
     fn try_block(&self, atts: &[Attestation], ev: &[PociEvidence]) -> Result<PowitState, String> {
+        self.try_block_with(atts, ev, &[])
+    }
+
+    fn try_block_with(&self, atts: &[Attestation], ev: &[PociEvidence], rejoins: &[WitnessRejoin])
+        -> Result<PowitState, String>
+    {
         let h = self.h + 1;
         let sw: Vec<(KeyId, u128)> = self.shares.iter().map(|k| (*k, W)).collect();
         let input = BlockInput { height: h, hash: hash(h), share_work: &sw, attestations: atts, evidence: &[], exits: &[] };
-        self.st.apply_block(&P, CHAIN, 0, 0, &input, ev, &Chain(h))
+        self.st.apply_block(&P, CHAIN, 0, 0, &input, PociItems { evidence: ev, rejoins }, &Chain(h))
+    }
+
+    fn block_with(&mut self, atts: &[Attestation], rejoins: &[WitnessRejoin]) {
+        self.st = self.try_block_with(atts, &[], rejoins).unwrap_or_else(|e| panic!("block {}: {e}", self.h + 1));
+        self.h += 1;
+    }
+
+    /// `keys` vote justified -> `slot` in the block right after it.
+    fn slot(&mut self, keys: &[&Key], slot: u64) {
+        self.to(slot);
+        let v = self.votes(keys, slot);
+        self.block(&v, &[]);
+    }
+
+    /// Votes at every slot up to the one after the opening of `x`, which
+    /// finalizes it: the handoff to `C_x`.
+    fn handoff_to(&mut self, keys: &[&Key], x: u64) {
+        let mut slot = self.st.justified.height.max(self.h - self.h % PP.checkpoint_interval);
+        while slot < PP.opening(x) + PP.checkpoint_interval {
+            slot += PP.checkpoint_interval;
+            self.slot(keys, slot);
+            assert_eq!(self.st.justified, cp(slot), "slot {slot}");
+        }
+        assert_eq!(self.st.finalized, cp(PP.opening(x)));
+        assert_eq!(self.config().epoch(), x);
     }
 
     fn block(&mut self, atts: &[Attestation], ev: &[PociEvidence]) {
@@ -237,7 +273,7 @@ fn evidence_bans_from_the_next_handoff_and_keeps_the_configuration_in_force() {
     // Not GnB's equivocation proofs on a PoCI chain.
     let gnb = BlockInput { height: c.h + 1, hash: hash(c.h + 1), share_work: &[], attestations: &[],
                            evidence: &[Equivocation { a: a.clone(), b: b.clone() }], exits: &[] };
-    assert!(c.st.apply_block(&P, CHAIN, 0, 0, &gnb, &[], &Chain(c.h + 1)).is_err());
+    assert!(c.st.apply_block(&P, CHAIN, 0, 0, &gnb, PociItems::default(), &Chain(c.h + 1)).is_err());
     // Identical votes and unknown configurations are not evidence.
     let same = PociEvidence { config_id: c4.id(), a: a.clone(), b: a.clone() };
     assert!(c.try_block(&[], &[same]).unwrap_err().contains("identical"));
@@ -304,7 +340,8 @@ fn poci_body_format() {
     // GnB rejects PoCI evidence.
     let st = PowitState::genesis(0, hash(0));
     let input = BlockInput { height: 1, hash: hash(1), share_work: &[], attestations: &[], evidence: &[], exits: &[] };
-    assert!(st.apply_block(&TESTNET_PARAMS, ChainId::Testnet, 0, 0, &input, &[ev], &Chain(1)).is_err());
+    assert!(st.apply_block(&TESTNET_PARAMS, ChainId::Testnet, 0, 0, &input,
+                           PociItems { evidence: &[ev], rejoins: &[] }, &Chain(1)).is_err());
 }
 
 #[test]
@@ -352,4 +389,158 @@ fn kes_certificates_and_registry_proofs() {
     let ev = PociEvidence { config_id: cfg.id(), a, b };
     let (va, vb) = ev.votes();
     assert_eq!(check_evidence(&PP, &va, &vb, |id| (*id == cfg.id()).then_some(&cfg)), Ok(EvidenceKind::Double));
+}
+
+#[test]
+fn absent_keys_are_pruned_at_the_handoff_and_rejoin_from_the_next() {
+    let keys: Vec<Key> = (61..=65).map(Key::new).collect();
+    let k: Vec<&Key> = keys.iter().collect();
+    let (core, quiet) = (&k[..4], k[4]);
+    let mut c = Harness::new(&k);
+    c.to(PP.opening(4));
+    c.block(&[], &[]);
+    assert_eq!(c.config().len(), 5);
+    // Epochs 5..=7: the quiet key is in its grace period.
+    for x in 5..=7 {
+        c.handoff_to(core, x);
+        assert!(c.config().weight(&quiet.id()).is_some(), "grace at {x}");
+    }
+    // A rejoin by a key that is not pruned is refused.
+    let early = quiet.rejoin(7);
+    assert!(c.try_block_with(&[], &[], &[early]).unwrap_err().contains("not_pruned"));
+    // An entry since epoch 4 with no vote included: pruned at 8.
+    c.handoff_to(core, 8);
+    let st = c.st.poci.as_ref().unwrap();
+    assert!(c.config().weight(&quiet.id()).is_none());
+    assert_eq!(st.pruned.get(&quiet.id()).map(|p| p.start), Some(8));
+    assert_eq!(c.config().len(), 4);
+    // No leak: the keys that stayed keep their whole window work (the same
+    // shares for every key, whether it voted or not).
+    let w8 = c.config().entries()[0].1;
+    assert!(w8 >= 79 * W && c.config().entries().iter().all(|(_, w)| *w == w8));
+    // Pruned, not banned: its shares are still valid; it cannot vote.
+    let id8 = c.config().id();
+    let v = quiet.vote(&id8, c.st.justified, cp(c.h - c.h % 5));
+    assert!(c.try_block(&[v], &[]).unwrap_err().contains("not in the PoCI configuration"));
+    // Rejoin: refused for an old epoch, with a bad signature, twice.
+    assert!(c.try_block_with(&[], &[], &[k[0].rejoin(8)]).unwrap_err().contains("not_pruned"));
+    let mut bad = quiet.rejoin(8);
+    bad.sig.sig[0] ^= 1;
+    assert!(c.try_block_with(&[], &[], &[bad]).unwrap_err().contains("signature"));
+    let rj = quiet.rejoin(8);
+    assert!(c.try_block_with(&[], &[], &[rj.clone(), rj.clone()]).unwrap_err().contains("pending"));
+    c.block_with(&[], &[rj.clone()]);
+    let rj_at = c.h + 1;
+    assert_eq!(c.st.poci.as_ref().unwrap().rejoins.get(&quiet.id()), Some(&rj_at));
+    assert!(c.try_block_with(&[], &[], &[rj]).unwrap_err().contains("pending"));
+    // The handoff whose finalization holds the rejoin brings it back, with
+    // its share work, and a fresh grace period.
+    c.handoff_to(core, 9);
+    let st = c.st.poci.as_ref().unwrap();
+    assert!(st.pruned.is_empty() && st.rejoins.is_empty());
+    let w9 = c.config().weight(&k[0].id());
+    assert!(w9.is_some() && c.config().weight(&quiet.id()) == w9, "back with its share work");
+    for x in 10..=12 {
+        c.handoff_to(core, x);
+        assert!(c.config().weight(&quiet.id()).is_some(), "grace at {x}");
+    }
+    c.handoff_to(core, 13);
+    assert!(c.config().weight(&quiet.id()).is_none(), "silent again: pruned at 13");
+    // The ledger stays bounded: included votes of PRUNE_AFTER + 3 epochs at most.
+    let st = c.st.poci.as_ref().unwrap();
+    assert!(st.seen.values().all(|m| m.len() <= (POCI_PRUNE_AFTER_EPOCHS + 3) as usize));
+    assert!(c.st.decay.is_empty() && c.st.banned.is_empty());
+}
+
+#[test]
+fn a_stall_never_changes_the_configuration_and_nobody_is_pruned() {
+    let keys: Vec<Key> = (71..=75).map(Key::new).collect();
+    let k: Vec<&Key> = keys.iter().collect();
+    let mut c = Harness::new(&k);
+    c.to(PP.opening(4));
+    c.block(&[], &[]);
+    let c4 = c.config();
+    // 40 % vanish at once: three keys out of five are not a strict quorum.
+    let mut slot = PP.opening(4);
+    while slot < PP.opening(14) {
+        slot += 5;
+        c.slot(&k[..3], slot);
+        assert_eq!(c.st.justified, cp(PP.opening(4)), "no quorum at {slot}");
+    }
+    let st = c.st.poci.as_ref().unwrap();
+    assert_eq!(c.config().id(), c4.id(), "the same C, the same denominator");
+    assert!(st.pruned.is_empty(), "no local pruning without a handoff");
+    assert!(c.st.decay.is_empty(), "no inactivity leak on PoCI");
+    // The weight returns: finality resumes under C_4 and hands off at once.
+    let back = c.votes(&k[3..], slot);
+    c.block(&back, &[]);
+    assert_eq!(c.st.justified, cp(slot));
+    c.slot(&k, slot + 5);
+    assert_eq!(c.st.finalized, cp(slot));
+    assert_eq!(c.config().epoch(), 14);
+    // The keys that came back have no vote in the finalized history of the
+    // last four epochs (theirs are in the blocks above F): pruned at this
+    // handoff, they rejoin. The keys that kept voting stay.
+    let st = c.st.poci.as_ref().unwrap();
+    assert_eq!(st.pruned.keys().copied().collect::<Vec<_>>(),
+               { let mut v = vec![k[3].id(), k[4].id()]; v.sort(); v });
+    assert_eq!(c.config().len(), 3);
+}
+
+#[test]
+fn rejoins_need_poci_and_the_membership_list() {
+    let k = Key::new(81);
+    let r = k.rejoin(3);
+    // GnB: no rejoin.
+    let st = PowitState::genesis(0, hash(0));
+    let input = BlockInput { height: 1, hash: hash(1), share_work: &[], attestations: &[], evidence: &[], exits: &[] };
+    assert!(st.apply_block(&TESTNET_PARAMS, ChainId::Testnet, 0, 0, &input,
+                           PociItems { evidence: &[], rejoins: std::slice::from_ref(&r) }, &Chain(1))
+        .unwrap_err().contains("without PoCI"));
+    // ObenBlock before the launch: nothing to rejoin.
+    let mut c = Harness::new(&[&k]);
+    c.to(10);
+    assert!(c.try_block_with(&[], &[], &[r.clone()]).unwrap_err().contains("bootstrap"));
+    // Body format: exits then rejoins in one tagged list; an empty one is
+    // the GnB bytes.
+    let x = WitnessExit::sign(PP.chain_id, &k.0.borrow()).unwrap();
+    let body = PowitBody { exits: vec![x.clone()], rejoins: vec![r.clone(), r.clone()], ..PowitBody::default() };
+    let fmt = BodyFormat { exits: true, poci: true };
+    let mut buf = Vec::new();
+    body.write_wire_for(&mut buf, fmt);
+    let mut cur = std::io::Cursor::new(buf.as_slice());
+    assert_eq!(PowitBody::read_wire_for(&mut cur, fmt).unwrap(), body);
+    assert_eq!(cur.position() as usize, buf.len());
+    // An exit after a rejoin, an unknown tag, too many rejoins: refused.
+    let swapped = {
+        let mut out = Vec::new();
+        let b = PowitBody { exits: vec![], rejoins: vec![r.clone()], ..PowitBody::default() };
+        b.write_wire_for(&mut out, fmt);
+        // Patch the count to 2 and append an exit item.
+        let n = out.len() - (1 + r.to_wire_bytes().len()) - 1;
+        out[n] = 2;
+        out.push(0);
+        out.extend_from_slice(&x.to_wire_bytes());
+        out
+    };
+    assert!(PowitBody::read_wire_for(&mut std::io::Cursor::new(swapped.as_slice()), fmt).unwrap_err().contains("after"));
+    let mut tagged = Vec::new();
+    PowitBody { exits: vec![x.clone()], ..PowitBody::default() }.write_wire_for(&mut tagged, fmt);
+    let tag_at = tagged.len() - x.to_wire_bytes().len() - 1;
+    tagged[tag_at] = 7;
+    assert!(PowitBody::read_wire_for(&mut std::io::Cursor::new(tagged.as_slice()), fmt).unwrap_err().contains("tag"));
+    let five = PowitBody { rejoins: vec![r.clone(); MAX_REJOINS_PER_BLOCK + 1], ..PowitBody::default() };
+    let mut out = Vec::new();
+    five.write_wire_for(&mut out, fmt);
+    assert!(PowitBody::read_wire_for(&mut std::io::Cursor::new(out.as_slice()), fmt).is_err());
+    // The rejoin message is its own domain: not an exit.
+    assert!(r.verify_signature(PP.chain_id));
+    assert!(!r.verify_signature(OBB_MAINNET_POCI.chain_id));
+    let as_exit = WitnessExit { witness: r.witness, epoch: r.epoch, sig: r.sig.clone() };
+    assert!(!as_exit.verify_signature(PP.chain_id));
+    let mut wb = Vec::new();
+    PowitBody::default().write_wire_for(&mut wb, fmt);
+    let mut gb = Vec::new();
+    PowitBody::default().write_wire_with(&mut gb, true);
+    assert_eq!(wb, gb);
 }
