@@ -296,11 +296,14 @@ signatures assumed valid" when it applies.
 
 ### The Bloch anchor (`--bloch-rpc`)
 
-`--bloch-rpc <URL of your own Bloch node>` makes the newest ObenBlock
-checkpoint that Bloch has finalized in its anchor registry a
-weak-subjectivity checkpoint: fork choice is pinned to it and chains that
-contradict it are refused. An anchor that contradicts the node's own PoWit
-finality changes nothing and is reported as `conflict` by `getblochanchor`.
+`--bloch-rpc <URL of your own Bloch node>` (`https://`, or `http://` to a
+loopback host only) compares the newest ObenBlock checkpoint that Bloch has
+finalized in its anchor registry with the node's chain. It is advisory: it
+never pins or refuses a block. Agreement is reported as corroboration; a
+contradiction, or an anchor naming a block the node does not have, raises
+the conflict alert (`getblochanchor`, `getfinalityinfo.bloch_anchor`, metric
+`gnb_bloch_anchor_conflict`, an error log line) and you decide with
+`setfinalitycheckpoint` / `ignorefinalized`.
 Node-local, not consensus; details, the registry interface and the
 `obenblock-anchor` publisher in [OBB-ANCHOR.md](OBB-ANCHOR.md).
 
@@ -744,6 +747,22 @@ answer to its own request; it is checked like a new block (height implied by
 its parents, difficulty, timestamp, proof of work, the witness commitment
 rules) before it is stored.
 
+### PoCI finality certificates (ObenBlock)
+
+On ObenBlock every finalized checkpoint after the launch has a finality
+certificate (docs/DESIGN-obenblock-poci.md §6): the votes of more than two
+thirds of the configuration in force, which the node keeps when it accepts
+the block that finalized it. `gnb-cli finalitycertificate [slot | hash]`
+(RPC `getfinalitycertificate`) returns it with the registry proof of its
+voters; without an argument, the latest finalized checkpoint's. Anyone who
+trusts the `config_id` (from their own node, or reached through earlier
+certificates) checks it without the configuration's entries. `getpowitinfo`
+and `getfinalityinfo` show, under `poci`, the configuration in force (epoch,
+`config_id`, exact `total`), the bans, the latest finalized checkpoint with
+its certificate, and `absent`: per recent epoch, the weight and number of
+the configuration's keys with no vote included on the chain. Watch it: if
+it nears a third of `total`, finality is about to halt.
+
 ### PoWit finality: the pin, conflicts and the operator
 
 From the PoWit activation the node never leaves a finalized checkpoint it
@@ -852,6 +871,84 @@ After step 4 every finalized checkpoint that conflicts with the new anchor
 stops counting, so the checkpoints set aside in step 2 need no
 `reconsiderfinalized`. Until then the node has no anchor: run the sequence
 with peers you trust.
+
+## Witness signer protection
+
+A witness key must never sign two conflicting links (a double or surround
+vote is evidence and bars the key). The witness duty (`--witness-key`) and
+`gnb-cli powitattest` share one protection (`powit_signer`,
+docs/DESIGN-obenblock-poci.md §8):
+
+- Every vote is written and fsynced to the vote record
+  (`<data-dir>/powit-votes-<key id>.json`, format
+  `gnb-powit-vote-record/2`) and to the high-water file beside the key
+  (`<key>.votes-highwater.json`) before its signature leaves the process. A
+  repeated request returns the stored attestation; after a crash the restart
+  releases the stored vote once. A v1 record (a plain list of links) is
+  migrated at the first start; older releases then refuse the v2 file as
+  corrupt (they never sign against an unreadable record).
+- One signer per key: the node and the CLI take an exclusive lock on
+  `<key>.signer.lock` and on `powit-votes-<key id>.lock`, and write a fresh
+  instance id into the record. A second instance (another node, or
+  `powitattest` while the node runs) refuses to start. Before every vote the
+  signer re-reads the record and the high-water file; if another instance
+  wrote them (shared storage where locks do not hold) it halts.
+- Rollback guard: at start and before every vote the signer looks for votes
+  of its key, in the selected tip's PoWit state and the pool, that its record
+  does not hold at or above its highest signed heights, and for an
+  equivocation proof against the key. Finding one means the record is stale
+  (a restored backup) or another instance signs with a copy of the key: the
+  signer stops signing (the node keeps running), adopts those votes into the
+  record, and alerts: an error log line ("PoWit signer ... HALTED"),
+  `signer_halted: true` and `signers[].alert` in `getpowitinfo`, and the
+  metric `gnb_powit_signer_halted`. The alert is persisted in the record.
+  Stop every other instance of the key, then, with the node stopped:
+
+```sh
+gnb-cli powitsignerclear <witness-key.json> <data-dir>
+```
+
+- `gnb-cli powitattest <key> <net> <src_slot> <src_hash> <tgt_slot>
+  <tgt_hash> [activation] [record-dir] [--offline]` keeps its record in
+  `record-dir` (default: the key's directory; give the node's data
+  directory to share the duty's record) and reads the key's votes from the
+  node (`getpowitkeyvotes`, `--rpc-url`/`--rpc-port`) for the rollback
+  guard; without a node it refuses unless `--offline` is given.
+
+## ObenBlock: absence pruning and rejoin (PoCI)
+
+On ObenBlock, finality weight never decays (docs/DESIGN-obenblock-poci.md
+§4.1; there is no inactivity leak). Instead the committee in force removes
+dead weight at a handoff: a key of the configuration in force whose votes
+were not included in any block of the finalized history during the last 4
+epochs (24 hours) is left out of the next configuration. A key that has been
+in the configuration for less than 4 epochs is not pruned. Pruning is not a
+punishment: the key keeps its share rewards and may come back.
+
+- `getpowitinfo` → `poci.absent_weight` lists, per recent epoch, the weight
+  (`weight`) and the number of keys (`keys`) of the configuration in force
+  with no vote included in a block of that
+  epoch, and `over_a_third` when it exceeds a third (finality then halts
+  until that weight returns). `poci.pruned` lists the pruned keys, the epoch
+  their pruning started, and where a pending rejoin was included.
+- Keys whose votes only return after a halt longer than 4 epochs are pruned
+  at the handoff their own votes enable (those votes are in blocks above the
+  finalized checkpoint); they rejoin like any other pruned key.
+- A node running the witness duty (`--witness-key`) publishes the rejoin
+  itself when it finds its key pruned at the tip (log line "witness key
+  pruned for absence: rejoin ... published"). Once the block that includes
+  it is final, the key's share work counts again from the next handoff.
+- Without the duty, sign a rejoin with the witness key for the current epoch
+  and submit it (item kind 5):
+
+```sh
+gnb-cli powitrejoin <witness-key.json> obenblock <current-epoch>
+```
+
+  then `submitpowititem [5, "<hex>"]`. The epoch must be the current one or
+  the one before when the block is mined; the command evolves the key file
+  (forward security: older epochs are erased). Stop the node's witness duty
+  first if it uses the same key file.
 
 ## Chain-state check at start-up
 

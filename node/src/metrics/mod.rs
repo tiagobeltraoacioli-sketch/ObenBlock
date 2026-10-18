@@ -89,6 +89,17 @@ pub struct MetricsState {
     /// The configured weak-subjectivity anchor is unknown while the applied
     /// tip is above its height (review round 2, M3): 1, else 0.
     pub finality_anchor_unknown:         IntGauge,
+    /// PoWit signer protection (DESIGN-obenblock-poci.md §8): witness
+    /// signers of this process halted by the rollback guard or the
+    /// one-signer check; 0 when none.
+    pub powit_signer_halted:             IntGauge,
+    /// Advisory Bloch anchor (`--bloch-rpc`, DESIGN-obenblock §8): 1 while
+    /// the newest anchor contradicts the node's chain, names a block it does
+    /// not have, or the registry answered inconsistently; else 0.
+    pub bloch_anchor_conflict:           IntGauge,
+    /// Highest slot a Bloch anchor corroborated (the node's finalized chain
+    /// holds it); 0 until one does.
+    pub bloch_anchor_corroborated_slot:  IntGauge,
 
     // ── Histograms (Phase 2) ────────────────────────────────────
     pub block_validation_seconds:        Histogram,
@@ -242,6 +253,26 @@ impl MetricsState {
             registry
         ).expect("register finality_anchor_unknown");
 
+        let powit_signer_halted = register_int_gauge_with_registry!(
+            opts!("gnb_powit_signer_halted",
+                  "PoWit witness signers of this node halted by signer protection (a vote of the key the record \
+                   does not hold, or a second instance): alert while > 0; getpowitinfo.signers has the reason"),
+            registry
+        ).expect("register powit_signer_halted");
+
+        let bloch_anchor_conflict = register_int_gauge_with_registry!(
+            opts!("gnb_bloch_anchor_conflict",
+                  "1 while the newest Bloch anchor (--bloch-rpc) contradicts this node's chain or names a block it \
+                   does not have (advisory: nothing is changed, an operator decides: getblochanchor)"),
+            registry
+        ).expect("register bloch_anchor_conflict");
+
+        let bloch_anchor_corroborated_slot = register_int_gauge_with_registry!(
+            opts!("gnb_bloch_anchor_corroborated_slot",
+                  "Highest slot of a Bloch anchor that this node's finalized chain contains (0 until one does)"),
+            registry
+        ).expect("register bloch_anchor_corroborated_slot");
+
         // ── Histograms ───────────────────────────────────────────
         // Block validation buckets tuned for expected range: 1ms..10s
         let block_validation_seconds = register_histogram_with_registry!(
@@ -287,6 +318,9 @@ impl MetricsState {
             deep_reorgs_total,
             finality_conflicts,
             finality_anchor_unknown,
+            powit_signer_halted,
+            bloch_anchor_conflict,
+            bloch_anchor_corroborated_slot,
             block_validation_seconds,
             rpc_latency_seconds,
         }
@@ -433,10 +467,28 @@ pub fn set_finality_conflicts(n: i64) {
     if let Some(m) = METRICS.get() { m.finality_conflicts.set(n); }
 }
 
+/// The advisory Bloch anchor raises (or clears) its conflict alert.
+#[inline]
+pub fn set_bloch_anchor_conflict(alert: bool) {
+    if let Some(m) = METRICS.get() { m.bloch_anchor_conflict.set(i64::from(alert)); }
+}
+
+/// A Bloch anchor corroborated the node's finalized chain at `slot`.
+#[inline]
+pub fn set_bloch_anchor_corroborated_slot(slot: u64) {
+    if let Some(m) = METRICS.get() { m.bloch_anchor_corroborated_slot.set(i64::try_from(slot).unwrap_or(i64::MAX)); }
+}
+
 /// Review round 2, M3: the anchor is unknown above its height.
 #[inline]
 pub fn set_finality_anchor_unknown(overdue: bool) {
     if let Some(m) = METRICS.get() { m.finality_anchor_unknown.set(i64::from(overdue)); }
+}
+
+/// PoWit signer protection: halted witness signers (`powit_signer`).
+#[inline]
+pub fn set_powit_signer_halted(n: i64) {
+    if let Some(m) = METRICS.get() { m.powit_signer_halted.set(n); }
 }
 
 #[inline]

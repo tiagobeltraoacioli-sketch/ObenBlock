@@ -323,6 +323,9 @@ const HEAVY_READ_METHODS: &[&str] = &[
     // ObenBlock anchors (docs/OBB-ANCHOR.md): up to `MAX_STATE_READS` PoWit
     // state decodes per call.
     "getfinalityanchors",
+    // PoCI (ObenBlock): a certificate not kept yet is rebuilt from up to
+    // `vote_ttl + 1` bodies and verified (one signature per vote) once.
+    "getfinalitycertificate",
     // L-8 (audit): `getblocktemplate` is bounded the same way (cache +
     // single flight) but through its OWN gate (`AppState::template_gate`,
     // `gated_dispatch`): sharing this one's single scan permit answered a
@@ -338,7 +341,7 @@ const KNOWN_RPC_METHODS: &[&str] = &[
     "getblockbyheight", "getrecentblocks", "gettransaction", "getrawtransaction", "getbalance",
     "getaddresscount", "getutxos", "sendrawtransaction", "validateaddress", "estimatefee",
     "getrawmempool", "decoderawtransaction", "getblocktemplate", "submitblock", "getdaginfo",
-    "submitpowititem", "getpowitinfo", "pqpsbt", "getdescriptorinfo", "deriveaddresses",
+    "submitpowititem", "getpowitinfo", "getpowitkeyvotes", "pqpsbt", "getdescriptorinfo", "deriveaddresses",
     "listtransactions", "getpeerinfo", "getpeers", "getsupplyinfo", "getchainstats",
     "getsupplydistribution", "getselectedchain", "getblockdag", "gettransactionfull",
     "getdagwindow", "getaddresshistory", "getrichlist", "gethashrate", "getdifficultyhistory",
@@ -346,7 +349,7 @@ const KNOWN_RPC_METHODS: &[&str] = &[
     "getmempoolstats", "validateaddressverbose", "gettxsbyblock", "getaddressbalance_at_height",
     "getattestation", "invalidateblock", "reconsiderblock", "gettxoutsetinfo",
     "getfinalityinfo", "ignorefinalized", "reconsiderfinalized", "setfinalitycheckpoint",
-    "getfinalityanchors", "getblochanchor",
+    "getfinalityanchors", "getblochanchor", "getfinalitycertificate",
 ];
 
 /// Longest method-name prefix written to a log line (NET-13).
@@ -1352,6 +1355,20 @@ fn policy_rpc_snapshot(state: &AppState) -> Result<(u64,[u8;32]), Value> {
     Ok((crate::mempool::admission::pool_next_height(&dag,&state.store,&state.mempool),tip))
 }
 
+/// The chain identity `getnetworkinfo` reports for the network `p`:
+/// `network` (`"mainnet"`, `"testnet"` or `"regtest"`, as set once at
+/// start-up; was the literal "mainnet" on every node,
+/// test/functional/feature_test_build_guard.py), `chain` (DESIGN-obenblock
+/// §2: `"gnb"` or `"obenblock"`) and `chain_id`, the id folded into every
+/// signature.
+fn network_identity_json(p: &crate::core::chain::ChainParams) -> Value {
+    json!({
+        "network":  p.network_name,
+        "chain":    p.chain.name(),
+        "chain_id": format!("{:#010x}", p.chain_id.to_u32()),
+    })
+}
+
 async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Value {
     match method {
         "getnetworkinfo" => {
@@ -1360,15 +1377,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 crate::accept::no_verdict_branch_warning(&state.dag.read(), &state.store).into_iter().collect();
             let s = state.node_state.read();
             let pruned_h = state.store.pruned_height();
-            json!({
-                // The chain this node runs (`--testnet`), as set once at
-                // start-up. Was the literal "mainnet" on every node
-                // (test/functional/feature_test_build_guard.py).
-                "network":         crate::core::chain::node_params().network_name,
-                // DESIGN-obenblock §2: "gnb" or "obenblock", and the chain id
-                // folded into every signature.
-                "chain":           crate::core::chain::node_params().chain.name(),
-                "chain_id":        format!("{:#010x}", crate::core::node_chain_id().to_u32()),
+            let mut info = json!({
                 "version":         s.version,
                 // The hardening activation height this binary enforces on its
                 // chain (builds before 0.1.1 do not report the field), so an
@@ -1390,10 +1399,17 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 // tolerance or gave up", not "provably at the network tip".
                 "best_announced":  s.best_announced_blue_score,
                 "behind_by":       s.best_announced_blue_score.saturating_sub(s.tip_blue_score),
-                "chain":           "gnb",
                 "pruned_height":   pruned_h,
                 "warnings":        warnings,
-            })
+            });
+            // The chain identity comes from one place only: a second literal
+            // "chain" key in this object used to override it with "gnb" on
+            // every chain (found by the ObenBlock pool end-to-end run).
+            if let (Some(obj), Value::Object(id)) = (info.as_object_mut(),
+                                                      network_identity_json(crate::core::chain::node_params())) {
+                obj.extend(id);
+            }
+            info
         }
         "getblockcount"  => json!(state.node_state.read().block_count),
         // MEM-6: the size plus the relay policy in force (docs/MEMPOOL.md).
@@ -1617,7 +1633,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                         "satoshis":   sats.to_string(),
                         "gnb":       sats as f64 / 1e8,
                         "utxo_count": utxo_count,
-                        "address":    addr,
+                        "address":    crate::address::display_address(addr),
                     }),
                     Err(e) => storage_err_response(&e),
                 },
@@ -1765,7 +1781,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                             }
                         }
                         let mut result = json!({
-                            "address":    addr,
+                            "address":    crate::address::display_address(addr),
                             "utxo_count": list.len(),
                             "returned":   list.len(),
                             "truncated":  truncated,
@@ -2037,7 +2053,9 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
             let mut result = json!({
                 "hardening_active":     tmpl.hardened,
                 "hardening_activation_height": tmpl.activation_height,
-                "merkle_rule":          if tmpl.hardened { "gnb-tagged-v1" } else { "sha256d-duplicate-last" },
+                // ObenBlock: "bitcoin-sha256d" (Bitcoin's tree; the body is
+                // committed by the coinbase commitment).
+                "merkle_rule":          tmpl.merkle_rule_name(),
                 "size_rule":            if tmpl.hardened { "wire" } else { "bincode" },
                 "coinbase_script_sig_prefix": commitment.map(hex::encode).unwrap_or_default(),
                 "max_coinbase_extra_bytes": max_extra,
@@ -2159,11 +2177,28 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         // checkpoints it counts and any conflict (read; bounded output).
         "getfinalityinfo" => {
             let dag = state.dag.read();
-            crate::powit::finality_info_json(&dag, 32)
+            let mut out = crate::powit::finality_info_json(&dag, 32);
+            // PoCI (ObenBlock): the configuration in force and the latest
+            // finalized checkpoint's certificate (GnB's answer is unchanged).
+            let poci = crate::powit::poci_finality_json(&dag, &state.store);
+            if !poci.is_null() {
+                out["poci"] = poci;
+            }
+            out
+        }
+
+        // getfinalitycertificate [slot | checkpoint hash]: the PoCI finality
+        // certificate (Proof of Integrity, docs/DESIGN-obenblock-poci.md §6)
+        // of a finalized checkpoint, with its registry proof; without a
+        // parameter, the latest finalized checkpoint's.
+        "getfinalitycertificate" => {
+            let dag = state.dag.read();
+            crate::powit::certificate::rpc_json(&dag, &state.store, params.and_then(|p| p.get(0)))
         }
 
         // submitpowititem [kind, hex]: kind 1 = witness share, 2 = attestation,
-        // 3 = equivocation proof, 4 = witness exit (liveness activation).
+        // 3 = equivocation proof, 4 = witness exit (liveness activation),
+        // 5 = PoCI rejoin (ObenBlock only).
         // Validated like a gossiped item, then relayed.
         "submitpowititem" => {
             let kind = params.and_then(|p| p.get(0)).and_then(|v| v.as_u64()).unwrap_or(0);
@@ -2171,7 +2206,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 Some(Ok(d)) => d,
                 _ => return json!({ "error": "usage: submitpowititem [kind, hex]" }),
             };
-            if !(1..=u64::from(crate::powit::ITEM_KIND_MAX)).contains(&kind) || data.len() > crate::network::MAX_WIRE_POWIT_ITEM {
+            if !(1..=u64::from(crate::powit::item_kind_max())).contains(&kind) || data.len() > crate::network::MAX_WIRE_POWIT_ITEM {
                 return json!({ "error": "bad kind or item too large" });
             }
             let kind = kind as u8;
@@ -2219,6 +2254,21 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
         // The Bloch weak-subjectivity anchor (`--bloch-rpc`) and what the
         // node made of it.
         "getblochanchor" => crate::anchoring::status_json(),
+
+        // getpowitkeyvotes [key id hex]: one witness key's votes in the
+        // selected tip's state and the pool (signer rollback guard).
+        "getpowitkeyvotes" => {
+            let key = params.and_then(|p| p.get(0)).and_then(|v| v.as_str())
+                .and_then(|h| hex::decode(h).ok())
+                .and_then(|b| <[u8; 20]>::try_from(b.as_slice()).ok());
+            match key {
+                Some(k) => {
+                    let dag = state.dag.read();
+                    crate::powit::key_votes_json(&dag, &state.store, &k)
+                }
+                None => json!({ "error": "usage: getpowitkeyvotes [key id, 20 bytes hex]" }),
+            }
+        }
 
         "getdaginfo" => {
             let dag = state.dag.read();
@@ -2345,7 +2395,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                                 })
                             }).collect();
                             json!({
-                                "address":         addr,
+                                "address":         crate::address::display_address(addr),
                                 "count":           txs.len(),
                                 "total_available": total,
                                 "total_at_least":  total.unwrap_or(LISTTX_COUNT_CAP),
@@ -2550,7 +2600,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
 
             match crate::analytics::address_info(&state.store, &state.mempool, addr_str, &addr_hash) {
                 Ok(info) => json!({
-                    "address":           info.address,
+                    "address":           crate::address::display_address(&info.address),
                     // R3: satoshi amounts → decimal strings.
                     "balance_sats":      info.balance_sats.to_string(),
                     "balance_gnb":      info.balance_gnb,
@@ -2722,7 +2772,7 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                                 Err(_) => return json!({ "error": "cancelled" }),
                             };
                             json!({
-                                "address":               addr,
+                                "address":               crate::address::display_address(addr),
                                 "height":                height,
                                 // R3: satoshi amount → decimal string.
                                 "balance_sats":          balance.to_string(),
@@ -4640,6 +4690,31 @@ mod audit_2026_10_rpc_tests {
         let r = dispatch("getdaginfo", None, &state).await;
         assert_eq!(r["tip_height"], 5);
         assert_eq!(r["next_block_height"], 9, "the pool's next height, not tip_height + 1");
+    }
+
+    /// Regression (ObenBlock pool end-to-end run): `getnetworkinfo` built its
+    /// object with a second literal `"chain": "gnb"`, so every ObenBlock node
+    /// reported GnB. The identity now comes only from the node's chain
+    /// parameters, for each of the four networks.
+    #[tokio::test]
+    async fn getnetworkinfo_reports_the_node_chain() {
+        use crate::core::chain::{GNB_MAINNET, OBENBLOCK_MAINNET, OBENBLOCK_REGTEST};
+        let cases = [(&GNB_MAINNET, "gnb", "mainnet", "0x474e0001"),
+                     (&OBENBLOCK_MAINNET, "obenblock", "mainnet", "0x4f420001"),
+                     (&OBENBLOCK_REGTEST, "obenblock", "regtest", "0x4f420002")];
+        for (p, chain, network, id) in cases {
+            assert_eq!(network_identity_json(p), json!({"chain": chain, "network": network, "chain_id": id}));
+        }
+        let (_tmp, state) = state_with_chain(2);
+        let r = dispatch("getnetworkinfo", None, &state).await;
+        assert_eq!(r["chain"], crate::core::chain::node_params().chain.name());
+        assert_eq!(r["network"], crate::core::chain::node_params().network_name);
+        assert_eq!(r["chain_id"], format!("{:#010x}", crate::core::node_chain_id().to_u32()));
+        // No literal chain name is left in the handler.
+        let src = include_str!("mod.rs");
+        let start = src.find("\"getnetworkinfo\" => {").unwrap();
+        let end = src[start..].find("\"getblockcount\"").unwrap() + start;
+        assert!(!src[start..end].contains("\"chain\":"), "getnetworkinfo must not hard-code its chain");
     }
 
     /// `getdaginfo` and `getnetworkinfo` report the hardening activation

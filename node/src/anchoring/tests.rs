@@ -1,6 +1,5 @@
 use super::*;
 use std::collections::BTreeMap;
-use std::sync::Arc;
 use tempfile::TempDir;
 
 fn h(i: u64) -> Hash {
@@ -157,106 +156,86 @@ fn forked(n: u64, from: u64, to: u64) -> GhostDAG {
 }
 
 #[test]
-fn an_anchor_below_own_finality_is_checked_not_applied() {
+fn an_anchor_below_own_finality_is_compared() {
     let mut dag = chain(100);
     dag.set_finalized(h(90), 90);
-    assert_eq!(decide(&dag, &rec(60, h(59))), (Verdict::Consistent, Action::None));
-    let (v, a) = decide(&dag, &rec(60, h(58)));
-    assert!(matches!(v, Verdict::Conflict(_)) && a == Action::None);
-    let (v, _) = decide(&dag, &rec(60, f(59)));
-    assert!(matches!(v, Verdict::Conflict(_)), "an unknown block where own finality names another");
+    assert_eq!(check(&dag, &rec(60, h(59))), Verdict::Consistent);
+    assert!(matches!(check(&dag, &rec(60, h(58))), Verdict::Conflict(_)));
+    assert!(matches!(check(&dag, &rec(60, f(59))), Verdict::Conflict(_)),
+            "an unknown block where own finality names another");
 }
 
 #[test]
-fn a_known_anchor_ahead_of_finality_is_pinned_unless_it_leaves_it() {
+fn an_anchor_ahead_of_finality_agrees_only_with_the_selected_chain() {
     let mut dag = forked(100, 30, 120);
     assert_eq!(dag.selected_tip(), Some(f(120)), "the fork is heavier");
     dag.set_finalized(h(20), 20);
-    assert_eq!(decide(&dag, &rec(60, h(59))), (Verdict::Pinned, Action::Pin(h(59))));
-    let (v, a) = decide(&dag, &rec(60, f(59)));
-    assert_eq!((v, a), (Verdict::Pinned, Action::Pin(f(59))), "the fork descends from h(20) too");
+    assert_eq!(check(&dag, &rec(60, f(59))), Verdict::Ahead, "the selected chain names f(59)");
+    assert!(matches!(check(&dag, &rec(60, h(59))), Verdict::Conflict(_)), "the lighter chain's block");
+    assert!(matches!(check(&dag, &rec(60, h(1_000))), Verdict::Unknown(_)), "a block the node does not have");
     dag.set_finalized(h(40), 40);
-    let (v, a) = decide(&dag, &rec(60, f(59)));
-    assert!(matches!(v, Verdict::Conflict(_)) && a == Action::None, "it leaves the node's finality");
-    let (v, _) = decide(&dag, &rec(50, h(59)));
-    assert!(matches!(v, Verdict::Conflict(_)), "a block above its slot");
-}
-
-struct DagOps<'a> {
-    dag: &'a RwLock<GhostDAG>,
-    calls: Mutex<Vec<Action>>,
-}
-
-impl ChainOps for DagOps<'_> {
-    fn pin(&self, hash: Hash) -> Result<(), String> {
-        self.calls.lock().push(Action::Pin(hash));
-        let height = self.dag.read().get_block_data(&hash).unwrap().height;
-        self.dag.write().set_finalized(hash, height);
-        Ok(())
+    assert!(matches!(check(&dag, &rec(60, f(59))), Verdict::Conflict(_)), "it leaves the node's finality");
+    assert!(matches!(check(&dag, &rec(50, h(59))), Verdict::Conflict(_)), "a block above its slot");
+    for v in [Verdict::Conflict(String::new()), Verdict::Unknown(String::new())] {
+        assert!(v.is_alert());
     }
-    fn refuse(&self, hash: Hash) -> Result<(), String> {
-        self.calls.lock().push(Action::Refuse(hash));
-        self.dag.write().mark_invalid(hash);
-        Ok(())
-    }
+    assert!(!Verdict::Consistent.is_alert() && !Verdict::Ahead.is_alert());
 }
 
+/// A hostile registry answer changes nothing the fork choice reads: the
+/// selected tip, the pin, the invalid set; and nothing is stored.
 #[test]
-fn pinning_moves_fork_choice_off_a_contradicting_chain() {
+fn a_hostile_answer_is_reported_never_applied() {
+    let (_t, store) = mk_store();
     let dag = RwLock::new(forked(100, 30, 120));
-    let ops = DagOps { dag: &dag, calls: Mutex::new(Vec::new()) };
-    assert_eq!(enforce(&dag, &ops, &rec(60, h(59))), Verdict::Pinned);
-    assert_eq!(dag.read().selected_tip(), Some(h(100)));
-    assert_eq!(enforce(&dag, &ops, &rec(60, h(59))), Verdict::Pinned, "idempotent");
-    assert_eq!(ops.calls.lock().len(), 1);
-}
-
-#[test]
-fn an_unknown_anchor_refuses_chains_that_passed_its_slot() {
-    // Only the fork is known past height 30; the anchored block is not.
-    let mut d = chain(30);
-    let mut prev = h(30);
-    for i in 31..=120 {
-        d.add_block(f(i), vec![prev], i, 1_000).unwrap();
-        prev = f(i);
+    dag.write().set_finalized(h(20), 20);
+    let snapshot = |d: &GhostDAG| (d.selected_tip(), d.finalized(), d.is_invalid(&f(60)), d.is_invalid(&h(60)));
+    let before = snapshot(&dag.read());
+    for hostile in [rec(60, h(59)), rec(61, h(5_000)), rec(70, f(80))] {
+        let v = check(&dag.read(), &hostile);
+        assert!(v.is_alert(), "{hostile:?}: {v:?}");
+        take_answer(Ok(Some(hostile)), "mock", &dag);
+        assert_eq!(snapshot(&dag.read()), before, "{hostile:?}");
     }
-    let dag = RwLock::new(d);
-    let ops = DagOps { dag: &dag, calls: Mutex::new(Vec::new()) };
-    let anchor = rec(60, h(59));
-    assert_eq!(enforce(&dag, &ops, &anchor), Verdict::Pending);
-    assert_eq!(*ops.calls.lock(), vec![Action::Refuse(f(60))], "the fork's first block past the slot");
-    assert_eq!(dag.read().selected_tip(), Some(f(59)));
-    // A chain still below the slot is left alone.
-    assert_eq!(decide(&dag.read(), &anchor), (Verdict::Pending, Action::None));
-    // The honest block arrives: the next enforcement pins it.
-    {
-        let mut w = dag.write();
-        let mut prev = h(30);
-        for i in 31..=70 {
-            w.add_block(h(i), vec![prev], i, 1_000).unwrap();
-            prev = h(i);
-        }
-    }
-    assert_eq!(enforce(&dag, &ops, &anchor), Verdict::Pinned);
-    assert_eq!(dag.read().selected_tip(), Some(h(70)));
+    assert_eq!(store.get_meta("bloch_anchor/latest").unwrap(), None);
+    let s = status_json();
+    assert_eq!((s["advisory"].as_bool(), s["alert"].as_bool()), (Some(true), Some(true)), "{s}");
+    // The reader's path, then Bloch unreachable: the error is reported and
+    // the fork choice is still untouched. (One test: the status is global.)
+    let r = rec(90, f(89));
+    let res = futures::executor::block_on(MockReader::new(Ok(Some(r))).latest(r.chain_id));
+    take_answer(res, "mock", &dag);
+    assert_eq!(status_json()["status"], "ahead");
+    take_answer(Err("down".into()), "mock", &dag);
+    assert_eq!(status_json()["last_error"], "down");
+    assert_eq!(snapshot(&dag.read()), before);
 }
 
 #[test]
 fn fresh_anchors_only_move_forward() {
-    let (_t, store) = mk_store();
     let a = rec(720, h(719));
-    assert_eq!(accept_fresh(&store, None, a), (Some(a), None));
-    assert_eq!(load_latest(&store), Some(a));
+    assert_eq!(accept_fresh(None, a), (Some(a), None));
     let newer = rec(1440, h(1439));
-    assert_eq!(accept_fresh(&store, Some(a), newer), (Some(newer), None));
-    assert_eq!(load_latest(&store), Some(newer));
-    let (kept, alarm) = accept_fresh(&store, Some(newer), a);
+    assert_eq!(accept_fresh(Some(a), newer), (Some(newer), None));
+    let (kept, alarm) = accept_fresh(Some(newer), a);
     assert_eq!(kept, Some(newer));
     assert!(alarm.unwrap().contains("older"));
-    let (kept, alarm) = accept_fresh(&store, Some(newer), rec(1440, h(1438)));
+    let (kept, alarm) = accept_fresh(Some(newer), rec(1440, h(1438)));
     assert_eq!(kept, Some(newer));
     assert!(alarm.is_some(), "other bytes for the same slot");
-    assert_eq!(load_latest(&store), Some(newer));
+}
+
+#[test]
+fn the_bloch_rpc_url_must_be_https_or_loopback() {
+    for ok in ["https://bloch.example/registry", "http://127.0.0.1:8545/", "http://localhost:1/x",
+               "http://[::1]:8545", "http://127.1.2.3/"] {
+        assert_eq!(check_bloch_rpc_url(ok), Ok(()), "{ok}");
+    }
+    for bad in ["http://bloch.example/registry", "http://10.0.0.5:8545", "http://[2001:db8::1]/", "ftp://x",
+                "http://", "not a url", "http://127.0.0.1.evil.example/"] {
+        assert!(check_bloch_rpc_url(bad).is_err(), "{bad}");
+    }
+    assert!(BlochRpcReader::new("http://203.0.113.7:8545", Duration::from_secs(1)).is_err());
 }
 
 #[test]
@@ -326,24 +305,4 @@ async fn the_bloch_reader_speaks_the_registry_interface() {
     assert!(req.contains("\"method\":\"obbanchor_latest\""));
     assert!(req.contains(&format!("\"params\":[{}]", r.chain_id)));
     assert!(BlochRpcReader::new("ftp://x", Duration::from_secs(1)).is_err());
-}
-
-#[test]
-fn a_poll_takes_persists_and_enforces_the_answer() {
-    let (_t, store) = mk_store();
-    let dag = Arc::new(RwLock::new(forked(100, 30, 120)));
-    let ops = DagOps { dag: &dag, calls: Mutex::new(Vec::new()) };
-    let r = rec(60, h(59));
-    let mock = MockReader::new(Ok(Some(r)));
-    let res = futures::executor::block_on(mock.latest(r.chain_id));
-    take_answer(res, "mock", &dag, &store, &ops);
-    assert_eq!(dag.read().selected_tip(), Some(h(100)));
-    assert_eq!(load_latest(&store), Some(r));
-    let s = status_json();
-    assert_eq!(s["status"], "pinned");
-    assert_eq!(s["anchor"]["slot"], 60);
-    // Bloch unreachable: the held anchor stays in force.
-    take_answer(Err("down".into()), "mock", &dag, &store, &ops);
-    assert_eq!(status_json()["last_error"], "down");
-    assert_eq!(load_latest(&store), Some(r));
 }

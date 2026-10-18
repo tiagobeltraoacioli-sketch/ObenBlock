@@ -39,7 +39,7 @@ use std::sync::OnceLock;
 use gnb_smh::difficulty::{self, AsertAnchor, AsertParams, Target};
 use gnb_smh::sha256d::{self, ParentsError, PowHeader};
 
-use super::{pow_cache, Block, BlockHeader, ASERT_HALFLIFE_SECS, MAX_PARENTS, TARGET_BLOCK_TIME};
+use super::{pow_cache, Block, BlockHeader, MerkleRoot, ASERT_HALFLIFE_SECS, MAX_PARENTS, TARGET_BLOCK_TIME};
 
 // ── ObenBlock constants ─────────────────────────────────────────────────────
 
@@ -305,10 +305,115 @@ pub(super) fn validate_pow_sha256d(block: &Block, params: &Sha256dParams) -> boo
     ok
 }
 
+// ── The header Merkle root under SHA-256d (Bitcoin's tree) ──────────────────
+//
+// docs/CONSENSUS.md, "Header Merkle root and body commitment (ObenBlock)".
+// Stock Stratum V1 firmware rebuilds `merkle_root` itself whenever it rolls
+// extranonce2: `sha256d(coinb1 ‖ extranonce1 ‖ extranonce2 ‖ coinb2)` folded
+// up the job's merkle branch with `sha256d(cur ‖ sibling)`. So on ObenBlock
+// the header root is Bitcoin's transaction root over the txids, and every
+// other byte of the block (witnesses, the shielded section, the PoWit
+// section) is committed by the coinbase commitment instead
+// ([`obb_body_commitment`]), which the coinbase txid covers. GnB keeps its
+// tagged tree and its body roots.
+
+/// Tag of the ObenBlock body commitment (coinbase commitment bytes 48..80).
+pub const OBB_BODY_COMMITMENT_TAG: &[u8] = b"OBB/coinbase/body";
+
+/// Bitcoin's Merkle root over `ids` and Bitcoin Core's `mutated` flag
+/// (`ComputeMerkleRoot`, consensus/merkle.cpp):
+///
+/// * no ids: 32 zero bytes;
+/// * each level pairs its nodes left to right with `SHA-256d(l ‖ r)`; a
+///   level of odd length first appends a copy of its last node;
+/// * `mutated` is set when, on any level BEFORE that duplication, the nodes
+///   at positions `2i` and `2i + 1` are equal (CVE-2012-2459: `[.., x]` and
+///   `[.., x, x]` share a root; a block whose tree is mutated is invalid).
+pub fn bitcoin_merkle_root(ids: &[[u8; 32]]) -> (MerkleRoot, bool) {
+    if ids.is_empty() {
+        return (MerkleRoot::ZERO, false);
+    }
+    let mut mutated = false;
+    let mut level: Vec<[u8; 32]> = ids.to_vec();
+    while level.len() > 1 {
+        mutated |= level.chunks_exact(2).any(|p| p[0] == p[1]);
+        if level.len() % 2 == 1 {
+            let last = level[level.len() - 1];
+            level.push(last);
+        }
+        level = level.chunks_exact(2).map(|p| bitcoin_merkle_node(&p[0], &p[1])).collect();
+    }
+    (MerkleRoot(level[0]), mutated)
+}
+
+/// An inner node of Bitcoin's tree: `SHA-256d(left ‖ right)`.
+pub fn bitcoin_merkle_node(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut buf = [0u8; 64];
+    buf[..32].copy_from_slice(left);
+    buf[32..].copy_from_slice(right);
+    sha256d::sha256d(&buf)
+}
+
+/// [`bitcoin_merkle_root`] over the txids of `txs` (`Transaction::txid`:
+/// SHA-256d of the wire encoding, `script_sig`s included only for the
+/// coinbase), in block order.
+pub fn obb_tx_merkle_root(txs: &[super::Transaction]) -> (MerkleRoot, bool) {
+    let ids: Vec<[u8; 32]> = txs.iter().map(super::Transaction::txid).collect();
+    bitcoin_merkle_root(&ids)
+}
+
+/// The ObenBlock header-root rule: `header.merkle_root` is Bitcoin's root
+/// over the block's txids and the tree is not mutated.
+pub fn obb_validate_merkle(block: &Block) -> bool {
+    let (root, mutated) = obb_tx_merkle_root(&block.transactions);
+    !mutated && root == block.header.merkle_root
+}
+
+/// The error `check_block_hardened_at` reports for a block whose header root
+/// fails: a mutated tree (under SHA-256d) or any other mismatch.
+pub fn merkle_error(block: &Block) -> &'static str {
+    if node_sha256d_params().is_some() && obb_tx_merkle_root(&block.transactions).1 {
+        "bad-txns-duplicate: mutated merkle tree (CVE-2012-2459)"
+    } else {
+        "invalid merkle root"
+    }
+}
+
+/// `tagged_hash("OBB/coinbase/body", witness_root ‖ shielded_root ‖ powit_root)`:
+/// the 32 bytes an ObenBlock coinbase commitment carries at offset 48 in
+/// place of GnB's bare witness root.
+pub fn obb_body_commitment_parts(witness_root: &MerkleRoot, shielded_root: &[u8; 32], powit_root: &[u8; 32]) -> MerkleRoot {
+    MerkleRoot(super::block_rules::tagged_hash(OBB_BODY_COMMITMENT_TAG, &[&witness_root.0, shielded_root, powit_root]))
+}
+
+/// The body commitment of `block`: its witness root
+/// (`block_rules::witness_root`, the wtxids with the coinbase as zero), the
+/// root of its shielded section and the root of its PoWit section in the
+/// exact wire encoding of the block's body format
+/// (`PowitBody::root_for(BodyFormat::at(height))`: on a PoCI chain the PoCI
+/// evidence list and the membership list with its exits and rejoins; with
+/// the exits list from the liveness activation; GnB's v2 body root hashes
+/// the same section the same way). Together with the header's transaction
+/// root this commits every byte of the block's wire encoding except the
+/// uncommitted `blue_score` and the height (bound to the parents by
+/// `accept_block` and committed by the coinbase commitment's height field):
+/// a relay that deletes, adds or swaps any PoWit item (share, vote, PoCI
+/// evidence, exit, rejoin) changes the commitment, so the altered copy is
+/// refused (`bad witness commitment`) without disqualifying the id.
+pub fn obb_body_commitment(block: &Block) -> MerkleRoot {
+    obb_body_commitment_for(block, super::powit::BodyFormat::at(block.height))
+}
+
+/// [`obb_body_commitment`] with the PoWit section hashed in an explicit
+/// body format (tools and tests; consensus uses the block's own format).
+pub fn obb_body_commitment_for(block: &Block, fmt: super::powit::BodyFormat) -> MerkleRoot {
+    let powit_root = block.powit.root_for(fmt);
+    obb_body_commitment_parts(&super::block_rules::witness_root(&block.transactions), &block.shielded_root(), &powit_root)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::MerkleRoot;
 
     fn header(parents: Vec<[u8; 32]>, bits: u32, nonce: u64) -> BlockHeader {
         BlockHeader { version: OBB_BLOCK_VERSION, parents, merkle_root: MerkleRoot([7; 32]), timestamp: 1_800_000_000, bits, nonce }
@@ -403,6 +508,86 @@ mod tests {
         let withheld: u64 = (1..SLOW_START_BLOCKS).map(|h| full - slow_start_subsidy_sat(full, h)).sum();
         assert_eq!(withheld / super::super::tokenomics::SAT_PER_GNB, 3_081, "about 3,080 OBB (§4.2)");
         assert_eq!(slow_start_subsidy_sat(u64::MAX, SLOW_START_BLOCKS - 1), (u64::MAX as u128 * 5_759 / 5_760) as u64);
+    }
+
+    /// Review finding (CRITICAL, D1): the body commitment hashed the PoWit
+    /// section in the GnB/liveness encoding, which carries neither the PoCI
+    /// evidence list nor the rejoins, so a relay could strip or swap them
+    /// under the same block id. In the PoCI format every item is committed.
+    #[test]
+    fn body_commitment_covers_poci_evidence_and_rejoins() {
+        use super::super::kes::{KesPublic, KesSignature};
+        use super::super::powit::{poci::PociEvidence, Attestation, BodyFormat, Checkpoint, PowitBody, WitnessExit,
+                                  WitnessRejoin};
+        let sig = |n: u8| KesSignature { index: 0, leaf_pk: vec![n], sig: vec![n; 4], path: vec![[n; 32]] };
+        let key = |n: u8| KesPublic { depth: 1, root: [n; 32] };
+        let vote = |n: u8, t: u8| Attestation {
+            source: Checkpoint { height: 80, hash: [1; 32] },
+            target: Checkpoint { height: 85, hash: [t; 32] },
+            witness: key(n),
+            sig: sig(t),
+        };
+        let ev = |n: u8| PociEvidence { config_id: [0xC0; 32], a: vote(n, 2), b: vote(n, 3) };
+        let rejoin = |n: u8| WitnessRejoin { witness: key(n), epoch: 9, sig: sig(n) };
+        let block = |powit: PowitBody| Block {
+            header: header(vec![[3; 32]], 0x207f_ffff, 0),
+            transactions: Vec::new(),
+            blue_score: 90,
+            height: 90,
+            shielded_transactions: Vec::new(),
+            powit,
+        };
+        let full = PowitBody {
+            poci_evidence: vec![ev(5), ev(6)],
+            exits: vec![WitnessExit { witness: key(7), epoch: 9, sig: sig(7) }],
+            rejoins: vec![rejoin(8), rejoin(9)],
+            ..PowitBody::default()
+        };
+        let poci = BodyFormat { exits: true, poci: true };
+        let honest = obb_body_commitment_for(&block(full.clone()), poci);
+        let mut variants: Vec<(&str, PowitBody)> = Vec::new();
+        let mut b = full.clone();
+        b.poci_evidence.pop();
+        variants.push(("evidence deleted", b));
+        let mut b = full.clone();
+        b.poci_evidence.swap(0, 1);
+        variants.push(("evidence swapped", b));
+        let mut b = full.clone();
+        let e = &mut b.poci_evidence[0];
+        std::mem::swap(&mut e.a, &mut e.b);
+        variants.push(("evidence votes swapped", b));
+        let mut b = full.clone();
+        b.rejoins.remove(0);
+        variants.push(("rejoin deleted", b));
+        let mut b = full.clone();
+        b.rejoins.swap(0, 1);
+        variants.push(("rejoins swapped", b));
+        let mut b = full.clone();
+        b.rejoins[1] = rejoin(10);
+        variants.push(("rejoin replaced", b));
+        let mut b = full.clone();
+        b.exits.clear();
+        variants.push(("exit deleted", b));
+        for (what, body) in variants {
+            let altered = block(body);
+            assert_eq!(altered.block_hash(), block(full.clone()).block_hash(), "{what}: same header, same id");
+            assert_ne!(obb_body_commitment_for(&altered, poci), honest, "{what}: the commitment changes");
+        }
+        // The commitment is the hash of the section's wire bytes.
+        let mut wire = Vec::new();
+        full.write_wire_for(&mut wire, poci);
+        let back = PowitBody::read_wire_for(&mut std::io::Cursor::new(&wire[..]), poci).unwrap();
+        assert_eq!(obb_body_commitment_for(&block(back), poci), honest);
+        // The encoding the commitment used before ignores both lists.
+        let mut stripped = full.clone();
+        stripped.poci_evidence.clear();
+        stripped.rejoins.clear();
+        assert_eq!(full.root_with(true), stripped.root_with(true), "the old encoding: the bug");
+        // An empty section is the same with and without PoCI (genesis
+        // commitments unchanged).
+        let empty = block(PowitBody::default());
+        assert_eq!(obb_body_commitment_for(&empty, poci),
+                   obb_body_commitment_for(&empty, BodyFormat { exits: true, poci: false }));
     }
 
     #[test]

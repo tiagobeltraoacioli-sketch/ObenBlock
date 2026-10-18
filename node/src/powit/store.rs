@@ -32,6 +32,16 @@
 //! node (a block's state is staged once, `accept::TriggerRecord`); nothing
 //! deletes them, so a diff never loses its parent.
 //!
+//! - **The growth cap** (ObenBlock, `PowitState::cap`, DESIGN-obenblock.md
+//!   §6.3): the admitted credit per key per window epoch is stored like the
+//!   frozen epochs, as content-addressed segments (`powit/epoch/<digest>`,
+//!   the same digest of `(epoch, map)`: a credit map is a key -> u128 map
+//!   too). A ledger changes only at a PoCI handoff, so it is stored once per
+//!   ledger (`powit/capl/<ledger id>`: its epoch, the segments of its
+//!   credits, its last report), and each block stores only the ledger's id
+//!   and the first-block bits it keeps (`powit/cap/<hash>`). GnB states
+//!   have no ledger and store none of these rows.
+//!
 //! Compatibility: data dirs written before this layout hold
 //! `powit/state/<hash>` (the whole state, bincode). They are read as before
 //! when a block has no record in this layout, and a child of such a block
@@ -46,7 +56,9 @@ use serde::{Deserialize, Serialize};
 use sha3::{Digest, Sha3_256};
 
 use crate::storage::Storage;
+use gnb_crypto::core::powit::growth_cap::{CapLedger, CapReport, CapState};
 use gnb_crypto::core::powit::{KeyId, PowitState};
+use primitive_types::U256;
 
 type Hash = [u8; 32];
 type EpochWork = BTreeMap<KeyId, u128>;
@@ -59,6 +71,10 @@ const CORE_PREFIX: &str = "powit/sc/";
 const WORK_PREFIX: &str = "powit/sw/";
 /// A frozen epoch's work map, by [`epoch_digest`].
 const EPOCH_PREFIX: &str = "powit/epoch/";
+/// A block's [`CapRecord`] (ObenBlock).
+const CAP_PREFIX: &str = "powit/cap/";
+/// A growth cap ledger's [`LedgerRow`], by [`CapLedger::id`].
+const CAP_LEDGER_PREFIX: &str = "powit/capl/";
 /// Domain tag of a segment digest.
 const EPOCH_TAG: &[u8] = b"GNB-POWIT-STORE-v1/epoch";
 /// First byte of a core or work row: the layout version.
@@ -164,9 +180,117 @@ fn core_of(s: &PowitState) -> PowitState {
         decay: s.decay.clone(),
         active_this_epoch: s.active_this_epoch.clone(),
         epoch: s.epoch,
-        // Not in the serde encoding: node/src/powit.rs stores it in its own row.
+        // Not in the serde encoding: node/src/powit.rs stores them in their own rows.
         exited: BTreeMap::new(),
+        poci: None,
+        cap: None,
     }
+}
+
+// ── Growth cap rows (ObenBlock) ──────────────────────────────────────────────
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct CapRecord {
+    ledger: Hash,
+    first_bits: Vec<(u64, u32)>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct ReportRow {
+    epoch: u64,
+    w: u128,
+    g: u128,
+    /// sum_x, admitted, admitted_new, dropped: 256-bit, little-endian.
+    wide: [[u8; 32]; 4],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct LedgerRow {
+    epoch: u64,
+    credits: Vec<FrozenRef>,
+    report: Option<ReportRow>,
+}
+
+/// Decoded ledgers by id (a handful are live at once: one per configuration
+/// in force on the branches the node follows).
+static LEDGER_CACHE: Mutex<Option<HashMap<Hash, CapLedger>>> = parking_lot::const_mutex(None);
+const LEDGER_CACHE_CAP: usize = 16;
+
+fn report_row(r: &CapReport) -> ReportRow {
+    ReportRow { epoch: r.epoch, w: r.w, g: r.g,
+                wide: [r.sum_x, r.admitted, r.admitted_new, r.dropped].map(|v| v.to_little_endian()) }
+}
+
+fn report_of(r: &ReportRow) -> CapReport {
+    let [sum_x, admitted, admitted_new, dropped] = r.wide.map(|b| U256::from_little_endian(&b));
+    CapReport { epoch: r.epoch, w: r.w, g: r.g, sum_x, admitted, admitted_new, dropped }
+}
+
+fn load_ledger(store: &Storage, id: &Hash) -> Option<CapLedger> {
+    if let Some(l) = LEDGER_CACHE.lock().as_ref().and_then(|m| m.get(id).cloned()) {
+        return Some(l);
+    }
+    let row: LedgerRow = unversioned(&store.get_meta(&key(CAP_LEDGER_PREFIX, id)).ok().flatten()?)?;
+    let mut credits = BTreeMap::new();
+    for f in &row.credits {
+        if credits.insert(f.epoch, load_epoch(store, f)?).is_some() {
+            return None;
+        }
+    }
+    let ledger = CapLedger::from_parts(row.epoch, credits, row.report.as_ref().map(report_of));
+    if ledger.id() != *id {
+        return None;
+    }
+    let mut g = LEDGER_CACHE.lock();
+    let m = g.get_or_insert_with(HashMap::new);
+    if m.len() >= LEDGER_CACHE_CAP {
+        m.clear();
+    }
+    m.insert(*id, ledger.clone());
+    Some(ledger)
+}
+
+/// `hash`'s growth cap state: `Some(None)` when it has none (GnB, or a
+/// state stored before the cap), `None` when a row it needs is missing or
+/// corrupt.
+pub fn load_cap(store: &Storage, hash: &Hash) -> Option<Option<CapState>> {
+    let Some(bytes) = store.get_meta(&key(CAP_PREFIX, hash)).ok()? else { return Some(None) };
+    let rec: CapRecord = unversioned(&bytes)?;
+    let ledger = load_ledger(store, &rec.ledger)?;
+    let first_bits: BTreeMap<u64, u32> = rec.first_bits.iter().copied().collect();
+    if first_bits.len() != rec.first_bits.len() {
+        return None;
+    }
+    Some(Some(CapState { ledger, first_bits }))
+}
+
+/// Stage `state`'s growth cap rows: the block's record, and the ledger with
+/// its credit segments unless already stored (by the block whose handoff
+/// built it).
+pub fn stage_cap(store: &Storage, batch: &mut rocksdb::WriteBatch, hash: &Hash, state: &PowitState)
+    -> Result<(), String>
+{
+    let Some(cap) = &state.cap else { return Ok(()) };
+    let err = |e: String| format!("storage: powit growth cap: {e}");
+    let id = cap.ledger.id();
+    let lkey = key(CAP_LEDGER_PREFIX, &id);
+    if store.get_meta(&lkey).map_err(|e| err(e.to_string()))?.is_none() {
+        let mut credits = Vec::with_capacity(cap.ledger.credits().len());
+        for (n, m) in cap.ledger.credits() {
+            let bytes = encode(&**m, "credit")?;
+            let digest = epoch_digest(*n, &bytes);
+            let k = key(EPOCH_PREFIX, &digest);
+            if store.get_meta(&k).map_err(|e| err(e.to_string()))?.is_none() {
+                store.stage_meta(batch, &k, &bytes).map_err(|e| err(e.to_string()))?;
+            }
+            let (keys, sum) = fingerprint(m);
+            credits.push(FrozenRef { epoch: *n, digest, keys, sum });
+        }
+        let row = LedgerRow { epoch: cap.ledger.epoch(), credits, report: cap.ledger.report().map(report_row) };
+        store.stage_meta(batch, &lkey, &versioned(&row, "growth cap ledger")?).map_err(|e| err(e.to_string()))?;
+    }
+    let rec = CapRecord { ledger: id, first_bits: cap.first_bits.iter().map(|(e, b)| (*e, *b)).collect() };
+    store.stage_meta(batch, &key(CAP_PREFIX, hash), &versioned(&rec, "growth cap")?).map_err(|e| err(e.to_string()))
 }
 
 // ── Segment cache ────────────────────────────────────────────────────────────
@@ -410,6 +534,306 @@ pub fn stage(store: &Storage, batch: &mut rocksdb::WriteBatch, hash: &Hash, pare
 #[allow(dead_code)] // tests; the node binary compiles this module too
 pub fn record_kind(store: &Storage, hash: &Hash) -> Option<bool> {
     read_work(store, hash).map(|r| matches!(r.kind, WorkKind::Anchor { .. }))
+}
+
+// ── PoCI ledger rows (ObenBlock) ─────────────────────────────────────────────
+//
+// The PoCI ledger beside a block's state (`PociState`: the history head, the
+// bans, the pruned keys, the pending rejoins and the included votes `seen`)
+// used to be stored whole per block (`powit/poci/<hash>`), never deleted:
+// with `seen` holding up to `PRUNE_AFTER + 3` block epochs of every key of
+// the configuration, that repeated the whole absence-pruning ledger at every
+// block (review finding LOW: tens of MB a day). It is now laid out like the
+// work records above:
+//
+// - **Slow part** (bans, pruned keys, pending rejoins): it changes only when
+//   a block includes evidence or a rejoin, or at a handoff; stored once per
+//   content as a segment `powit/pocis/<digest>`.
+// - **`seen` by block epoch**: an anchor references one content-addressed
+//   segment per block epoch (`key -> lowest included_at`), so the epochs
+//   that no longer change are shared by every later anchor and branch.
+// - **Per block** (`powit/pocir/<hash>`): the history head, the slow part's
+//   digest, and either an anchor (the epoch segments) or a diff against the
+//   selected parent's record: the `seen` entries the block added or lowered.
+//   A block stores an anchor every `ANCHOR_EVERY` records, when an entry
+//   was dropped (`trim_seen`, a handoff), and when its parent has no record
+//   in this layout; a load walks at most `ANCHOR_EVERY - 1` diffs.
+//
+// Data dirs written before this layout keep their `powit/poci/<hash>` rows
+// (read when a block has no record here; `node/src/powit.rs`).
+
+/// A block's PoCI record.
+const POCI_REC_PREFIX: &str = "powit/pocir/";
+/// A content-addressed PoCI segment (slow part or one block epoch of `seen`).
+const POCI_SEG_PREFIX: &str = "powit/pocis/";
+/// Domain tag of a PoCI segment digest.
+const POCI_SEG_TAG: &[u8] = b"GNB-POWIT-STORE-v1/poci";
+
+/// The PoCI ledger of a block as stored (the history itself is stored by
+/// `node/src/powit.rs` as history nodes and named here by its head).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PociLedgerRows {
+    pub head: Hash,
+    pub bans: BTreeMap<KeyId, Vec<gnb_crypto::core::powit::poci::Ban>>,
+    /// key -> the epoch its pruning started.
+    pub pruned: BTreeMap<KeyId, u64>,
+    pub rejoins: BTreeMap<KeyId, u64>,
+    /// key -> (block epoch -> lowest `included_at`).
+    pub seen: BTreeMap<KeyId, BTreeMap<u64, u64>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct PociSlow {
+    bans: BTreeMap<KeyId, Vec<gnb_crypto::core::powit::poci::Ban>>,
+    pruned: BTreeMap<KeyId, u64>,
+    rejoins: BTreeMap<KeyId, u64>,
+}
+
+/// One block epoch of `seen` referenced by an anchor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct SeenRef {
+    epoch: u64,
+    digest: Hash,
+    keys: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum PociKind {
+    Anchor { seen: Vec<SeenRef> },
+    /// `(key, block epoch, lowest included_at)` added or lowered since the
+    /// record of `parent` (`depth - 1` diffs from its anchor).
+    Diff { parent: Hash, depth: u32, changed: Vec<(KeyId, u64, u64)> },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PociRec {
+    head: Hash,
+    slow: Hash,
+    kind: PociKind,
+}
+
+type SeenEpoch = BTreeMap<KeyId, u64>;
+
+/// Decoded, verified PoCI segments by digest.
+#[derive(Clone)]
+enum PociSeg {
+    Slow(Arc<PociSlow>),
+    Seen(Arc<SeenEpoch>),
+}
+
+static POCI_SEG_CACHE: Mutex<Option<(HashMap<Hash, PociSeg>, VecDeque<Hash>)>> = parking_lot::const_mutex(None);
+const POCI_SEG_CACHE_CAP: usize = 512;
+
+/// SHA3-256(tag ‖ kind ‖ u64le(epoch) ‖ bytes): kind 0 the slow part
+/// (epoch 0), kind 1 one block epoch of `seen`.
+fn poci_digest(kind: u8, epoch: u64, bytes: &[u8]) -> Hash {
+    let mut h = Sha3_256::new();
+    h.update(POCI_SEG_TAG);
+    h.update([kind]);
+    h.update(epoch.to_le_bytes());
+    h.update(bytes);
+    h.finalize().into()
+}
+
+fn poci_seg_cached(digest: &Hash) -> Option<PociSeg> {
+    POCI_SEG_CACHE.lock().as_ref().and_then(|(m, _)| m.get(digest).cloned())
+}
+
+fn poci_seg_remember(digest: Hash, seg: PociSeg) {
+    let mut g = POCI_SEG_CACHE.lock();
+    let (m, order) = g.get_or_insert_with(Default::default);
+    if m.insert(digest, seg).is_none() {
+        order.push_back(digest);
+        if order.len() > POCI_SEG_CACHE_CAP {
+            if let Some(old) = order.pop_front() {
+                m.remove(&old);
+            }
+        }
+    }
+}
+
+fn load_slow(store: &Storage, digest: &Hash) -> Option<Arc<PociSlow>> {
+    if let Some(PociSeg::Slow(s)) = poci_seg_cached(digest) {
+        return Some(s);
+    }
+    let bytes = store.get_meta(&key(POCI_SEG_PREFIX, digest)).ok().flatten()?;
+    if poci_digest(0, 0, &bytes) != *digest {
+        return None;
+    }
+    let s = Arc::new(decode::<PociSlow>(&bytes)?);
+    poci_seg_remember(*digest, PociSeg::Slow(s.clone()));
+    Some(s)
+}
+
+fn load_seen_epoch(store: &Storage, r: &SeenRef) -> Option<Arc<SeenEpoch>> {
+    if let Some(PociSeg::Seen(s)) = poci_seg_cached(&r.digest) {
+        return Some(s);
+    }
+    let bytes = store.get_meta(&key(POCI_SEG_PREFIX, &r.digest)).ok().flatten()?;
+    if poci_digest(1, r.epoch, &bytes) != r.digest {
+        return None;
+    }
+    let m: SeenEpoch = decode(&bytes)?;
+    if m.len() as u64 != r.keys || m.is_empty() {
+        return None;
+    }
+    let m = Arc::new(m);
+    poci_seg_remember(r.digest, PociSeg::Seen(m.clone()));
+    Some(m)
+}
+
+fn read_poci_rec(store: &Storage, hash: &Hash) -> Option<PociRec> {
+    unversioned(&store.get_meta(&key(POCI_REC_PREFIX, hash)).ok().flatten()?)
+}
+
+/// A PoCI record resolved through its diffs: its depth and `seen` by
+/// block epoch.
+struct PociResolved {
+    rec: PociRec,
+    depth: u32,
+    seen: BTreeMap<u64, SeenEpoch>,
+}
+
+fn resolve_poci(store: &Storage, hash: &Hash) -> Option<PociResolved> {
+    let first = read_poci_rec(store, hash)?;
+    let depth = match &first.kind {
+        PociKind::Anchor { .. } => 0,
+        PociKind::Diff { depth, .. } => *depth,
+    };
+    if depth >= ANCHOR_EVERY {
+        return None;
+    }
+    let mut diffs: Vec<Vec<(KeyId, u64, u64)>> = Vec::new();
+    let mut rec = first.clone();
+    loop {
+        match rec.kind {
+            PociKind::Anchor { seen: refs } => {
+                if diffs.len() as u32 != depth {
+                    return None;
+                }
+                let mut seen: BTreeMap<u64, SeenEpoch> = BTreeMap::new();
+                for r in &refs {
+                    if seen.insert(r.epoch, (*load_seen_epoch(store, r)?).clone()).is_some() {
+                        return None;
+                    }
+                }
+                for changed in diffs.into_iter().rev() {
+                    for (k, y, at) in changed {
+                        seen.entry(y).or_default().insert(k, at);
+                    }
+                }
+                return Some(PociResolved { rec: first, depth, seen });
+            }
+            PociKind::Diff { parent, depth: d, changed } => {
+                if d as usize != depth as usize - diffs.len() || d == 0 {
+                    return None;
+                }
+                diffs.push(changed);
+                rec = read_poci_rec(store, &parent)?;
+            }
+        }
+    }
+}
+
+fn seen_by_epoch(seen: &BTreeMap<KeyId, BTreeMap<u64, u64>>) -> BTreeMap<u64, SeenEpoch> {
+    let mut out: BTreeMap<u64, SeenEpoch> = BTreeMap::new();
+    for (k, m) in seen {
+        for (y, at) in m {
+            out.entry(*y).or_default().insert(*k, *at);
+        }
+    }
+    out
+}
+
+/// `hash`'s PoCI ledger rows in this layout: `Some(None)` when it has no
+/// record here, `None` when a row it needs is missing or corrupt.
+pub fn load_poci_ledger(store: &Storage, hash: &Hash) -> Option<Option<PociLedgerRows>> {
+    if store.get_meta(&key(POCI_REC_PREFIX, hash)).ok()?.is_none() {
+        return Some(None);
+    }
+    let r = resolve_poci(store, hash)?;
+    let slow = load_slow(store, &r.rec.slow)?;
+    let mut seen: BTreeMap<KeyId, BTreeMap<u64, u64>> = BTreeMap::new();
+    for (y, m) in r.seen {
+        for (k, at) in m {
+            seen.entry(k).or_default().insert(y, at);
+        }
+    }
+    Some(Some(PociLedgerRows { head: r.rec.head, bans: slow.bans.clone(), pruned: slow.pruned.clone(),
+                               rejoins: slow.rejoins.clone(), seen }))
+}
+
+/// The `seen` entries of `child` that are new or changed against `parent`,
+/// or `None` when one of `parent`'s is gone (then the block stores an anchor).
+fn seen_changes(parent: &BTreeMap<u64, SeenEpoch>, child: &BTreeMap<u64, SeenEpoch>) -> Option<Vec<(KeyId, u64, u64)>> {
+    for (y, pm) in parent {
+        let cm = child.get(y)?;
+        if pm.keys().any(|k| !cm.contains_key(k)) {
+            return None;
+        }
+    }
+    let mut out = Vec::new();
+    for (y, cm) in child {
+        let pm = parent.get(y);
+        for (k, at) in cm {
+            if pm.and_then(|m| m.get(k)) != Some(at) {
+                out.push((*k, *y, *at));
+            }
+        }
+    }
+    Some(out)
+}
+
+/// Stage `hash`'s PoCI ledger rows: its record (a diff against `parent`'s
+/// when it can be one), the slow part's segment and the anchor's `seen`
+/// segments that are not stored yet.
+pub fn stage_poci_ledger(store: &Storage, batch: &mut rocksdb::WriteBatch, hash: &Hash, parent: Option<&Hash>,
+                         rows: &PociLedgerRows) -> Result<(), String>
+{
+    let err = |e: String| format!("storage: powit poci: {e}");
+    let put_seg = |batch: &mut rocksdb::WriteBatch, digest: &Hash, bytes: &[u8]| -> Result<(), String> {
+        let k = key(POCI_SEG_PREFIX, digest);
+        if store.get_meta(&k).map_err(|e| err(e.to_string()))?.is_none() {
+            store.stage_meta(batch, &k, bytes).map_err(|e| err(e.to_string()))?;
+        }
+        Ok(())
+    };
+    let slow = PociSlow { bans: rows.bans.clone(), pruned: rows.pruned.clone(), rejoins: rows.rejoins.clone() };
+    let slow_bytes = encode(&slow, "poci ledger")?;
+    let slow_digest = poci_digest(0, 0, &slow_bytes);
+    put_seg(batch, &slow_digest, &slow_bytes)?;
+    let seen = seen_by_epoch(&rows.seen);
+    let diff = parent.and_then(|p| resolve_poci(store, p).map(|r| (*p, r))).and_then(|(p, r)| {
+        if r.depth + 1 >= ANCHOR_EVERY {
+            return None;
+        }
+        let changed = seen_changes(&r.seen, &seen)?;
+        Some(PociKind::Diff { parent: p, depth: r.depth + 1, changed })
+    });
+    let kind = match diff {
+        Some(d) => d,
+        None => {
+            let mut refs = Vec::with_capacity(seen.len());
+            for (y, m) in &seen {
+                let bytes = encode(m, "poci seen")?;
+                let digest = poci_digest(1, *y, &bytes);
+                put_seg(batch, &digest, &bytes)?;
+                refs.push(SeenRef { epoch: *y, digest, keys: m.len() as u64 });
+            }
+            PociKind::Anchor { seen: refs }
+        }
+    };
+    let rec = PociRec { head: rows.head, slow: slow_digest, kind };
+    store.stage_meta(batch, &key(POCI_REC_PREFIX, hash), &versioned(&rec, "poci record")?).map_err(|e| err(e.to_string()))
+}
+
+/// Whether `hash`'s PoCI record is an anchor (`Some(true)`), a diff
+/// (`Some(false)`), or absent (`None`), and its encoded size. Tests.
+#[allow(dead_code)] // tests; the node binary compiles this module too
+pub fn poci_record_kind(store: &Storage, hash: &Hash) -> Option<(bool, usize)> {
+    let bytes = store.get_meta(&key(POCI_REC_PREFIX, hash)).ok().flatten()?;
+    let rec: PociRec = unversioned(&bytes)?;
+    Some((matches!(rec.kind, PociKind::Anchor { .. }), bytes.len()))
 }
 
 #[cfg(test)]
@@ -684,5 +1108,145 @@ mod tests {
         drop(b);
         assert_eq!(load(&st, &h(0)), None);
         assert_eq!(record_kind(&st, &h(0)), None);
+    }
+
+    // ── PoCI ledger rows ─────────────────────────────────────────────────────
+
+    fn poci_put(st: &Storage, hash: &Hash, parent: Option<&Hash>, r: &PociLedgerRows) {
+        let mut b = rocksdb::WriteBatch::default();
+        stage_poci_ledger(st, &mut b, hash, parent, r).unwrap();
+        st.write_batch(b).unwrap();
+    }
+
+    fn poci_forget_all() {
+        *POCI_SEG_CACHE.lock() = None;
+    }
+
+    /// A ledger walk shaped like `apply_poci`'s: each block includes votes
+    /// of some keys (first inclusion per key per block epoch kept), an
+    /// epoch step trims the oldest block epochs, evidence and rejoins now
+    /// and then.
+    fn poci_walk(n: u64, per_epoch: u64, keys: u32, seed: u64) -> Vec<PociLedgerRows> {
+        let mut x = seed | 1;
+        let mut rnd = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut r = PociLedgerRows { head: [0x11; 32], ..Default::default() };
+        let mut out = Vec::new();
+        let mut epoch = 0;
+        for i in 1..=n {
+            let y = i / per_epoch;
+            if y > epoch {
+                epoch = y;
+                for m in r.seen.values_mut() {
+                    m.retain(|e, _| *e + 10 >= y);
+                }
+                r.seen.retain(|_, m| !m.is_empty());
+                r.head = [y as u8; 32];
+            }
+            for _ in 0..(1 + rnd() % 3) {
+                let key = k((rnd() % keys as u64) as u32);
+                r.seen.entry(key).or_default().entry(y).or_insert(i);
+            }
+            if rnd() % 50 == 0 {
+                r.bans.entry(k(1000 + (i % 7) as u32)).or_default().push(
+                    gnb_crypto::core::powit::poci::Ban { config_id: [i as u8; 32], included_at: i, start: None });
+            }
+            if rnd() % 70 == 0 {
+                r.pruned.insert(k(2000 + (i % 5) as u32), y);
+                r.rejoins.insert(k(2000 + (i % 5) as u32), i);
+            }
+            out.push(r.clone());
+        }
+        out
+    }
+
+    /// Review finding (LOW): the PoCI ledger was stored whole per block. It
+    /// is now per-epoch segments plus diffs: every block's ledger reloads
+    /// exactly (from disk, with no segment cached), most blocks store a
+    /// small diff, an anchor at least every `ANCHOR_EVERY` records, and the
+    /// rows written per block stay far below the whole ledger's size.
+    #[test]
+    fn poci_ledger_round_trips_as_segments_and_diffs() {
+        let (_d, st) = store();
+        let rows = poci_walk(400, 40, 60, 7);
+        let mut diff_bytes = 0usize;
+        let (mut anchors, mut diffs) = (0, 0);
+        for (i, r) in rows.iter().enumerate() {
+            let parent = (i > 0).then(|| h(i as u64 - 1));
+            poci_put(&st, &h(i as u64), parent.as_ref(), r);
+            let (anchor, size) = poci_record_kind(&st, &h(i as u64)).unwrap();
+            if anchor {
+                anchors += 1;
+            } else {
+                diffs += 1;
+                diff_bytes += size;
+            }
+        }
+        assert!(diffs > 300, "mostly diffs ({anchors} anchors, {diffs} diffs)");
+        let whole = encode(&rows.last().unwrap().seen, "x").unwrap().len();
+        assert!(diff_bytes / diffs < 256, "a diff is small: {} bytes on average", diff_bytes / diffs);
+        assert!(whole > 4 * (diff_bytes / diffs), "the whole ledger ({whole} bytes) was stored per block before");
+        poci_forget_all();
+        for (i, r) in rows.iter().enumerate() {
+            assert_eq!(load_poci_ledger(&st, &h(i as u64)), Some(Some(r.clone())), "block {i}");
+        }
+        // No anchor is more than ANCHOR_EVERY - 1 diffs away.
+        for i in 0..rows.len() as u64 {
+            assert!(resolve_poci(&st, &h(i)).unwrap().depth < ANCHOR_EVERY);
+        }
+        // A block without a record in this layout: Some(None).
+        assert_eq!(load_poci_ledger(&st, &h(9_999)), Some(None));
+    }
+
+    /// Reorgs: two branches from one parent store diffs against their own
+    /// parents and each reloads its own ledger, whatever was stored first;
+    /// a block whose entries were trimmed stores an anchor; a corrupt
+    /// segment or a missing parent record loads nothing (never a wrong
+    /// ledger).
+    #[test]
+    fn poci_ledger_branches_trims_and_corruption() {
+        let (_d, st) = store();
+        let rows = poci_walk(20, 1_000, 20, 3);
+        for (i, r) in rows.iter().enumerate() {
+            poci_put(&st, &h(i as u64), (i > 0).then(|| h(i as u64 - 1)).as_ref(), r);
+        }
+        let base = rows.last().unwrap().clone();
+        let tip = h(rows.len() as u64 - 1);
+        let mut a = base.clone();
+        a.seen.entry(k(500)).or_default().insert(0, 31);
+        let mut b = base.clone();
+        b.seen.entry(k(501)).or_default().insert(0, 31);
+        b.bans.entry(k(502)).or_default().push(
+            gnb_crypto::core::powit::poci::Ban { config_id: [9; 32], included_at: 31, start: None });
+        let (ha, hb) = ([0xA1; 32], [0xB1; 32]);
+        poci_put(&st, &hb, Some(&tip), &b);
+        poci_put(&st, &ha, Some(&tip), &a);
+        let mut a2 = a.clone();
+        a2.seen.entry(k(503)).or_default().insert(0, 32);
+        poci_put(&st, &[0xA2; 32], Some(&ha), &a2);
+        poci_forget_all();
+        assert_eq!(load_poci_ledger(&st, &ha), Some(Some(a.clone())));
+        assert_eq!(load_poci_ledger(&st, &hb), Some(Some(b.clone())));
+        assert_eq!(load_poci_ledger(&st, &[0xA2; 32]), Some(Some(a2.clone())));
+        assert_eq!(poci_record_kind(&st, &[0xA2; 32]).map(|x| x.0), Some(false), "a diff on its branch");
+        // A trimmed entry: the block stores an anchor.
+        let mut t = a2.clone();
+        t.seen.remove(&k(500));
+        poci_put(&st, &[0xA3; 32], Some(&[0xA2; 32]), &t);
+        assert_eq!(poci_record_kind(&st, &[0xA3; 32]).map(|x| x.0), Some(true));
+        assert_eq!(load_poci_ledger(&st, &[0xA3; 32]), Some(Some(t)));
+        // A diff whose parent's record is gone loads nothing.
+        st.put_meta(&key(POCI_REC_PREFIX, &ha), b"").unwrap();
+        assert_eq!(load_poci_ledger(&st, &[0xA2; 32]), None);
+        // A corrupt segment (out of the cache) loads nothing.
+        let Some(PociRec { kind: PociKind::Anchor { seen }, .. }) = read_poci_rec(&st, &h(0)) else { panic!() };
+        st.put_meta(&key(POCI_SEG_PREFIX, &seen[0].digest), b"garbage").unwrap();
+        poci_forget_all();
+        assert_eq!(load_poci_ledger(&st, &h(0)), None);
+        assert_eq!(load_poci_ledger(&st, &hb), None);
     }
 }

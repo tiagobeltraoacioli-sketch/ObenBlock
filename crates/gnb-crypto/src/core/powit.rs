@@ -66,6 +66,13 @@ use super::witness_share::WitnessShare;
 use super::kes::{self, KesPublic, KesSignature, KesSigner};
 use super::{read_varint, write_varint, ChainId};
 
+pub mod growth_cap;
+pub mod poci;
+use growth_cap::CapState;
+use poci::{PociEvidence, PociParams, PociState};
+
+pub use poci::MAX_REJOINS_PER_BLOCK;
+
 /// 20-byte key id: SHA3-256(public key)[0..20], the same hash a
 /// pay-to-pubkey-hash `script_pubkey` holds.
 pub type KeyId = [u8; 20];
@@ -176,10 +183,13 @@ pub const fn obenblock_window(p: PowitParams) -> PowitParams {
     PowitParams { window_epochs: OBB_WINDOW_EPOCHS, ban_epochs: OBB_WINDOW_EPOCHS, ..p }
 }
 
-/// ObenBlock mainnet (`docs/DESIGN-obenblock.md` §5.2): GnB mainnet's clock
-/// and bounds with the half leak. [`params_for`] selects it, with the
-/// 112-epoch window of [`obenblock_window`], for [`ChainId::ObenBlockMainnet`].
-pub const OBENBLOCK_MAINNET_PARAMS: PowitParams = PowitParams { leak: InactivityLeak::Half, ..MAINNET_PARAMS };
+/// ObenBlock mainnet (`docs/DESIGN-obenblock.md` §5.2, §6.2): GnB mainnet's
+/// clock and bounds with the half leak and the 112-epoch window and ban of
+/// [`obenblock_window`]. The constant is the complete parameter set
+/// [`params_for`] returns for [`ChainId::ObenBlockMainnet`], so no caller
+/// can pick up GnB's 28-epoch window through it.
+pub const OBENBLOCK_MAINNET_PARAMS: PowitParams =
+    obenblock_window(PowitParams { leak: InactivityLeak::Half, ..MAINNET_PARAMS });
 
 /// ObenBlock regtest: the short test clock (and window) with the half leak.
 pub const OBENBLOCK_REGTEST_PARAMS: PowitParams = PowitParams { leak: InactivityLeak::Half, ..TESTNET_PARAMS };
@@ -195,7 +205,7 @@ pub fn params_for(chain: ChainId) -> PowitParams {
     match chain {
         ChainId::Mainnet => MAINNET_PARAMS,
         ChainId::Testnet => TESTNET_PARAMS,
-        ChainId::ObenBlockMainnet => obenblock_window(OBENBLOCK_MAINNET_PARAMS),
+        ChainId::ObenBlockMainnet => OBENBLOCK_MAINNET_PARAMS,
         ChainId::ObenBlockRegtest => OBENBLOCK_REGTEST_PARAMS,
     }
 }
@@ -502,6 +512,65 @@ impl WitnessExit {
     }
 }
 
+/// A pruned witness's return (PoCI, ObenBlock; `docs/DESIGN-obenblock-poci.md`
+/// §4.1): signed with the KES leaf of `epoch` over [`poci::rejoin_message`].
+/// A block of epoch `E` may carry it iff `epoch <= E <= epoch + 1`, the key
+/// is pruned and has no rejoin pending; once the block is final, the key's
+/// share work counts again from the next handoff ([`PowitState::apply_poci`]).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WitnessRejoin {
+    pub witness: KesPublic,
+    pub epoch: u64,
+    pub sig: KesSignature,
+}
+
+impl WitnessRejoin {
+    pub fn key_id(&self) -> KeyId {
+        self.witness.witness_id()
+    }
+
+    /// The forward-secure signature of the leaf of `epoch` over the rejoin
+    /// message of `chain_id`.
+    pub fn verify_signature(&self, chain_id: u32) -> bool {
+        kes::verify(&self.witness, self.epoch, &poci::rejoin_message(chain_id, &self.witness, self.epoch), &self.sig)
+    }
+
+    /// Sign a rejoin with a KES signer evolved to `epoch` (its current epoch).
+    pub fn sign(chain_id: u32, signer: &KesSigner) -> Result<Self, String> {
+        let witness = signer.public();
+        let epoch = signer.epoch();
+        let sig = signer.sign(&poci::rejoin_message(chain_id, &witness, epoch))?;
+        Ok(WitnessRejoin { witness, epoch, sig })
+    }
+
+    /// Wire: u8 depth ‖ root[32] ‖ u64le epoch ‖ KES signature (an exit's layout).
+    pub fn to_wire_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(9_000);
+        out.push(self.witness.depth);
+        out.extend_from_slice(&self.witness.root);
+        out.extend_from_slice(&self.epoch.to_le_bytes());
+        self.sig.write_wire(&mut out);
+        out
+    }
+
+    pub fn read_wire(cur: &mut std::io::Cursor<&[u8]>) -> Result<Self, String> {
+        let depth = read_fixed::<1>(cur)?[0];
+        let root = read_array32(cur)?;
+        let epoch = read_u64(cur)?;
+        let sig = KesSignature::read_wire(cur)?;
+        Ok(WitnessRejoin { witness: KesPublic { depth, root }, epoch, sig })
+    }
+
+    /// Unique id (gossip and pool dedup).
+    pub fn id(&self) -> [u8; 32] {
+        Sha3_256::digest(self.to_wire_bytes()).into()
+    }
+}
+
+/// Item tags of the PoCI format's membership list ([`PowitBody::write_wire_for`]).
+const MEMBERSHIP_EXIT: u8 = 0;
+const MEMBERSHIP_REJOIN: u8 = 1;
+
 // ── The PoWit section of a block ─────────────────────────────────────────────
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -513,11 +582,46 @@ pub struct PowitBody {
     /// activation ([`Self::write_wire_with`]); empty below it.
     #[serde(default)]
     pub exits: Vec<WitnessExit>,
+    /// PoCI equivocation evidence (ObenBlock, `docs/DESIGN-obenblock-poci.md`
+    /// §5): on the wire in place of `evidence` in the PoCI body format
+    /// ([`BodyFormat`]); always empty on GnB, where `evidence` is used.
+    #[serde(default)]
+    pub poci_evidence: Vec<PociEvidence>,
+    /// PoCI rejoin messages (ObenBlock, §4.1): in the PoCI format's
+    /// membership list, after the exits ([`Self::write_wire_for`]); always
+    /// empty on GnB.
+    #[serde(default)]
+    pub rejoins: Vec<WitnessRejoin>,
+}
+
+/// The encoding of a block's PoWit section: with the exits list (liveness
+/// activation) and with PoCI evidence in place of GnB's equivocation proofs
+/// (ObenBlock). An empty section encodes the same in every format.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BodyFormat {
+    pub exits: bool,
+    pub poci: bool,
+}
+
+impl BodyFormat {
+    /// GnB before the liveness activation: `PowitBody::write_wire`, bit for bit.
+    pub const GNB: BodyFormat = BodyFormat { exits: false, poci: false };
+
+    /// The format of a block at `height` on the node's chain.
+    pub fn at(height: u64) -> Self {
+        BodyFormat { exits: super::liveness::liveness_active_at(height), poci: poci_active() }
+    }
+}
+
+/// Whether the node's chain runs PoCI (ObenBlock, from genesis).
+pub fn poci_active() -> bool {
+    PociParams::for_chain(super::node_chain_id()).is_some()
 }
 
 impl PowitBody {
     pub fn is_empty(&self) -> bool {
         self.shares.is_empty() && self.attestations.is_empty() && self.evidence.is_empty() && self.exits.is_empty()
+            && self.poci_evidence.is_empty() && self.rejoins.is_empty()
     }
 
     /// The section's encoding for a block where exits are (`with_exits`) or
@@ -544,6 +648,100 @@ impl PowitBody {
             }
         }
         Ok(b)
+    }
+
+    /// The section's encoding in `fmt`: [`Self::write_wire_with`] unless
+    /// `fmt.poci`; with PoCI the evidence list holds `poci_evidence`
+    /// (`varint n ‖ n × PociEvidence`) and `evidence` is not encoded (a PoCI
+    /// block carries none: `PowitState::apply_poci`), and the exits list is
+    /// the membership list `varint n ‖ n × (u8 tag ‖ item)`: the exits (tag
+    /// 0, `WitnessExit`) then the rejoins (tag 1, `WitnessRejoin`), so an
+    /// empty section is still the same bytes as GnB's. Without `fmt.exits`
+    /// there is no membership list (and a block carries no rejoin).
+    pub fn write_wire_for(&self, out: &mut Vec<u8>, fmt: BodyFormat) {
+        if !fmt.poci {
+            return self.write_wire_with(out, fmt.exits);
+        }
+        write_varint(out, self.shares.len() as u64);
+        for s in &self.shares {
+            out.extend_from_slice(&s.to_wire_bytes());
+        }
+        write_varint(out, self.attestations.len() as u64);
+        for a in &self.attestations {
+            out.extend_from_slice(&a.to_wire_bytes());
+        }
+        write_varint(out, self.poci_evidence.len() as u64);
+        for e in &self.poci_evidence {
+            out.extend_from_slice(&e.to_wire_bytes());
+        }
+        if fmt.exits {
+            write_varint(out, (self.exits.len() + self.rejoins.len()) as u64);
+            for x in &self.exits {
+                out.push(MEMBERSHIP_EXIT);
+                out.extend_from_slice(&x.to_wire_bytes());
+            }
+            for r in &self.rejoins {
+                out.push(MEMBERSHIP_REJOIN);
+                out.extend_from_slice(&r.to_wire_bytes());
+            }
+        }
+    }
+
+    /// Inverse of [`Self::write_wire_for`].
+    pub fn read_wire_for(cur: &mut std::io::Cursor<&[u8]>, fmt: BodyFormat) -> Result<Self, String> {
+        if !fmt.poci {
+            return Self::read_wire_with(cur, fmt.exits);
+        }
+        let n = read_count(cur, super::witness_share::MAX_SHARES_PER_BLOCK, "shares")?;
+        let mut shares = Vec::with_capacity(n);
+        for _ in 0..n {
+            shares.push(WitnessShare::read_wire(cur)?);
+        }
+        let n = read_count(cur, MAINNET_PARAMS.max_attestations_per_block, "attestations")?;
+        let mut attestations = Vec::with_capacity(n);
+        for _ in 0..n {
+            attestations.push(Attestation::read_wire(cur)?);
+        }
+        let n = read_count(cur, MAINNET_PARAMS.max_evidence_per_block, "evidence")?;
+        let mut poci_evidence = Vec::with_capacity(n);
+        for _ in 0..n {
+            poci_evidence.push(PociEvidence::read_wire(cur)?);
+        }
+        let mut exits = Vec::new();
+        let mut rejoins = Vec::new();
+        if fmt.exits {
+            let n = read_count(cur, super::liveness::MAX_EXITS_PER_BLOCK + MAX_REJOINS_PER_BLOCK, "membership items")?;
+            for _ in 0..n {
+                // Exits first, then rejoins: one encoding per body.
+                match read_fixed::<1>(cur)?[0] {
+                    MEMBERSHIP_EXIT if rejoins.is_empty() => {
+                        if exits.len() == super::liveness::MAX_EXITS_PER_BLOCK {
+                            return Err("exits: too many".into());
+                        }
+                        exits.push(WitnessExit::read_wire(cur)?);
+                    }
+                    MEMBERSHIP_REJOIN => {
+                        if rejoins.len() == MAX_REJOINS_PER_BLOCK {
+                            return Err("rejoins: too many".into());
+                        }
+                        rejoins.push(WitnessRejoin::read_wire(cur)?);
+                    }
+                    MEMBERSHIP_EXIT => return Err("membership items: an exit after a rejoin".into()),
+                    t => return Err(format!("membership items: unknown tag {t}")),
+                }
+            }
+        }
+        Ok(PowitBody { shares, attestations, evidence: Vec::new(), exits, poci_evidence, rejoins })
+    }
+
+    /// [`Self::root`] of the encoding [`Self::write_wire_for`].
+    pub fn root_for(&self, fmt: BodyFormat) -> [u8; 32] {
+        let mut buf = Vec::new();
+        self.write_wire_for(&mut buf, fmt);
+        let mut h = Sha3_256::new();
+        h.update(DS_BODY);
+        h.update(&buf);
+        h.finalize().into()
     }
 
     /// [`Self::root`] of the encoding [`Self::write_wire_with`].
@@ -589,7 +787,7 @@ impl PowitBody {
         for _ in 0..n {
             evidence.push(Equivocation::read_wire(cur)?);
         }
-        Ok(PowitBody { shares, attestations, evidence, exits: Vec::new() })
+        Ok(PowitBody { shares, attestations, evidence, exits: Vec::new(), poci_evidence: Vec::new(), rejoins: Vec::new() })
     }
 
     /// Commitment folded into the block's body Merkle root.
@@ -713,6 +911,18 @@ pub struct PowitState {
     /// the state (`node/src/powit.rs`).
     #[serde(skip)]
     pub exited: BTreeMap<KeyId, u64>,
+    /// PoCI (ObenBlock, `docs/DESIGN-obenblock-poci.md`): the configuration
+    /// in force, the ones before it and the bans; `None` on GnB and during
+    /// the PoCI launch bootstrap (§9). Not part of the serde encoding, like
+    /// `exited`: the node stores it beside the state.
+    #[serde(skip)]
+    pub poci: Option<PociState>,
+    /// The growth cap (ObenBlock, `docs/DESIGN-obenblock.md` §6.3): the
+    /// credit ledger of the configuration in force and the first-block bits
+    /// the next handoff needs; `None` on GnB. Not part of the serde encoding,
+    /// like `poci`: the node stores it beside the state.
+    #[serde(skip)]
+    pub cap: Option<CapState>,
 }
 
 impl PowitState {
@@ -735,6 +945,8 @@ impl PowitState {
             active_this_epoch: BTreeSet::new(),
             epoch: 0,
             exited: BTreeMap::new(),
+            poci: None,
+            cap: None,
         }
     }
 
@@ -993,6 +1205,11 @@ impl PowitState {
     pub fn apply_full(&self, p: &PowitParams, chain: ChainId, hardening2_height: u64, liveness_height: u64,
                       b: &BlockInput<'_>, view: &dyn ChainView) -> Result<PowitState, String>
     {
+        if let Some(pp) = PociParams::for_chain(chain) {
+            // ObenBlock: PoCI from genesis (its evidence comes through `apply_block`).
+            return self.apply_poci(&pp, p, chain, liveness_height, b, None, PociItems::default(), view,
+                                   &mut ObbConfigWeights::default());
+        }
         let exits_on = activation::is_active_at(b.height, liveness_height);
         if !b.exits.is_empty() && !exits_on {
             return Err("powit: witness exit before the liveness activation".into());
@@ -1212,6 +1429,419 @@ impl PowitState {
     }
 }
 
+/// The PoCI items of a block (ObenBlock, `PowitBody::poci_evidence` and
+/// `PowitBody::rejoins`), beside [`BlockInput`]. GnB blocks carry none.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PociItems<'a> {
+    pub evidence: &'a [PociEvidence],
+    pub rejoins: &'a [WitnessRejoin],
+}
+
+impl<'a> PociItems<'a> {
+    pub fn of(body: &'a PowitBody) -> Self {
+        PociItems { evidence: &body.poci_evidence, rejoins: &body.rejoins }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.evidence.is_empty() && self.rejoins.is_empty()
+    }
+}
+
+/// The configuration weights ObenBlock runs with ([`ConfigWeights`]): the
+/// growth cap of DESIGN-obenblock.md §6.3 ([`GrowthCapWeights`]).
+pub type ObbConfigWeights = GrowthCapWeights;
+
+impl PowitState {
+    /// One block under the rules of `chain`: PoCI on ObenBlock
+    /// ([`Self::apply_poci`] with the block's compact `bits`, its PoCI items
+    /// and the chain's configuration weights, [`ObbConfigWeights`], the
+    /// growth cap); PoWit on GnB ([`Self::apply_full`]), where a block
+    /// carries no PoCI item and `bits` are not used.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_block(&self, p: &PowitParams, chain: ChainId, hardening2_height: u64, liveness_height: u64,
+                       b: &BlockInput<'_>, bits: u32, poci: PociItems<'_>, view: &dyn ChainView)
+        -> Result<PowitState, String>
+    {
+        match PociParams::for_chain(chain) {
+            Some(pp) => self.apply_poci(&pp, p, chain, liveness_height, b, Some(bits), poci, view,
+                                        &mut ObbConfigWeights::default()),
+            None if !poci.evidence.is_empty() => Err("powit: PoCI evidence on a chain without PoCI".into()),
+            None if !poci.rejoins.is_empty() => Err("powit: PoCI rejoin on a chain without PoCI".into()),
+            None => self.apply_full(p, chain, hardening2_height, liveness_height, b, view),
+        }
+    }
+
+    /// The PoCI configuration in force, if any (ObenBlock after the launch
+    /// bootstrap).
+    pub fn poci_config(&self) -> Option<&std::sync::Arc<poci::Configuration>> {
+        self.poci.as_ref().map(PociState::config)
+    }
+
+    /// Whether `key` is left out of `C_epoch` (PoCI): banned, pruned for
+    /// absence (§4.1) or exited by `epoch`. What a [`ConfigWeights`] provider
+    /// excludes in every epoch a handoff covers (the growth cap's exclusions).
+    pub fn poci_excluded_at(&self, pp: &PociParams, key: &KeyId, epoch: u64) -> bool {
+        self.has_exited(key, epoch) || self.poci.as_ref().is_some_and(|st| st.excluded_at(pp, key, epoch))
+    }
+
+    /// One block under PoCI (`docs/DESIGN-obenblock-poci.md`; ObenBlock, PoWit
+    /// from height 0). What differs from PoWit ([`Self::apply_full`]):
+    ///
+    /// - **Launch** (§9): no votes, evidence or rejoins before `C_4` is in
+    ///   force. The first block at or above [`PociParams::launch_height`]
+    ///   (the slot opening `bootstrap_epochs`, buried by `launch_bury` =
+    ///   one epoch of blocks) makes that slot justified and final on the
+    ///   block's selected chain and puts `C_4` in force (weights from
+    ///   `weights`, the history below that slot). Until then every state's
+    ///   finalized checkpoint is the genesis slot: nothing to pin, so a fork
+    ///   at the epoch-4 boundary is settled by work, never split by the
+    ///   finality pin.
+    /// - **Votes** name the configuration in force: an attestation's signature
+    ///   covers the v3 message with its `config_id`
+    ///   ([`Attestation::verify_signature_v3`]); its weight is the registry's.
+    ///   A key outside the configuration cannot vote. Every included vote is
+    ///   recorded for absence pruning (`included_at = b.height + 1`).
+    /// - **Strict quorum** of the configuration's frozen total ([`poci::quorum`],
+    ///   `3 got > 2 total`); Casper FFG otherwise ([`poci::ffg_step`]).
+    /// - **Handoff** (§4, §4.1): finalizing `F` with `epoch(F) = x` above the
+    ///   configuration's epoch starts the pending bans and ends the prunings
+    ///   of the pending rejoins included at or below `opening(x)`, prunes the
+    ///   keys of the configuration absent from the blocks of epochs
+    ///   `x - PRUNE_AFTER ..= x - 1` when the present ones hold a strict
+    ///   quorum ([`PociState::begin_handoff`]), and puts `C_x` in force from
+    ///   `weights`, without the keys banned, pruned or exited at `x`, never
+    ///   empty ([`PociState::enter`]). Everything `C_x` reads lies at or
+    ///   below `opening(x)`, so it does not depend on which checkpoint of
+    ///   epoch `x` was finalized first.
+    /// - **Proof of Corruption** (§5): `poci.evidence` ([`PociState::admit_evidence`],
+    ///   included at `b.height + 1` in the ledger's convention); GnB's
+    ///   `evidence` is refused. Nothing in force changes.
+    /// - **Rejoins** (§4.1): `poci.rejoins`, at most
+    ///   [`MAX_REJOINS_PER_BLOCK`] ([`PociState::admit_rejoin`]; signature last).
+    /// - **No inactivity leak**: absence never changes a weight in force
+    ///   (`decay` and `banned` stay empty). Exits, bans and pruning take effect
+    ///   at the next handoff.
+    /// - **Window** (§2): the PoCI parameters' `window_epochs` (part of
+    ///   `params_digest`) is the one window of the chain: share work and links
+    ///   are kept for `pp.window_epochs + 2` epochs; `p.window_epochs` and
+    ///   `p.ban_epochs` (GnB's PoWit rules) are not read.
+    /// - **Growth cap** (DESIGN-obenblock.md §6.3): `bits` are the block's
+    ///   compact bits; the first block of each epoch on the chain records
+    ///   them (`G_min` of that epoch; `None`, as from [`Self::apply_full`],
+    ///   records nothing and that epoch's `G_min` is 0). Share work is kept
+    ///   from the epoch the next handoff starts at (`ledger.epoch - 1`) even
+    ///   past the window, so a handoff after a long finality stall still
+    ///   reads the finalized history it needs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_poci(&self, pp: &PociParams, p: &PowitParams, chain: ChainId, liveness_height: u64,
+                      b: &BlockInput<'_>, bits: Option<u32>, poci: PociItems<'_>, view: &dyn ChainView,
+                      weights: &mut dyn ConfigWeights) -> Result<PowitState, String>
+    {
+        if self.activation != 0 {
+            return Err("powit: PoCI runs PoWit from height 0".into());
+        }
+        if pp.chain_id != chain.to_u32() || pp.epoch_len != p.epoch_len || pp.checkpoint_interval != p.checkpoint_interval
+            || pp.vote_ttl != p.vote_ttl
+        {
+            return Err("powit: PoCI parameters do not match the chain's PoWit parameters".into());
+        }
+        let exits_on = activation::is_active_at(b.height, liveness_height);
+        if !b.exits.is_empty() && !exits_on {
+            return Err("powit: witness exit before the liveness activation".into());
+        }
+        if !poci.rejoins.is_empty() && !exits_on {
+            return Err("powit: PoCI rejoin before the liveness activation (no membership list)".into());
+        }
+        if b.exits.len() > super::liveness::MAX_EXITS_PER_BLOCK {
+            return Err("powit: too many witness exits".into());
+        }
+        if poci.rejoins.len() > MAX_REJOINS_PER_BLOCK {
+            return Err("powit: too many PoCI rejoins".into());
+        }
+        if !b.evidence.is_empty() {
+            return Err("powit: PoWit equivocation proofs on a PoCI chain (PoCI evidence names its configuration)".into());
+        }
+        if b.attestations.len() > p.max_attestations_per_block {
+            return Err("powit: too many attestations".into());
+        }
+        if poci.evidence.len() > p.max_evidence_per_block {
+            return Err("powit: too many equivocation proofs".into());
+        }
+        let mut s = self.clone();
+        let epoch = p.epoch(0, b.height);
+        // Where this block's items sit in the ledger (module docs of `poci`, "Heights").
+        let included_at = b.height + 1;
+        if s.cap.is_none() {
+            if s.poci.is_some() {
+                return Err("powit: PoCI state without its growth cap ledger".into());
+            }
+            s.cap = Some(CapState::default());
+        }
+        let cap_from = s.cap.as_ref().map_or(0, |c| c.ledger.epoch().saturating_sub(1));
+
+        // ── Epoch boundary: prune old history (no inactivity decay) ───────
+        if epoch > s.epoch {
+            s.active_this_epoch.clear();
+            s.epoch = epoch;
+            let keep_from = epoch.saturating_sub(pp.window_epochs + 2).min(cap_from);
+            s.epoch_work = s.epoch_work.split_off(&keep_from);
+            if !s.exited.is_empty() {
+                let live: BTreeSet<KeyId> = s.epoch_work.values().flat_map(|m| m.keys().copied()).collect();
+                s.exited.retain(|k, _| live.contains(k));
+            }
+            let link_floor = b.height.saturating_sub((pp.window_epochs + 2).saturating_mul(pp.epoch_len));
+            for v in s.links.values_mut() {
+                v.retain(|(_, th, _)| *th >= link_floor);
+            }
+            s.links.retain(|_, v| !v.is_empty());
+            if let Some(st) = s.poci.as_mut() {
+                st.trim_seen(epoch);
+            }
+        }
+
+        s.cap.as_mut().expect("set above").note_block(epoch, bits);
+
+        // ── Launch (§9) ──────────────────────────────────────────────────
+        if s.poci.is_none() && b.height >= pp.launch_height() {
+            let height = pp.opening(pp.bootstrap_epochs);
+            let hash = view.selected_at(height).ok_or("powit: PoCI launch checkpoint is not on the selected chain")?;
+            let cp = Checkpoint { height, hash };
+            let candidates = weights.weights(&mut s, pp, pp.bootstrap_epochs, &cp)?;
+            let w: BTreeMap<KeyId, u128> = candidates.into_iter()
+                .filter(|(k, _)| !s.has_exited(k, pp.bootstrap_epochs)).collect();
+            s.poci = Some(PociState::launch(pp, &w).map_err(|e| format!("powit: {e}"))?);
+            s.justified = cp;
+            s.finalized = cp;
+            s.finalized_at = b.height;
+            s.votes.clear();
+        }
+        if s.poci.is_none() && (!b.attestations.is_empty() || !poci.is_empty()) {
+            return Err("powit: PoCI launch bootstrap: no finality votes, evidence or rejoins before its first \
+                        configuration".into());
+        }
+
+        // ── Proof of Corruption ──────────────────────────────────────────
+        let finalized_height = s.finalized.height;
+        for ev in poci.evidence {
+            let st = s.poci.as_mut().expect("checked above");
+            let (va, vb) = ev.votes();
+            st.admit_evidence(pp, included_at, finalized_height, &va, &vb).map_err(|e| format!("powit: {e}"))?;
+        }
+
+        // ── Witness exits (as PoWit; they leave at the next handoff) ─────
+        for x in b.exits {
+            if !super::liveness::exit_epoch_ok(epoch, x.epoch) {
+                return Err("powit: witness exit not signed for this block's epoch or the one before".into());
+            }
+            let k = x.key_id();
+            if s.exited.contains_key(&k) {
+                return Err("powit: witness already exited".into());
+            }
+            if !s.epoch_work.values().any(|m| m.contains_key(&k)) {
+                return Err("powit: witness exit by a key without share work".into());
+            }
+            if !x.verify_signature(chain.to_u32()) {
+                return Err("powit: invalid witness exit signature (KES leaf must be the exit's epoch)".into());
+            }
+            s.exited.insert(k, epoch + 1);
+        }
+
+        // ── Rejoins (§4.1): back from the handoff that finalizes them ────
+        for r in poci.rejoins {
+            let st = s.poci.as_mut().expect("checked above");
+            st.admit_rejoin(included_at, finalized_height, epoch, &r.key_id(), r.epoch, || r.verify_signature(pp.chain_id))
+                .map_err(|e| format!("powit: {e}"))?;
+        }
+
+        // ── Shares ───────────────────────────────────────────────────────
+        for (k, w) in b.share_work {
+            if s.poci.as_ref().is_some_and(|st| st.banned_at(pp, k, epoch)) {
+                return Err("powit: share paid to a barred key".into());
+            }
+            if s.exited.contains_key(k) {
+                return Err("powit: share credited to a witness that exited".into());
+            }
+            let e = s.epoch_work.entry(epoch).or_default().entry(*k).or_insert(0);
+            *e = e.saturating_add(*w);
+        }
+
+        let Some(config) = s.poci_config().cloned() else { return Ok(s) };
+
+        // ── Attestations: v3 votes under the configuration in force ──────
+        let config_id = config.id();
+        let mut seen_in_block: BTreeSet<(KeyId, Checkpoint)> = BTreeSet::new();
+        for a in b.attestations {
+            let k = a.key_id();
+            let t = a.target;
+            if !pp.is_slot(t.height) || t.height > b.height {
+                return Err("powit: target is not a checkpoint slot at or below this block".into());
+            }
+            if b.height > t.height + p.vote_ttl {
+                return Err("powit: attestation expired".into());
+            }
+            if a.source != s.justified {
+                return Err("powit: source is not the justified checkpoint".into());
+            }
+            if view.selected_at(t.height) != Some(t.hash) {
+                return Err("powit: target is not on this block's selected chain".into());
+            }
+            let weight = config.weight(&k).ok_or("powit: attester is not in the PoCI configuration in force")?;
+            if !seen_in_block.insert((k, t)) || s.votes.get(&t).is_some_and(|v| v.contains_key(&k)) {
+                return Err("powit: duplicate attestation".into());
+            }
+            if let Some(hist) = s.links.get(&k) {
+                for &(sh, th, thash) in hist {
+                    let earlier = Checkpoint { height: th, hash: thash };
+                    if poci::conflict(sh, &earlier, a.source.height, &t).is_some() {
+                        return Err("powit: attestation conflicts with this key's earlier vote".into());
+                    }
+                }
+            }
+            if !a.verify_signature_v3(pp, &config_id) {
+                return Err("powit: invalid attestation signature (v3 message of the configuration in force, \
+                            KES leaf of the target's epoch)".into());
+            }
+            s.votes.entry(t).or_default().insert(k, weight);
+            s.links.entry(k).or_default().push((a.source.height, t.height, t.hash));
+            s.active_this_epoch.insert(k);
+            s.poci.as_mut().expect("in force").record_vote(pp, &k, included_at);
+        }
+
+        // ── Justification, finality and handoff ──────────────────────────
+        let mut newly: Option<Checkpoint> = None;
+        for (t, votes) in &s.votes {
+            let got = votes.values().fold(0u128, |acc, w| acc.saturating_add(*w));
+            if config.quorum(got) && t.height > s.justified.height && newly.is_none_or(|n| t.height > n.height) {
+                newly = Some(*t);
+            }
+        }
+        if let Some(t) = newly {
+            let step = poci::ffg_step(pp, &mut s.justified, &t, true);
+            if let Some(f) = step.finalized {
+                s.finalized = f;
+                s.finalized_at = b.height;
+                if let Some(x) = s.poci.as_mut().expect("in force").begin_handoff(pp, &f) {
+                    let candidates = weights.weights(&mut s, pp, x, &f)?;
+                    let exited: BTreeSet<KeyId> =
+                        candidates.keys().filter(|k| s.has_exited(k, x)).copied().collect();
+                    s.poci.as_mut().expect("in force").enter(pp, x, &candidates, &|k: &KeyId| exited.contains(k))
+                        .map_err(|e| format!("powit: {e}"))?;
+                }
+            }
+            s.votes.clear();
+        }
+        s.votes.retain(|t, _| b.height <= t.height + p.vote_ttl);
+        Ok(s)
+    }
+}
+
+/// The candidate weights of a new PoCI configuration `C_epoch`, computed
+/// from the chain's state when `finalized` (the checkpoint whose
+/// finalization hands off, or the launch checkpoint) is final.
+///
+/// Contract (B2, DESIGN-obenblock-poci.md §4 and §4.1):
+///
+/// - `state.poci` is the ledger in the middle of the handoff: `config()` is
+///   still `C_e`, the configuration being replaced (the growth cap's
+///   `W = total(C_{x-1})` when no epoch is skipped), and the bans started,
+///   rejoins ended and keys pruned by this handoff are already recorded, so
+///   [`PowitState::poci_excluded_at`] answers for every epoch `e < y <= epoch`
+///   the handoff covers (the growth cap runs one step per such epoch and
+///   gives an excluded key no new credit there). At the launch `state.poci`
+///   is `None`.
+/// - Only finalized history at or below `opening(epoch)` may be read (share
+///   work of epochs `< epoch`; the growth cap reads epochs `<= epoch - 2`),
+///   never the blocks between `opening(epoch)` and `finalized`: `C_epoch`
+///   must not depend on which checkpoint of `epoch` was finalized first
+///   (DESIGN-obenblock-poci.md §4, one configuration per epoch).
+/// - Return every key with weight, the excluded ones included: the ledger
+///   leaves out the keys banned, pruned or exited at `epoch`, and forgets a
+///   pruned key the provider gives no weight.
+/// - The provider may update the part of `state` it derives the weights
+///   from (the growth cap's credit ledger, [`GrowthCapWeights`]): it runs
+///   exactly once per launch or handoff, on the state of the block that
+///   performs it.
+pub trait ConfigWeights {
+    fn weights(&mut self, state: &mut PowitState, params: &PociParams, epoch: u64, finalized: &Checkpoint)
+        -> Result<BTreeMap<KeyId, u128>, String>;
+}
+
+/// The consensus provider on ObenBlock: the growth cap of DESIGN-obenblock.md
+/// §6.3 ([`growth_cap`], reference `reference/obb_growth_cap.py`). It runs
+/// the cap step for every epoch from the ledger's (the configuration in
+/// force) to `epoch`, from the finalized history of the state: share work
+/// of epoch `n = x - 2` (`epoch_work`), the first-block bits of `n`
+/// (`G_min`), and the keys excluded at each `x`
+/// ([`PowitState::poci_excluded_at`]: banned, pruned or exited at `x`; the
+/// bans and prunings this handoff starts are already in the ledger, see
+/// [`ConfigWeights`]). An excluded key gets no credit and does not compete;
+/// a pruned key's share work counts again, as new weight under the cap,
+/// from the first handoff after its rejoin is finalized (§4.1). Every
+/// input is finalized history: `n <= epoch - 2`, and an exit recorded for
+/// `x <= epoch` was included in an epoch below `epoch`, below `finalized`.
+/// It stores the new ledger in `state.cap` and returns every key with
+/// credit, excluded keys included ([`ConfigWeights`]: the PoCI ledger
+/// leaves them out of `C_epoch`, and forgets a pruned key whose credits
+/// have all expired).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct GrowthCapWeights;
+
+impl ConfigWeights for GrowthCapWeights {
+    fn weights(&mut self, state: &mut PowitState, params: &PociParams, epoch: u64, _finalized: &Checkpoint)
+        -> Result<BTreeMap<KeyId, u128>, String>
+    {
+        let mut cap = state.cap.take().ok_or("powit: growth cap ledger missing")?;
+        let result = {
+            let st: &PowitState = state;
+            let excluded = |k: &KeyId, x: u64| -> bool { st.poci_excluded_at(params, k, x) };
+            let work = |n: u64| st.epoch_work.get(&n);
+            let bits = |n: u64| cap.first_bits.get(&n).copied();
+            cap.ledger.advance(epoch, params.epoch_len, params.window_epochs, params.growth_div,
+                               params.g_min_epoch_div, &work, &bits, &excluded)
+        };
+        match result {
+            Ok(ledger) => {
+                let w = ledger.weights();
+                cap.ledger = ledger;
+                cap.prune();
+                state.cap = Some(cap);
+                Ok(w)
+            }
+            Err(e) => {
+                state.cap = Some(cap);
+                Err(format!("powit: {e}"))
+            }
+        }
+    }
+}
+
+/// Plain window weights, without the growth cap (tests and comparisons; not
+/// a consensus provider): every key's share work over epochs
+/// `epoch - window_epochs ..= epoch - 1` (history entirely below the slot
+/// opening `epoch`, as far as the state keeps it). Exclusions are the
+/// ledger's ([`ConfigWeights`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WindowWeights;
+
+impl ConfigWeights for WindowWeights {
+    fn weights(&mut self, state: &mut PowitState, params: &PociParams, epoch: u64, _finalized: &Checkpoint)
+        -> Result<BTreeMap<KeyId, u128>, String>
+    {
+        let mut out: BTreeMap<KeyId, u128> = BTreeMap::new();
+        if epoch == 0 {
+            return Ok(out);
+        }
+        let lo = epoch.saturating_sub(params.window_epochs);
+        for (_, m) in state.epoch_work.range(lo..epoch) {
+            for (k, w) in m {
+                let e = out.entry(*k).or_insert(0);
+                *e = e.saturating_add(*w);
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// The justification threshold: `got` is at least two thirds of `total`
 /// (`3 got >= 2 total`, saturating) and `total` is not zero. `total` is the
 /// weight of `W(epoch(target))`: of the 64 heaviest keys before the second
@@ -1259,3 +1889,5 @@ mod hardening2_tests;
 mod finalized_history_tests;
 #[cfg(test)]
 mod liveness_tests;
+#[cfg(test)]
+mod poci_tests;

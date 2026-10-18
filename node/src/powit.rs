@@ -23,14 +23,16 @@ use parking_lot::Mutex;
 use crate::consensus::finality::{Anchor, AnchorSetting, PinOutcome, PinPolicy};
 use crate::consensus::GhostDAG;
 use crate::storage::Storage;
+use gnb_crypto::core::powit::poci::{self, Configuration, PociEvidence, PociParams, PociState};
 use gnb_crypto::core::powit::{self, Attestation, BlockInput, ChainView, Checkpoint, Equivocation,
-                              KeyId, PowitBody, PowitParams, PowitState, Regime, WitnessExit};
+                              KeyId, PowitBody, PowitParams, PowitState, Regime, WitnessExit, WitnessRejoin};
 use gnb_crypto::core::witness_share::{self, WitnessShare, SHARE_WINDOW};
 use gnb_crypto::core::{self, activation, Block};
 
 type Hash = [u8; 32];
 
 mod store;
+pub mod certificate;
 
 /// The second hardening activation height the PoWit rules switch at
 /// (`core::powit::Regime`; process-wide, the node's chain schedule):
@@ -111,14 +113,163 @@ fn encode_exited(state: &PowitState) -> Result<Option<Vec<u8>>, String> {
         .map(Some).map_err(|e| format!("powit exits encode: {e}"))
 }
 
+/// The state's PoCI ledger (`PowitState::poci`, ObenBlock), stored beside it
+/// like the exits. Per block (`powit/poci/<block>`): the id of its history
+/// head, the bans and the absence-pruning ledger (pruned keys, pending
+/// rejoins, included votes of the last `PRUNE_AFTER + 3` epochs). The
+/// configurations are stored once each as history nodes
+/// (`powit/pocihist/<node id>`, the configuration and the id of the node
+/// before it). A node id commits to the whole history,
+/// `SHA3-256("OBB-POCI-store/node" ‖ config_id ‖ prev node id or 32 zero
+/// bytes)`: two branches may put the same configuration in force after
+/// different ones (a handoff that skips epochs computes the same `C_x`), and
+/// each must read its own predecessors (Proof of Corruption names past
+/// configurations). Node-local, not consensus. GnB states have none, so
+/// nothing changes for them.
+fn poci_key(hash: &Hash) -> String {
+    format!("powit/poci/{}", hex::encode(hash))
+}
+
+fn poci_node_key(id: &Hash) -> String {
+    format!("powit/pocihist/{}", hex::encode(id))
+}
+
+const POCI_NODE_TAG: &[u8] = b"OBB-POCI-store/node";
+
+fn poci_node_id(config_id: &Hash, prev: Option<&Hash>) -> Hash {
+    use sha3::{Digest, Sha3_256};
+    let mut h = Sha3_256::new();
+    h.update(POCI_NODE_TAG);
+    h.update(config_id);
+    h.update(prev.unwrap_or(&[0u8; 32]));
+    h.finalize().into()
+}
+
+/// The node ids of `st`'s history, oldest first.
+fn poci_node_ids(st: &PociState) -> Vec<Hash> {
+    let configs: Vec<Hash> = st.history().map(|c| c.id()).collect();
+    let mut ids: Vec<Hash> = Vec::with_capacity(configs.len());
+    for cid in configs.iter().rev() {
+        let id = poci_node_id(cid, ids.last());
+        ids.push(id);
+    }
+    ids
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PociRecord {
+    head: Hash,
+    bans: BTreeMap<KeyId, Vec<poci::Ban>>,
+    /// key -> the epoch its pruning started (§4.1).
+    pruned: BTreeMap<KeyId, u64>,
+    /// key -> where its pending rejoin was included.
+    rejoins: BTreeMap<KeyId, u64>,
+    /// key -> (block epoch -> lowest `included_at`).
+    seen: BTreeMap<KeyId, BTreeMap<u64, u64>>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PociNodeRow {
+    config: Configuration,
+    prev: Option<Hash>,
+}
+
+/// Histories by their head node id (shared by every state of a chain; a
+/// handful are live at once).
+static POCI_HISTORIES: Mutex<Option<HashMap<Hash, PociState>>> = parking_lot::const_mutex(None);
+const POCI_HISTORY_CACHE_CAP: usize = 64;
+
+fn bincode_decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Option<T> {
+    match bincode::serde::decode_from_slice(bytes, bincode::config::standard()) {
+        Ok((v, used)) if used == bytes.len() => Some(v),
+        _ => None,
+    }
+}
+
+fn load_poci(store: &Storage, hash: &Hash) -> Option<Option<PociState>> {
+    // The per-epoch + diff layout (`store`), else a row of the layout before
+    // it (`powit/poci/<hash>`, the whole ledger per block; read only).
+    let rec = match store::load_poci_ledger(store, hash)? {
+        Some(r) => PociRecord { head: r.head, bans: r.bans, pruned: r.pruned, rejoins: r.rejoins, seen: r.seen },
+        None => {
+            let Some(bytes) = store.get_meta(&poci_key(hash)).ok()? else { return Some(None) };
+            bincode_decode::<PociRecord>(&bytes)?
+        }
+    };
+    let cached = POCI_HISTORIES.lock().as_ref().and_then(|m| m.get(&rec.head).cloned());
+    let st = match cached {
+        Some(st) => st,
+        None => {
+            let mut history: Vec<Arc<Configuration>> = Vec::new();
+            let mut ids: Vec<Hash> = Vec::new();
+            let mut cur = Some(rec.head);
+            while let Some(id) = cur {
+                let row: PociNodeRow = bincode_decode(&store.get_meta(&poci_node_key(&id)).ok()??)?;
+                ids.push(id);
+                history.push(Arc::new(row.config));
+                cur = row.prev;
+            }
+            // Every node id must be the one its contents and predecessors give.
+            for i in 0..history.len() {
+                if poci_node_id(&history[i].id(), ids.get(i + 1)) != ids[i] {
+                    return None;
+                }
+            }
+            let st = PociState::from_history(history, BTreeMap::new())?;
+            let mut g = POCI_HISTORIES.lock();
+            let m = g.get_or_insert_with(HashMap::new);
+            if m.len() >= POCI_HISTORY_CACHE_CAP {
+                m.clear();
+            }
+            m.insert(rec.head, st.clone());
+            st
+        }
+    };
+    let pruned = rec.pruned.into_iter().map(|(k, start)| (k, poci::Prune { start, until: None })).collect();
+    let mut st = st.with_ledger(pruned, rec.rejoins, rec.seen);
+    st.bans = rec.bans;
+    Some(Some(st))
+}
+
+/// Stage the PoCI rows of `state`: the block's ledger record (per-epoch
+/// segments plus a diff against `parent`'s record, `store::stage_poci_ledger`),
+/// and the history nodes not stored yet, newest first until one is (normally
+/// only the head's, the first block a configuration is in force at; the walk
+/// also covers a state whose earlier heads were never stored).
+fn stage_poci(store: &Storage, batch: &mut rocksdb::WriteBatch, hash: &Hash, parent: Option<&Hash>,
+              state: &PowitState) -> Result<(), String> {
+    let Some(st) = &state.poci else { return Ok(()) };
+    let ids = poci_node_ids(st);
+    let head = *ids.last().expect("a history has a configuration in force");
+    for (i, config) in (0..ids.len()).rev().zip(st.history()) {
+        let nkey = poci_node_key(&ids[i]);
+        if store.get_meta(&nkey).map_err(|e| format!("storage: powit poci: {e}"))?.is_some() {
+            break;
+        }
+        let prev = i.checked_sub(1).map(|j| ids[j]);
+        let row = PociNodeRow { config: (**config).clone(), prev };
+        let bytes = bincode::serde::encode_to_vec(&row, bincode::config::standard())
+            .map_err(|e| format!("powit poci encode: {e}"))?;
+        store.stage_meta(batch, &nkey, &bytes).map_err(|e| format!("storage: powit poci: {e}"))?;
+    }
+    debug_assert!(st.pruned.values().all(|p| p.until.is_none()), "a stored ledger holds no handoff in progress");
+    let rows = store::PociLedgerRows {
+        head, bans: st.bans.clone(), pruned: st.pruned.iter().map(|(k, p)| (*k, p.start)).collect(),
+        rejoins: st.rejoins.clone(), seen: st.seen.clone(),
+    };
+    store::stage_poci_ledger(store, batch, hash, parent, &rows)
+}
+
 /// `hash`'s stored PoWit state (`store`: per-epoch segments plus per-block
 /// diffs, package A3; data dirs of earlier releases are read as written),
-/// with its witness exits.
+/// with its witness exits and its PoCI ledger.
 pub fn load_state(store: &Storage, hash: &Hash) -> Option<PowitState> {
     let mut st = store::load(store, hash)?;
     if let Some(x) = store.get_meta(&exited_key(hash)).ok()? {
         st.exited = bincode::serde::decode_from_slice(&x, bincode::config::standard()).ok()?.0;
     }
+    st.poci = load_poci(store, hash)?;
+    st.cap = store::load_cap(store, hash)?;
     Some(st)
 }
 
@@ -149,6 +300,8 @@ pub fn stage_state(store: &Storage, batch: &mut rocksdb::WriteBatch, hash: &Hash
     if let Some(x) = encode_exited(state)? {
         store.stage_meta(batch, &exited_key(hash), &x).map_err(|e| format!("storage: powit exits: {e}"))?;
     }
+    stage_poci(store, batch, hash, parent, state)?;
+    store::stage_cap(store, batch, hash, state)?;
     if let Some((key, row)) = finality_row(hash, state) {
         store.stage_meta(batch, &key, &row).map_err(|e| format!("storage: powit finality row: {e}"))?;
     }
@@ -266,7 +419,9 @@ pub fn block_state(block: &Block, block_hash: &Hash, dag: &GhostDAG, store: &Sto
         exits: &block.powit.exits,
     };
     let view = DagChainView { dag, start: sp };
-    base.apply_full(&powit::params(), core::node_chain_id(), hardening2_height(), liveness_height(), &input, &view)
+    // PoCI on ObenBlock (with the block's PoCI evidence), PoWit on GnB.
+    base.apply_block(&powit::params(), core::node_chain_id(), hardening2_height(), liveness_height(), &input,
+                     block.header.bits, powit::PociItems::of(&block.powit), &view)
         .map(Some)
 }
 
@@ -307,6 +462,8 @@ const SEEN_LINKS_PER_KEY: usize = 16;
 const SEEN_LINKS_CAP: usize = 2_048;
 /// Witness exits held, one per key (liveness activation).
 const EXIT_CAP: usize = 256;
+/// PoCI rejoins held, one per key (ObenBlock, §4.1).
+const REJOIN_CAP: usize = 256;
 
 /// `admit_evidence`'s refusal of a proof against a key outside the recent
 /// witness sets: this node's view, never a misbehaviour (`ingress` charges
@@ -334,8 +491,11 @@ pub struct TipWitnesses {
     justified: Checkpoint,
     /// Epoch of the next block.
     epoch: u64,
-    /// The tip's state (barred keys; witness weights from the activation).
+    /// The tip's state (barred keys; witness weights from the activation;
+    /// the PoCI configuration in force on ObenBlock).
     state: PowitState,
+    /// PoCI (ObenBlock): its parameters; `None` on GnB.
+    poci: Option<PociParams>,
     /// Old-rule W(e) (the 64 heaviest) for the epochs from
     /// `EVIDENCE_MEMBER_EPOCHS` (or the oldest open target) before the next
     /// block's to the newest open target's; empty once the next block is at
@@ -358,7 +518,25 @@ impl TipWitnesses {
         } else {
             BTreeMap::new()
         };
-        TipWitnesses { tip, tip_h, activation: act, hardening2, justified: st.justified, epoch, state: st, sets }
+        let poci = PociParams::for_chain(core::node_chain_id());
+        TipWitnesses { tip, tip_h, activation: act, hardening2, justified: st.justified, epoch, state: st, poci, sets }
+    }
+
+    /// The PoCI configuration in force at the tip (ObenBlock after the
+    /// launch bootstrap).
+    pub fn poci_config(&self) -> Option<&Arc<Configuration>> {
+        self.poci.and(self.state.poci_config())
+    }
+
+    /// Whether `att` carries a valid signature for the next block: the v3
+    /// message of the configuration in force (PoCI), else the PoWit message
+    /// of its target's height.
+    fn verify_attestation(&self, att: &Attestation, chain: core::ChainId, p: &PowitParams, act: u64) -> bool {
+        match (self.poci, self.state.poci_config()) {
+            (Some(pp), Some(c)) => att.verify_signature_v3(&pp, &c.id()),
+            (Some(_), None) => false,
+            (None, _) => att.verify_signature_at(chain, p, act, self.hardening2),
+        }
     }
 
     fn next_height(&self) -> u64 {
@@ -373,6 +551,10 @@ impl TipWitnesses {
     /// `key`'s weight in W(epoch of `target`) under the rules of the earliest
     /// block that may include a vote for `target`, if it is a member.
     pub fn weight_for(&self, p: &PowitParams, target: &Checkpoint, key: &KeyId) -> Option<u128> {
+        if self.poci.is_some() {
+            // PoCI: the registry weight of the configuration in force.
+            return self.poci_config()?.weight(key);
+        }
         let e = p.epoch(self.activation, target.height.max(self.activation));
         match Regime::at(target.height.max(self.next_height()), self.hardening2) {
             Regime::V1 => self.sets.get(&e)?.get(key).copied(),
@@ -385,6 +567,11 @@ impl TipWitnesses {
     /// activation, its highest weight over the recent witness sets (node
     /// policy); from it, over the next block's evidence epochs (consensus).
     pub fn evidence_weight(&self, p: &PowitParams, key: &KeyId) -> Option<u128> {
+        if self.poci.is_some() {
+            // PoCI: a key of a configuration the chain has had in force.
+            let st = self.state.poci.as_ref()?;
+            return st.history().filter_map(|c| c.weight(key)).max();
+        }
         match self.regime() {
             Regime::V1 => self.sets.values().filter_map(|s| s.get(key)).max().copied(),
             Regime::Hardening2 => PowitState::evidence_epochs(self.epoch)
@@ -394,7 +581,13 @@ impl TipWitnesses {
     }
 
     fn is_banned(&self, key: &KeyId) -> bool {
-        self.state.is_banned(key, self.epoch)
+        match (self.poci, &self.state.poci) {
+            // PoCI: a ban pending or not over refuses new evidence (§5).
+            (Some(pp), Some(st)) => st.bans.get(key).is_some_and(|bl| bl.iter().any(|b| {
+                b.end(pp.ban_epochs).is_none_or(|end| st.config().epoch() < end)
+            })),
+            _ => self.state.is_banned(key, self.epoch),
+        }
     }
 
     /// What the next block checks of an exit before its signature
@@ -415,6 +608,23 @@ impl TipWitnesses {
             return Err("witness exit by a key without share work".into());
         }
         Ok(())
+    }
+
+    /// What the next block checks of a PoCI rejoin before its signature
+    /// (`PociState::may_rejoin`): PoCI in force at the tip, signed for the
+    /// next block's epoch or the one before, the key pruned and without a
+    /// rejoin pending.
+    fn rejoin_admissible(&self, key: &KeyId, r: &WitnessRejoin) -> Result<(), String> {
+        let st = match (self.poci, &self.state.poci) {
+            (Some(_), Some(st)) => st,
+            (Some(_), None) => return Err("PoCI has no configuration in force yet".into()),
+            (None, _) => return Err("rejoin messages exist on PoCI chains only".into()),
+        };
+        if !core::liveness::liveness_active_at(self.next_height()) {
+            return Err("rejoin messages need the membership list (liveness activation)".into());
+        }
+        st.may_rejoin(self.next_height() + 1, self.state.finalized.height, self.epoch, key, r.epoch)
+            .map_err(|e| e.to_string())
     }
 
     /// Verify an equivocation proof's signatures as the next block will, or
@@ -452,6 +662,8 @@ struct PendingAttestation {
 
 struct HeldEvidence {
     ev: Equivocation,
+    /// PoCI (ObenBlock): the configuration both votes name.
+    config_id: Option<Hash>,
     weight: u128,
 }
 
@@ -460,7 +672,8 @@ struct HeldEvidence {
 /// are caught against).
 #[derive(Default)]
 struct SeenLinks {
-    by_key: HashMap<KeyId, std::collections::VecDeque<(u64, Attestation)>>,
+    /// (arrival sequence, link, the PoCI configuration it was verified under).
+    by_key: HashMap<KeyId, std::collections::VecDeque<(u64, Attestation, Option<Hash>)>>,
     /// Arrival sequence -> key, oldest first.
     order: BTreeMap<u64, KeyId>,
     next: u64,
@@ -468,27 +681,37 @@ struct SeenLinks {
 
 impl SeenLinks {
     fn of(&self, key: &KeyId) -> impl Iterator<Item = &Attestation> {
-        self.by_key.get(key).into_iter().flat_map(|v| v.iter().map(|(_, a)| a))
+        self.by_key.get(key).into_iter().flat_map(|v| v.iter().map(|(_, a, _)| a))
     }
 
+    /// `key`'s links with the PoCI configuration each was verified under.
+    fn of_with_config(&self, key: &KeyId) -> impl Iterator<Item = (&Attestation, Option<Hash>)> {
+        self.by_key.get(key).into_iter().flat_map(|v| v.iter().map(|(_, a, c)| (a, *c)))
+    }
+
+    #[cfg(test)]
     fn record(&mut self, key: KeyId, att: &Attestation) {
+        self.record_with(key, att, None)
+    }
+
+    fn record_with(&mut self, key: KeyId, att: &Attestation, config_id: Option<Hash>) {
         let links = self.by_key.entry(key).or_default();
-        if links.iter().any(|(_, a)| a == att) {
+        if links.iter().any(|(_, a, c)| a == att && *c == config_id) {
             return;
         }
         let seq = self.next;
         self.next += 1;
-        links.push_back((seq, att.clone()));
+        links.push_back((seq, att.clone(), config_id));
         self.order.insert(seq, key);
         if links.len() > SEEN_LINKS_PER_KEY {
-            if let Some((old, _)) = links.pop_front() {
+            if let Some((old, _, _)) = links.pop_front() {
                 self.order.remove(&old);
             }
         }
         while self.order.len() > SEEN_LINKS_CAP {
             let Some((old, k)) = self.order.pop_first() else { break };
             if let Some(v) = self.by_key.get_mut(&k) {
-                v.retain(|(s, _)| *s != old);
+                v.retain(|(s, _, _)| *s != old);
                 if v.is_empty() {
                     self.by_key.remove(&k);
                 }
@@ -523,6 +746,8 @@ struct PoolInner {
     evidence: BTreeMap<KeyId, HeldEvidence>,
     /// Witness exits waiting for a block, one per key.
     exits: BTreeMap<KeyId, WitnessExit>,
+    /// PoCI rejoins waiting for a block, one per key (ObenBlock).
+    rejoins: BTreeMap<KeyId, WitnessRejoin>,
     /// Links seen per witness-set member (gossip), to build equivocation proofs.
     seen_links: SeenLinks,
     /// The tip the pool was last pruned for, and its witness sets (`None`
@@ -534,7 +759,15 @@ struct PoolInner {
 impl PoolInner {
     /// Hold `ev` against `key`. Full: the lightest key's proof (then the
     /// greatest KeyId's) makes room for a heavier one, never the reverse.
+    #[cfg(test)]
     fn insert_evidence(&mut self, key: KeyId, ev: Equivocation, weight: u128) -> Result<(), String> {
+        self.insert_evidence_for(key, ev, None, weight)
+    }
+
+    /// [`Self::insert_evidence`] with the PoCI configuration the proof names.
+    fn insert_evidence_for(&mut self, key: KeyId, ev: Equivocation, config_id: Option<Hash>, weight: u128)
+        -> Result<(), String>
+    {
         if self.evidence.contains_key(&key) {
             return Ok(());
         }
@@ -548,7 +781,7 @@ impl PoolInner {
                 _ => return Err("evidence pool full".into()),
             }
         }
-        self.evidence.insert(key, HeldEvidence { ev, weight });
+        self.evidence.insert(key, HeldEvidence { ev, config_id, weight });
         Ok(())
     }
 
@@ -601,6 +834,7 @@ impl PoolInner {
         });
         self.evidence.retain(|k, _| !v.is_banned(k));
         self.exits.retain(|k, x| v.exit_admissible(k, x).is_ok());
+        self.rejoins.retain(|k, r| v.rejoin_admissible(k, r).is_ok());
         self.seen_links.retain_keys(|k| v.evidence_weight(p, k).is_some());
     }
 }
@@ -623,8 +857,19 @@ pub const ITEM_ATTESTATION: u8 = 2;
 pub const ITEM_EVIDENCE: u8 = 3;
 /// A witness exit (liveness activation, ObenBlock).
 pub const ITEM_EXIT: u8 = 4;
-/// The highest item kind.
+/// The highest item kind on GnB (unchanged: GnB has no rejoin).
 pub const ITEM_KIND_MAX: u8 = ITEM_EXIT;
+/// A PoCI rejoin (ObenBlock only, `docs/DESIGN-obenblock-poci.md` §4.1).
+pub const ITEM_REJOIN: u8 = 5;
+
+/// The highest item kind of the node's chain: [`ITEM_REJOIN`] on PoCI
+/// chains, [`ITEM_KIND_MAX`] on GnB, where kind 5 stays unknown.
+pub fn item_kind_max() -> u8 {
+    if powit::poci_active() { ITEM_REJOIN } else { ITEM_KIND_MAX }
+}
+
+/// `PowitPool::admit_rejoin`'s refusal of a bad signature (context-free).
+pub const POWIT_BAD_REJOIN_SIGNATURE: &str = "invalid PoCI rejoin signature";
 
 /// `PowitPool::admit_exit`'s refusal of a bad signature (context-free).
 pub const POWIT_BAD_EXIT_SIGNATURE: &str = "invalid witness exit signature";
@@ -651,6 +896,16 @@ impl PowitPool {
     pub fn counts(&self) -> (usize, usize, usize) {
         let g = self.inner.lock();
         (g.shares.len(), g.attestations.len(), g.evidence.len())
+    }
+
+    /// Every link of `key` the pool holds (pending and seen in gossip), and
+    /// whether it holds an equivocation proof against it: the signer's
+    /// rollback guard (`WitnessDuty::scan_for_rollback`).
+    pub fn votes_of(&self, key: &KeyId) -> (Vec<Attestation>, bool) {
+        let g = self.inner.lock();
+        let mut out: Vec<Attestation> = g.seen_links.of(key).cloned().collect();
+        out.extend(g.attestations.values().filter(|x| x.key == *key).map(|x| x.att.clone()));
+        (out, g.evidence.contains_key(key))
     }
 
     /// Links remembered for equivocation detection (tests, metrics).
@@ -748,22 +1003,33 @@ impl PowitPool {
         let key = att.key_id();
         let weight = view.weight_for(&p, &t, &key).ok_or("attester is not in the witness set")?;
         // The message of the target's height (v2 from the second hardening
-        // activation: it commits the witness key).
-        if !att.verify_signature_at(chain, &p, act, view.hardening2) {
+        // activation: it commits the witness key); PoCI: the v3 message of
+        // the configuration in force.
+        if !view.verify_attestation(&att, chain, &p, act) {
             return Err("invalid attestation signature".into());
         }
+        let config_id = view.poci_config().map(|c| c.id());
         {
             let mut g = self.inner.lock();
             if g.attestations.contains_key(&id) {
                 return Ok(id);
             }
             // Every recorded link passed `verify_signature`: the shape check
-            // is the rest of `Equivocation::verify`.
-            let conflicting = g.seen_links.of(&key).find(|o| links_conflict(o, &att)).cloned();
+            // is the rest of `Equivocation::verify` (PoCI: under the same
+            // configuration).
+            let conflicting = g.seen_links.of_with_config(&key)
+                .find(|(o, c)| *c == config_id && links_conflict(o, &att)).map(|(o, _)| o.clone());
             if let Some(o) = conflicting {
-                let _ = g.insert_evidence(key, Equivocation { a: o, b: att.clone() }, weight);
+                // PoCI: only evidence the next block may carry (one ban at a time).
+                let admissible = match (view.poci, &view.state.poci, &config_id) {
+                    (Some(pp), Some(st), Some(cid)) => st.may_ban(&pp, &key, cid).is_ok(),
+                    _ => true,
+                };
+                if admissible {
+                    let _ = g.insert_evidence_for(key, Equivocation { a: o, b: att.clone() }, config_id, weight);
+                }
             }
-            g.seen_links.record(key, &att);
+            g.seen_links.record_with(key, &att, config_id);
         }
         if att.source != view.justified {
             return Err("attestation source is not the tip's justified checkpoint".into());
@@ -789,9 +1055,34 @@ impl PowitPool {
         if self.inner.lock().evidence.contains_key(&key) {
             return Err("equivocation proof for this key already held".into());
         }
+        if view.poci.is_some() {
+            return Err("PoWit equivocation proof on a PoCI chain (PoCI evidence names its configuration)".into());
+        }
         let k = view.verify_evidence(&ev, core::node_chain_id(), &p)?;
         debug_assert_eq!(k, key);
-        self.inner.lock().insert_evidence(key, ev, weight)?;
+        self.inner.lock().insert_evidence_for(key, ev, None, weight)?;
+        Ok(key)
+    }
+
+    /// Admit PoCI evidence (ObenBlock) as the next block will check it: the
+    /// one-ban-at-a-time rule and the named configuration's membership
+    /// before the two signatures (`poci::check_evidence`), one proof per key.
+    pub fn admit_poci_evidence(&self, ev: PociEvidence, dag: &GhostDAG, store: &Storage) -> Result<KeyId, String> {
+        if ev.a.witness != ev.b.witness {
+            return Err("equivocation: different witnesses".into());
+        }
+        let key = ev.key_id();
+        let view = self.follow_tip(dag, store).ok_or("PoWit not active at the tip")?;
+        let pp = view.poci.ok_or("PoCI evidence on a chain without PoCI")?;
+        let st = view.state.poci.as_ref().ok_or("PoCI has no configuration in force yet")?;
+        let weight = st.find_config(&ev.config_id).and_then(|c| c.weight(&key)).ok_or(EVIDENCE_NOT_A_WITNESS)?;
+        st.may_ban(&pp, &key, &ev.config_id).map_err(|e| e.to_string())?;
+        if self.inner.lock().evidence.contains_key(&key) {
+            return Err("equivocation proof for this key already held".into());
+        }
+        let (a, b) = ev.votes();
+        poci::check_evidence(&pp, &a, &b, |id| st.find_config(id)).map_err(|e| e.to_string())?;
+        self.inner.lock().insert_evidence_for(key, Equivocation { a: ev.a, b: ev.b }, Some(ev.config_id), weight)?;
         Ok(key)
     }
 
@@ -821,6 +1112,33 @@ impl PowitPool {
         self.inner.lock().exits.values().cloned().collect()
     }
 
+    /// Admit a PoCI rejoin for the next block (ObenBlock, §4.1): the cheap
+    /// checks of the next block (`TipWitnesses::rejoin_admissible`), then the
+    /// KES signature. One rejoin per key.
+    pub fn admit_rejoin(&self, r: WitnessRejoin, dag: &GhostDAG, store: &Storage) -> Result<KeyId, String> {
+        let key = r.key_id();
+        let view = self.follow_tip(dag, store).ok_or("PoWit not active at the tip")?;
+        view.rejoin_admissible(&key, &r)?;
+        if self.inner.lock().rejoins.contains_key(&key) {
+            return Ok(key);
+        }
+        let pp = view.poci.ok_or("rejoin messages exist on PoCI chains only")?;
+        if !r.verify_signature(pp.chain_id) {
+            return Err(POWIT_BAD_REJOIN_SIGNATURE.into());
+        }
+        let mut g = self.inner.lock();
+        if g.rejoins.len() >= REJOIN_CAP {
+            return Err("rejoin pool full".into());
+        }
+        g.rejoins.insert(key, r);
+        Ok(key)
+    }
+
+    /// Rejoins in the pool, by key.
+    pub fn rejoins_snapshot(&self) -> Vec<WitnessRejoin> {
+        self.inner.lock().rejoins.values().cloned().collect()
+    }
+
     /// Forget what the current selected tip made stale (also done by every
     /// admission against a new tip).
     pub fn prune(&self, dag: &GhostDAG, store: &Storage) {
@@ -841,6 +1159,15 @@ impl PowitPool {
     /// and a block holds 32 votes, so the votes that carry the most weight
     /// toward two thirds go first; proofs heaviest key first (then KeyId),
     /// by the weights of the tip they were admitted at.
+    /// Held proofs with the PoCI configuration each names (ObenBlock), in
+    /// the order of [`Self::snapshot`].
+    pub fn evidence_snapshot(&self) -> Vec<(Equivocation, Option<Hash>)> {
+        let g = self.inner.lock();
+        let mut ev: Vec<(&KeyId, &HeldEvidence)> = g.evidence.iter().collect();
+        ev.sort_by(|a, b| b.1.weight.cmp(&a.1.weight).then(a.0.cmp(b.0)));
+        ev.into_iter().map(|(_, h)| (h.ev.clone(), h.config_id)).collect()
+    }
+
     pub fn snapshot(&self) -> (Vec<WitnessShare>, Vec<Attestation>, Vec<Equivocation>) {
         let g = self.inner.lock();
         let mut held: Vec<(&Hash, &PendingAttestation)> = g.attestations.iter().collect();
@@ -859,7 +1186,20 @@ impl PowitPool {
 /// re-checked against the template's own context, so the section is valid.
 /// Equivocation proofs go by the key's witness weight on `tip` (heaviest
 /// first, then KeyId): a KeyId is free to grind, a weight is not.
+///
+/// The template's compact bits are not known here: [`template_body_with_bits`]
+/// takes them. They never change which items are valid (the ObenBlock growth
+/// cap records an epoch's first-block bits for a handoff at least two
+/// epochs later), so the bits of a GnB template do not matter.
+#[allow(dead_code)] // tests; the node binary compiles this module too
 pub fn template_body(pool: &PowitPool, dag: &GhostDAG, store: &Storage, tip: Hash, height: u64) -> PowitBody {
+    template_body_with_bits(pool, dag, store, tip, height, 0)
+}
+
+/// [`template_body`] for a template whose compact bits are `bits`.
+pub fn template_body_with_bits(pool: &PowitPool, dag: &GhostDAG, store: &Storage, tip: Hash, height: u64, bits: u32)
+    -> PowitBody
+{
     if !core::powit_active(height) {
         return PowitBody::default();
     }
@@ -871,15 +1211,17 @@ pub fn template_body(pool: &PowitPool, dag: &GhostDAG, store: &Storage, tip: Has
     let epoch = p.epoch(base.activation, height);
     let recent = selected_chain_since(dag, Some(tip), height.saturating_sub(SHARE_WINDOW));
     let Ok(included) = included_share_ids(store, &recent) else { return PowitBody::default() };
-    let (shares, atts, mut evidence) = pool.snapshot();
+    let (shares, atts, _) = pool.snapshot();
+    let mut evidence = pool.evidence_snapshot();
     if !evidence.is_empty() {
         let tip_h = dag.get_block_data(&tip).map(|d| d.height).unwrap_or(height.saturating_sub(1));
         let w = pool.view_of(&tip).unwrap_or_else(|| Arc::new(TipWitnesses::of_at(tip, tip_h, base.clone(), &p, h2)));
-        evidence.sort_by_cached_key(|e| {
+        evidence.sort_by_cached_key(|(e, _)| {
             let k = e.a.key_id();
             (std::cmp::Reverse(w.evidence_weight(&p, &k).unwrap_or(0)), k)
         });
     }
+    let poci_chain = PociParams::for_chain(chain).is_some();
 
     let mut body = PowitBody::default();
     let mut share_work = Vec::new();
@@ -899,15 +1241,26 @@ pub fn template_body(pool: &PowitPool, dag: &GhostDAG, store: &Storage, tip: Has
     let try_apply = |b: &PowitBody, sw: &[(KeyId, u128)]| {
         let input = BlockInput { height, hash: [0; 32], share_work: sw, attestations: &b.attestations,
                                  evidence: &b.evidence, exits: &b.exits };
-        base.apply_full(&p, chain, h2, live, &input, &view).is_ok()
+        base.apply_block(&p, chain, h2, live, &input, bits, powit::PociItems::of(b), &view).is_ok()
     };
-    for ev in evidence {
-        if body.evidence.len() >= p.max_evidence_per_block {
+    for (ev, config_id) in evidence {
+        if body.evidence.len() + body.poci_evidence.len() >= p.max_evidence_per_block {
             break;
         }
-        body.evidence.push(ev);
-        if !try_apply(&body, &share_work) {
-            body.evidence.pop();
+        match (poci_chain, config_id) {
+            (true, Some(config_id)) => {
+                body.poci_evidence.push(PociEvidence { config_id, a: ev.a, b: ev.b });
+                if !try_apply(&body, &share_work) {
+                    body.poci_evidence.pop();
+                }
+            }
+            (false, None) => {
+                body.evidence.push(ev);
+                if !try_apply(&body, &share_work) {
+                    body.evidence.pop();
+                }
+            }
+            _ => {}
         }
     }
     if core::liveness::liveness_active_at(height) {
@@ -928,6 +1281,18 @@ pub fn template_body(pool: &PowitPool, dag: &GhostDAG, store: &Storage, tip: Has
             if try_apply(&trial, &trial_work) {
                 body = trial;
                 share_work = trial_work;
+            }
+        }
+        // PoCI (ObenBlock, §4.1): pruned keys' rejoins, after the exits.
+        if poci_chain {
+            for r in pool.rejoins_snapshot() {
+                if body.rejoins.len() >= powit::MAX_REJOINS_PER_BLOCK {
+                    break;
+                }
+                body.rejoins.push(r);
+                if !try_apply(&body, &share_work) {
+                    body.rejoins.pop();
+                }
             }
         }
     }
@@ -953,80 +1318,15 @@ pub fn template_body(pool: &PowitPool, dag: &GhostDAG, store: &Storage, tip: Has
 
 // ── Witness duty ─────────────────────────────────────────────────────────────
 
-/// Write `bytes` to `path` so that it survives a crash or a power loss:
-/// a temp file in the same directory, fsync'd, renamed over `path`, then the
-/// directory fsync'd (the rename itself is durable only then). Owner-only
-/// permissions (the KES key file holds the encrypted seed).
-fn write_durable(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    use std::io::Write;
-    let name = path.file_name().ok_or_else(|| format!("{}: not a file path", path.display()))?;
-    let mut tmp_name = name.to_os_string();
-    tmp_name.push(".tmp");
-    let tmp = path.with_file_name(tmp_name);
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
-    }
-    let io = |what: &str, e: std::io::Error| format!("{what} {}: {e}", tmp.display());
-    let mut f = opts.open(&tmp).map_err(|e| io("create", e))?;
-    f.write_all(bytes).map_err(|e| io("write", e))?;
-    f.sync_all().map_err(|e| io("fsync", e))?;
-    drop(f);
-    std::fs::rename(&tmp, path).map_err(|e| format!("rename to {}: {e}", path.display()))?;
-    let dir = match path.parent() {
-        Some(d) if !d.as_os_str().is_empty() => d,
-        _ => Path::new("."),
-    };
-    std::fs::File::open(dir).and_then(|d| d.sync_all())
-        .map_err(|e| format!("fsync directory {}: {e}", dir.display()))
-}
+use crate::powit_signer::{write_durable, CrashPoint, ObservedVote, Signed, VoteGuard};
 
-/// Read a JSON file that may be absent (`None`), refusing one that exists but
-/// cannot be read or parsed: an unreadable vote record must never read as
-/// "no votes" (that re-opens every link the key signed).
-fn read_json_if_present<T: serde::de::DeserializeOwned>(path: &Path, what: &str) -> Result<Option<T>, String> {
-    match std::fs::read(path) {
-        Ok(b) => serde_json::from_slice(&b).map(Some).map_err(|e| format!(
-            "{what} {} is corrupt ({e}); refusing to sign: restore it from a backup (deleting it can make \
-             this key sign a double vote and be barred)", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("{what} {} is unreadable ({e}); refusing to sign", path.display())),
-    }
-}
-
-/// The highest source and target heights a key ever signed (EIP-3076's
-/// minimal slashing protection): a link with a lower source or a target not
-/// above it is never signed, so no double or surround vote is possible even
-/// if the full record is lost. Kept in the record and, so that it moves with
-/// the key on a failover onto a fresh data directory, beside the key file.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-struct HighWater {
-    source: u64,
-    target: u64,
-}
-
-impl HighWater {
-    fn of(signed: &[(Checkpoint, Checkpoint)]) -> Self {
-        signed.iter().fold(HighWater::default(), |h, (s, t)| h.max(&HighWater { source: s.height, target: t.height }))
-    }
-    fn max(self, o: &HighWater) -> Self {
-        HighWater { source: self.source.max(o.source), target: self.target.max(o.target) }
-    }
-    fn allows(&self, source: &Checkpoint, target: &Checkpoint) -> bool {
-        source.height >= self.source && target.height > self.target
-    }
-}
-
-/// A witness's forward-secure KES key, its payout script and its persistent
-/// vote record. The KES state evolves to each target's epoch (erasing every
-/// earlier seed, on disk first) before signing, and the record makes a double
-/// or surround vote impossible even across restarts and reorgs. Both files
-/// are written durably (`write_durable`) before a signature is released; a
-/// record that exists but cannot be read refuses to load; the highest
-/// signed heights (`HighWater`) are enforced and kept beside the key too.
+/// A witness's forward-secure KES key, its payout script and its signer
+/// protection (`powit_signer::VoteGuard`, DESIGN-obenblock-poci.md §8). The
+/// KES state evolves to each target's epoch (erasing every earlier seed, on
+/// disk first) before signing; the guard persists every vote before its
+/// signature is released, refuses double and surround votes, holds the
+/// key's exclusive signer lock, and stops signing on a vote of this key in
+/// the chain or the pool that its record does not hold (rollback guard).
 pub struct WitnessDuty {
     pub key_id: KeyId,
     pub payout_script: Vec<u8>,
@@ -1038,9 +1338,7 @@ pub struct WitnessDuty {
     /// secure-allocator memory, for the same reason).
     password: gnb_crypto::crypto::SecretBytes,
     signer: Mutex<gnb_crypto::core::kes::KesSigner>,
-    record_path: PathBuf,
-    highwater_path: PathBuf,
-    signed: Mutex<(Vec<(Checkpoint, Checkpoint)>, HighWater)>,
+    guard: VoteGuard,
 }
 
 /// The witness password held in secret memory, as the `&str` the key file
@@ -1050,11 +1348,24 @@ fn password_str(password: &gnb_crypto::crypto::SecretBytes) -> &str {
     std::str::from_utf8(password).expect("the witness password was read as UTF-8")
 }
 
+/// Votes of `key` the next block's view knows: the tip state's included
+/// links (source height, target) and the pool's links and held evidence.
+fn observed_votes(st: &PowitState, key: &KeyId) -> (Vec<ObservedVote>, bool) {
+    let mut seen: Vec<ObservedVote> = st.links.get(key).into_iter().flatten()
+        .map(|&(sh, th, thash)| ObservedVote { source_height: sh, source_hash: None,
+                                              target: Checkpoint { height: th, hash: thash } })
+        .collect();
+    let (pooled, evidence) = pool().votes_of(key);
+    seen.extend(pooled.iter().map(ObservedVote::of));
+    (seen, evidence)
+}
+
 impl WitnessDuty {
     /// Load a KES witness key (`gnb-cli witnesskeygen`); the password is read
     /// from `password_file` (first line), never from the command line.
-    /// Refuses a vote record or high-water file that exists but cannot be
-    /// read (it would otherwise read as "never signed").
+    /// Opens the key's signer guard: refuses a second signer of the key, and
+    /// a vote record or high-water file that exists but cannot be read (it
+    /// would otherwise read as "never signed").
     pub fn load(key: &Path, password_file: &Path, payout_script: Vec<u8>, data_dir: &Path) -> Result<Self, String> {
         // CRY-4: the file's contents are wiped once the first line is copied.
         let pw = zeroize::Zeroizing::new(
@@ -1064,45 +1375,62 @@ impl WitnessDuty {
         let file = gnb_crypto::core::kes::KesKeyFile::load(key)?;
         let signer = file.open(password_str(&password))?;
         let key_id = signer.public().witness_id();
-        let record_path = data_dir.join(format!("powit-votes-{}.json", hex::encode(key_id)));
-        let mut hw_name = key.file_name().ok_or("witness key path has no file name")?.to_os_string();
-        hw_name.push(".votes-highwater.json");
-        let highwater_path = key.with_file_name(hw_name);
-        let signed: Vec<(Checkpoint, Checkpoint)> =
-            read_json_if_present(&record_path, "witness vote record")?.unwrap_or_default();
-        let beside_key: HighWater =
-            read_json_if_present(&highwater_path, "witness vote high-water file")?.unwrap_or_default();
-        let hw = HighWater::of(&signed).max(&beside_key);
+        let guard = VoteGuard::open(key_id, key, &crate::powit_signer::record_path(data_dir, &key_id))?;
         Ok(WitnessDuty {
             key_id,
             payout_script,
             key_path: key.to_path_buf(),
             password,
             signer: Mutex::new(signer),
-            record_path,
-            highwater_path,
-            signed: Mutex::new((signed, hw)),
+            guard,
         })
     }
 
-    fn conflicts(&self, source: &Checkpoint, target: &Checkpoint) -> bool {
-        let g = self.signed.lock();
-        !g.1.allows(source, target) || g.0.iter().any(|(s, t)| {
-            (t.height == target.height && t != target)
-                || (s.height < source.height && target.height < t.height)
-                || (source.height < s.height && t.height < target.height)
-        })
+    /// The signer guard (status, alert, record).
+    pub fn guard(&self) -> &VoteGuard {
+        &self.guard
+    }
+
+    /// Tests: make the next signature stop at `p` as a crash would.
+    #[doc(hidden)]
+    #[allow(dead_code)] // tests only; the node binary compiles this module too
+    pub fn set_crash_point(&self, p: Option<CrashPoint>) {
+        self.guard.set_crash_point(p, false);
+    }
+
+    /// Rollback guard against the selected tip's state and the pool: at
+    /// start (main) and before every vote (`maybe_attest`). Returns the
+    /// alert if the signer is (now) halted.
+    pub fn scan_for_rollback(&self, dag: &GhostDAG, store: &Storage) -> Option<String> {
+        let st = tip_context(dag).and_then(|(tip, _)| load_state(store, &tip));
+        let (seen, evidence) = match &st {
+            Some(st) => observed_votes(st, &self.key_id),
+            None => {
+                let (pooled, evidence) = pool().votes_of(&self.key_id);
+                (pooled.iter().map(ObservedVote::of).collect(), evidence)
+            }
+        };
+        self.guard.observe(&seen, evidence, "chain or pool")
     }
 
     /// If this key is a witness for the checkpoint to vote for above the
     /// tip's justified one, sign that link once (the message of the target's
-    /// height). Returns the new attestation. The checkpoint is the newest slot
-    /// at or below the next block's height; from the second hardening
-    /// activation, the justified checkpoint's direct child while a vote for
-    /// it can still be included.
+    /// height). Returns the new attestation (or, once per process, one
+    /// persisted but maybe never released before a crash). The checkpoint is
+    /// the newest slot at or below the next block's height; from the second
+    /// hardening activation, the justified checkpoint's direct child while a
+    /// vote for it can still be included.
     pub fn maybe_attest(&self, dag: &GhostDAG, store: &Storage) -> Result<Option<Attestation>, String> {
+        if self.guard.alert().is_some() {
+            return Ok(None);
+        }
         let Some((tip, tip_h)) = tip_context(dag) else { return Ok(None) };
         let Some(st) = load_state(store, &tip) else { return Ok(None) };
+        // Rollback guard before every vote.
+        let (seen, evidence) = observed_votes(&st, &self.key_id);
+        if let Some(alert) = self.guard.observe(&seen, evidence, "chain or pool") {
+            return Err(format!("PoWit signer halted: {alert}"));
+        }
         let p: PowitParams = powit::params();
         let act = st.activation;
         if tip_h < act {
@@ -1131,6 +1459,14 @@ impl WitnessDuty {
             }
         }
         let source = st.justified;
+        // PoCI (ObenBlock): votes name the configuration in force, and only
+        // its keys vote; nothing to sign during the launch bootstrap.
+        let poci = PociParams::for_chain(core::node_chain_id());
+        let config = st.poci_config().cloned();
+        if poci.is_some() && config.is_none() {
+            return Ok(None);
+        }
+        let config_id = config.as_ref().map(|c| c.id());
         // The next block's view of the slot: its selected chain starts at tip.
         let view = DagChainView { dag, start: Some(tip) };
         let mut signer = self.signer.lock();
@@ -1142,9 +1478,10 @@ impl WitnessDuty {
             let te = p.epoch(act, slot);
             // A member under the rules of the block that will include the
             // vote (from the next block on: slot <= next).
-            let member = match regime {
-                Regime::V1 => st.witness_set(&p, te).iter().any(|(k, _)| *k == self.key_id),
-                Regime::Hardening2 => st.member_weight_h2(&p, te, &self.key_id).is_some(),
+            let member = match (&config, regime) {
+                (Some(c), _) => c.weight(&self.key_id).is_some(),
+                (None, Regime::V1) => st.witness_set(&p, te).iter().any(|(k, _)| *k == self.key_id),
+                (None, Regime::Hardening2) => st.member_weight_h2(&p, te, &self.key_id).is_some(),
             };
             // Not a member for this slot's epoch, no block for it, a conflict
             // with the record, or an epoch whose leaf is gone (forward
@@ -1154,41 +1491,80 @@ impl WitnessDuty {
             }
             let Some(hash) = view.selected_at(slot) else { continue };
             let target = Checkpoint { height: slot, hash };
-            if self.signed.lock().0.iter().any(|(s, t)| *s == source && *t == target) {
-                return Ok(None); // signed: waiting for it to be included
+            if self.guard.holds(&source, &target) {
+                // Signed: the guard returns the stored attestation once per
+                // process (persisted, maybe not released before a restart),
+                // then nothing while it waits to be included.
+                return match self.guard.sign_link(source, target, config_id, || Err("already signed".into()))? {
+                    Signed::Stored { att, first_release: true } => Ok(Some(att)),
+                    _ => Ok(None),
+                };
             }
-            if self.conflicts(&source, &target) || te < signer.epoch() {
+            if !self.guard.permits(&source, &target) || te < signer.epoch() {
                 continue;
             }
             chosen = Some((target, te));
             break;
         }
         let Some((target, te)) = chosen else { return Ok(None) };
-        if te > signer.epoch() {
-            // Erase every earlier seed, ON DISK FIRST (durably), then in memory.
-            let password = password_str(&self.password);
-            let mut next_state = gnb_crypto::core::kes::KesKeyFile::load(&self.key_path)?.open(password)?;
-            next_state.evolve_to(te)?;
-            let sealed = gnb_crypto::core::kes::KesKeyFile::seal(&next_state, password)?;
-            let json = serde_json::to_vec_pretty(&sealed).map_err(|e| format!("kes save: {e}"))?;
-            write_durable(&self.key_path, &json).map_err(|e| format!("kes save: {e}"))?;
-            *signer = next_state;
+        let signed = self.guard.sign_link(source, target, config_id, || {
+            self.evolve(&mut signer, te)?;
+            // PoCI (ObenBlock): the v3 message naming the configuration in
+            // force. GnB: the message of the target's height (v2, committing
+            // this key, from the second hardening activation).
+            match (poci, &config_id) {
+                (Some(pp), Some(cid)) => Attestation::sign_v3(pp.chain_id, cid, source, target, &signer),
+                _ => Attestation::sign_at(core::node_chain_id(), h2, source, target, &signer),
+            }
+        })?;
+        match signed {
+            Signed::Fresh(att) | Signed::Stored { att, first_release: true } => Ok(Some(att)),
+            _ => Ok(None),
         }
-        // The message of the target's height (v2, committing this key, from
-        // the second hardening activation).
-        let att = Attestation::sign_at(core::node_chain_id(), h2, source, target, &signer)?;
+    }
+
+    /// Evolve the signer to KES epoch `e`: every earlier seed is erased ON
+    /// DISK FIRST (durably), then in memory. No-op at or above `e`.
+    fn evolve(&self, signer: &mut gnb_crypto::core::kes::KesSigner, e: u64) -> Result<(), String> {
+        if e <= signer.epoch() {
+            return Ok(());
+        }
+        let password = password_str(&self.password);
+        let mut next_state = gnb_crypto::core::kes::KesKeyFile::load(&self.key_path)?.open(password)?;
+        next_state.evolve_to(e)?;
+        let sealed = gnb_crypto::core::kes::KesKeyFile::seal(&next_state, password)?;
+        let json = serde_json::to_vec_pretty(&sealed).map_err(|e| format!("kes save: {e}"))?;
+        write_durable(&self.key_path, &json).map_err(|e| format!("kes save: {e}"))?;
+        *signer = next_state;
+        Ok(())
+    }
+
+    /// PoCI (ObenBlock, DESIGN-obenblock-poci.md §4.1): this key was pruned
+    /// for absence at the tip and is online again, so it asks to come back.
+    /// Signs a rejoin for the next block's epoch when the key is pruned, has
+    /// no rejoin pending in the chain and none in the pool. A rejoin is not a
+    /// vote (it can never be evidence), so the vote guard is not involved;
+    /// a halted signer still publishes none.
+    pub fn maybe_rejoin(&self, dag: &GhostDAG, store: &Storage) -> Result<Option<WitnessRejoin>, String> {
+        let Some(pp) = PociParams::for_chain(core::node_chain_id()) else { return Ok(None) };
+        if self.guard.alert().is_some() {
+            return Ok(None);
+        }
+        // The pool's view of the tip (cached per tip: no state load per tick).
+        let Some(view) = pool().follow_tip(dag, store) else { return Ok(None) };
+        let Some(ledger) = view.state.poci.as_ref() else { return Ok(None) };
+        if !ledger.pruned.contains_key(&self.key_id) || ledger.rejoins.contains_key(&self.key_id)
+            || pool().inner.lock().rejoins.contains_key(&self.key_id)
         {
-            let mut g = self.signed.lock();
-            g.0.push((source, target));
-            g.1 = g.1.max(&HighWater { source: source.height, target: target.height });
-            // Persist BEFORE releasing the signature: the record, then the
-            // high-water mark beside the key.
-            let bytes = serde_json::to_vec(&g.0).map_err(|e| e.to_string())?;
-            write_durable(&self.record_path, &bytes).map_err(|e| format!("witness vote record: {e}"))?;
-            let hw = serde_json::to_vec(&g.1).map_err(|e| e.to_string())?;
-            write_durable(&self.highwater_path, &hw).map_err(|e| format!("witness vote high-water file: {e}"))?;
+            return Ok(None);
         }
-        Ok(Some(att))
+        let e = pp.epoch_of(view.tip_h + 1);
+        let mut signer = self.signer.lock();
+        if signer.epoch() > e {
+            return Ok(None);
+        }
+        self.evolve(&mut signer, e)?;
+        WitnessRejoin::sign(pp.chain_id, &signer).map(Some)
     }
 }
 
@@ -1230,8 +1606,22 @@ pub fn mine_share(attested: &Block, attested_hash: Hash, witness: KeyId, payout:
 }
 
 /// Equivocation proofs in the pool (for gossip).
+#[allow(dead_code)] // tests; gossip uses `pool_evidence_items`
 pub fn pool_evidence() -> Vec<Equivocation> {
     pool().snapshot().2
+}
+
+/// The pool's proofs as gossip items, by key: GnB equivocation proofs, or
+/// PoCI evidence on ObenBlock (`ITEM_EVIDENCE` carries `PociEvidence` there).
+pub fn pool_evidence_items() -> Vec<(KeyId, (Hash, u8, Vec<u8>))> {
+    pool().evidence_snapshot().into_iter().map(|(ev, cfg)| {
+        let key = ev.a.key_id();
+        let item = match cfg {
+            Some(config_id) => poci_evidence_item(&PociEvidence { config_id, a: ev.a, b: ev.b }),
+            None => evidence_item(&ev),
+        };
+        (key, item)
+    }).collect()
 }
 
 /// JSON summary for `getpowitinfo`.
@@ -1265,7 +1655,8 @@ pub fn info_json(dag: &GhostDAG, store: &Storage) -> serde_json::Value {
         "rules": match regime { Regime::V1 => "v1", Regime::Hardening2 => "hardening2" },
         "params": {
             "epoch_len": p.epoch_len, "checkpoint_interval": p.checkpoint_interval,
-            "window_epochs": p.window_epochs,
+            // On ObenBlock the PoCI window (params_digest) is the chain's window.
+            "window_epochs": PociParams::for_chain(core::node_chain_id()).map_or(p.window_epochs, |pp| pp.window_epochs),
             // The 64-key cap applies only before the second hardening activation.
             "max_witnesses": p.max_witnesses,
         },
@@ -1280,7 +1671,8 @@ pub fn info_json(dag: &GhostDAG, store: &Storage) -> serde_json::Value {
                 "key": hex::encode(k), "weight": w.to_string() })).collect::<Vec<_>>(),
         },
         "barred_keys": st.as_ref().map(|s| s.banned.len()).unwrap_or(0),
-        "pool": { "shares": ps, "attestations": pa, "evidence": pe, "exits": pool().exits_snapshot().len() },
+        "pool": { "shares": ps, "attestations": pa, "evidence": pe, "exits": pool().exits_snapshot().len(),
+                  "rejoins": pool().rejoins_snapshot().len() },
         // Hardening 2: the witness set comes from finalized history.
         "witness_set_from_finalized_history": core::activation::hardening2_active_at(tip_h + 1),
         // The node's fork-choice pin (`getfinalityinfo` has the details).
@@ -1290,9 +1682,155 @@ pub fn info_json(dag: &GhostDAG, store: &Storage) -> serde_json::Value {
         "finality_conflict": dag.finality_outcome().conflict.is_some(),
         // Liveness (ObenBlock): the leak rule and the witness exits.
         "liveness_active": core::liveness::liveness_active_at(tip_h + 1),
-        "inactivity_leak": match p.leak { powit::InactivityLeak::Sixteenth => "1/16", powit::InactivityLeak::Half => "1/2" },
+        // PoCI (ObenBlock): absence never changes the finality weight
+        // (DESIGN-obenblock-poci.md §4.1; DESIGN-obenblock.md §5.2 superseded).
+        "inactivity_leak": if powit::poci_active() { "none (PoCI)" } else {
+            match p.leak { powit::InactivityLeak::Sixteenth => "1/16", powit::InactivityLeak::Half => "1/2" }
+        },
         "exited_keys": st.as_ref().map(|s| s.exited.len()).unwrap_or(0),
+        // Signer protection (DESIGN-obenblock-poci.md §8): this node's
+        // witness signers; `signer_halted` is the alert.
+        "signer_halted": crate::powit_signer::any_halted(),
+        "signers": crate::powit_signer::statuses(),
+        // PoCI (ObenBlock, DESIGN-obenblock-poci.md): the configuration in
+        // force (`null` on GnB and during the launch bootstrap).
+        "poci": poci_info_json(dag, store, st.as_ref()),
     })
+}
+
+/// The PoCI part of `getfinalityinfo` (ObenBlock; `null` on GnB): the
+/// configuration in force at the selected tip, as in `getpowitinfo`, with
+/// the latest finalized checkpoint and the summary of its kept certificate
+/// (`getfinalitycertificate` serves the certificate itself).
+pub fn poci_finality_json(dag: &GhostDAG, store: &Storage) -> serde_json::Value {
+    if PociParams::for_chain(core::node_chain_id()).is_none() {
+        return serde_json::Value::Null;
+    }
+    let tip = dag.selected_tip();
+    let tip_h = tip.and_then(|t| dag.get_block_data(&t)).map(|d| d.height).unwrap_or(0);
+    let st = selected_chain_since(dag, tip, tip_h.saturating_sub(16)).into_iter().find_map(|(h, _)| load_state(store, &h));
+    poci_info_json(dag, store, st.as_ref())
+}
+
+/// The PoCI part of `getpowitinfo` and `getfinalityinfo`: the configuration
+/// in force (epoch, id, exact total, entries), its absent weight per epoch,
+/// the bans, and the latest finalized checkpoint with its kept certificate.
+fn poci_info_json(dag: &GhostDAG, store: &Storage, st: Option<&PowitState>) -> serde_json::Value {
+    let Some(pp) = PociParams::for_chain(core::node_chain_id()) else { return serde_json::Value::Null };
+    let Some((s, ps)) = st.and_then(|s| s.poci.as_ref().map(|p| (s, p))) else {
+        return serde_json::json!({ "active": false, "bootstrap_epochs": pp.bootstrap_epochs,
+                                   "launch_height": pp.launch_height() });
+    };
+    let c = ps.config();
+    // The weight of C_e with no vote included in a block of each recent
+    // epoch (not final: blocks above the finalized checkpoint count), so
+    // operators see it grow long before it reaches a third.
+    let now = s.epoch;
+    let absent: Vec<serde_json::Value> = (now.saturating_sub(poci::POCI_PRUNE_AFTER_EPOCHS)..=now)
+        .filter(|e| *e >= c.epoch())
+        .map(|e| {
+            let w = ps.absent_weight(e);
+            let keys = c.entries().iter().filter(|(k, _)| !ps.seen.get(k).is_some_and(|m| m.contains_key(&e))).count();
+            serde_json::json!({ "epoch": e, "weight": w.to_string(), "keys": keys,
+                                "over_a_third": w.checked_mul(3).is_none_or(|x| x > c.total()) })
+        }).collect();
+    let f = s.finalized;
+    let certificate = if certificate::final_by_definition(&pp, &f) {
+        serde_json::json!({ "available": false, "reason": "final by definition (launch checkpoint)" })
+    } else {
+        match certificate::load(store, &f.hash) {
+            Some(k) => {
+                let mut j = certificate::certificate_json(dag, &k, false);
+                j["available"] = true.into();
+                j
+            }
+            None => serde_json::json!({ "available": false, "reason": "not kept yet (getfinalitycertificate rebuilds it)" }),
+        }
+    };
+    let bans: Vec<serde_json::Value> = ps.bans.iter().flat_map(|(k, bl)| bl.iter().map(move |b| serde_json::json!({
+        "key": hex::encode(k), "config_id": hex::encode(b.config_id), "included_at": b.included_at,
+        "start": b.start, "end": b.end(pp.ban_epochs),
+    }))).collect();
+    serde_json::json!({
+        "active": true,
+        "config_epoch": c.epoch(),
+        "config_id": hex::encode(c.id()),
+        // u128 as a decimal string (JSON numbers lose precision).
+        "total": c.total().to_string(),
+        "entries": c.len(),
+        "params_digest": hex::encode(pp.digest()),
+        "previous_config_id": ps.previous().map(|p| hex::encode(p.id())),
+        "configurations": ps.history().count(),
+        "bans": bans,
+        // §4.1: absence pruning by the old committee.
+        "prune_after_epochs": poci::POCI_PRUNE_AFTER_EPOCHS,
+        "absent_weight": absent,
+        "pruned": ps.pruned.iter().map(|(k, p)| serde_json::json!({
+            "key": hex::encode(k), "since_epoch": p.start, "rejoin_included_at": ps.rejoins.get(k) })).collect::<Vec<_>>(),
+        "growth_cap": growth_cap_json(s.cap.as_ref()),
+        "finalized": { "slot": f.height, "hash": hex::encode(f.hash) },
+        "finalized_certificate": certificate,
+    })
+}
+
+/// The growth cap of `getpowitinfo` (DESIGN-obenblock.md §6.3: the capture
+/// is visible the whole time): the ledger's epoch and, for the last cap
+/// step (the one that built the configuration in force), `W`, the budget
+/// `G`, `sum(x)`, what it admitted, what new keys got and what it dropped.
+/// Integers as decimal strings.
+fn growth_cap_json(cap: Option<&gnb_crypto::core::powit::growth_cap::CapState>) -> serde_json::Value {
+    let Some(c) = cap else { return serde_json::Value::Null };
+    let last = c.ledger.report().map(|r| serde_json::json!({
+        "epoch": r.epoch, "w": r.w.to_string(), "g": r.g.to_string(), "sum_x": r.sum_x.to_string(),
+        "admitted": r.admitted.to_string(), "admitted_new": r.admitted_new.to_string(),
+        "dropped": r.dropped.to_string(),
+    }));
+    serde_json::json!({
+        "ledger_epoch": c.ledger.epoch(),
+        "credited_epochs": c.ledger.credits().len(),
+        "last_step": last,
+    })
+}
+
+/// JSON for `getpowitkeyvotes <key id hex>`: the votes of one witness key
+/// the selected tip's PoWit state includes (source height, target) and the
+/// pool holds, and whether the pool holds an equivocation proof against it.
+/// Read by `gnb-cli powitattest`'s rollback guard (signer protection).
+pub fn key_votes_json(dag: &GhostDAG, store: &Storage, key: &KeyId) -> serde_json::Value {
+    let st = tip_context(dag).and_then(|(tip, _)| load_state(store, &tip));
+    let chain: Vec<serde_json::Value> = st.as_ref().and_then(|s| s.links.get(key)).into_iter().flatten()
+        .map(|(sh, th, thash)| serde_json::json!({
+            "source_height": sh, "target_height": th, "target_hash": hex::encode(thash) }))
+        .collect();
+    let (pooled, evidence) = pool().votes_of(key);
+    let pool_votes: Vec<serde_json::Value> = pooled.iter().map(|a| serde_json::json!({
+        "source_height": a.source.height, "source_hash": hex::encode(a.source.hash),
+        "target_height": a.target.height, "target_hash": hex::encode(a.target.hash) })).collect();
+    serde_json::json!({ "key": hex::encode(key), "chain": chain, "pool": pool_votes, "evidence": evidence })
+}
+
+/// Parse `getpowitkeyvotes`'s answer into observed votes (`gnb-cli`).
+#[allow(dead_code)] // gnb-cli only; the node binary compiles this module too
+pub fn parse_key_votes(v: &serde_json::Value) -> Result<(Vec<crate::powit_signer::ObservedVote>, bool), String> {
+    if let Some(e) = v.get("error") {
+        return Err(format!("getpowitkeyvotes: {e}"));
+    }
+    let h32 = |x: &serde_json::Value| -> Result<[u8; 32], String> {
+        let b = hex::decode(x.as_str().ok_or("hash is not a string")?).map_err(|e| e.to_string())?;
+        b.try_into().map_err(|_| "hash is not 32 bytes".to_string())
+    };
+    let u = |x: &serde_json::Value| x.as_u64().ok_or_else(|| "height is not a number".to_string());
+    let mut out = Vec::new();
+    for (list, with_source) in [("chain", false), ("pool", true)] {
+        for x in v.get(list).and_then(|l| l.as_array()).ok_or(format!("getpowitkeyvotes: no {list}"))? {
+            out.push(crate::powit_signer::ObservedVote {
+                source_height: u(&x["source_height"])?,
+                source_hash: if with_source { Some(h32(&x["source_hash"])?) } else { None },
+                target: Checkpoint { height: u(&x["target_height"])?, hash: h32(&x["target_hash"])? },
+            });
+        }
+    }
+    Ok((out, v.get("evidence").and_then(|e| e.as_bool()).unwrap_or(false)))
 }
 
 // ── Gossip ingress ───────────────────────────────────────────────────────────
@@ -1314,6 +1852,11 @@ pub fn admit_item(kind: u8, data: &[u8], dag: &GhostDAG, store: &Storage) -> Res
             done(&cur)?;
             pool().admit_attestation(a, dag, store).map(|_| ())
         }
+        ITEM_EVIDENCE if powit::poci_active() => {
+            let e = PociEvidence::read_wire(&mut cur)?;
+            done(&cur)?;
+            pool().admit_poci_evidence(e, dag, store).map(|_| ())
+        }
         ITEM_EVIDENCE => {
             let e = Equivocation::read_wire(&mut cur)?;
             done(&cur)?;
@@ -1323,6 +1866,11 @@ pub fn admit_item(kind: u8, data: &[u8], dag: &GhostDAG, store: &Storage) -> Res
             let x = WitnessExit::read_wire(&mut cur)?;
             done(&cur)?;
             pool().admit_exit(x, dag, store).map(|_| ())
+        }
+        ITEM_REJOIN if powit::poci_active() => {
+            let r = WitnessRejoin::read_wire(&mut cur)?;
+            done(&cur)?;
+            pool().admit_rejoin(r, dag, store).map(|_| ())
         }
         _ => Err("unknown PoWit item kind".into()),
     }
@@ -1342,6 +1890,19 @@ pub fn attestation_item(a: &Attestation) -> (Hash, u8, Vec<u8>) {
 pub fn evidence_item(e: &Equivocation) -> (Hash, u8, Vec<u8>) {
     let d = e.to_wire_bytes();
     (item_id(ITEM_EVIDENCE, &d), ITEM_EVIDENCE, d)
+}
+
+/// PoCI evidence as a gossip item (ObenBlock: kind `ITEM_EVIDENCE`).
+pub fn poci_evidence_item(e: &PociEvidence) -> (Hash, u8, Vec<u8>) {
+    let d = e.to_wire_bytes();
+    (item_id(ITEM_EVIDENCE, &d), ITEM_EVIDENCE, d)
+}
+
+/// A PoCI rejoin as a gossip item (ObenBlock: kind [`ITEM_REJOIN`]).
+#[allow(dead_code)] // the node's duty loop and tests; gnb-cli compiles this module too
+pub fn rejoin_item(r: &WitnessRejoin) -> (Hash, u8, Vec<u8>) {
+    let d = r.to_wire_bytes();
+    (item_id(ITEM_REJOIN, &d), ITEM_REJOIN, d)
 }
 
 #[allow(dead_code)] // RPC and tests relay exits through `admit_item`; kept beside its siblings
@@ -1929,6 +2490,9 @@ pub fn finality_info_json(dag: &GhostDAG, max: usize) -> serde_json::Value {
         "recorded_checkpoints": idx.candidates(),
         "recorded_sources": idx.sources(),
         "minimum_chain_work": crate::ingress::minimum_chain_work().to_string(),
+        // The advisory Bloch anchor (`--bloch-rpc`, DESIGN-obenblock §8): its
+        // conflict alert never changes the pin; the operator decides.
+        "bloch_anchor": crate::anchoring::status_json(),
     })
 }
 
@@ -1936,6 +2500,48 @@ pub fn finality_info_json(dag: &GhostDAG, max: usize) -> serde_json::Value {
 mod tests {
     use super::*;
     use gnb_crypto::core::kes::{KesPublic, KesSignature};
+
+    /// Review (witness exits on reload with O9's per-epoch store): a state
+    /// with witness exits, stored as an anchor record and as a diff of its
+    /// parent in the same epoch, keeps its exits after the database is
+    /// closed and reopened (a node restart). A state without exits writes no
+    /// exits row (GnB layout unchanged), and a child whose exits were pruned
+    /// reloads without them.
+    #[test]
+    fn witness_exits_survive_a_restart() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("db");
+        let (k1, k2, k3) = ([0x11u8; 20], [0x22u8; 20], [0x33u8; 20]);
+        let (parent, child, grandchild) = ([0xA1u8; 32], [0xA2u8; 32], [0xA3u8; 32]);
+        let mut st = PowitState::genesis(0, [0xA0; 32]);
+        st.epoch = 3;
+        st.epoch_work.insert(3, BTreeMap::from([(k1, 100u128), (k2, 50u128), (k3, 7u128)]));
+        st.exited.insert(k1, 4);
+        let mut st2 = st.clone();
+        st2.exited.insert(k2, 4);
+        let mut st3 = st2.clone();
+        st3.exited.clear();
+        {
+            let store = Storage::open(&path).unwrap();
+            save_state(&store, &parent, &st).unwrap();
+            let mut batch = rocksdb::WriteBatch::default();
+            stage_state(&store, &mut batch, &child, Some(&parent), &st2).unwrap();
+            stage_state(&store, &mut batch, &grandchild, Some(&child), &st3).unwrap();
+            store.write_batch(batch).unwrap();
+            assert_eq!(state_record_is_anchor(&store, &child), Some(false), "the child is a diff of its parent");
+            assert_eq!(store.get_meta(&exited_key(&grandchild)).unwrap(), None, "no exits, no row");
+        }
+        let store = Storage::open(&path).unwrap();
+        let back = load_state(&store, &parent).expect("parent state");
+        assert_eq!(back.exited, st.exited);
+        assert!(back.has_exited(&k1, 4) && !back.has_exited(&k1, 3));
+        let back2 = load_state(&store, &child).expect("child state");
+        assert_eq!(back2.exited, st2.exited);
+        assert!(back2.has_exited(&k2, 4));
+        assert_eq!(back2.epoch_work, st2.epoch_work);
+        let back3 = load_state(&store, &grandchild).expect("grandchild state");
+        assert!(back3.exited.is_empty());
+    }
 
     /// A link by witness `w` (unsigned: these tests exercise the pool's
     /// bounded structures, which hold items only after verification).
@@ -1955,6 +2561,55 @@ mod tests {
     fn proof(w: u64) -> (KeyId, Equivocation) {
         let a = link(w, 0, 10);
         (a.key_id(), Equivocation { a, b: link(w, 1, 10) })
+    }
+
+    /// PoCI rejoins (ObenBlock, DESIGN-obenblock-poci.md §4.1): the pool
+    /// holds one only as the next block would accept it (PoCI in force, the
+    /// key pruned, no rejoin pending, signed for the next block's epoch or the
+    /// one before), drops it once the tip makes it stale, and GnB has no
+    /// rejoin (kind 5 stays unknown there).
+    #[test]
+    fn rejoins_are_held_only_as_the_next_block_accepts_them() {
+        let _live = core::liveness::scoped_override(0);
+        let pp = poci::OBB_REGTEST_POCI;
+        let p = PowitParams { epoch_len: pp.epoch_len, checkpoint_interval: pp.checkpoint_interval,
+                              vote_ttl: pp.vote_ttl, ..powit::TESTNET_PARAMS };
+        let rejoin = |root: u8, epoch: u64| WitnessRejoin {
+            witness: KesPublic { depth: 1, root: [root; 32] }, epoch,
+            sig: KesSignature { index: 0, leaf_pk: vec![], sig: vec![], path: vec![] },
+        };
+        // A pruned key and a member of the configuration in force.
+        let (rp, rm) = (rejoin(1, 8), rejoin(2, 8));
+        let mut ledger = PociState::launch(&pp, &[(rp.key_id(), 10u128), (rm.key_id(), 30)].into_iter().collect())
+            .unwrap();
+        ledger.pruned.insert(rp.key_id(), poci::Prune { start: 8, until: None });
+        let mut st = PowitState::genesis(0, [0; 32]);
+        st.poci = Some(ledger);
+        st.finalized = Checkpoint { height: pp.opening(8), hash: [8; 32] };
+        // The tip is in epoch 8; the next block too.
+        let tip_h = pp.opening(8) + 7;
+        let mut view = TipWitnesses::of_at([9; 32], tip_h, st, &p, 0);
+        assert!(view.poci.is_none(), "the test process runs GnB");
+        assert!(view.rejoin_admissible(&rp.key_id(), &rp).unwrap_err().contains("PoCI chains only"));
+        view.poci = Some(pp);
+        assert_eq!(view.rejoin_admissible(&rp.key_id(), &rp), Ok(()));
+        assert!(view.rejoin_admissible(&rp.key_id(), &rejoin(1, 7)).is_ok(), "the epoch before");
+        assert!(view.rejoin_admissible(&rp.key_id(), &rejoin(1, 6)).unwrap_err().contains("epoch"));
+        assert!(view.rejoin_admissible(&rm.key_id(), &rm).unwrap_err().contains("not_pruned"));
+        // A pending rejoin makes another one stale: the pool drops it.
+        let mut g = PoolInner::default();
+        g.rejoins.insert(rp.key_id(), rp.clone());
+        g.prune_to(Some(&view), tip_h, &p);
+        assert_eq!(g.rejoins.len(), 1);
+        view.state.poci.as_mut().unwrap().rejoins.insert(rp.key_id(), tip_h);
+        assert!(view.rejoin_admissible(&rp.key_id(), &rp).unwrap_err().contains("pending"));
+        g.prune_to(Some(&view), tip_h, &p);
+        assert!(g.rejoins.is_empty());
+        // GnB: the gossip kind range is unchanged.
+        assert_eq!(item_kind_max(), ITEM_KIND_MAX);
+        assert_eq!(ITEM_KIND_MAX, ITEM_EXIT);
+        let (id, kind, data) = rejoin_item(&rp);
+        assert_eq!((kind, id), (ITEM_REJOIN, item_id(ITEM_REJOIN, &data)));
     }
 
     /// A full evidence pool makes room for a heavier key's proof by evicting
@@ -2074,7 +2729,8 @@ mod tests {
             blue_score: height,
             height,
             shielded_transactions: Vec::new(),
-            powit: PowitBody { shares: Vec::new(), attestations: vec![vote], evidence: Vec::new(), exits: Vec::new() },
+            powit: PowitBody { shares: Vec::new(), attestations: vec![vote], evidence: Vec::new(), exits: Vec::new(),
+                               poci_evidence: Vec::new(), rejoins: Vec::new() },
         }
     }
 

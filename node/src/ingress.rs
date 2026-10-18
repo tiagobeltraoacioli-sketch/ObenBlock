@@ -664,6 +664,7 @@ pub fn verdict_for_accept_error(err: &str) -> GossipVerdict {
         "invalid height",
         "invalid difficulty",
         "consensus rejection: invalid GnB-SMH proof of work",
+        "consensus rejection: invalid SHA-256d proof of work",
         "consensus rejection: non-genesis block without parents",
         "timestamp rejected: timestamp before parent",
         "coinbase rejected",
@@ -746,7 +747,9 @@ pub enum BlockFault {
 /// context-free; every other error [`verdict_for_accept_error`] rejects
 /// depends on the parents).
 pub fn accept_error_fault(err: &str) -> BlockFault {
-    if err.starts_with("consensus rejection: invalid GnB-SMH proof of work") {
+    if err.starts_with("consensus rejection: invalid GnB-SMH proof of work")
+        || err.starts_with("consensus rejection: invalid SHA-256d proof of work")
+    {
         BlockFault::ContextFree
     } else {
         BlockFault::Context
@@ -3162,8 +3165,12 @@ pub fn powit_item_precheck(claimed: &[u8; 32], kind: u8, data: &[u8]) -> Result<
     match kind {
         crate::powit::ITEM_SHARE => core::witness_share::WitnessShare::read_wire(&mut cur).map(|_| ()),
         crate::powit::ITEM_ATTESTATION => core::powit::Attestation::read_wire(&mut cur).map(|_| ()),
+        crate::powit::ITEM_EVIDENCE if core::powit::poci_active() =>
+            core::powit::poci::PociEvidence::read_wire(&mut cur).map(|_| ()),
         crate::powit::ITEM_EVIDENCE => core::powit::Equivocation::read_wire(&mut cur).map(|_| ()),
         crate::powit::ITEM_EXIT => core::powit::WitnessExit::read_wire(&mut cur).map(|_| ()),
+        crate::powit::ITEM_REJOIN if core::powit::poci_active() =>
+            core::powit::WitnessRejoin::read_wire(&mut cur).map(|_| ()),
         k => Err(format!("unknown PoWit item kind {k}")),
     }
     .map_err(|e| format!("malformed PoWit item: {e}"))?;
@@ -3197,11 +3204,30 @@ pub fn powit_admit_error_fault(kind: u8, err: &str) -> Option<BlockFault> {
                     .any(|e| err == e.to_string())
         }
         crate::powit::ITEM_ATTESTATION => err == POWIT_BAD_ATTESTATION_SIGNATURE,
-        crate::powit::ITEM_EVIDENCE => err.starts_with("equivocation: "),
+        crate::powit::ITEM_EVIDENCE => err.starts_with("equivocation: ") || poci_evidence_fault_is_context_free(err),
         crate::powit::ITEM_EXIT => err == crate::powit::POWIT_BAD_EXIT_SIGNATURE,
+        crate::powit::ITEM_REJOIN => err == crate::powit::POWIT_BAD_REJOIN_SIGNATURE,
         _ => false,
     };
     context_free.then_some(BlockFault::ContextFree)
+}
+
+/// Whether a refusal of PoCI evidence (ObenBlock, `powit::admit_poci_evidence`,
+/// `poci::check_evidence`'s `"poci evidence: <reason>"`) is a context-free
+/// fault: the two votes are not by one key, name different configurations,
+/// are identical, do not conflict, or a signature does not verify (each
+/// checkable from the item and the network's constants alone; the signature
+/// is checked last, only for a key of a configuration this node has had in
+/// force). What depends on this node's chain (an unknown configuration, a
+/// non-member, a ban already pending or running, a proof already held) is
+/// not. Review finding (MEDIUM): these refusals used to be `Ignore` with the
+/// verification budget refunded, so a peer could make this node verify KES
+/// signatures of a real member's forged votes without limit.
+pub fn poci_evidence_fault_is_context_free(err: &str) -> bool {
+    use core::powit::poci::EvidenceReject as R;
+    [R::DifferentKeys, R::DifferentConfigs, R::Identical, R::NoConflict, R::Signature]
+        .iter()
+        .any(|r| err == r.to_string())
 }
 
 /// Whether a `powit::admit_item` refusal keeps the delivering peer's
@@ -4206,6 +4232,23 @@ mod tests {
         assert_eq!(powit_admit_error_fault(ITEM_EVIDENCE, "equivocation: invalid signature"), cf);
         assert_eq!(powit_admit_error_fault(ITEM_EVIDENCE, "equivocation: links do not conflict"), cf);
         assert_eq!(powit_admit_error_fault(ITEM_SHARE, POWIT_BAD_ATTESTATION_SIGNATURE), None, "per kind");
+        // PoCI evidence (ObenBlock): what the item alone shows is a fault,
+        // what depends on this node's chain is not.
+        {
+            use crate::core::powit::poci::EvidenceReject as R;
+            for r in [R::DifferentKeys, R::DifferentConfigs, R::Identical, R::NoConflict, R::Signature] {
+                assert_eq!(powit_admit_error_fault(ITEM_EVIDENCE, &r.to_string()), cf, "{r:?}");
+                assert_eq!(powit_admit_error_fault(ITEM_ATTESTATION, &r.to_string()), None, "per kind");
+            }
+            for r in [R::UnknownConfig, R::NonMember, R::BelowFinality, R::AlreadyBannedForConfig, R::BanPendingOrActive] {
+                assert_eq!(powit_admit_error_fault(ITEM_EVIDENCE, &r.to_string()), None, "{r:?}");
+            }
+            assert_eq!(R::Signature.to_string(), "poci evidence: signature", "the wording admit_poci_evidence returns");
+            for e in ["equivocation proof for this key already held", "PoCI has no configuration in force yet",
+                      "PoCI evidence on a chain without PoCI", "PoWit not active at the tip"] {
+                assert_eq!(powit_admit_error_fault(ITEM_EVIDENCE, e), None, "{e}");
+            }
+        }
         // The literals are the ones `powit` returns: a reworded refusal would
         // silently stop being penalised.
         let src = include_str!("powit.rs");
@@ -4331,5 +4374,61 @@ mod tests {
         assert_eq!(v.penalty, BlockPenalty { gossip: Ignore, misbehaving: false });
         assert_eq!(p.scheduler().stats().invalid, 2);
         assert_eq!(p.scheduler().stats().valid, 0);
+    }
+
+    /// Review finding (MEDIUM): PoCI evidence whose signature does not
+    /// verify (`poci evidence: signature`, a real member's key with forged
+    /// votes: the cheap checks pass and the node pays for the KES
+    /// verifications) is a context-free fault: its budget charge is kept,
+    /// its author is misbehaving, a relay is penalised once penalties are in
+    /// force, and a peer that floods them runs out of budget, after which
+    /// its items are refused unverified. Before the fix they were `Ignore`
+    /// and refunded: unlimited verifications for free.
+    #[test]
+    fn poci_evidence_with_bad_signatures_is_throttled_and_penalised() {
+        use crate::network::GossipVerdict::{Ignore, Reject};
+        use crate::pow::verifier::StartNext;
+        let t0 = Instant::now();
+        let limits = PowLimits {
+            workers: 1, max_queued: 64, max_queued_per_peer: 64, max_queued_per_group: 64, max_queued_solicited: 0,
+            peer_burst: 3, peer_refill_per_sec: 0.0, group_burst: 100, group_refill_per_sec: 0.0,
+            verdict_ttl: Duration::from_secs(10), results_cap: 1,
+        };
+        let bad_sig = crate::core::powit::poci::EvidenceReject::Signature.to_string();
+        assert_eq!(powit_admit_error_fault(crate::powit::ITEM_EVIDENCE, &bad_sig), Some(BlockFault::ContextFree));
+        assert!(!powit_admit_error_keeps_charge(crate::powit::ITEM_EVIDENCE, &bad_sig), "a fault, not a charged refusal");
+
+        // A relay, penalties in force: Reject, misbehaving; the charge is kept.
+        let mut p = PowitIngress::new(limits);
+        let (relay, author) = (PeerId::random(), PeerId::random());
+        let src = |peer: PeerId| PowSource { peer: Some(peer), group: None };
+        let mut verified = 0;
+        let mut refused_unverified = 0;
+        for n in 0..20 {
+            let (id, kind, data) = evidence_frame(n);
+            match p.on_item(id, kind, data, gossip_from(relay, Some(author), t0), src(relay), true, t0) {
+                None => {
+                    let StartNext::Start(job) = p.start_next(t0) else { panic!("a free worker") };
+                    verified += 1;
+                    let v = p.complete(job, &Err(bad_sig.clone()), true, t0);
+                    assert_eq!(v.penalty, BlockPenalty { gossip: Reject, misbehaving: true });
+                }
+                Some(v) => {
+                    refused_unverified += 1;
+                    assert_eq!(v.penalty.gossip, Ignore, "budget spent: refused unverified");
+                }
+            }
+        }
+        assert_eq!(verified, 3, "the flood is verified only up to the peer's budget");
+        assert_eq!(refused_unverified, 17);
+        assert_eq!(p.scheduler().stats().invalid, 3);
+        assert_eq!(p.scheduler().stats().valid, 0);
+
+        // Delivered by its author (before penalties are in force too): misbehaving.
+        let mut p = PowitIngress::new(limits);
+        let (id, kind, data) = evidence_frame(99);
+        assert!(p.on_item(id, kind, data, gossip_from(author, Some(author), t0), src(author), false, t0).is_none());
+        let StartNext::Start(job) = p.start_next(t0) else { panic!("a free worker") };
+        assert_eq!(p.complete(job, &Err(bad_sig), false, t0).penalty, BlockPenalty { gossip: Ignore, misbehaving: true });
     }
 }

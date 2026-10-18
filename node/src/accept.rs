@@ -1481,7 +1481,7 @@ fn commit_chunk(
             Ok(()) => Ok(()),
             Err(ConnectFailure::Invalid(e)) => {
                 witness_failure.set(e.witness_dependent.then(|| {
-                    (b.block_hash(), core::block_rules::witness_root(&b.transactions).0)
+                    (b.block_hash(), core::block_rules::body_commitment_root(&b).0)
                 }));
                 Err(ValidationFailure::Invalid(e.reason))
             }
@@ -2144,7 +2144,7 @@ pub fn accept_block_tracking(
                 hex::encode(block_hash)
             ));
         }
-        let witness_root = core::block_rules::witness_root(&block.transactions).0;
+        let witness_root = core::block_rules::body_commitment_root(block).0;
         if dag.read().body_rejected_before(&block_hash, &witness_root) {
             return Err(format!(
                 "consensus rejection: block already in DAG: {} (this body was already rejected; \
@@ -2262,7 +2262,12 @@ pub fn accept_block_tracking(
     //    only the cheap checks run again (`pow::proof_recorded_in_dag`, P5-G).
     let proof_ok = if replacing { pow::proof_recorded_in_dag(block) } else { block.validate_pow() };
     if !proof_ok {
-        return Err("consensus rejection: invalid GnB-SMH proof of work".into());
+        // Name the scheme the block was judged under (ObenBlock: SHA-256d).
+        return Err(if core::pow_scheme::node_sha256d_params().is_some() {
+            "consensus rejection: invalid SHA-256d proof of work".into()
+        } else {
+            "consensus rejection: invalid GnB-SMH proof of work".into()
+        });
     }
 
     // ── Context-free consensus checks (VAL-11 MoneyRange, VAL-12 canonical
@@ -2365,6 +2370,9 @@ pub fn accept_block_tracking(
         // finality; one that conflicts with it only raises the conflict
         // alert (review HIGH 1, `consensus::finality`).
         crate::powit::note_block_finality(dag, store, &block_hash, powit_state.as_ref());
+        // PoCI (ObenBlock): keep the finality certificate of a checkpoint
+        // this block finalized (docs/DESIGN-obenblock-poci.md §6).
+        crate::powit::certificate::keep(dag, store, &block_hash, powit_state.as_ref());
         crate::powit::refresh_finality_pin(dag, store);
     }
     // Informational only (RPC / tip notifications).
@@ -2828,7 +2836,7 @@ pub fn recheck_stored_blocks_under_hardening(
                 }
                 warn!("stored body of {} fails the hardening rules only by its witnesses ({}); \
                        dropped, waiting for another copy", hex::encode(&h[..8]), reason);
-                let wr = core::block_rules::witness_root(&body.transactions).0;
+                let wr = core::block_rules::body_commitment_root(&body).0;
                 dag.write().mark_body_pending(h, Some(wr));
                 store.delete_block_body(&h).map_err(|e| e.to_string())?;
                 report.bodies_dropped.push(h);
@@ -3976,70 +3984,6 @@ pub fn invalidate_block(
         after_failed_override(dag, store, e);
     }
     res
-}
-
-/// Pin fork choice to `hash` as a finalized checkpoint from outside the
-/// node's own PoWit finality (a weak-subjectivity checkpoint: the newest
-/// Bloch anchor, `anchoring`), then move the applied chain to the best block
-/// whose selected chain passes through it, committed in chunks like
-/// [`invalidate_block`]. The checkpoint becomes the finality pin's anchor
-/// (`consensus::finality::AnchorSetting::Operator`, as `setfinalitycheckpoint`
-/// sets it, but in memory only: the operator's persisted setting is left as
-/// it is), because the pin is recomputed from the anchor after every block
-/// (`powit::refresh_finality_pin`). It only moves forward: a checkpoint at
-/// or below the current pin or anchor changes nothing, and one above the
-/// anchor must descend from it. An operator who disabled the anchor
-/// (`setfinalitycheckpoint none`) is not overridden. The caller checks that
-/// `hash` does not contradict the node's own finality (`anchoring::decide`)
-/// and restores the checkpoint at start-up.
-#[allow(clippy::too_many_arguments)]
-pub fn set_finality_checkpoint(
-    hash: BlockHash,
-    dag: &Arc<RwLock<consensus::GhostDAG>>,
-    store: &Arc<storage::Storage>,
-    mempool: &Arc<mempool::Mempool>,
-    node_state: &Arc<RwLock<rpc::NodeState>>,
-    tip_tx: Option<&broadcast::Sender<tip::TipChanged>>,
-    shielded: &Arc<RwLock<ShieldedPool>>,
-) -> Result<ChainOverride, OverrideError> {
-    let _guard = store.acceptance_lock();
-    ensure_invalid_set_loaded(dag, store);
-    let height = dag.read().get_block_data(&hash).map(|d| d.height)
-        .ok_or_else(|| format!("block {} not found", hex::encode(hash)))?;
-    if dag.read().is_invalid(&hash) {
-        return Err(format!("block {} is disqualified", hex::encode(hash)).into());
-    }
-    // Re-checked under the acceptance lock: own finality may have advanced
-    // since the caller decided. A pin above it must descend from it.
-    if let Some((fh, fheight)) = dag.read().finalized() {
-        if fheight < height && !dag.read().is_on_selected_chain_of(&fh, &hash) {
-            return Err(format!("block {} does not descend from the finalized checkpoint {}",
-                               hex::encode(hash), hex::encode(fh)).into());
-        }
-    }
-    let below_pin = dag.read().finalized().is_some_and(|(_, fheight)| fheight >= height);
-    if !below_pin {
-        use crate::consensus::finality::{Anchor, AnchorSetting};
-        let current = match dag.read().finality_index().anchor_setting {
-            AnchorSetting::Disabled => return Err(
-                "the operator disabled the finality anchor (setfinalitycheckpoint none)".to_string().into()),
-            AnchorSetting::Operator(a) => Some(a),
-            AnchorSetting::Release => crate::powit::release_finality_checkpoint()
-                .map(|c| Anchor { hash: c.hash, height: c.height }),
-        };
-        match current {
-            Some(a) if a.height >= height => {}
-            Some(a) if !dag.read().is_on_selected_chain_of(&a.hash, &hash) => {
-                return Err(format!("block {} does not descend from the finality anchor {}",
-                                   hex::encode(hash), hex::encode(a.hash)).into());
-            }
-            _ => dag.write().finality_index_mut().anchor_setting = AnchorSetting::Operator(Anchor { hash, height }),
-        }
-    }
-    let before = dag.read().finalized();
-    let after = crate::powit::refresh_finality_pin(dag, store).pin;
-    apply_operator_override(dag, store, mempool, node_state, tip_tx, shielded, Vec::new(),
-                            MarkClears::default(), usize::from(before != after))
 }
 
 /// Operator `reconsiderblock` (Bitcoin Core's `ReconsiderBlock`): consider

@@ -283,7 +283,7 @@ fn wire_roundtrip() {
         shares: vec![WitnessShare { attested: [3; 32], witness: [5; 20], payout: vec![7; 20], bits: 0x1f00_ffff, nonce: 42, sha256d: None }],
         attestations: vec![a.clone()],
         evidence: vec![Equivocation { a: a.clone(), b: k.attest(cp(0, ACT), cp(1, ACT + 5)) }],
-        exits: Vec::new(),
+        exits: Vec::new(), poci_evidence: Vec::new(), rejoins: Vec::new(),
     };
     let mut buf = Vec::new();
     body.write_wire(&mut buf);

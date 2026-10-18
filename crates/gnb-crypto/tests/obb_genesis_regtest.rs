@@ -31,7 +31,7 @@ fn obenblock_regtest_runs_every_rule_from_genesis() {
     assert_eq!(g.block_hash(), g.header.sha256d_block_id());
     assert_eq!(g.block_hash(), chain_genesis(ChainId::ObenBlockRegtest).block().block_hash());
     assert!(g.validate_pow());
-    assert!(g.validate_merkle(), "the header root is the body root the node computes at height 0");
+    assert!(g.validate_merkle(), "the header root is Bitcoin's root the node computes at height 0");
     assert_eq!(g.body_merkle_root(), genesis::obenblock_genesis_merkle_root(&g.transactions[0]));
     assert_eq!(block_rules::check_coinbase_commitment(&g), Ok(()));
     assert_eq!(g.validate_coinbase_value(0), Ok(()));
@@ -41,10 +41,13 @@ fn obenblock_regtest_runs_every_rule_from_genesis() {
     assert_eq!(genesis::launch_refusal(ChainId::ObenBlockRegtest), None);
 
     // ASERT from the genesis: on schedule or behind it, the regtest pow
-    // limit; ahead of it, harder.
-    assert_eq!(core::expected_bits(OBB_REGTEST_GENESIS_TIMESTAMP, 1).unwrap(), OBB_REGTEST_POW_LIMIT_BITS);
-    assert_eq!(core::expected_bits(OBB_REGTEST_GENESIS_TIMESTAMP + 86_400, 2).unwrap(), OBB_REGTEST_POW_LIMIT_BITS);
-    let ahead = core::expected_bits(OBB_REGTEST_GENESIS_TIMESTAMP, 2_000).unwrap();
+    // limit; ahead of it, harder. `expected_bits_at` is the real rule: a
+    // workspace build unifies the `test-pow-limit` feature (node tests),
+    // which pins `expected_bits` to the pow limit.
+    let real = |ts: u64, h: u64| core::expected_bits_at(ts, h, activation::hardening_activation_height()).unwrap();
+    assert_eq!(real(OBB_REGTEST_GENESIS_TIMESTAMP, 1), OBB_REGTEST_POW_LIMIT_BITS);
+    assert_eq!(real(OBB_REGTEST_GENESIS_TIMESTAMP + 86_400, 2), OBB_REGTEST_POW_LIMIT_BITS);
+    let ahead = real(OBB_REGTEST_GENESIS_TIMESTAMP, 2_000);
     assert!(gnb_smh::difficulty::bits_to_target(ahead) < gnb_smh::difficulty::bits_to_target(OBB_REGTEST_POW_LIMIT_BITS));
     assert_eq!(core::block_work(OBB_REGTEST_POW_LIMIT_BITS, 1), gnb_smh::sha256d::work_from_bits(OBB_REGTEST_POW_LIMIT_BITS));
 

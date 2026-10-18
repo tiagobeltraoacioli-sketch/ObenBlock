@@ -20,16 +20,18 @@ pin both.
 | timestamp | **set at launch** | 1,792,281,600 (2026-10-18 00:00 UTC) |
 | version | `0x20000000` + rolled BIP 320 bits, **set at launch** | `0x20000000` |
 | nonce | **set at launch** | 0 |
-| block id (display order) | **set at launch** | `5c6e3306…6f3ac188` |
+| block id (display order) | **set at launch** | `6918ae0c…0117163d` |
 
 The header is the 80-byte SHA-256d header (§4.1). It has no parents, so the
 parent commitment is `SHA-256d("OBB-PARENTS-v1" ‖ 00000000)`. The Merkle
-field is the v2 body root of a height-0 block, because PoWit applies from
-height 0: `SHA3-256("gnb:block:body:v2" ‖ txid(coinbase) ‖ empty shielded
-root ‖ empty PoWit root)`.
+field is Bitcoin's transaction root, as in every ObenBlock header
+(docs/CONSENSUS.md, "Header Merkle root and body commitment (ObenBlock)"):
+with one transaction, `txid(coinbase)`.
 
 The coinbase `script_sig` starts with the 80-byte commitment of height 0
-(`GNB-CB01`), like every later coinbase. The genesis text follows it. The
+(`GNB-CB01`), like every later coinbase; its last 32 bytes are the body
+commitment over the empty witness list, the empty shielded section and the
+empty PoWit section (PoWit and liveness apply from height 0). The genesis text follows it. The
 text commits to the SHA3-256 of the Bloch Genesis-3 snapshot, to the
 conversion, and to the SHA3-256 of the vesting keys. The coinbase has one
 output of 0 to an all-zero script.

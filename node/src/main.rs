@@ -44,10 +44,12 @@ mod ingress;      // audit fixes: block-ingress / orphan / IBD-latch policy
 mod accept;       // Block acceptance pipeline (accept/connect split, DAG-1)
 mod assumevalid;  // assumed-valid block (Core's -assumevalid), P5-G
 mod template;     // Block templates for the miner + getblocktemplate (MEM-2, DAG-2)
-mod anchoring;    // ObenBlock checkpoints anchored in Bloch: records + --bloch-rpc pin
+mod anchoring;    // ObenBlock checkpoints anchored in Bloch: records + advisory --bloch-rpc check
 mod blockval;     // this chain's tx rules on top of the audit set (locktime, policy, BIP30)
 mod powit;        // PoW + PoWit: witness shares, attestations, finality (node side)
 mod genesis_init; // first-boot genesis and the data-dir genesis check (both chains)
+#[allow(dead_code)] // the CLI and tests use the rest of its API
+mod powit_signer; // PoWit signer protection (vote record, locks, rollback guard)
 
 // The acceptance pipeline lives in `accept.rs` (shared with the library so
 // integration tests drive the real path); same names and signatures as the
@@ -275,11 +277,13 @@ struct Cli {
     /// (docs/RUNNING.md).
     #[arg(long = "finalitycheckpoint")]                  finality_checkpoint: Option<String>,
     /// JSON-RPC URL of the operator's own Bloch node serving the ObenBlock
-    /// anchor registry (docs/OBB-ANCHOR.md). The newest anchor Bloch has
-    /// finalized becomes a weak-subjectivity checkpoint: fork choice is
-    /// pinned to it and chains that contradict it are refused; one that
-    /// contradicts the node's own finality only raises the conflict alert
-    /// (`getblochanchor`). Non-consensus — node-local.
+    /// anchor registry (docs/OBB-ANCHOR.md): https://, or http:// to a
+    /// loopback host only. Advisory (DESIGN-obenblock §8): the newest anchor
+    /// Bloch has finalized is compared with the node's chain; agreement is
+    /// reported as corroboration, a contradiction or an unknown block raises
+    /// the conflict alert (`getblochanchor`, `getfinalityinfo`, metric
+    /// `gnb_bloch_anchor_conflict`). It never pins or refuses a block: the
+    /// operator decides. Non-consensus, node-local.
     #[arg(long = "bloch-rpc")]                           bloch_rpc: Option<String>,
     /// Seconds between two reads of the Bloch anchor registry.
     #[arg(long = "bloch-anchor-interval", default_value_t = 300)] bloch_anchor_interval: u64,
@@ -2195,8 +2199,15 @@ async fn main() {
             Ok(d) => Arc::new(d),
             Err(e) => { eprintln!("witness: {}", e); std::process::exit(2); }
         };
-        info!("🛡  PoWit witness key {} (activation {})", hex::encode(duty.key_id),
-              match core::powit_height() { u64::MAX => "off".to_string(), h => h.to_string() });
+        info!("🛡  PoWit witness key {} (activation {}, signer instance {})", hex::encode(duty.key_id),
+              match core::powit_height() { u64::MAX => "off".to_string(), h => h.to_string() },
+              hex::encode(duty.guard().instance()));
+        // Signer protection: the rollback guard at start (and again before
+        // every vote). A halted signer keeps the node running and reports
+        // the alert (log, gnb_powit_signer_halted, getpowitinfo.signers).
+        if let Some(alert) = duty.scan_for_rollback(&dag.read(), &store) {
+            error!("🛡  PoWit witness signing halted: {alert}");
+        }
 
         // Duty loop: follow the tip, sign the newest checkpoint once, gossip
         // equivocation proofs.
@@ -2221,7 +2232,7 @@ async fn main() {
                         // chain, and the persistent vote record would then
                         // bar this key's vote on the real one).
                         if ingress::below_minimum_chain_work(&d, ingress::minimum_chain_work()) {
-                            return (None, powit::pool_evidence());
+                            return (None, powit::pool_evidence_items(), None);
                         }
                         let att = match duty_b.maybe_attest(&d, &store_b) {
                             Ok(Some(a)) => {
@@ -2231,18 +2242,32 @@ async fn main() {
                             Ok(None) => None,
                             Err(e) => { warn!("witness: {}", e); None }
                         };
-                        (att, powit::pool_evidence())
+                        // PoCI (ObenBlock): pruned for absence, online again: rejoin.
+                        let rejoin = match duty_b.maybe_rejoin(&d, &store_b) {
+                            Ok(Some(r)) => powit::pool().admit_rejoin(r.clone(), &d, &store_b)
+                                .map_err(|e| warn!("witness rejoin: {}", e)).ok().map(|_| r),
+                            Ok(None) => None,
+                            Err(e) => { warn!("witness rejoin: {}", e); None }
+                        };
+                        if let Some(r) = rejoin {
+                            info!("🛡  witness key pruned for absence: rejoin for epoch {} published", r.epoch);
+                            let (id, kind, data) = powit::rejoin_item(&r);
+                            return (att, powit::pool_evidence_items(), Some((id, kind, data)));
+                        }
+                        (att, powit::pool_evidence_items(), None)
                     }).await;
-                    let Ok((att, evidence)) = out else { continue };
+                    let Ok((att, evidence, rejoin)) = out else { continue };
+                    if let Some((id, kind, data)) = rejoin {
+                        let _ = otx_w.try_send(network::NetworkMessage::NewPowitItem { id, kind, data });
+                    }
                     if let Some(a) = att {
                         info!("🛡  attested checkpoint slot {} ({})", a.target.height, hex::encode(&a.target.hash[..8]));
                         let (id, kind, data) = powit::attestation_item(&a);
                         let _ = otx_w.try_send(network::NetworkMessage::NewPowitItem { id, kind, data });
                     }
-                    for ev in evidence {
-                        if sent_evidence.insert(ev.a.key_id()) {
-                            warn!("🛡  equivocation by witness {} — proof gossiped", hex::encode(ev.a.key_id()));
-                            let (id, kind, data) = powit::evidence_item(&ev);
+                    for (key, (id, kind, data)) in evidence {
+                        if sent_evidence.insert(key) {
+                            warn!("🛡  equivocation by witness {} — proof gossiped", hex::encode(key));
                             let _ = otx_w.try_send(network::NetworkMessage::NewPowitItem { id, kind, data });
                         }
                     }
@@ -2612,8 +2637,9 @@ async fn main() {
         dag.clone(), store.clone(), mempool.clone(), node_state.clone(),
         shielded.clone(), tip_tx.clone(), body_requests.clone(),
     );
-    // ObenBlock anchors in Bloch (docs/OBB-ANCHOR.md): the persisted newest
-    // anchor is enforced first, then the registry is read periodically.
+    // ObenBlock anchors in Bloch (docs/OBB-ANCHOR.md), advisory only
+    // (DESIGN-obenblock §8): the registry is read periodically and compared
+    // with the node's chain; nothing is pinned, refused or persisted.
     if let Some(url) = cli.bloch_rpc.as_deref() {
         let reader = match anchoring::BlochRpcReader::new(url, std::time::Duration::from_secs(15)) {
             Ok(r) => r,
@@ -2622,19 +2648,10 @@ async fn main() {
                 std::process::exit(1);
             }
         };
-        let ops: Arc<dyn anchoring::ChainOps> = Arc::new(AnchorChainOps {
-            dag: dag.clone(), store: store.clone(), mempool: mempool.clone(), node_state: node_state.clone(),
-            shielded: shielded.clone(), tip_tx: tip_tx.clone(), body_requests: body_requests.clone(),
-        });
-        {
-            let (dag, store, ops, source) = (dag.clone(), store.clone(), ops.clone(), url.to_string());
-            if let Err(e) = tokio::task::spawn_blocking(move || anchoring::restore(&dag, &store, ops.as_ref(), source)).await {
-                error!("bloch anchor: start-up restore failed: {e}");
-            }
-        }
+        anchoring::restore(url.to_string());
         let every = std::time::Duration::from_secs(cli.bloch_anchor_interval.max(10));
-        info!("bloch anchor: reading the registry at {url} every {}s", every.as_secs());
-        tokio::spawn(anchoring::run(Box::new(reader), every, dag.clone(), store.clone(), ops));
+        info!("bloch anchor: reading the registry at {url} every {}s (advisory)", every.as_secs());
+        tokio::spawn(anchoring::run(Box::new(reader), every, dag.clone()));
     }
 
     let metrics_state = std::sync::Arc::new(
@@ -2943,44 +2960,6 @@ fn make_chain_admin_cb(
         }
         Ok(out)
     })
-}
-
-/// The acceptance-pipeline operations of the Bloch anchor (`anchoring`):
-/// pin a checkpoint (`accept::set_finality_checkpoint`) or refuse a chain
-/// (`accept::invalidate_block`). Pruned bodies the move needs are requested
-/// as for `invalidateblock`; the next poll retries.
-struct AnchorChainOps {
-    dag:        Arc<RwLock<consensus::GhostDAG>>,
-    store:      Arc<storage::Storage>,
-    mempool:    Arc<mempool::Mempool>,
-    node_state: Arc<RwLock<rpc::NodeState>>,
-    shielded:   Arc<RwLock<crate::coherence::ShieldedPool>>,
-    tip_tx:     broadcast::Sender<tip::TipChanged>,
-    body_requests: Arc<tokio::sync::Notify>,
-}
-
-impl AnchorChainOps {
-    fn done(&self, r: Result<accept::ChainOverride, accept::OverrideError>) -> Result<(), String> {
-        match r {
-            Ok(_) => Ok(()),
-            Err(accept::OverrideError::MissingBodies { missing, .. }) => {
-                self.body_requests.notify_one();
-                Err(format!("{} pruned block bod(ies) needed; re-fetching them", missing.len()))
-            }
-            Err(e) => Err(e.to_string()),
-        }
-    }
-}
-
-impl anchoring::ChainOps for AnchorChainOps {
-    fn pin(&self, hash: [u8; 32]) -> Result<(), String> {
-        self.done(accept::set_finality_checkpoint(hash, &self.dag, &self.store, &self.mempool, &self.node_state,
-                                                  Some(&self.tip_tx), &self.shielded))
-    }
-    fn refuse(&self, hash: [u8; 32]) -> Result<(), String> {
-        self.done(accept::invalidate_block(hash, &self.dag, &self.store, &self.mempool, &self.node_state,
-                                           Some(&self.tip_tx), &self.shielded))
-    }
 }
 
 // ── Block acceptance + Orphan processing ─────────────────────────────────────

@@ -1730,6 +1730,11 @@ activation it votes for the justified checkpoint's direct child while a
 block can still include that vote, else for the newest slot (below the
 activation, always the newest slot). `gnb-cli powitattest` signs on the
 schedule of the chain it names (`hardening2_activation_height_for_signer`).
+Both sign only through the node-local signer protection
+(`powit_signer::VoteGuard`: persist before release, double and surround
+votes refused against the record and the high-water mark, rollback guard,
+one signer per key; docs/RUNNING.md, "Witness signer protection"); it is not
+a consensus rule.
 The pool (gossip and the `submitpowititem` RPC, `powit::admit_item`) admits
 an attestation by the rules of a block at `max(target, next height)` and a
 proof by the next block's, and templates re-check every item with
@@ -2234,8 +2239,11 @@ pushes a block built from the template over `max_block_size`.
 
 Under the SHA-256d scheme (ObenBlock) the built-in miner searches the
 32-bit nonce of the 80-byte header, templates carry their parents sorted
-ascending and version `0x20000000`, and `getblocktemplate` adds a `sha256d`
-object (header fields, header jobs for pools); see docs/OBENBLOCK-MINING.md.
+ascending and version `0x20000000`, `merkle_rule` is `bitcoin-sha256d`
+(Bitcoin's tree, "Header Merkle root and body commitment (ObenBlock)"),
+`coinbase_merkle_branch` is Bitcoin's branch, and `getblocktemplate` adds a
+`sha256d` object (header fields, the ntime window, header jobs with the
+Stratum V1 `mining.notify` fields); see docs/OBENBLOCK-MINING.md.
 
 ## Block rules at the hardening activation
 
@@ -2333,6 +2341,12 @@ Before the activation the root is Bitcoin's: `sha256d(l || r)` over the txids,
 with the last node of an odd level paired with itself
 (`Transaction::merkle_root`, unchanged). There the duplicate-transaction rule
 is what rejects a mutated list.
+
+On ObenBlock (the SHA-256d scheme) this tagged tree is NOT used: the header
+root is Bitcoin's tree with Bitcoin Core's mutation check at every height,
+and the coinbase commitment's last field is the body commitment; see
+"Header Merkle root and body commitment (ObenBlock)". Everything in this
+section is GnB's rule, unchanged.
 
 ### 64-byte transactions (VAL-10)
 
@@ -2927,6 +2941,91 @@ the template keep agreeing on that height.
 `stored_blocks_failing_the_hardening_rules_are_disqualified_at_startup`
 covers the scenario.
 
+## Header Merkle root and body commitment (ObenBlock)
+
+Applies only under the SHA-256d proof-of-work scheme (`core::pow_scheme`,
+the ObenBlock chain ids), at every height including the genesis. GnB keeps
+"Header Merkle root (VAL-10)" and the coinbase commitment above byte for
+byte. Reason (DESIGN-obenblock.md §4.1): stock Stratum V1 firmware rebuilds
+`merkle_root` itself whenever it rolls extranonce2, as
+`SHA-256d(coinb1 ‖ extranonce1 ‖ extranonce2 ‖ coinb2)` folded up the job's
+merkle branch, so the header root must be exactly that computation.
+
+**Transaction id.** Unchanged: `txid(tx) = SHA-256d(to_wire_bytes(tx,
+include_script_sig = is_coinbase(tx)))`. For a coinbase that is the whole
+wire encoding (version, inputs with `script_sig`, outputs, locktime), which
+is Bitcoin's legacy transaction serialization; a pool's
+`coinb1 ‖ extranonce ‖ coinb2` is exactly those bytes, so its SHA-256d is
+the coinbase txid (vector: the Bitcoin genesis and block-1 coinbases decode
+and hash to their Bitcoin txids). For any other transaction the `script_sig`
+(this chain's witness) is omitted entirely, length included; that differs
+from a Bitcoin txid but only the coinbase txid is computed by a miner.
+
+**Header root.**
+
+```text
+root([])     = 32 zero bytes
+level_0      = [ txid_0, txid_1, ..., txid_n ]                      block order
+level_{k+1}  = [ SHA-256d(l ‖ r) for each pair of level_k ]         after appending a copy of
+                                                                    the last node to an odd level
+mutated      = some level_k has level_k[2i] == level_k[2i+1]        checked before that copy
+valid       <=> header.merkle_root == root  and  not mutated
+```
+
+This is Bitcoin Core's `ComputeMerkleRoot` with its `mutated` flag
+(CVE-2012-2459: `[.., x]` and `[.., x, x]` share a root). A block whose tree
+is mutated is refused with `bad-txns-duplicate: mutated merkle tree`, before
+it is stored and before the proof of work, so it never disqualifies the id
+(its honest body, which has the same root, is still accepted). The
+duplicate-transaction and 64-byte transaction rules also apply (a 64-byte
+txid preimage could pose as an inner node of this tree).
+
+**Body commitment.** The txids do not cover non-coinbase `script_sig`s, the
+shielded section or the PoWit section, so the coinbase commitment ("Coinbase
+commitment (VAL-2 BIP34, CRY-1)", same 80-byte layout and tag) carries, at
+offset 48, instead of the bare witness root:
+
+```text
+body_commitment = tagged_hash("OBB/coinbase/body", witness_root ‖ shielded_root ‖ powit_root)
+witness_root    = tagged Merkle root over [ 0^32, wtxid(tx_1), ..., wtxid(tx_n) ]   (as above)
+shielded_root   = SHA3-256("gnb:block:shielded:v1" ‖ SHA3-256(stx_1) ‖ ...)
+powit_root      = SHA3-256("GNB-POWIT-v1/body" ‖ PoWit section wire in the block's body format)
+```
+
+`powit_root` hashes the PoWit section exactly as the block's wire encoding
+carries it (`PowitBody::write_wire_for(BodyFormat::at(height))`): shares,
+attestations, then on a PoCI chain (both ObenBlock networks) the PoCI
+evidence list (`varint n ‖ n × PociEvidence`) and, from the liveness
+activation (height 0 on ObenBlock), the membership list (`varint n ‖ n ×
+(u8 tag ‖ item)`: the exits, tag 0, then the rejoins, tag 1). Every item a
+block carries, PoCI evidence and rejoins included, is therefore under the
+block id: deleting, adding or swapping one changes the commitment. An empty
+section is the same bytes in every format, so the genesis commitments are
+unchanged.
+
+The commitment is in the coinbase `script_sig`, which the coinbase txid
+covers, so the block id commits to every byte of the block's wire
+encoding: id → 80-byte header → `merkle_root` → coinbase txid → commitment →
+witnesses, shielded and PoWit sections (the uncommitted `blue_score` and the
+`height`, which `accept_block` binds to the parents, aside). The commitment
+is mandatory for every block from height 1 (the ObenBlock hardening
+activation is 0, and `block_rules::rules_apply` applies it under the
+SHA-256d scheme whatever a test override says). The genesis carries the
+commitment of height 0 and its header root is its coinbase txid.
+
+A copy of a block id whose witnesses or sections were altered fails the
+commitment (`bad witness commitment`), is refused before it is stored, and
+does not disqualify the id; a node remembers a rejected body by its body
+commitment (`block_rules::body_commitment_root`).
+
+Code: `core::pow_scheme` (`bitcoin_merkle_root`, `obb_validate_merkle`,
+`obb_body_commitment`), dispatched from `Block::body_merkle_root_at`,
+`Block::validate_merkle(_at)` and `block_rules::body_commitment_root`.
+Reference: `reference/obb_merkle.py`, vectors
+`reference/obb_merkle_vectors.json` (Bitcoin blocks 1, 170 and 100000,
+mutations, body commitments), checked by
+`crates/gnb-crypto/tests/obb_merkle_vectors.rs`.
+
 ## Liveness (ObenBlock)
 
 `docs/DESIGN-obenblock.md` §5. Code: `crates/gnb-smh/src/stall_relief.rs`,
@@ -2959,6 +3058,12 @@ relaxed  = floor(target(base_bits) * factor * 2^(shifts - 16))
 bits     = base_bits                                         if steps = 0
            bits(max(target(base_bits), min(pow_limit, relaxed)))   otherwise
 ```
+
+`pow_limit` is the pow limit of the chain's proof-of-work scheme: on
+ObenBlock the SHA-256d limit (`0x1d00ffff` mainnet, `0x207fffff` regtest),
+never GnB's ASERT limit (`liveness::scheme_pow_limit_at`). From the 1 EH/s
+launch bits a block more than about 16.5 hours late therefore carries exactly
+`0x1d00ffff`, which the SHA-256d PoW check accepts.
 
 `2^x` uses ASERT's 16.16 fixed point and cubic, so 30 steps are exactly one
 doubling. The relief never makes a block harder, and with no step the bits

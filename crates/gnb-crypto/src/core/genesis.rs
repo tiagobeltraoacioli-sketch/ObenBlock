@@ -16,17 +16,18 @@
 //!   expected at the launch difficulty
 //!   (`Sha256dParams::asert_anchor`).
 //! * **Coinbase**: one input whose `script_sig` is the 80-byte coinbase
-//!   commitment of height 0 (`block_rules::coinbase_commitment`, as every
+//!   commitment of height 0 (`block_rules::coinbase_commitment` with the
+//!   ObenBlock body commitment, `pow_scheme::obb_body_commitment`, as every
 //!   later ObenBlock coinbase starts) followed by the genesis text, which
 //!   commits to the Bloch Genesis-3 snapshot (`carryover::CARRYOVER_SNAPSHOT_SHA3`),
 //!   the conversion and the vesting keys (`vesting::VESTING_SPEC_SHA3`). One
 //!   output of 0 to an unspendable all-zero script: the first mined subsidy
 //!   is at height 1.
-//! * **Body root**: the v2 body root a block at height 0 has under the
-//!   ObenBlock rules (`Block::body_merkle_root_at`: the PoWit section is
-//!   present from height 0; the genesis itself is outside the hardening block
-//!   rules, `block_rules::rules_active_at`, so its transaction root is the
-//!   one-leaf legacy root, the coinbase txid).
+//! * **Header root**: Bitcoin's transaction root, as for every ObenBlock
+//!   block (`pow_scheme::bitcoin_merkle_root`): with one transaction, the
+//!   coinbase txid. The empty shielded and PoWit sections (with the exits
+//!   list: liveness applies from height 0) are committed by the coinbase
+//!   commitment's body commitment.
 //! * **Ledger**: exactly GnB's genesis ledger (owner decision, §3): the same
 //!   Bloch Genesis-3 snapshot, the same fixed conversion
 //!   `floor(v × CARRYOVER_ALLOCATION_SAT / CARRYOVER_SOURCE_TOTAL_SAT)` to the
@@ -73,8 +74,7 @@ use super::chain::Chain;
 use super::pow_scheme::{PowScheme, Sha256dParams, OBB_BLOCK_VERSION, OBB_POW_LIMIT_BITS, OBB_REGTEST_POW_LIMIT_BITS};
 #[allow(unused_imports)] // rustdoc links
 use super::pow_scheme::OBB_LAUNCH_BITS;
-use super::{block_rules, Block, BlockHeader, ChainId, MerkleRoot, Transaction, TxInput, TxOutput};
-use sha3::{Digest, Sha3_256};
+use super::{block_rules, pow_scheme, Block, BlockHeader, ChainId, MerkleRoot, Transaction, TxInput, TxOutput};
 
 // ── ObenBlock genesis constants ─────────────────────────────────────────────
 
@@ -124,13 +124,13 @@ pub const OBB_REGTEST_GENESIS_VERSION: u32 = OBB_BLOCK_VERSION;
 /// Nonce of the regtest genesis (`gnb-mine-genesis --chain obenblock --regtest`).
 pub const OBB_REGTEST_GENESIS_NONCE: u64 = 0;
 /// Block id of the regtest genesis (raw SHA-256d digest;
-/// 5c6e33060eaabb32cc2f9ac72e0551e96ae69c75189bbd6c0914cb4c6f3ac188 in
+/// 6918ae0c247b3c7475edd95f406b676e5fe42351c0df7c8488a51cfe0117163d in
 /// Bitcoin's display order).
 pub const OBB_REGTEST_GENESIS_HASH: [u8; 32] = [
-    0x88, 0xc1, 0x3a, 0x6f, 0x4c, 0xcb, 0x14, 0x09,
-    0x6c, 0xbd, 0x9b, 0x18, 0x75, 0x9c, 0xe6, 0x6a,
-    0xe9, 0x51, 0x05, 0x2e, 0xc7, 0x9a, 0x2f, 0xcc,
-    0x32, 0xbb, 0xaa, 0x0e, 0x06, 0x33, 0x6e, 0x5c,
+    0x3d, 0x16, 0x17, 0x01, 0xfe, 0x1c, 0xa5, 0x88,
+    0x84, 0x7c, 0xdf, 0xc0, 0x51, 0x23, 0xe4, 0x5f,
+    0x6e, 0x67, 0x6b, 0x40, 0x5f, 0xd9, 0xed, 0x75,
+    0x74, 0x3c, 0x7b, 0x24, 0x0c, 0xae, 0x18, 0x69,
 ];
 /// Header bits of the regtest genesis: the regtest pow limit.
 pub const OBB_REGTEST_GENESIS_BITS: u32 = OBB_REGTEST_POW_LIMIT_BITS;
@@ -220,8 +220,9 @@ impl ChainGenesis {
 }
 
 /// The ObenBlock genesis coinbase for `text`: the 80-byte commitment of
-/// height 0 (no parents; the witness root of a coinbase-only block), then
-/// the text; one output of 0 to an all-zero script.
+/// height 0 (no parents; the body commitment of a coinbase-only block with
+/// empty shielded and PoWit sections), then the text; one output of 0 to an
+/// all-zero script.
 pub fn obenblock_genesis_coinbase(text: &str) -> Transaction {
     let mut cb = Transaction {
         version: 1,
@@ -236,7 +237,7 @@ pub fn obenblock_genesis_coinbase(text: &str) -> Transaction {
     };
     // The witness root counts the coinbase as all-zero, so it does not
     // depend on the script_sig it is written into.
-    let commitment = block_rules::coinbase_commitment(0, &[], &block_rules::witness_root(std::slice::from_ref(&cb)));
+    let commitment = block_rules::coinbase_commitment(0, &[], &obenblock_genesis_body_commitment(&cb));
     cb.inputs[0].script_sig = block_rules::coinbase_script_sig(&commitment, text.as_bytes());
     cb
 }
@@ -244,32 +245,36 @@ pub fn obenblock_genesis_coinbase(text: &str) -> Transaction {
 // The genesis root includes the liveness exits section (height 0).
 const _: () = assert!(super::liveness::OBENBLOCK_LIVENESS_ACTIVATION_HEIGHT == 0, "the genesis root assumes it");
 
-/// The header Merkle root of an ObenBlock genesis with coinbase `cb`: the v2
-/// body root over the one-leaf legacy transaction root (the coinbase txid),
-/// the empty shielded section and the empty PoWit section (with its exits
-/// list: liveness applies from height 0). Equal to
-/// `Block::body_merkle_root()` of the genesis in a process running
-/// ObenBlock (`tests/obb_genesis_regtest.rs`), computed here without the
-/// process-wide heights so tools and other chains' processes get it too.
+/// The body commitment of an ObenBlock genesis with coinbase `cb`
+/// (`pow_scheme::obb_body_commitment` of the genesis): its witness root, the
+/// empty shielded section and the empty PoWit section in the ObenBlock body
+/// format (exits list and PoCI on both ObenBlock networks from height 0; an
+/// empty section is the same bytes in every format). Computed
+/// without the process-wide heights so tools and other chains' processes
+/// get it too; equal to the node's value in a process running ObenBlock
+/// (`tests/obb_genesis_regtest.rs`).
+pub fn obenblock_genesis_body_commitment(cb: &Transaction) -> MerkleRoot {
+    let shell = genesis_shell(cb);
+    pow_scheme::obb_body_commitment_parts(
+        &block_rules::witness_root(&shell.transactions), &shell.shielded_root(),
+        &shell.powit.root_for(super::powit::BodyFormat { exits: true, poci: true }))
+}
+
+/// The header Merkle root of an ObenBlock genesis with coinbase `cb`:
+/// Bitcoin's root over the one txid, which is that txid.
 pub fn obenblock_genesis_merkle_root(cb: &Transaction) -> MerkleRoot {
-    let shell = Block {
+    pow_scheme::bitcoin_merkle_root(&[cb.txid()]).0
+}
+
+fn genesis_shell(cb: &Transaction) -> Block {
+    Block {
         header: BlockHeader { version: 0, parents: vec![], merkle_root: MerkleRoot::ZERO, timestamp: 0, bits: 0, nonce: 0 },
         transactions: vec![cb.clone()],
         blue_score: 0,
         height: 0,
         shielded_transactions: Vec::new(),
         powit: Default::default(),
-    };
-    let tx_root = block_rules::tx_merkle_root(&shell.transactions, false);
-    let mut c = Sha3_256::new();
-    c.update(b"gnb:block:body:v2");
-    c.update(tx_root.0);
-    c.update(shell.shielded_root());
-    // The liveness rules (exits in the PoWit section) apply from height 0
-    // on both ObenBlock networks, so the genesis root is the one the node
-    // computes for height 0 (`Block::body_merkle_root`).
-    c.update(shell.powit.root_with(true));
-    MerkleRoot(c.finalize().into())
+    }
 }
 
 /// An ObenBlock genesis block (see the module documentation).
@@ -378,7 +383,7 @@ mod tests {
     }
 
     /// The coinbase carries the height-0 commitment, pays nothing, and the
-    /// header root is the v2 body root over the coinbase txid.
+    /// header root is Bitcoin's root, the coinbase txid.
     #[test]
     fn obenblock_genesis_structure() {
         for id in [ChainId::ObenBlockMainnet, ChainId::ObenBlockRegtest] {
@@ -392,11 +397,15 @@ mod tests {
             let cb = &b.transactions[0];
             assert_eq!(cb.outputs.len(), 1);
             assert_eq!((cb.outputs[0].value, cb.outputs[0].script_pubkey.as_slice()), (0, &[0u8; 20][..]));
-            assert_eq!(block_rules::check_coinbase_commitment(&b), Ok(()));
+            // This lib test process runs GnB-SMH, so the commitment is
+            // checked against the ObenBlock body commitment directly.
+            let want = block_rules::coinbase_commitment(0, &[], &obenblock_genesis_body_commitment(cb));
+            assert_eq!(&cb.inputs[0].script_sig[..block_rules::COINBASE_COMMITMENT_LEN], &want[..]);
+            assert_ne!(obenblock_genesis_body_commitment(cb), block_rules::witness_root(&b.transactions),
+                       "the body commitment, not GnB's bare witness root");
             assert_eq!(&cb.inputs[0].script_sig[block_rules::COINBASE_COMMITMENT_LEN..], g.text.as_bytes());
-            assert_eq!(block_rules::tx_merkle_root(&b.transactions, false).0, cb.txid());
             assert_eq!(b.header.merkle_root, obenblock_genesis_merkle_root(cb));
-            assert_ne!(b.header.merkle_root.0, cb.txid(), "the v2 body root, not the bare transaction root");
+            assert_eq!(b.header.merkle_root.0, cb.txid(), "Bitcoin's root of one transaction is its txid");
             // The header fits the 80-byte layout and the BIP 320 version rule.
             assert!(b.header.sha256d_pow_bytes().is_ok() || g.is_placeholder());
             assert!(gnb_smh::sha256d::version_ok(b.header.version, OBB_BLOCK_VERSION));
