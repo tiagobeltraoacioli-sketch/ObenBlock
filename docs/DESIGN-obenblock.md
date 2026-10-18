@@ -282,6 +282,40 @@ weight_k(e) gains renew_k + admit_k
   block. The first window (28 days) remains the weakest period; releases ship
   a finality checkpoint (§3) during it.
 
+**Normative reading** (reference `reference/obb_growth_cap.py`, vectors
+`reference/obb_growth_cap_vectors.json`):
+
+- **Weights are credits.** `weight_k` is the sum of the key's admitted
+  credits (`renew_k + admit_k`) over the window epochs, and `R_k` is the
+  *credit* of the epoch leaving the window, not its raw share work.
+  (With raw work, a key that once mined far more than it was admitted could
+  "renew" the excess later and bypass the cap.)
+- **Indices.** The configuration of epoch `x` (PoCI `C_x`) is built from
+  `C_{x-1}`: the epoch entering the window is `n = x-2`, the one leaving is
+  `x-2-112`. `W_e` is `total(C_{x-1})`, the eligible weight of the previous
+  configuration, and `N_k` is the finalized share work of key `k` in epoch `n`.
+- **`G_min(n) = floor(720 × 16 × share_work(n) / 8)`**: `16` share slots per
+  block, `share_work(n)` the work of the share target of epoch `n`'s first
+  block (`min(floor(2^256 / (share_target + 1)), 2^128 - 1)`), saturating at
+  `2^128 - 1`. This is 1/8 of the share work one epoch can carry.
+- **Exclusions.** A key barred at `x` (PoCI ban, exit) gets no credit at `x`
+  and its work does not count in `sum(x)`; its earlier credits stay and expire
+  on schedule, so it returns with the unexpired ones.
+- **Handoffs that skip epochs** run the step for every epoch in between, in
+  order, so `C_x` depends on finalized history only.
+- **Arithmetic.** Credits, weights and totals are u128 (sums saturate, as W
+  does today). `sum(x)` and `x_k × G_e` are exact: the Rust code uses 256-bit
+  intermediates, since a saturated denominator would admit more than `G_e`.
+- **Measured.** With honest-only weight at steady state and a flood of
+  `k = 10` or `k = 100` times the honest share work on new keys, the new keys
+  first hold strictly more than 2/3 after exactly 71 epochs; at `k = 2` never
+  (their credits expire before they get there). Honest keys that keep mining
+  keep their weight unchanged throughout.
+- **Out of the model.** The cap bounds weight, not inclusion: a flood of
+  shares also competes for the 16 share slots per block, which can lower
+  the honest `N_k` that blocks carry. Slot policy is the template's
+  (`docs/DESIGN-witness-shares.md`).
+
 ## 7. Reorg protection, together
 
 | Layer | What it stops |
