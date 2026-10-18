@@ -1274,46 +1274,66 @@ impl PociState {
         false
     }
 
-    /// The weight of the configuration in force with no vote included in a
-    /// block of `epoch` (`getpowitinfo`, §4.1: operators see absent weight
-    /// grow long before it reaches a third). Not final: blocks above the
-    /// finalized checkpoint count too.
-    pub fn absent_weight(&self, epoch: u64) -> u128 {
-        self.config().entries().iter()
-            .filter(|(k, _)| !self.seen.get(k).is_some_and(|m| m.contains_key(&epoch)))
+    /// The weight of the configuration in force `C_e` absent for a step to
+    /// `x` (`getpowitinfo`, §4.1: operators see absent weight grow long
+    /// before it reaches a third): its keys with no vote included in
+    /// `(opening(x - PRUNE_AFTER), opening(x)]`, the window of
+    /// [`Self::present`]. Not final: blocks above the finalized checkpoint
+    /// count too, and the window is the one this ledger still holds
+    /// ([`Self::trim_seen`]). Informational: the quorum gate of a step to `x`
+    /// is `!self.config().quorum(total - absent)` only when `x = e + 1`; the
+    /// later steps of a handoff gate on their own `C_{x-1}`.
+    pub fn absent_weight(&self, params: &PociParams, x: u64) -> u128 {
+        self.config().entries().iter().filter(|(k, _)| !self.present(params, k, x))
             .fold(0u128, |a, (_, w)| a.saturating_add(*w))
     }
 
-    /// Drop the included votes no later handoff reads, for a chain whose
-    /// blocks are now in epoch `block_epoch`: such a block finalizes a
+    /// Drop the included votes no later handoff step reads, for a chain
+    /// whose blocks are now in epoch `block_epoch`: such a block finalizes a
     /// checkpoint of epoch `>= block_epoch - 2`
-    /// ([`params_bound_the_finalized_lag`]), whose handoff reads inclusions
-    /// above `opening(block_epoch - 2 - PRUNE_AFTER)` only. Never changes a
-    /// verdict; it bounds the ledger at `PRUNE_AFTER + 3` epochs per key.
+    /// ([`params_bound_the_finalized_lag`]), and a handoff steps through
+    /// every epoch from `e + 1` (`C_e` in force), the step to `x` reading
+    /// inclusions above `opening(x - PRUNE_AFTER)` only. So the block epochs
+    /// from `min(block_epoch - 2, e + 1) - PRUNE_AFTER` on are kept. Never
+    /// changes a verdict; it bounds the ledger at `PRUNE_AFTER + 3` epochs
+    /// per key while finality runs (during a stall it keeps every block
+    /// epoch from `e - 3` on, one entry per key and epoch).
     pub fn trim_seen(&mut self, block_epoch: u64) {
-        let keep = block_epoch.saturating_sub(2 + POCI_PRUNE_AFTER_EPOCHS);
+        let first_step = block_epoch.saturating_sub(2).min(self.config().epoch().saturating_add(1));
+        let keep = first_step.saturating_sub(POCI_PRUNE_AFTER_EPOCHS);
         for m in self.seen.values_mut() {
             m.retain(|y, _| *y >= keep);
         }
         self.seen.retain(|_, m| !m.is_empty());
     }
 
-    /// The first half of a handoff (§4, §4.1, §5): `f` was finalized under
-    /// the configuration in force `C_e`. If it hands off to `x`
-    /// ([`Self::handoff_epoch`]), from the history up to `cut = opening(x)
-    /// <= f.height` only, so that every chain finalizing any checkpoint of
-    /// epoch `x` first (with the same `C_e` and the same history up to
-    /// `opening(x)`) computes the same `C_x`: every pending ban included at
-    /// or below `cut` starts at `x`; every pending rejoin included at or
-    /// below `cut` ends its key's pruning at `x`; and, if the keys of `C_e`
-    /// [`present`](Self::present) for `x` hold a strict quorum of `C_e`,
-    /// every key of `C_e` that has been an entry since `x - PRUNE_AFTER` or
-    /// earlier and is not present is pruned from `x`. Without that quorum
+    /// The epochs a handoff triggered by finalizing `f` under the
+    /// configuration in force `C_e` steps through (§4): `e + 1 ..= epoch(f)`,
+    /// in order, one [`Self::begin_step`] + [`Self::enter`] each; empty when
+    /// `f` does not hand off.
+    pub fn handoff_steps(&self, params: &PociParams, f: &Checkpoint) -> std::ops::RangeInclusive<u64> {
+        match self.handoff_epoch(params, f) {
+            Some(x) => self.config().epoch().saturating_add(1)..=x,
+            None => 1..=0,
+        }
+    }
+
+    /// The first half of one handoff step `C_{x-1} -> C_x` (§4, §4.1, §5),
+    /// `x = self.config().epoch() + 1`, from the history up to `cut =
+    /// opening(x)` only: every pending ban included at or below `cut` starts
+    /// at `x`; every pending rejoin included at or below `cut` ends its key's
+    /// pruning at `x`; and, if the keys of `C_{x-1}`
+    /// [`present`](Self::present) for `x` hold a strict quorum of `C_{x-1}`,
+    /// every key of `C_{x-1}` that has been an entry since `x - PRUNE_AFTER`
+    /// or earlier and is not present is pruned from `x`. Without that quorum
     /// (a finality stall covered the window: the committee that ends it has
-    /// no votes there) nobody is pruned. Returns `x`; the caller computes the
-    /// candidate weights (with this state) and calls [`Self::enter`].
-    pub fn begin_handoff(&mut self, params: &PociParams, f: &Checkpoint) -> Option<u64> {
-        let x = self.handoff_epoch(params, f)?;
+    /// no votes there) nobody is pruned. A handoff to `epoch(F)` runs one
+    /// step per epoch boundary ([`Self::handoff_steps`]), so `C_x` depends
+    /// on the history only, never on which checkpoints were finalized on the
+    /// way. The caller computes the candidate weights (with this state) and
+    /// calls [`Self::enter`] with the same `x`.
+    pub fn begin_step(&mut self, params: &PociParams, x: u64) {
+        debug_assert_eq!(x, self.config().epoch() + 1, "one handoff step at a time");
         let cut = params.opening(x);
         for bl in self.bans.values_mut() {
             for b in bl.iter_mut() {
@@ -1337,16 +1357,15 @@ impl PociState {
                 self.pruned.insert(k, Prune { start: x, until: None });
             }
         }
-        Some(x)
     }
 
-    /// The second half of a handoff: `C_x` enters into force from the
+    /// The second half of a handoff step: `C_x` enters into force from the
     /// provider's `candidates`, without the keys banned or pruned at `x` and
     /// those `also_excluded` (exits, which the PoWit state keeps). A pruned
     /// key without candidate weight (no share work left) is forgotten; the
     /// included votes are kept for the keys of `C_x` only. Never empty
-    /// (§4.1): if nothing is left, `C_x` holds the entries of `C_e`
-    /// unchanged and the prunings this handoff started are void (a
+    /// (§4.1): if nothing is left, `C_x` holds the entries of `C_{x-1}`
+    /// unchanged and the prunings this step started are void (a
     /// configuration that can reach no quorum would halt finality for good).
     pub fn enter(&mut self, params: &PociParams, x: u64, candidates: &BTreeMap<KeyId, u128>,
                  also_excluded: &dyn Fn(&KeyId) -> bool) -> Result<(), ConfigError>
@@ -1377,14 +1396,21 @@ impl PociState {
         Ok(())
     }
 
-    /// §4 + §4.1 + §5 in one call ([`Self::begin_handoff`], then
-    /// [`Self::enter`] with `weights(self, x)`). Returns whether it handed off.
+    /// §4 + §4.1 + §5 in one call: every step of [`Self::handoff_steps`]
+    /// ([`Self::begin_step`], then [`Self::enter`] with `weights(self, x)`).
+    /// Returns whether it handed off.
     pub fn finalized(&mut self, params: &PociParams, f: &Checkpoint,
-                     weights: impl FnOnce(&PociState, u64) -> BTreeMap<KeyId, u128>) -> Result<bool, ConfigError>
+                     mut weights: impl FnMut(&PociState, u64) -> BTreeMap<KeyId, u128>) -> Result<bool, ConfigError>
     {
-        let Some(x) = self.begin_handoff(params, f) else { return Ok(false) };
-        let w = weights(self, x);
-        self.enter(params, x, &w, &|_| false)?;
+        let steps = self.handoff_steps(params, f);
+        if steps.is_empty() {
+            return Ok(false);
+        }
+        for x in steps {
+            self.begin_step(params, x);
+            let w = weights(self, x);
+            self.enter(params, x, &w, &|_| false)?;
+        }
         Ok(true)
     }
 

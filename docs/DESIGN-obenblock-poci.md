@@ -128,27 +128,39 @@ quorum(C, votes) <=> 3 × sum(weight of distinct keys of C voting the link) > 2 
   cannot age it differently.
 - Exits (the KES-signed exit message of §5.2), bans and expiring weight take
   effect at the next handoff, never in the current configuration.
-- A handoff may skip epochs: when `C_e` finalizes a checkpoint of epoch
-  `e+k`, the next configuration is `C_{e+k}`. In one rule: finalizing `F`
-  under `C_e` hands off to `C_{epoch(F)}` iff `epoch(F) > e` (the opening
-  checkpoint of `e+1` is the usual case; a checkpoint later in `e+1` or
-  beyond also hands off when the opening one was skipped).
+- **One step per epoch boundary** (re-review 2026-10-18, orchestrator
+  decision). Finalizing `F` under `C_e` hands off iff `x = epoch(F) > e`
+  (the opening checkpoint of `e+1` is the usual case; a checkpoint later in
+  `e+1` or beyond also hands off when the opening one was skipped). The
+  handoff then steps through every epoch boundary in order: `C_{e+1}`,
+  `C_{e+2}`, ..., `C_x` enter into force one after the other, each computed
+  strictly from the configuration before it and the history up to the
+  opening of its own epoch, with that epoch's presence window, quorum gate,
+  bans, rejoins, exits and growth-cap step (§4.1, "Order at the handoff").
+  The intermediate configurations are never voted under on this chain, but
+  they are part of its history (a vote naming one, from another chain that
+  had it in force, is evidence here too) and of the grace walk of §4.1.
+  Bans and rejoins whose items lie at or below the opening of an
+  intermediate epoch take effect there.
 - **One configuration per epoch** (review 2026-10-18, decision D4). `C_x`
-  is a function of `C_e`, the configurations before it and the history up
-  to ledger height `opening(x)` only, never of `F` itself: the ban starts
-  (§5), the rejoins and the absence of §4.1 are cut at `opening(x)`, and the
-  growth cap reads share work and first-block bits of epochs `<= x - 2`.
-  Every chain that finalizes any checkpoint of epoch `x` first, with the same
-  `C_e` and the same history up to `opening(x)`, holds the same `C_x` (the
-  same `config_id`), so an equivocation across two such chains names one
-  configuration and is evidence on both. (`F.height >= opening(x)`, so that
-  history is final once `F` is.) A chain that first finalizes a checkpoint of
-  epoch `x - 1` above `opening(x)` passes through `C_{x-1}`, a different
-  history; its `C_x` follows from it.
-- **Never empty** (decision D3). If the candidate weights minus the keys
-  banned, pruned or exited at `x` leave nothing, `C_x` carries the entries of
-  `C_e` forward unchanged (same keys and weights, epoch `x`, its own
-  `config_id`) and the prunings this handoff started are void. A
+  is a function of the history only, whatever checkpoints were finalized on
+  the way: by induction, `C_y` depends on `C_{y-1}` and on the history up
+  to ledger height `opening(y)` (the ban starts (§5), the rejoins and the
+  absence of §4.1 are cut at `opening(y)`, and the growth cap reads share
+  work and first-block bits of epochs `<= y - 2`), never on `F`. Two chains
+  with the same history up to `opening(x)` hold the same `C_x` (the same
+  `config_id`), whichever checkpoint of epoch `x` (or of an earlier epoch
+  above `opening(x - 1)`) each finalized first, so an equivocation across
+  them names one configuration and is evidence on both.
+  (`F.height >= opening(x)`, so that history is final once `F` is.) Vectors
+  `handoff_unique_per_epoch_a/b` (two checkpoints of epoch 9) and
+  `handoff_path_independent_a/b` (one chain finalizes opening(9) under
+  `C_7`, the other a checkpoint of epoch 8 above `opening(8)` first: both
+  hold the same `C_8` and `C_9`).
+- **Never empty** (decision D3). If, at a step to `x`, the candidate weights
+  minus the keys banned, pruned or exited at `x` leave nothing, `C_x` carries
+  the entries of `C_{x-1}` forward unchanged (same keys and weights, epoch
+  `x`, its own `config_id`) and the prunings that step started are void. A
   configuration that can reach no quorum would halt finality for good: no
   rejoin and no new key can enter without a handoff.
 
@@ -183,33 +195,64 @@ quorum**, never by a local timeout:
   again from the next handoff, as new weight under the growth cap
   (DESIGN-obenblock.md §6.3).
 - `getpowitinfo` reports the absent weight of `C_e` per epoch, so operators
-  see it grow long before it reaches a third.
+  see it grow long before it reaches a third: for each epoch `x` from
+  `e + 1` to the tip's epoch, the weight of the keys of `C_e` with no vote
+  included in `(opening(x - 4), opening(x)]` (the window of a step to `x`,
+  as far as the chain holds it, unfinalized blocks included), and whether
+  the present keys hold a strict quorum of `C_e` (the gate; informational:
+  the steps of a handoff gate on their own `C_{x-1}`).
 
 Normative reading (package B2, revised by decisions D3 and D4; reference
-`reference/poci_reference.py`, `PociChain`, vectors `sequences` 8 to 16 of
+`reference/poci_reference.py`, `PociChain`, vectors `sequences` 8 to 19 of
 `reference/poci_vectors.json`):
 
 - **Included at.** A vote, rejoin or evidence in a block at height `h` sits
   at ledger height `h + 1` (§12, "Heights"): it is in the history finalized
   by `F` iff `h + 1 <= F.height`.
-- **Order at the handoff** triggered by finalizing `F` under `C_e`, with
-  `x = epoch(F) > e` and `cut = opening(x) <= F.height`: (1) pending bans
-  whose evidence was included at `h <= cut` start at `x` (§5); (2) pending
-  rejoins included at `h <= cut` end their key's pruning (the key is not
-  excluded at `x`); (3) a key `k` of `C_e` is *present* iff a vote of `k` was
-  included at a ledger height `h` with `opening(x - 4) < h <= cut`; if
-  `3 × (weight of the present keys of C_e) > 2 × total(C_e)`, every key `k`
-  of `C_e`, not pruned yet, is pruned from `x` on iff it is *eligible*,
-  walking the configurations in force newest first `k` is an entry of each
-  until one whose epoch is `<= x - 4` (a key that entered later is in its
-  grace period), and not present; otherwise nobody is pruned; (4) `C_x` =
-  the provider's candidate weights minus the keys banned, pruned or exited
-  at `x`, or, if that is empty, `C_e`'s entries (and step 3's prunings are
-  void).
+- **Order at the handoff** triggered by finalizing `F` under `C_e`: for
+  each step `C_{x-1} -> C_x`, `x = e + 1, ..., epoch(F)` in order (§4), with
+  `cut = opening(x) <= F.height`: (1) pending bans whose evidence was
+  included at `h <= cut` start at `x` (§5); (2) pending rejoins included at
+  `h <= cut` end their key's pruning (the key is not excluded at `x`); (3) a
+  key `k` of `C_{x-1}` is *present* iff a vote of `k` was included at a
+  ledger height `h` with `opening(x - 4) < h <= cut`; if `3 × (weight of the
+  present keys of C_{x-1}) > 2 × total(C_{x-1})`, every key `k` of
+  `C_{x-1}`, not pruned yet, is pruned from `x` on iff it is *eligible*,
+  walking the configurations in force newest first (the intermediate ones
+  included) `k` is an entry of each until one whose epoch is `<= x - 4` (a
+  key that entered later is in its grace period), and not present;
+  otherwise nobody is pruned; (4) `C_x` = the provider's candidate weights
+  (one growth-cap step, §6.3 of DESIGN-obenblock.md) minus the keys banned,
+  pruned or exited at `x`, or, if that is empty, `C_{x-1}`'s entries (and
+  step 3's prunings are void). Votes are recorded by key, whatever
+  configuration they named, and kept for the keys of the configuration a
+  step enters.
 - **Nothing above `opening(x)` counts** for `C_x`, including the votes of
   the link that finalizes `F` and evidence or rejoins included between
-  `opening(x)` and `F`: they wait for the next handoff. Every chain that
-  finalizes a checkpoint of `x` then computes the same `C_x` (§4).
+  `opening(x)` and `F`: they wait for the next step. Every chain with the
+  same history up to `opening(x)` then computes the same `C_x` (§4).
+- **Staggered return** (re-review 2026-10-18, LOW; vector
+  `staggered_return_rejoins`). When a quorum of `C_{x-1}` was present in
+  `(opening(x - 4), opening(x)]`, a key of `C_{x-1}` absent from that window
+  is pruned at `x` even if its votes were included after `opening(x)`, the
+  votes of the link that finalizes `F` among them: they lie above the cut.
+  Conservative reading, chosen for determinism: it stays a function of the
+  history up to `opening(x)`, and there is no automatic return. Pruning is
+  not a fault: the key is never banned (only two conflicting votes under one
+  `config_id` are evidence, §5), its votes for `C_{x-1}` stay valid, and it
+  returns through the ordinary rejoin, which the node publishes on its own
+  when it sees its key pruned (`gnb-node` witness duty). A rejoin included in
+  epoch `x` brings it back in `C_{x+1}`.
+- **Long stall or partition.** Each step reads its own window and gates on
+  its own `C_{x-1}`. When finalizing `F` ends a long stall, the early steps
+  find no present quorum (nobody pruned), but if, on the finalized chain,
+  the growth cap has shifted weight toward the keys that kept being
+  included (e.g. the larger side of a partition that could not finalize on
+  its own), a late step can find them a strict quorum of its `C_{x-1}`, and
+  then the keys absent from that chain's window are pruned there; they
+  rejoin at the next handoff (simulation `p60-long`, `p67-exact`). The
+  steps run only when `C_e` itself finalized `F` with a strict quorum, so no
+  side of a partition can step, or prune, on its own.
 - **Rejoin message**, signed with the KES leaf of `epoch`:
 
   ```text
@@ -220,7 +263,7 @@ Normative reading (package B2, revised by decisions D3 and D4; reference
   A block of epoch `E` may carry it iff, first failure wins: it is above the
   finalized checkpoint, `epoch <= E <= epoch + 1`, the key is pruned, it has
   no rejoin pending, the signature verifies (last). At most 4 per block.
-  The key is not excluded from the first handoff to an epoch `x` with the
+  The key is not excluded from the first step to an epoch `x` with the
   rejoin included at or below `opening(x)`; under the growth cap its share
   work then competes as new weight (vector `growth_cap_pruned_then_rejoin`:
   the growth cap provider of the reference, `GrowthCapProvider`, gives the
@@ -257,12 +300,13 @@ Rules:
   different keys, identical attestations, non-conflicting links (shared
   source or shared target with different heights, consecutive links) or a
   bad signature make it invalid.
-- **Exclusion**: `ban_start` = the epoch `x` of the first handoff with the
-  evidence included at or below `opening(x)` (ledger height, §4.1): the
-  handoff triggered by the finalization of the evidence's block counts when
-  the evidence lies below the opening of its epoch; evidence included
-  between `opening(x)` and the finalized checkpoint waits for the next
-  handoff (§4, one configuration per epoch). The key
+- **Exclusion**: `ban_start` = the epoch `x` of the first handoff step with
+  the evidence included at or below `opening(x)` (ledger height, §4.1): the
+  steps of the handoff triggered by the finalization of the evidence's
+  block count when the evidence lies below their opening (an intermediate
+  step of a handoff that skips epochs included, §4); evidence included
+  between `opening(epoch(F))` and the finalized checkpoint waits for the
+  next handoff (§4, one configuration per epoch). The key
   is ineligible for every epoch `ban_start <= e < ban_start + 100` (72,000
   blocks, about 25 days at nominal cadence). The epoch is the protocol's,
   never a local clock.
@@ -506,24 +550,29 @@ tests.
   `rejoins` (key -> included at), `seen` (key -> block epoch -> lowest
   `included_at`; the lowest inclusion of each block epoch answers §4.1's
   question exactly, `PociState::present`, window `(opening(x - 4),
-  opening(x)]`; `present_weight` for the quorum gate). A handoff is two
-  calls: `begin_handoff` (ban starts, rejoins, the gated pruning, all cut at
-  `opening(x)`; returns `x`) and `enter` (candidate weights minus bans,
-  pruning and exits; forgetting; never empty; `C_x` in force). `finalized`
-  does both for ledger-only callers.
+  opening(x)]`; `present_weight` for the quorum gate). A handoff is one
+  step per epoch boundary (`handoff_steps`: `e + 1 ..= epoch(F)`), each two
+  calls: `begin_step` (ban starts, rejoins, the gated pruning, all cut at
+  `opening(x)`) and `enter` (candidate weights minus bans, pruning and
+  exits; forgetting; never empty; `C_x` in force). `finalized` runs every
+  step for ledger-only callers.
   `crates/gnb-crypto/tests/poci_vectors.rs` reproduces every pruning and
   rejoin sequence of the reference.
-- Bounds: `trim_seen` keeps the included votes of the last `PRUNE_AFTER + 3`
-  block epochs per key (a block of epoch `E` finalizes a checkpoint of epoch
-  `>= E - 2`, `params_bound_the_finalized_lag`), and only for keys of the
-  configuration in force. A block carries at most 4 rejoins.
+- Bounds: `trim_seen` keeps the included votes of the block epochs from
+  `min(E - 2, e + 1) - PRUNE_AFTER` on per key (a block of epoch `E`
+  finalizes a checkpoint of epoch `>= E - 2`,
+  `params_bound_the_finalized_lag`, and the first step of its handoff is
+  `e + 1`, `C_e` in force): `PRUNE_AFTER + 3` epochs while finality runs,
+  one entry per key and epoch from `e - 3` on during a stall; only for keys
+  of the configuration in force. A block carries at most 4 rejoins.
 - `PowitState::apply_poci` records every included vote, admits rejoins
   (`PowitBody::rejoins`, `PociItems`), and hands off through the ledger with
   a `ConfigWeights` provider. The provider contract is on `ConfigWeights`:
-  it is called mid-handoff (`state.poci.config()` is still `C_e`; this
-  handoff's bans and pruning are recorded, `PowitState::poci_excluded_at`
-  answers for every epoch the handoff covers), reads finalized history only,
-  and returns every key with weight, excluded ones included. ObenBlock uses
+  it is called once per handoff step to `x` (`state.poci.config()` is still
+  `C_{x-1}`; this step's bans and pruning are recorded,
+  `PowitState::poci_excluded_at` answers for `x`), reads finalized history
+  at or below `opening(x)` only, and returns every key with weight,
+  excluded ones included. ObenBlock uses
   `ObbConfigWeights`, an alias of `GrowthCapWeights` (§14).
 - No inactivity leak: `apply_poci` never decays (the O4 half leak and the
   GnB 1/16 leak stay in `apply_full`, GnB's path, unchanged); exits and bans
@@ -626,14 +675,16 @@ tests.
   configuration it handed off to. It is in the single-flight read group of
   the RPC server (a rebuild verifies signatures).
 - `getpowitinfo.poci` and `getfinalityinfo.poci`: the configuration in
-  force, the absent weight of §4.1 (`absent_weight`, §13; per epoch the
-  weight and number of its keys), the bans, and the latest finalized
+  force, the absent weight of §4.1 (`absent_weight`, §13; per handoff
+  epoch `x` up to the tip's epoch + 1, the weight and number of its keys
+  absent from the window `(opening(x - 4), opening(x)]` and whether the
+  present ones hold the quorum gate), the bans, and the latest finalized
   checkpoint with its kept certificate's summary.
 - Ledger storage fix (found while testing partitions; B2 found and fixed
   the same bug, and the merge keeps B2's rows, §13): a block's PoCI record
   names a history node whose id commits to the whole sequence of
   configurations (`powit/pocihist/<node id>`). Two forks that reach the
-  same configuration through different handoffs (one skips an epoch) used
+  same configuration after different histories (another predecessor) used
   to read back the same history, so evidence naming a past configuration
   could be judged against the other fork's history (a consensus split
   between nodes that saw the forks in a different order).

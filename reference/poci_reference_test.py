@@ -228,8 +228,9 @@ class Finality(unittest.TestCase):
         out = ch.votes(t2, votes(ch, ks, t2))
         self.assertTrue(out["handoff"])
         self.assertEqual(ch.config.epoch, 9)
-        self.assertEqual(seen, [(4, 4 * L), (9, 9 * L + 2 * I)])
-        self.assertEqual([c.epoch for c in ch.history], [4, 9])
+        # Section 4: one step per epoch boundary, C_5 .. C_9 in order.
+        self.assertEqual(seen, [(4, 4 * L)] + [(e, 9 * L + 2 * I) for e in range(5, 10)])
+        self.assertEqual([c.epoch for c in ch.history], [4, 5, 6, 7, 8, 9])
 
     def test_votes_naming_an_old_config_do_not_count(self):
         ks = keys(4)
@@ -367,15 +368,20 @@ class Pruning(unittest.TestCase):
         ks = keys(6, "fin")
         k5 = ks[5].key_id
         core = [k.key_id for k in ks[:5]]
-        # The window is (opening(x - 4), opening(x)]: exactly opening(5) is
-        # outside, one above inside; exactly opening(9) inside, one above
-        # (the blocks of epoch 9, the finalizing links among them) outside.
-        for h, pruned in ((5 * L, True), (5 * L + 1, False), (9 * L, False), (9 * L + 1, True)):
+        # The window is (opening(x - 4), opening(x)]. A jump from 4 to 9
+        # steps through 5..9 (section 4); key 5 is first eligible at 8, whose
+        # window is (opening(4), opening(8)]: exactly opening(4) is outside
+        # (pruned at 8), one above inside (present at 8, outside the window
+        # (opening(5), opening(9)] of the step to 9: pruned at 9); exactly
+        # opening(8) is inside both; one above (a block of epoch 8) is
+        # outside the window of 8: pruned at 8, before the step to 9 reads it.
+        for h, start in ((4 * L, 8), (4 * L + 1, 9), (8 * L, None), (8 * L + 1, 8)):
             c = chain(lambda e: {k.key_id: 100 for k in ks})
             c.include(6 * L, core)
             c.include(h, [k5])
             self.handoff(c, ks[:5], 9)
-            self.assertEqual(c.config.weight(k5) is None, pruned, h)
+            self.assertEqual(c.config.weight(k5) is None, start is not None, h)
+            self.assertEqual(c.pruned[k5].start if start else None, start, h)
         # A vote in the finalizing link does not count either.
         ch = chain(lambda e: {k.key_id: 100 for k in ks})
         ch.include(6 * L, core)
@@ -400,7 +406,7 @@ class Pruning(unittest.TestCase):
             # Finality goes on, and pruning resumes once a committee is present.
             self.handoff(ch, ks[:4], 21)
             self.handoff(ch, ks[:4], 22)
-            self.assertEqual(ch.config.total, 500, "key 4: an entry of C_20 only, in its grace period")
+            self.assertEqual(ch.config.total, 500, "key 4: its votes for C_20 (at 20L + 1) keep it present")
             for x in (23, 24, 25):
                 self.handoff(ch, ks[:4], x)
             self.assertEqual(sorted(ch.pruned), [ks[4].key_id])
@@ -448,6 +454,54 @@ class Pruning(unittest.TestCase):
             self.assertEqual(ch.config.epoch, 9)
             out.append(ch.config.id)
         self.assertEqual(out[0], out[1])
+
+    def test_the_configuration_does_not_depend_on_the_path(self):
+        # Re-review MEDIUM: one history, two finalization paths to epoch 9.
+        # Chain a finalizes opening(9) under C_7; chain b first finalizes
+        # 9L - I (epoch 8). Every handoff steps through each epoch boundary,
+        # so both hold the same C_8 and C_9 (key 5, included only at 8L + 3,
+        # pruned at 8 on both).
+        ks = keys(6, "path")
+        k5 = ks[5].key_id
+        w = lambda e: {k.key_id: 100 for k in ks}  # noqa: E731
+        out = []
+        for path in ((9 * L, 9 * L + I), (9 * L - I, 9 * L, 9 * L + I)):
+            ch = chain(w)
+            for x in (5, 6, 7):
+                self.handoff(ch, ks[:5], x)
+            ch.include(8 * L + 3, [k5])
+            for n, h in enumerate(path):
+                t = ch.cp(h)
+                ch.votes(t, votes(ch, ks[:5], t), h + 1 + n)
+            self.assertEqual(ch.finalized[0], 9 * L)
+            self.assertEqual(ch.pruned[k5].start, 8)
+            out.append([(c.epoch, c.id) for c in ch.history])
+        self.assertEqual(out[0], out[1])
+        self.assertEqual([e for e, _ in out[0]], [4, 5, 6, 7, 8, 9])
+
+    def test_a_staggered_return_is_pruned_then_rejoins(self):
+        # Re-review LOW (section 4.1): keys 0..4 end a stall late in epoch 8;
+        # key 5 returns in epoch 9 and votes in the link that finalizes
+        # opening(9). Those votes are above opening(9) and keys 0..4 hold a
+        # present quorum: key 5 is pruned at 9, never banned, and its rejoin
+        # (published in epoch 9) brings it back in C_10.
+        ks = keys(6, "stag")
+        k5 = ks[5].key_id
+        ch = chain(lambda e: {k.key_id: 100 for k in ks})
+        for h in (9 * L - 2 * I, 9 * L - I):
+            t = ch.cp(h)
+            ch.votes(t, votes(ch, ks[:5], t))
+        self.assertEqual((ch.config.epoch, ch.pruned), (8, {}), "the stall prunes nobody")
+        for h in (9 * L, 9 * L + I):
+            t = ch.cp(h)
+            self.assertEqual(ch.votes(t, votes(ch, ks, t))["weight"], 600)
+        self.assertEqual(ch.config.epoch, 9)
+        self.assertEqual(ch.pruned[k5].start, 9)
+        self.assertEqual(ch.bans, {}, "pruning is not a ban")
+        self.assertEqual(ch.rejoin(9 * L + I + 2, 9, r.sign_rejoin(r.CHAIN_OBB_MAINNET, ks[5], 9)), "ok")
+        self.handoff(ch, ks[:5], 10)
+        self.assertEqual(ch.config.weight(k5), 100)
+        self.assertEqual((ch.pruned, ch.bans), ({}, {}))
 
     def test_pruned_then_rejoin_under_the_growth_cap(self):
         ks = keys(6, "gcap")

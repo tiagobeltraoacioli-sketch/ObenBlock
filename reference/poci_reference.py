@@ -81,15 +81,19 @@ t > J justifies t; if t.height == J.height + checkpoint_interval it also
 finalizes J.
 
 Handoff (section 4): when a checkpoint F is finalized under C_e and
-x = epoch(F) > e, C_x enters into force; epochs e+1 .. x-1 are skipped.
-Otherwise C_e stays. C_x is a function of C_e's history and of the history
-up to ledger height opening(x) only (the bans, rejoins and absence of
-section 4.1 are cut there, and the provider reads share work of epochs
-< x - 1): every chain that finalizes any checkpoint of epoch x first, and
-shares C_e and the history up to opening(x), gets the same C_x. If C_x would
-be empty, it carries C_e's entries forward unchanged (and the prunings this
-handoff started are void): a handoff never leaves a configuration that can
-reach no quorum.
+x = epoch(F) > e, the chain steps through every epoch boundary in order:
+C_{e+1}, C_{e+2}, ..., C_x enter into force one after the other, each
+computed strictly from the configuration before it and the history up to
+ledger height opening(y) of its own epoch y (the bans, rejoins and absence
+of section 4.1 are cut there, the presence window and the quorum gate are
+those of y, and the provider reads share work of epochs < y - 1); bans and
+rejoins that start in an intermediate epoch take effect there. Otherwise
+C_e stays. C_x is then a function of the history only, whatever
+checkpoints were finalized on the way: two chains with the same history up
+to opening(x) hold the same C_x. If a step would be empty, it carries the
+entries of the configuration before it forward unchanged (and the prunings
+that step started are void): a handoff never leaves a configuration that
+can reach no quorum.
 
 Proof of Corruption (section 5): two distinct v3 attestations, same KES key,
 same config_id, a known configuration that has the key as an entry, both
@@ -97,18 +101,18 @@ signatures valid, and a double vote (same target height, different targets)
 or a strict surround (s1 < s2 and t2 < t1, either way round). A block at
 height h may carry it unless the key already has a ban pending or not yet
 over, or was already banned for that config_id. ban_start = the epoch of the
-first configuration entering into force at or after the finalization of the
-block holding the evidence whose epoch x has the evidence at or below
-opening(x) (included_at <= opening(x); the handoff triggered by that same
-finalization counts when it does). The key is not an entry of C_x for ban_start <= x < ban_start +
+first configuration entering into force (a handoff step) at or after the
+finalization of the block holding the evidence whose epoch x has the
+evidence at or below opening(x) (included_at <= opening(x); the steps of the
+handoff triggered by that same finalization count when they do). The key is not an entry of C_x for ban_start <= x < ban_start +
 ban_epochs (100). Configurations already in force or past never change.
 
 Absence pruning by the old committee (section 4.1, PRUNE_AFTER = 4 epochs).
 A vote is "included at" ledger height h (the node passes block height + 1,
 the convention of the evidence height above: h <= F.height means the block is
-in the history finalized by F). At the handoff to C_x triggered by F, with
-cut = opening(x) <= F.height, after the ban starts (evidence included at
-h <= cut):
+in the history finalized by F). At each handoff step C_e -> C_x (x = e + 1,
+section 4) of a finalization of F, with cut = opening(x) <= F.height, after
+the ban starts (evidence included at h <= cut):
 
   1. rejoins: every pending rejoin included at h <= cut ends its key's
      pruning; the key is no longer excluded from x on.
@@ -778,24 +782,36 @@ class PociChain:
         return False
 
     def _finalize(self, f: tuple) -> bool:
+        """Finalizing `f` under C_e hands off iff x = epoch(f) > e, one epoch
+        boundary at a time (section 4): C_{e+1}, C_{e+2}, ..., C_x, each from
+        the configuration before it and the history up to the opening of its
+        own epoch only, so C_x is a function of the history whatever
+        checkpoints were finalized on the way."""
         self.finalized = f
-        e = epoch_of(self.params, f[0])
-        if e <= self.config.epoch:
+        x = epoch_of(self.params, f[0])
+        if x <= self.config.epoch:
             return False
-        cut = checkpoint_opening(self.params, e)       # C_e is a function of history up to opening(e)
+        for y in range(self.config.epoch + 1, x + 1):
+            self._step(y)
+        return True
+
+    def _step(self, y: int) -> None:
+        """One handoff step C_{y-1} -> C_y (section 4.1, "Order at the
+        handoff"), from the history up to cut = opening(y)."""
+        assert y == self.config.epoch + 1
+        cut = checkpoint_opening(self.params, y)
         for bans in self.bans.values():
             for b in bans:
                 if b.start is None and b.height <= cut:
-                    b.start = e
+                    b.start = y
         for k in [k for k, h in self.rejoins.items() if h <= cut]:
             del self.rejoins[k]
-            self.pruned[k].until = e
-        if quorum(self.present_weight(e), self.config.total):
+            self.pruned[k].until = y
+        if quorum(self.present_weight(y), self.config.total):
             for k, _ in self.config.entries:
-                if k not in self.pruned and self.prune_eligible(k, e) and not self.present(k, e):
-                    self.pruned[k] = Prune(e)
-        self._enter(e)
-        return True
+                if k not in self.pruned and self.prune_eligible(k, y) and not self.present(k, y):
+                    self.pruned[k] = Prune(y)
+        self._enter(y)
 
     def evidence(self, height: int, a: Vote, b: Vote) -> str:
         """A block at `height` (above the finalized checkpoint) carries the
@@ -1337,12 +1353,13 @@ def gen_sequences() -> list:
     steps += handoff(15, core)                     # key 6 (entry since 11) still silent: pruned again
     run("absence_pruning_and_rejoin", fading, steps)
 
-    # 9. A jump from epoch 4 to 9 with a committee that kept voting: votes
-    #    included in the blocks of epochs 5..8 count (keys 0..3 and 5: 500 of
-    #    600, a strict quorum present, so the absent are pruned), the votes of
-    #    the finalizing links (above opening(9)) do not, nor key 4's vote
-    #    included at exactly opening(5). Key 5 is also banned (pending
-    #    evidence): both apply at 9.
+    # 9. A jump from epoch 4 to 9 with a committee that kept voting, stepped
+    #    C_5 .. C_9 (section 4). Key 5's evidence is included below opening(5):
+    #    banned from 5. Votes included in the blocks of epochs 5..8 count
+    #    (keys 0..3: 400 of C_8's 500, a strict quorum present, so the absent
+    #    are pruned), the votes of the finalizing links (above opening(9)) do
+    #    not: key 4, included only at exactly opening(5), is present at 8 and
+    #    pruned at 9.
     steps = [
         {"op": "evidence", "height": b4 + 10, "key": 5, "links": [[b4, b4 + I], [b4, b4 + I, 1]]},
         {"op": "votes", "target": b4 + I, "voters": [0, 1, 2]},
@@ -1413,6 +1430,43 @@ def gen_sequences() -> list:
     steps += [{"op": "rejoin", "height": 9 * L + 1, "block_epoch": 9, "key": 5, "epoch": 9}]
     steps += handoff(9, core) + handoff(10, core) + handoff(11, core)
     run("growth_cap_pruned_then_rejoin", GrowthCapProvider(hist, gc.PARAMS["obenblock"]), steps)
+
+    # 15. Path independence (DESIGN §4, re-review MEDIUM): one history, two
+    #     finalization paths. Key 5's vote is included at 8L + 3, above
+    #     opening(8). Chain a finalizes opening(9) under C_7 and steps through
+    #     C_8 (key 5 absent from (opening(4), opening(8)]: pruned at 8) to
+    #     C_9; chain b finalizes 9L - I, a checkpoint of epoch 8, then 9L.
+    #     Both hold the same C_8 and C_9.
+    def path_prefix():
+        st = [{"op": "votes", "target": 5 * L, "voters": core},
+              {"op": "votes", "target": 5 * L + I, "voters": core}]
+        for x in (6, 7):
+            st += handoff(x, core)
+        return st + [{"op": "include", "height": 8 * L + 3, "voters": [5]}]
+    run("handoff_path_independent_a", flat, path_prefix() + [
+        {"op": "votes", "target": 9 * L, "voters": core, "included_at": 9 * L + 1},
+        {"op": "votes", "target": 9 * L + I, "voters": core, "included_at": 9 * L + I + 1},
+    ])
+    run("handoff_path_independent_b", flat, path_prefix() + [
+        {"op": "votes", "target": 9 * L - I, "voters": core, "included_at": 9 * L + 2},
+        {"op": "votes", "target": 9 * L, "voters": core, "included_at": 9 * L + 3},
+        {"op": "votes", "target": 9 * L + I, "voters": core, "included_at": 9 * L + I + 1},
+    ])
+
+    # 16. Staggered return after a stall (DESIGN §4.1, re-review LOW): nobody
+    #     votes in epochs 4..8 until keys 0..4 return late in epoch 8 and
+    #     finalize 9L - 2I (steps 5..8, no quorum present: nobody pruned).
+    #     Key 5 returns at the first block of epoch 9 and votes in the link
+    #     that finalizes opening(9); its votes are above opening(9) and keys
+    #     0..4 hold a present quorum, so it is pruned at 9 (never banned). Its
+    #     node publishes a rejoin in epoch 9: back in C_10.
+    run("staggered_return_rejoins", flat, [
+        {"op": "votes", "target": 9 * L - 2 * I, "voters": core},
+        {"op": "votes", "target": 9 * L - I, "voters": core},
+        {"op": "votes", "target": 9 * L, "voters": core + [5]},
+        {"op": "votes", "target": 9 * L + I, "voters": core + [5]},
+        {"op": "rejoin", "height": 9 * L + I + 2, "block_epoch": 9, "key": 5, "epoch": 9},
+    ] + handoff(10, core, core + [5]))
     return seqs
 
 

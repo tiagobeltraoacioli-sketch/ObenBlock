@@ -93,7 +93,7 @@ fn absence_pruning_ledger_round_trips_through_the_store() {
     assert_eq!(a.config().weight(&[1; 20]), Some(100), "back after the rejoin is final");
 }
 
-/// Two branches reach the same configuration through different handoffs:
+/// Two branches reach the same configuration after different histories:
 /// each block reads back its own chain's history, whatever was stored first
 /// (evidence naming a past configuration is valid only where it was in
 /// force). Found by both B2 and B4.
@@ -103,15 +103,18 @@ fn branches_with_the_same_configuration_keep_their_own_history() {
     let store = Storage::open(&dir.path().join("db")).unwrap();
     let pp = OBB_REGTEST_POCI;
     let launch = PociState::launch(&pp, &weights(4, 100)).unwrap();
-    // Branch A hands off 4 -> 5 -> 6; branch B skips: 4 -> 6. Both compute the
-    // same C_6 (same weights), after different configurations.
+    // Branch A hands off 4 -> 5 -> 6; branch B, with other share work in
+    // epoch 5's window, finalizes a checkpoint of 6 at once and steps
+    // through its own C_5 (§4: one step per epoch boundary). Both compute
+    // the same C_6 (same weights), after different configurations.
     let mut a = launch.clone();
     assert!(a.finalized(&pp, &cp(pp.opening(5)), |_, _| weights(4, 50)).unwrap());
     assert!(a.finalized(&pp, &cp(pp.opening(6)), |_, _| weights(4, 60)).unwrap());
     let mut b = launch;
-    assert!(b.finalized(&pp, &cp(pp.opening(6) + 5), |_, _| weights(4, 60)).unwrap());
+    assert!(b.finalized(&pp, &cp(pp.opening(6) + 5), |_, x| weights(4, if x == 5 { 55 } else { 60 })).unwrap());
     assert_eq!(a.config().id(), b.config().id());
-    assert_ne!(a.history().count(), b.history().count());
+    let (c5a, c5b) = (a.history().nth(1).unwrap().id(), b.history().nth(1).unwrap().id());
+    assert_ne!(c5a, c5b);
     let mut st = PowitState::genesis(0, [0; 32]);
     st.poci = Some(a.clone());
     gnb::powit::save_state(&store, &[0xA; 32], &st).unwrap();
@@ -122,9 +125,9 @@ fn branches_with_the_same_configuration_keep_their_own_history() {
     assert_eq!(la, a);
     assert_eq!(lb, b);
     assert_eq!(la.history().map(|c| c.epoch()).collect::<Vec<_>>(), vec![6, 5, 4]);
-    assert_eq!(lb.history().map(|c| c.epoch()).collect::<Vec<_>>(), vec![6, 4]);
-    let c5 = a.history().nth(1).unwrap().id();
-    assert!(la.find_config(&c5).is_some() && lb.find_config(&c5).is_none());
+    assert_eq!(lb.history().map(|c| c.epoch()).collect::<Vec<_>>(), vec![6, 5, 4]);
+    assert!(la.find_config(&c5a).is_some() && lb.find_config(&c5a).is_none());
+    assert!(lb.find_config(&c5b).is_some() && la.find_config(&c5b).is_none());
 }
 
 /// Review finding (LOW): the acceptance pipeline stored a full copy of the

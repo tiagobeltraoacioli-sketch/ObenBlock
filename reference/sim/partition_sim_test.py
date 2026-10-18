@@ -157,15 +157,19 @@ class StallExitBanExpiry(unittest.TestCase):
         self.assertGreater(self.sim.registry[self.b.config_by_epoch[10]].weight("k00"), 0)
 
     def test_ban_start_and_end_are_exact(self):
-        self.assertEqual(self.b.bans, {"k01": (15, 115)})
+        # The handoff 2 -> 15 steps through every epoch boundary (§4): the
+        # evidence (included in epoch 5) is below opening(6), so the ban
+        # starts at the step to 6, inside the stall.
+        self.assertEqual(self.b.bans, {"k01": (6, 106)})
         by_epoch = {c.epoch: c for c in self.sim.registry.values()}
-        for e in range(15, 116):
+        self.assertGreater(by_epoch[5].weight("k01"), 0)
+        for e in range(6, 107):
             self.assertEqual(by_epoch[e].weight("k01"), 0, e)
-        # Eligible again at 115; its work during the ban is dropped (conservative
-        # reading), so it holds weight from C_116 (one epoch of new work).
-        self.assertFalse(self.sim.banned_at(self.b, "k01", 115))
-        self.assertTrue(self.sim.banned_at(self.b, "k01", 114))
-        self.assertEqual(by_epoch[116].weight("k01"), 10)
+        # Eligible again at 106; its work during the ban is dropped (conservative
+        # reading), so it holds weight from C_107 (one epoch of new work).
+        self.assertFalse(self.sim.banned_at(self.b, "k01", 106))
+        self.assertTrue(self.sim.banned_at(self.b, "k01", 105))
+        self.assertEqual(by_epoch[107].weight("k01"), 10)
 
     def test_no_ban_for_absence(self):
         self.assertEqual(sorted(self.b.bans), ["k01"])

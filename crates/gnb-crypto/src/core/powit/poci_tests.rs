@@ -603,6 +603,89 @@ fn compatible_chains_finalizing_different_checkpoints_of_an_epoch_hold_the_same_
     assert_eq!(b.st.poci.as_ref().unwrap().pruned, c.st.poci.as_ref().unwrap().pruned);
 }
 
+/// Re-review MEDIUM (§4, one step per epoch boundary): one history up to
+/// block 180, two finalization paths to epoch 9. Key 4's only vote is
+/// included in block 166, above opening(8). Chain a finalizes opening(9)
+/// (slot 180) under C_7 and steps through C_8 to C_9; chain b first
+/// finalizes slot 175 (epoch 8, votes included above opening(9)), then 180.
+/// Both prune key 4 at 8 (absent from (opening(4), opening(8)], a quorum
+/// present) and hold the same C_8 and C_9.
+#[test]
+fn the_configuration_does_not_depend_on_the_finalization_path() {
+    let keys: Vec<Key> = (111..=115).map(Key::new).collect();
+    let k: Vec<&Key> = keys.iter().collect();
+    let (core, late) = (&k[..4], k[4]);
+    let mut a = Harness::new(&k);
+    a.launch();
+    for x in 5..=7 {
+        a.handoff_to(core, x);
+    }
+    assert_eq!(a.st.justified, cp(145));
+    a.slot(&k, 165);
+    assert_eq!(a.st.justified, cp(165));
+    a.to(180);
+    let mut b = Harness { st: a.st.clone(), h: a.h, shares: a.shares.clone(), extra: a.extra.clone() };
+    // b: block 181 carries the votes for 175 (epoch 8, signed first).
+    let v = b.votes(core, 175);
+    b.block(&v, &[]);
+    assert_eq!(b.st.justified, cp(175));
+    // a: block 181 carries the votes for 180.
+    let v = a.votes(core, 180);
+    a.block(&v, &[]);
+    assert_eq!((a.st.justified, a.config().epoch()), (cp(180), 7));
+    // b: 175 -> 180 finalizes 175, a checkpoint of epoch 8 above opening(8).
+    let v = b.votes(core, 180);
+    b.block(&v, &[]);
+    assert_eq!((b.st.finalized, b.config().epoch()), (cp(175), 8));
+    for c in [&mut a, &mut b] {
+        c.to(185);
+        let v = c.votes(core, 185);
+        c.block(&v, &[]);
+        assert_eq!((c.st.finalized, c.config().epoch()), (cp(180), 9));
+    }
+    let (pa, pb) = (a.st.poci.as_ref().unwrap(), b.st.poci.as_ref().unwrap());
+    let ids = |p: &PociState| p.history().map(|c| (c.epoch(), c.id())).collect::<Vec<_>>();
+    assert_eq!(ids(pa), ids(pb), "the same C_4 ..= C_9 on both paths");
+    assert_eq!(ids(pa).iter().map(|(e, _)| *e).collect::<Vec<_>>(), vec![9, 8, 7, 6, 5, 4]);
+    assert_eq!(pa.pruned.get(&late.id()).map(|p| p.start), Some(8));
+    assert_eq!(pa.pruned, pb.pruned);
+    assert_eq!(a.st.cap.as_ref().unwrap().ledger.weights(), b.st.cap.as_ref().unwrap().ledger.weights());
+}
+
+/// Re-review LOW (§4.1, staggered return): nobody votes in epochs 4..8 until
+/// keys 0..3 return late in epoch 8 and finalize slot 170 (steps 5..8, no
+/// quorum present in any window: nobody pruned). Key 4 returns at the first
+/// block of epoch 9 and votes in the link that finalizes opening(9); its
+/// votes are above opening(9) and keys 0..3 hold a present quorum, so it is
+/// pruned at 9. It is never banned, and its rejoin (epoch 9) brings it back
+/// in C_10.
+#[test]
+fn a_staggered_return_is_pruned_never_banned_and_rejoins() {
+    let keys: Vec<Key> = (121..=125).map(Key::new).collect();
+    let k: Vec<&Key> = keys.iter().collect();
+    let (core, late) = (&k[..4], k[4]);
+    let mut c = Harness::new(&k);
+    c.launch();
+    c.slot(core, 170);
+    c.slot(core, 175);
+    assert_eq!((c.st.finalized, c.config().epoch()), (cp(170), 8));
+    assert!(c.st.poci.as_ref().unwrap().pruned.is_empty(), "the stall prunes nobody");
+    assert_eq!(c.st.poci.as_ref().unwrap().history().count(), 5, "C_4 ..= C_8, one per epoch");
+    c.slot(&k, 180);
+    c.slot(&k, 185);
+    assert_eq!((c.st.finalized, c.config().epoch()), (cp(180), 9));
+    let st = c.st.poci.as_ref().unwrap();
+    assert_eq!(st.pruned.get(&late.id()).map(|p| p.start), Some(9));
+    assert!(st.bans.is_empty(), "pruning is not a ban");
+    assert!(c.config().weight(&late.id()).is_none());
+    let rj = late.rejoin(9);
+    c.block_with(&[], &[rj]);
+    c.handoff_to(core, 10);
+    let st = c.st.poci.as_ref().unwrap();
+    assert!(c.config().weight(&late.id()).is_some(), "back in C_10");
+    assert!(st.pruned.is_empty() && st.bans.is_empty());
+}
+
 /// §4.1 (review HIGH, the worst case): a handoff never leaves an empty
 /// configuration. Every key of C_5 equivocates; the handoff to 6 bans them
 /// all, so the candidates leave nothing: C_6 carries C_5's entries forward
