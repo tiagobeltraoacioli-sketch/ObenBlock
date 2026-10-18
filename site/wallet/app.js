@@ -23,7 +23,7 @@ import { html, raw, isAddress, watchAddress, isHex64, num, sats } from "/assets/
 
 // SHA-256 of /wallet/gnb_wallet.wasm. Written by scripts/build-wallet-wasm.sh
 // and checked by `node --test site/tests/`; loadCore refuses any other binary.
-const WASM_SHA256 = "1c6eef6e2fa5bc2ba470132d868bfa3a3289e91cdce635c79f4ecda0d11e59ea";
+const WASM_SHA256 = "d7fdb66f9912b0bc202ac55d9b33626c6c9163a513b63da01485a5c5e847c83c";
 
 const SAT = 100000000n;
 // UTXO_WINDOW / UTXO_WIDE_WINDOW (core.js): rows asked of getutxos, the same
