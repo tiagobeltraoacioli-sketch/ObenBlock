@@ -1312,7 +1312,7 @@ impl Block {
     /// `powit_height()` the body root is v2 (transparent, shielded and PoWit
     /// sections, always); below it, with no shielded txs the commitment is
     /// the transaction root itself.
-    pub fn body_merkle_root_at(&self, activation_height: u64) -> MerkleRoot {
+    pub fn body_merkle_root_at(&self, activation_height: u64) -> MerkleRoot { if pow_scheme::node_sha256d_params().is_some() { return pow_scheme::obb_tx_merkle_root(&self.transactions).0; } // ObenBlock: Bitcoin's tree
         let hardened = block_rules::rules_active_at(self.height, activation_height);
         let tx_root = block_rules::tx_merkle_root(&self.transactions, hardened);
         if powit_active(self.height) {
@@ -1356,12 +1356,12 @@ impl Block {
         sh.finalize().into()
     }
 
-    pub fn validate_merkle(&self) -> bool {
+    pub fn validate_merkle(&self) -> bool { if pow_scheme::node_sha256d_params().is_some() { return pow_scheme::obb_validate_merkle(self); } // ObenBlock: Bitcoin's tree, not mutated
         self.body_merkle_root() == self.header.merkle_root
     }
 
     /// [`Block::validate_merkle`] for an explicit activation height.
-    pub fn validate_merkle_at(&self, activation_height: u64) -> bool {
+    pub fn validate_merkle_at(&self, activation_height: u64) -> bool { if pow_scheme::node_sha256d_params().is_some() { return pow_scheme::obb_validate_merkle(self); } // ObenBlock: every height
         self.body_merkle_root_at(activation_height) == self.header.merkle_root
     }
 
@@ -1635,7 +1635,7 @@ impl Block {
     /// height. Below the activation: the wire size (`legacy_block_size`, never
     /// dependent on the uncommitted blue_score, B1-T0), legacy Merkle root.
     pub fn validate_structure_without_pow_at(&self, activation_height: u64) -> Result<(), &'static str> {
-        let hardened = block_rules::rules_active_at(self.height, activation_height);
+        let hardened = block_rules::rules_apply(self.height, activation_height);
         if self.header.parents.len() > MAX_PARENTS   { return Err("too many parents"); }
         block_rules::check_block_size_at(self, activation_height)?; // VAL-12; B1-T0: blue_score-independent
         if !self.validate_merkle_at(activation_height) { return Err("invalid merkle root"); }

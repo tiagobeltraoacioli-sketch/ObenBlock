@@ -1,9 +1,12 @@
 //! ObenBlock SHA-256d mining (docs/DESIGN-obenblock.md §4, package O3b):
 //! the built-in miner, `getblocktemplate`'s `sha256d` object and header
-//! jobs, and the `submitblock` share solution, driven through the real
+//! jobs, a simulated stock Stratum V1 miner (Bitcoin's merkle root from
+//! `mining.notify` alone), the ntime window under stall relief, and the
+//! `submitblock` share solution, driven through the real
 //! template builder and `accept::accept_block` under a process-wide SHA-256d
 //! scheme (regtest pow limit; `test-pow-limit` pins the expected bits to it)
-//! with the hardening rules from genesis and PoWit from height 1 (every
+//! with the hardening and liveness rules from genesis (thread overrides,
+//! as ObenBlock has them) and PoWit from height 1 (every
 //! block after genesis, as on ObenBlock; a genesis at the PoWit height needs
 //! its own stored PoWit state, which belongs to the genesis package).
 //!
@@ -68,6 +71,7 @@ fn submit(n: &Node, job: &HeaderJob, solution: Value) -> Result<[u8; 32], String
 fn built_in_miner_and_header_jobs_produce_accepted_blocks() {
     let params = obb();
     let _act = core::activation::scoped_override(0);
+    let _live = core::liveness::scoped_override(0);
     let genesis = mk_genesis(unix_now() - 10_000);
     let k = key();
     let fund = ([0x9Eu8; 32], 0u32, out(1_000_000_000, &k.spk));
@@ -114,7 +118,8 @@ fn built_in_miner_and_header_jobs_produce_accepted_blocks() {
     assert_eq!(fields["version_rolling_mask"], json!("1fffe000"));
     assert_eq!(fields["bits"], json!(format!("{:08x}", OBB_REGTEST_POW_LIMIT_BITS)));
     assert_eq!(fields["mintime"], json!(tmpl2.parent_timestamp));
-    assert_eq!(fields["merkle_root_rule"], json!("gnb-body-v2"));
+    assert_eq!(fields["merkle_root_rule"], json!("bitcoin-sha256d"));
+    assert_eq!(fields["asert_bits"], fields["bits"], "no stall relief at curtime: the job is not late");
     let commitment = gnb_smh::sha256d::parents_commitment(&tmpl2.parents);
     assert_eq!(fields["parents_commitment"], json!(hex::encode(commitment)));
     let mut display = commitment;
@@ -132,7 +137,11 @@ fn built_in_miner_and_header_jobs_produce_accepted_blocks() {
     cb.extend_from_slice(&other);
     cb.extend_from_slice(&job.coinb2);
     let root = job::header_merkle_root(&tmpl2, &gnb_smh::sha256d::sha256d(&cb)).unwrap();
-    assert_eq!(root, job::header_job(&tmpl2, &params, &spk, other, now).unwrap().block.header.merkle_root);
+    let other_job = job::header_job(&tmpl2, &params, &spk, other, now).unwrap();
+    assert_eq!(root, other_job.block.header.merkle_root);
+    // That root is Bitcoin's root of the block's txids (the consensus rule).
+    let txids: Vec<[u8; 32]> = other_job.block.transactions.iter().map(Transaction::txid).collect();
+    assert_eq!(pow_scheme::bitcoin_merkle_root(&txids), (root, false));
 
     // Shares: version rolled inside the BIP 320 mask and time rolled ahead.
     let (version, time) = (OBB_BLOCK_VERSION | 0x0000_6000, job.block.header.timestamp as u32 + 1);
@@ -140,6 +149,14 @@ fn built_in_miner_and_header_jobs_produce_accepted_blocks() {
     let losing = (0u32..).find(|&x| !gnb_smh::sha256d::meets_target(&gnb_smh::sha256d::block_id(&rolled(&job.header, version, time, x)), &target)).unwrap();
     let err = submit(&n, &job, json!({"version": version, "time": time, "nonce": losing})).unwrap_err();
     assert!(err.contains("proof") || err.contains("pow") || err.contains("PoW"), "{err}");
+    // `accept_block` itself names the scheme the proof was judged under.
+    let mut lb = Block::from_wire_bytes(&hex::decode(job.to_json()["block"].as_str().unwrap()).unwrap()).unwrap();
+    job::apply_submit_solution(&mut lb, Some(&json!({"version": version, "time": time, "nonce": losing}))).unwrap();
+    let err = gnb::accept::accept_block(&lb, lb.block_hash(), lb.height, &n.dag, &n.store, &n.mempool, &n.node_state,
+                                        Some(&n.tip_tx), &n.shielded).unwrap_err();
+    assert_eq!(err, "consensus rejection: invalid SHA-256d proof of work");
+    assert_eq!(gnb::ingress::verdict_for_accept_error(&err), gnb::network::GossipVerdict::Reject);
+    assert_eq!(gnb::ingress::accept_error_fault(&err), gnb::ingress::BlockFault::ContextFree);
     let bad_version = OBB_BLOCK_VERSION | 0x0000_1000;
     let nonce = solve(&job.header, bad_version, time, OBB_REGTEST_POW_LIMIT_BITS);
     assert!(submit(&n, &job, json!({"version": bad_version, "time": time, "nonce": nonce})).is_err(),
@@ -206,6 +223,7 @@ fn synthetic_template(height: u64, parents: Vec<[u8; 32]>, n_tx: u8, parent_time
 }
 
 fn vector_cases(params: &Sha256dParams) -> Value {
+    let _live = core::liveness::scoped_override(0);
     let cases = [
         ("one parent, coinbase only", 1u64, vec![[0x11u8; 32]], 0u8, [0u8; 8], vec![0x76; 20]),
         ("two parents, three transactions", 7, vec![[0x11; 32], [0x22; 32]], 3, [1, 2, 3, 4, 5, 6, 7, 8], vec![0xA9; 20]),
@@ -246,10 +264,8 @@ fn vector_cases(params: &Sha256dParams) -> Value {
                 "coinb1": hex::encode(&j.coinb1),
                 "coinb2": hex::encode(&j.coinb2),
                 "extranonce": hex::encode(j.extranonce),
-                "coinbase_merkle_branch": tmpl.coinbase_merkle_branch().iter().map(hex::encode).collect::<Vec<_>>(),
-                "merkle_root_rule": "gnb-body-v2",
-                "shielded_root": hex::encode(job::empty_shielded_root()),
-                "powit_root": hex::encode(tmpl.powit.root()),
+                "merkle_branch": j.merkle_branch.iter().map(hex::encode).collect::<Vec<_>>(),
+                "merkle_root_rule": job::MERKLE_RULE,
                 "version": block_version,
                 "bits": OBB_REGTEST_POW_LIMIT_BITS,
                 "time": time,
@@ -260,6 +276,7 @@ fn vector_cases(params: &Sha256dParams) -> Value {
                 "header": hex::encode(j.header),
                 "block_id": hex::encode(gnb_smh::sha256d::block_id(&j.header)),
             },
+            "stratum": j.stratum_json(),
             "shares": shares,
         }));
     }
@@ -267,6 +284,7 @@ fn vector_cases(params: &Sha256dParams) -> Value {
         "description": "ObenBlock SHA-256d header jobs (docs/OBENBLOCK-MINING.md). Produced by \
             node/tests/obb_sha256d_mining.rs, recomputed from the job fields by reference/obb_job_test.py.",
         "extranonce_bytes": job::EXTRANONCE_LEN,
+        "merkle_root_rule": job::MERKLE_RULE,
         "coinbase_tag": hex::encode(job::COINBASE_TAG),
         "bip320_mask": gnb_smh::sha256d::BIP320_VERSION_MASK,
         "cases": out,
@@ -289,4 +307,190 @@ fn header_job_vectors_match_the_reference_file() {
     for c in got["cases"].as_array().unwrap() {
         assert!(c["shares"].as_array().unwrap().iter().any(|s| s["meets_target"] == json!(true)), "{}", c["name"]);
     }
+}
+
+// ── A stock Stratum V1 miner ────────────────────────────────────────────────
+
+/// What unmodified Stratum V1 firmware does with `mining.notify` (the job's
+/// `stratum` object), its `extranonce1` from `mining.subscribe` and its own
+/// `extranonce2`: no knowledge of ObenBlock at all.
+fn stock_firmware_header(notify: &Value, en1: &[u8], en2: &[u8], ntime: u32, nonce: u32, version_bits: u32) -> [u8; 80] {
+    let hexs = |k: &str| hex::decode(notify[k].as_str().unwrap()).unwrap();
+    let be_u32 = |k: &str| u32::from_str_radix(notify[k].as_str().unwrap(), 16).unwrap();
+    let words = hexs("prevhash");
+    let mut prev = [0u8; 32];
+    for i in 0..8 {
+        for k in 0..4 {
+            prev[4 * i + k] = words[4 * i + 3 - k];
+        }
+    }
+    let mut cb = hexs("coinb1");
+    cb.extend_from_slice(en1);
+    cb.extend_from_slice(en2);
+    cb.extend_from_slice(&hexs("coinb2"));
+    let mut root = gnb_smh::sha256d::sha256d(&cb);
+    for s in notify["merkle_branch"].as_array().unwrap() {
+        let mut buf = root.to_vec();
+        buf.extend_from_slice(&hex::decode(s.as_str().unwrap()).unwrap());
+        root = gnb_smh::sha256d::sha256d(&buf);
+    }
+    let mut h = [0u8; 80];
+    h[0..4].copy_from_slice(&(be_u32("version") | version_bits).to_le_bytes());
+    h[4..36].copy_from_slice(&prev);
+    h[36..68].copy_from_slice(&root);
+    h[68..72].copy_from_slice(&ntime.to_le_bytes());
+    h[72..76].copy_from_slice(&be_u32("nbits").to_le_bytes());
+    h[76..80].copy_from_slice(&nonce.to_le_bytes());
+    h
+}
+
+/// End to end on regtest: a node cuts a header job over a template with
+/// several transactions (a non-trivial merkle branch); a simulated stock
+/// miner rolls extranonce2, version bits, ntime and the nonce from the
+/// `mining.notify` fields alone; the pool hands the share back with
+/// `submitblock [block, {version, time, nonce, extranonce}]` and the node
+/// accepts exactly the block the miner hashed. GnB-style roots (the
+/// pre-change header root) are not what the miner computes.
+#[test]
+fn stock_stratum_v1_miner_finds_a_block_the_node_accepts() {
+    let params = obb();
+    let _act = core::activation::scoped_override(0);
+    let _live = core::liveness::scoped_override(0);
+    let genesis = mk_genesis(unix_now() - 20);
+    let k = key();
+    let funds: Vec<_> = (0..3u8).map(|i| ([0xA0 + i; 32], 0u32, out(1_000_000_000, &k.spk))).collect();
+    let n = node_with(&genesis, &funds);
+    for (i, f) in funds.iter().enumerate() {
+        let spend = signed_spend_at(&k, &[(f.0, 0)], std::slice::from_ref(&f.2),
+                                    vec![out(999_000_000 - i as u64, &[0x44 + i as u8; 20])], 1);
+        n.mempool.add(spend, 1_000_000).unwrap();
+    }
+    let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap();
+    assert_eq!(tmpl.transactions.len(), 3, "coinbase + 3: a two-level branch");
+    let now = unix_now();
+    let job = job::header_job(&tmpl, &params, &[0x5A; 20], [0; 8], now).unwrap();
+    let notify = job.stratum_json();
+    assert_eq!(notify["merkle_branch"].as_array().unwrap().len(), 2);
+    assert_eq!(notify["extranonce_size"], json!(8));
+    assert_eq!(notify["nbits"], json!(format!("{:08x}", job.block.header.bits)));
+
+    // Pool: extranonce1 per connection; the miner owns extranonce2.
+    let en1 = [0xE1, 0xE1, 0x00, 0x07];
+    let target = gnb_smh::difficulty::bits_to_target(job.block.header.bits);
+    let ntime = job.block.header.timestamp as u32 + 2;
+    assert!(u64::from(ntime) <= job.window.maxtime);
+    let version_bits = 0x0000_4000;
+    let (en2, nonce, header) = (0u32..).find_map(|e2| {
+        let en2 = e2.to_be_bytes();
+        (0u32..64).find_map(|nonce| {
+            let h = stock_firmware_header(&notify, &en1, &en2, ntime, nonce, version_bits);
+            gnb_smh::sha256d::meets_target(&gnb_smh::sha256d::block_id(&h), &target).then_some((en2, nonce, h))
+        })
+    }).unwrap();
+    let mut extranonce = en1.to_vec();
+    extranonce.extend_from_slice(&en2);
+
+    // The pool's view of the same share: the job fields and the rolled values.
+    let mut block = job.block.clone();
+    job::apply_submit_solution(&mut block, Some(&json!({
+        "version": OBB_BLOCK_VERSION | version_bits, "time": ntime, "nonce": nonce,
+        "extranonce": hex::encode(&extranonce),
+    }))).unwrap();
+    assert_eq!(block.header.sha256d_pow_bytes().unwrap(), header, "the node rebuilds the miner's header");
+    let id = accept(&n, &block).expect("the stock-firmware share is a valid ObenBlock block");
+    assert_eq!(id, gnb_smh::sha256d::block_id(&header));
+    assert_eq!(sel_tip(&n), Some(id));
+    assert_eq!(block_id_root(&n, &id), block.header.merkle_root);
+
+    // A share whose extranonce does not reach the node (pool forgot it) is
+    // the job's own coinbase: another root, not the miner's block.
+    let mut wrong = job.block.clone();
+    job::apply_submit_solution(&mut wrong, Some(&json!({
+        "version": OBB_BLOCK_VERSION | version_bits, "time": ntime, "nonce": nonce,
+    }))).unwrap();
+    assert_ne!(wrong.header.merkle_root, block.header.merkle_root);
+    // An extranonce on a block that is not a header job's is refused.
+    let mut foreign = genesis.clone();
+    assert!(job::apply_submit_solution(&mut foreign, Some(&json!({
+        "version": 1, "time": 1, "nonce": 1, "extranonce": "0000000000000000",
+    }))).is_err());
+}
+
+fn block_id_root(n: &Node, id: &[u8; 32]) -> core::MerkleRoot {
+    n.store.get_block(id).unwrap().unwrap().header.merkle_root
+}
+
+/// Stall relief (DESIGN-obenblock.md §5.1): `bits` depend on the block's own
+/// time in 60-second steps after a 180 s grace. Every job's `[mintime,
+/// maxtime]` stays inside one step, so any rolled `ntime` in it keeps the
+/// job's bits, and the next step starts at `next_bits_time`.
+#[test]
+fn ntime_window_never_crosses_a_relief_step() {
+    let params = obb();
+    let _act = core::activation::scoped_override(0);
+    let _live = core::liveness::scoped_override(0);
+    let parent = 1_800_000_000u64;
+    // A harder ASERT base than the pow limit, so relief steps change bits.
+    let mut tmpl = synthetic_template(5, vec![[0x11; 32]], 2, parent);
+    tmpl.bits = 0x1d00_ffff;
+    let relief = core::liveness::OBENBLOCK_STALL_RELIEF;
+    let bits_at = |t: u64| core::liveness::relieve_at(tmpl.bits, parent, tmpl.height, t, 0,
+                                                     core::liveness::liveness_activation_height());
+    for now in [parent - 5, parent, parent + 30, parent + 239, parent + 240, parent + 299, parent + 300,
+                parent + 1_000, parent + 1_799, parent + 36_000] {
+        let w = job::time_window(&tmpl, now);
+        assert!(w.mintime <= w.curtime && w.curtime <= w.maxtime, "now={now} {w:?}");
+        assert!(w.mintime >= parent && w.maxtime <= now.max(parent) + core::MAX_FUTURE_SECS);
+        for t in w.mintime..=w.maxtime {
+            assert_eq!(bits_at(t), w.bits, "now={now} t={t}");
+        }
+        let next = w.next_bits_time.unwrap();
+        assert_eq!((next - parent - relief.grace_secs as u64) % relief.step_secs as u64, 0);
+        assert!(w.maxtime < next);
+        // (Far behind, every step is clamped to the pow limit.)
+        if w.relief_step > 0 && now < parent + 3_000 {
+            assert_ne!(bits_at(w.mintime - 1), w.bits, "the window starts at its step");
+        }
+        let j = job::header_job(&tmpl, &params, &[0x76; 20], [3; 8], now).unwrap();
+        assert_eq!(j.block.header.bits, w.bits);
+        assert_eq!(j.block.header.timestamp, w.curtime);
+        let f = job::template_fields(&tmpl, None, now).unwrap();
+        assert_eq!(f["bits"], json!(format!("{:08x}", w.bits)), "sha256d.bits is the job time's");
+        assert_eq!(f["asert_bits"], json!("1d00ffff"));
+        assert_eq!((f["mintime"].as_u64(), f["maxtime"].as_u64()), (Some(w.mintime), Some(w.maxtime)));
+    }
+    // Late enough for relief: bits are easier than the ASERT base.
+    assert_ne!(job::time_window(&tmpl, parent + 1_000).bits, tmpl.bits);
+}
+
+/// The coordinator's finding on obenblock/integration: header jobs hashed
+/// the PoWit section without its exits list (`PowitBody::root`) while
+/// consensus commits `root_with(exits)` from the liveness activation, so
+/// every job failed its self-check. Now the section is committed through
+/// the coinbase commitment, from the same block the validator sees: a job
+/// over a template whose PoWit section carries an exit is consistent, and
+/// dropping the exit breaks the commitment.
+#[test]
+fn header_jobs_commit_the_powit_section_with_exits() {
+    let params = obb();
+    let _act = core::activation::scoped_override(0);
+    let _live = core::liveness::scoped_override(0);
+    let signer = core::kes::KesSigner::generate(4, [7; 32], |_| {}).unwrap();
+    let exit = core::powit::WitnessExit::sign(core::ChainId::ObenBlockRegtest.to_u32(), &signer).unwrap();
+    let mut tmpl = synthetic_template(3, vec![[0x22; 32]], 1, 1_800_000_000);
+    tmpl.powit.exits.push(exit);
+    let j = job::header_job(&tmpl, &params, &[0x76; 20], [9; 8], 1_800_000_030).expect("the job's self-check passes");
+    let b = &j.block;
+    assert_eq!(b.powit.exits.len(), 1);
+    assert!(b.validate_merkle());
+    assert_eq!(core::block_rules::check_block_hardened_at(b, 0), Ok(()));
+    assert_eq!(&b.transactions[0].inputs[0].script_sig[..80], &tmpl.coinbase_commitment().unwrap()[..]);
+    // The wire round trip keeps the exit and the verdict.
+    let back = Block::from_wire_bytes(&b.to_wire_bytes()).unwrap();
+    assert_eq!(back.block_hash(), b.block_hash());
+    assert_eq!(core::block_rules::check_block_hardened_at(&back, 0), Ok(()));
+    let mut stripped = b.clone();
+    stripped.powit.exits.clear();
+    assert_eq!(stripped.block_hash(), b.block_hash(), "the section is not in the header");
+    assert!(core::block_rules::check_block_hardened_at(&stripped, 0).unwrap_err().starts_with("bad witness commitment"));
 }
