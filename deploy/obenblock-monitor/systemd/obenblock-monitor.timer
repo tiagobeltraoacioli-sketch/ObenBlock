@@ -1,0 +1,11 @@
+# Runs obenblock-monitor.service every minute (not installed by any script).
+[Unit]
+Description=ObenBlock monitor snapshot every minute
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=60s
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

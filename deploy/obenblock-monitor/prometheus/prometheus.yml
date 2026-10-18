@@ -1,0 +1,42 @@
+# Optional Prometheus scrape config for the three ObenBlock mainnet hosts.
+#
+# The node's metrics (--metrics, 127.0.0.1:18310, gnb_* series) and the
+# stratum proxy's (OBB_STRATUM_METRICS=127.0.0.1:9333, obb_stratum_* series)
+# listen on loopback only, and should stay there. This file assumes a
+# Prometheus on the operator's Mac reaching them through SSH tunnels
+# (README.md, "Prometheus"):
+#
+#   host             node metrics   stratum metrics
+#   136.244.93.186   127.0.0.1:19310  127.0.0.1:19333
+#   209.250.236.240  127.0.0.1:29310  127.0.0.1:29333
+#   152.236.5.112    127.0.0.1:39310  127.0.0.1:39333
+#
+# The node exposes metrics only when started with --metrics: the launch
+# kit's obenblock-launch does not pass it yet (README.md, open issues).
+global:
+  scrape_interval: 30s
+  scrape_timeout: 10s
+
+rule_files:
+  - obenblock-alerts.yml
+
+scrape_configs:
+  - job_name: obenblock-node
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:19310"]
+        labels: {host: "136.244.93.186"}
+      - targets: ["127.0.0.1:29310"]
+        labels: {host: "209.250.236.240"}
+      - targets: ["127.0.0.1:39310"]
+        labels: {host: "152.236.5.112"}
+
+  - job_name: obenblock-stratum
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["127.0.0.1:19333"]
+        labels: {host: "136.244.93.186"}
+      - targets: ["127.0.0.1:29333"]
+        labels: {host: "209.250.236.240"}
+      - targets: ["127.0.0.1:39333"]
+        labels: {host: "152.236.5.112"}

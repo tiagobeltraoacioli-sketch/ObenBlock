@@ -1,0 +1,5 @@
+      1  9938211 115-00:36:51  0.0 13312 systemd         /sbin/init
+  41237    93784 1-02:03:04 187.5 1843200 obenblock      /opt/obenblock/current/obenblock --chain obenblock --data-dir /var/lib/obenblock --rpc-port 18210 --archive --mine --miner-address LAUNCH-PLACEHOLDER-obb1-address --mine-threads 27
+  41300    93700 1-02:01:40  3.1 40960 obenblock-strat /opt/obenblock/current/obenblock-stratum
+  52001      120    02:00  0.0  9000 obenblock-ancho /opt/obenblock/current/obenblock-anchor --once
+  52002       15    00:15  0.0  4000 bash            bash -c ps -eo pid=,etimes=,etime=,pcpu=,rss=,comm=,args= | grep obenblock

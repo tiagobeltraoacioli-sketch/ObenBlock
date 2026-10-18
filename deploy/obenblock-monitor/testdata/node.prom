@@ -1,0 +1,31 @@
+# HELP gnb_info Node metadata; value always 1
+# TYPE gnb_info gauge
+gnb_info{network="mainnet",version="0.2.0"} 1
+# HELP gnb_block_count Current selected-chain block count (1-based, includes genesis; equals tip_height + 1)
+# TYPE gnb_block_count gauge
+gnb_block_count 1001
+# HELP gnb_finality_conflicts Finalized PoWit checkpoints that conflict with this node's finality pin
+# TYPE gnb_finality_conflicts gauge
+gnb_finality_conflicts 0
+# HELP gnb_bloch_anchor_conflict 1 while the newest Bloch anchor contradicts this node's chain
+# TYPE gnb_bloch_anchor_conflict gauge
+gnb_bloch_anchor_conflict 0
+# HELP gnb_powit_signer_halted PoWit witness signers of this node halted by signer protection
+# TYPE gnb_powit_signer_halted gauge
+gnb_powit_signer_halted 0
+# HELP gnb_rpc_requests_total RPC requests
+# TYPE gnb_rpc_requests_total counter
+gnb_rpc_requests_total{method="getdaginfo",status="ok"} 120
+gnb_rpc_requests_total{method="getpowitinfo",status="ok"} 30
+# HELP gnb_block_validation_seconds Block validation time
+# TYPE gnb_block_validation_seconds histogram
+gnb_block_validation_seconds_bucket{le="0.1"} 900
+gnb_block_validation_seconds_bucket{le="+Inf"} 1001
+gnb_block_validation_seconds_sum 41.5
+gnb_block_validation_seconds_count 1001
+# HELP gnb_stratum_sessions_active Built-in stratum sessions open
+# TYPE gnb_stratum_sessions_active gauge
+gnb_stratum_sessions_active{proto="v1"} 1
+gnb_stratum_sessions_active{proto="v2"} 1
+gnb_stratum_blocks_found_total 4
+process_cpu_seconds_total 1234.5

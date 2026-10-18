@@ -1,0 +1,27 @@
+# HELP obb_stratum_workers_active Miner connections currently open.
+# TYPE obb_stratum_workers_active gauge
+obb_stratum_workers_active 2
+# HELP obb_stratum_workers_total Miner connections accepted since start.
+# TYPE obb_stratum_workers_total counter
+obb_stratum_workers_total 5
+# HELP obb_stratum_workers_authorized Open connections that completed mining.authorize.
+# TYPE obb_stratum_workers_authorized gauge
+obb_stratum_workers_authorized 2
+# HELP obb_stratum_shares_accepted_total Shares that met their connection's share target.
+# TYPE obb_stratum_shares_accepted_total counter
+obb_stratum_shares_accepted_total 4410
+# HELP obb_stratum_shares_rejected_total Shares rejected for any reason.
+# TYPE obb_stratum_shares_rejected_total counter
+obb_stratum_shares_rejected_total 12
+# HELP obb_stratum_blocks_found_total Shares that met the block target and were submitted.
+# TYPE obb_stratum_blocks_found_total counter
+obb_stratum_blocks_found_total 37
+# HELP obb_stratum_blocks_accepted_total Submitted blocks the node accepted.
+# TYPE obb_stratum_blocks_accepted_total counter
+obb_stratum_blocks_accepted_total 36
+# HELP obb_stratum_blocks_rejected_total Submitted blocks the node refused (see the log).
+# TYPE obb_stratum_blocks_rejected_total counter
+obb_stratum_blocks_rejected_total 1
+# HELP obb_stratum_pplns_window_weight Total difficulty weight of the PPLNS window.
+# TYPE obb_stratum_pplns_window_weight gauge
+obb_stratum_pplns_window_weight 1.5e+09

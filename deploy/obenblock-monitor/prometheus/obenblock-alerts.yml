@@ -1,0 +1,63 @@
+# Alert rules for prometheus.yml (series of node/src/metrics/mod.rs and
+# tools/obenblock-stratum/src/metrics.rs). The cross-host checks (split
+# tips, diverging finality or Bloch anchors) need block hashes, which are
+# not metrics: obbmon.py status does those.
+groups:
+  - name: obenblock
+    rules:
+      - alert: ObenBlockFinalityConflict
+        expr: gnb_finality_conflicts > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.host }}: finalized checkpoints conflict with the pin (getfinalityinfo)"
+      - alert: ObenBlockFinalityAnchorUnknown
+        expr: gnb_finality_anchor_unknown > 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.host }}: finality anchor unknown, pin held"
+      - alert: ObenBlockBlochAnchorConflict
+        expr: gnb_bloch_anchor_conflict > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.host }}: Bloch anchor contradicts the chain (getblochanchor)"
+      - alert: ObenBlockSignerHalted
+        expr: gnb_powit_signer_halted > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.host }}: PoWit witness signer halted (getpowitinfo.signers)"
+      - alert: ObenBlockStalled
+        expr: changes(gnb_block_count[15m]) == 0
+        for: 5m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.host }}: no new selected-chain block for 15 minutes"
+      - alert: ObenBlockHeightSpread
+        expr: max(gnb_block_count) - min(gnb_block_count) > 6
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "selected-chain heights differ by more than 6 blocks across hosts"
+      - alert: ObenBlockNoPeers
+        expr: gnb_peer_count < 1
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.host }}: no P2P peers"
+      - alert: ObenBlockNodeDown
+        expr: up{job="obenblock-node"} == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.host }}: node metrics not answering (node down, --metrics off, or tunnel down)"
+      - alert: ObenBlockStratumBlocksRejected
+        expr: increase(obb_stratum_blocks_rejected_total[1h]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.host }}: the node refused blocks submitted by the stratum proxy"
+      - alert: ObenBlockStratumNoWorkers
+        expr: obb_stratum_workers_authorized == 0
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: "{{ $labels.host }}: no authorized stratum worker for 10 minutes"
