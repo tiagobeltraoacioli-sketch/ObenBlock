@@ -72,9 +72,15 @@ config_id  = SHA-256d("OBB-POCI-v1/config" ‖ u32le(chain_id) ‖ u64le(e)
       ‖ u64le(epoch_len) ‖ u64le(checkpoint_interval) ‖ u64le(window_epochs)
       ‖ u64le(vote_ttl) ‖ u64le(max_attestations_per_block)
       ‖ u64le(max_evidence_per_block) ‖ u64le(ban_epochs = 100)
-      ‖ u64le(bootstrap_epochs = 4) ‖ u64le(growth_div = 64)
-      ‖ u64le(g_min_epoch_div = 8) ‖ u32le(2) ‖ u32le(3))       // 110 bytes
+      ‖ u64le(bootstrap_epochs = 4) ‖ u64le(launch_bury = epoch_len)
+      ‖ u64le(growth_div = 64) ‖ u64le(g_min_epoch_div = 8)
+      ‖ u32le(2) ‖ u32le(3))                                     // 118 bytes
   ```
+
+  `window_epochs` here is the chain's one finality window: on ObenBlock the
+  PoWit state keeps share work and links for `window_epochs + 2` epochs of
+  these parameters (112 on mainnet and regtest), never the shorter window of
+  GnB's `PowitParams` (regtest: 3), which PoCI does not read.
 
 - A vote names its `config_id` (attestation message v3). Like v2 it commits
   the voter's KES public key `(depth, root)`: without it one leaf signature
@@ -123,22 +129,55 @@ quorum(C, votes) <=> 3 × sum(weight of distinct keys of C voting the link) > 2 
 - Exits (the KES-signed exit message of §5.2), bans and expiring weight take
   effect at the next handoff, never in the current configuration.
 - A handoff may skip epochs: when `C_e` finalizes a checkpoint of epoch
-  `e+k`, the next configuration is `C_{e+k}`, computed from the finalized
-  history up to that checkpoint. In one rule: finalizing `F` under `C_e`
-  hands off to `C_{epoch(F)}` iff `epoch(F) > e` (the opening checkpoint of
-  `e+1` is the usual case; a checkpoint later in `e+1` or beyond also hands
-  off when the opening one was skipped).
+  `e+k`, the next configuration is `C_{e+k}`. In one rule: finalizing `F`
+  under `C_e` hands off to `C_{epoch(F)}` iff `epoch(F) > e` (the opening
+  checkpoint of `e+1` is the usual case; a checkpoint later in `e+1` or
+  beyond also hands off when the opening one was skipped).
+- **One configuration per epoch** (review 2026-10-18, decision D4). `C_x`
+  is a function of `C_e`, the configurations before it and the history up
+  to ledger height `opening(x)` only, never of `F` itself: the ban starts
+  (§5), the rejoins and the absence of §4.1 are cut at `opening(x)`, and the
+  growth cap reads share work and first-block bits of epochs `<= x - 2`.
+  Every chain that finalizes any checkpoint of epoch `x` first, with the same
+  `C_e` and the same history up to `opening(x)`, holds the same `C_x` (the
+  same `config_id`), so an equivocation across two such chains names one
+  configuration and is evidence on both. (`F.height >= opening(x)`, so that
+  history is final once `F` is.) A chain that first finalizes a checkpoint of
+  epoch `x - 1` above `opening(x)` passes through `C_{x-1}`, a different
+  history; its `C_x` follows from it.
+- **Never empty** (decision D3). If the candidate weights minus the keys
+  banned, pruned or exited at `x` leave nothing, `C_x` carries the entries of
+  `C_e` forward unchanged (same keys and weights, epoch `x`, its own
+  `config_id`) and the prunings this handoff started are void. A
+  configuration that can reach no quorum would halt finality for good: no
+  rejoin and no new key can enter without a handoff.
 
 ### 4.1 Absence pruning by the old committee (owner, 2026-10-18)
 
 Dead weight is removed **by the current configuration, while it still has its
 quorum**, never by a local timeout:
 
-- A key of `C_e` whose votes were not included in any block of the finalized
-  history during the last `PRUNE_AFTER = 4` epochs (24 h) is left out of the
-  next configuration. The rule reads only finalized history, so every node
-  computes the same set, and it takes effect through the handoff, which more
-  than two thirds of `C_e` finalized: the old committee authorizes it.
+- A key of `C_e` whose votes were not included in any block of the last
+  `PRUNE_AFTER = 4` epochs (24 h) before the handoff (epochs `x - 4 ..=
+  x - 1`) is left out of the next configuration, **provided the keys that
+  were included there hold a strict quorum of `C_e`** (decision D3). The
+  rule reads only finalized history, so every node computes the same set,
+  and it takes effect through the handoff, which more than two thirds of
+  `C_e` finalized: the old committee authorizes it.
+- **A stall is not absence.** When the present keys hold no quorum of `C_e`,
+  `C_e` was not operating during the window (a finality stall: more than a
+  third offline, a partition, or nobody voting at all) and nobody is pruned
+  at that handoff. The committee whose votes end a stall has them above
+  `opening(x)`, outside the window; without this rule the handoff it
+  authorizes would prune it, after a stall of more than four epochs most or
+  all of `C_e`, leaving `C_x` without a quorum or empty and finality halted
+  for good (review HIGH, 2026-10-18). Pruning resumes at the first handoff
+  whose window holds a present quorum. Decision D3 also named "a vote counted
+  in the link that finalizes `F`" as presence; that link lies above
+  `opening(x)` and differs between chains finalizing different checkpoints
+  of `x`, which D4 forbids, so the quorum gate gives the same guarantee (the
+  returning committee is never pruned by its own handoff) from history up to
+  `opening(x)` only.
 - A pruned key returns by publishing a **rejoin** message signed with its KES
   key; once that message is in finalized history, the key's share work counts
   again from the next handoff, as new weight under the growth cap
@@ -146,26 +185,31 @@ quorum**, never by a local timeout:
 - `getpowitinfo` reports the absent weight of `C_e` per epoch, so operators
   see it grow long before it reaches a third.
 
-Normative reading (package B2; reference `reference/poci_reference.py`,
-`PociChain`, vectors `sequences` 8 to 10 of `reference/poci_vectors.json`):
+Normative reading (package B2, revised by decisions D3 and D4; reference
+`reference/poci_reference.py`, `PociChain`, vectors `sequences` 8 to 16 of
+`reference/poci_vectors.json`):
 
 - **Included at.** A vote, rejoin or evidence in a block at height `h` sits
   at ledger height `h + 1` (§12, "Heights"): it is in the history finalized
   by `F` iff `h + 1 <= F.height`.
 - **Order at the handoff** triggered by finalizing `F` under `C_e`, with
-  `x = epoch(F) > e`: (1) pending bans whose evidence `F` finalizes start at
-  `x` (§5); (2) pending rejoins that `F` finalizes end their key's pruning
-  (the key is not excluded at `x`); (3) every key `k` of `C_e` is pruned from
-  `x` on iff it is *eligible*, walking the configurations in force newest
-  first `k` is an entry of each until one whose epoch is `<= x - 4` (a key
-  that entered later is in its grace period), and *absent*, no vote of `k`
-  was included at a ledger height `h` with `opening(x - 4) < h <= F.height`;
-  (4) `C_x` = the provider's candidate weights minus the keys banned, pruned
-  or exited at `x`.
-- **Votes above `F` do not count**, including the votes of the link that
-  finalizes `F`: every node that finalized `F` then computes the same `C_x`.
-  Consequence: keys whose votes return only after a halt longer than four
-  epochs are pruned at the handoff their votes enable, and rejoin.
+  `x = epoch(F) > e` and `cut = opening(x) <= F.height`: (1) pending bans
+  whose evidence was included at `h <= cut` start at `x` (§5); (2) pending
+  rejoins included at `h <= cut` end their key's pruning (the key is not
+  excluded at `x`); (3) a key `k` of `C_e` is *present* iff a vote of `k` was
+  included at a ledger height `h` with `opening(x - 4) < h <= cut`; if
+  `3 × (weight of the present keys of C_e) > 2 × total(C_e)`, every key `k`
+  of `C_e`, not pruned yet, is pruned from `x` on iff it is *eligible*,
+  walking the configurations in force newest first `k` is an entry of each
+  until one whose epoch is `<= x - 4` (a key that entered later is in its
+  grace period), and not present; otherwise nobody is pruned; (4) `C_x` =
+  the provider's candidate weights minus the keys banned, pruned or exited
+  at `x`, or, if that is empty, `C_e`'s entries (and step 3's prunings are
+  void).
+- **Nothing above `opening(x)` counts** for `C_x`, including the votes of
+  the link that finalizes `F` and evidence or rejoins included between
+  `opening(x)` and `F`: they wait for the next handoff. Every chain that
+  finalizes a checkpoint of `x` then computes the same `C_x` (§4).
 - **Rejoin message**, signed with the KES leaf of `epoch`:
 
   ```text
@@ -176,9 +220,11 @@ Normative reading (package B2; reference `reference/poci_reference.py`,
   A block of epoch `E` may carry it iff, first failure wins: it is above the
   finalized checkpoint, `epoch <= E <= epoch + 1`, the key is pruned, it has
   no rejoin pending, the signature verifies (last). At most 4 per block.
-  The key is not excluded from the handoff that finalizing the rejoin's
-  block triggers (or the next one); under the growth cap its share work
-  then competes as new weight.
+  The key is not excluded from the first handoff to an epoch `x` with the
+  rejoin included at or below `opening(x)`; under the growth cap its share
+  work then competes as new weight (vector `growth_cap_pruned_then_rejoin`:
+  the growth cap provider of the reference, `GrowthCapProvider`, gives the
+  pruned key no credit while pruned and admits it again under the budget).
 - **Forgotten.** A pruned key the provider gives no weight (no share work
   left in its window) is forgotten at a handoff: its later share work counts
   as a new key's, with a new grace period.
@@ -211,10 +257,12 @@ Rules:
   different keys, identical attestations, non-conflicting links (shared
   source or shared target with different heights, consecutive links) or a
   bad signature make it invalid.
-- **Exclusion**: `ban_start` = the epoch of the first configuration that
-  enters into force at or after the finalization of the block holding the
-  evidence (the handoff triggered by that same finalization counts: its
-  configuration is computed from a history that holds the evidence). The key
+- **Exclusion**: `ban_start` = the epoch `x` of the first handoff with the
+  evidence included at or below `opening(x)` (ledger height, §4.1): the
+  handoff triggered by the finalization of the evidence's block counts when
+  the evidence lies below the opening of its epoch; evidence included
+  between `opening(x)` and the finalized checkpoint waits for the next
+  handoff (§4, one configuration per epoch). The key
   is ineligible for every epoch `ban_start <= e < ban_start + 100` (72,000
   blocks, about 25 days at nominal cadence). The epoch is the protocol's,
   never a local clock.
@@ -337,10 +385,29 @@ restored-record rows, in process and by aborting the CLI). Choices:
 `C` needs a finalized history, which does not exist at genesis. The first
 `POCI_BOOTSTRAP_EPOCHS = 4` epochs (24 h) are PoW-probabilistic: no
 finality. The configuration `C_4` is computed from the chain up to the
-checkpoint that opens epoch 4. The launch release names that checkpoint
-once it is buried (weak subjectivity, as Ethereum's checkpoint sync), and
-`C_4` comes into force from it. Until then wallets treat everything as
-provisional.
+checkpoint that opens epoch 4 (slot `opening(4)`, 2,880 on mainnet).
+
+**Buried launch** (review HIGH, 2026-10-18, decision D2). `C_4` enters into
+force, with that checkpoint justified and finalized, only at the first block
+whose height is at least
+
+```text
+launch_height = opening(bootstrap_epochs) + launch_bury,    launch_bury = epoch_len
+```
+
+(3,600 on mainnet, 100 on regtest): once the checkpoint is buried by one
+epoch of blocks on the block's selected chain. `launch_bury` is part of
+`params_digest` (§2). Before that block no PoWit state carries a finalized
+checkpoint above the genesis slot, so the finality pin has no candidate:
+there is no PoCI finality and nothing is pinned, and a fork at the epoch-4
+boundary is settled by work like any PoW fork. Making the slot final one
+block deep on whatever chain a node had selected turned such a fork into a
+permanent network split (the sticky pin of A2 never gives up a finalized
+checkpoint). A fork deeper than one epoch at that boundary is the
+weak-subjectivity case of every finality protocol: the launch release may
+also name the checkpoint, and operators may pin a release-named checkpoint
+with `setfinalitycheckpoint` (as Ethereum's checkpoint sync). Until
+`launch_height` wallets treat everything as provisional.
 
 ## 10. Tests that must try to break it
 
@@ -351,6 +418,10 @@ provisional.
 | exit, ban and expiry during a stall | same `C` and denominators on every honest node; one handoff; old certificates keep verifying |
 | weight fading out (5 %, 20 %, 30 % offline over days) | pruned at handoffs, finality never halts; 40 % vanishing at once halts finality (expected) and no node prunes locally |
 | pruned key rejoins | rejoin message finalized, weight back from the next handoff through the growth cap |
+| stall longer than `PRUNE_AFTER` (partial or total), then the committee returns | nobody pruned by the handoff it authorizes; `C_x` keeps the returning committee; pruning resumes once a quorum is present in the window |
+| two compatible chains finalize different checkpoints of epoch `x` first | the same `C_x` (`config_id`) on both |
+| a handoff whose candidates are all banned, pruned, exited or expired | `C_x` carries `C_e`'s entries; finality goes on |
+| fork at the epoch-4 boundary | no finalized checkpoint (nothing to pin) on either branch below `launch_height`; work settles it |
 | crash before/after persisting, before/after signing | no sequence releases two conflicting votes; restart is idempotent |
 | restored old record, two signer instances | signing stops with an alert |
 | forged weight, duplicate key, key outside `C` | certificate verification refuses it |
@@ -390,7 +461,8 @@ tests.
   (`included_at <= F.height`). The node passes `block height + 1`, since a
   slot names the highest selected-chain block strictly below it.
 - `PowitState::apply_poci` (ObenBlock; `apply_full` and `apply_block`
-  dispatch to it by chain id): launch at the first block of epoch 4, v3
+  dispatch to it by chain id): launch at the first block at or above
+  `PociParams::launch_height` (§9), v3
   votes of the configuration in force only, strict quorum, handoff on
   finalization, PoCI evidence, no inactivity decay. The configuration
   weights come from a `ConfigWeights` provider: on ObenBlock
@@ -411,10 +483,12 @@ tests.
 - Ledger (`core::powit::poci::PociState`): `pruned` (key -> `Prune { start }`),
   `rejoins` (key -> included at), `seen` (key -> block epoch -> lowest
   `included_at`; the lowest inclusion of each block epoch answers §4.1's
-  question exactly, `PociState::present`). A handoff is two calls:
-  `begin_handoff` (ban starts, rejoins, pruning; returns `x`) and `enter`
-  (candidate weights minus bans, pruning and exits; forgetting; `C_x` in
-  force). `finalized` does both for ledger-only callers.
+  question exactly, `PociState::present`, window `(opening(x - 4),
+  opening(x)]`; `present_weight` for the quorum gate). A handoff is two
+  calls: `begin_handoff` (ban starts, rejoins, the gated pruning, all cut at
+  `opening(x)`; returns `x`) and `enter` (candidate weights minus bans,
+  pruning and exits; forgetting; never empty; `C_x` in force). `finalized`
+  does both for ledger-only callers.
   `crates/gnb-crypto/tests/poci_vectors.rs` reproduces every pruning and
   rejoin sequence of the reference.
 - Bounds: `trim_seen` keeps the included votes of the last `PRUNE_AFTER + 3`

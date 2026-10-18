@@ -1487,11 +1487,15 @@ impl PowitState {
     /// One block under PoCI (`docs/DESIGN-obenblock-poci.md`; ObenBlock, PoWit
     /// from height 0). What differs from PoWit ([`Self::apply_full`]):
     ///
-    /// - **Launch** (§9): the first `bootstrap_epochs` epochs are PoW only (no
-    ///   votes, no evidence, no rejoins). The first block of epoch
-    ///   `bootstrap_epochs` makes the slot opening it justified and final and
-    ///   puts `C_4` in force (weights from `weights`, the history below that
-    ///   slot).
+    /// - **Launch** (§9): no votes, evidence or rejoins before `C_4` is in
+    ///   force. The first block at or above [`PociParams::launch_height`]
+    ///   (the slot opening `bootstrap_epochs`, buried by `launch_bury` =
+    ///   one epoch of blocks) makes that slot justified and final on the
+    ///   block's selected chain and puts `C_4` in force (weights from
+    ///   `weights`, the history below that slot). Until then every state's
+    ///   finalized checkpoint is the genesis slot: nothing to pin, so a fork
+    ///   at the epoch-4 boundary is settled by work, never split by the
+    ///   finality pin.
     /// - **Votes** name the configuration in force: an attestation's signature
     ///   covers the v3 message with its `config_id`
     ///   ([`Attestation::verify_signature_v3`]); its weight is the registry's.
@@ -1501,11 +1505,14 @@ impl PowitState {
     ///   `3 got > 2 total`); Casper FFG otherwise ([`poci::ffg_step`]).
     /// - **Handoff** (§4, §4.1): finalizing `F` with `epoch(F) = x` above the
     ///   configuration's epoch starts the pending bans and ends the prunings
-    ///   of the pending rejoins that `F` finalizes, prunes the keys of the
-    ///   configuration absent from the finalized history of the last
-    ///   `PRUNE_AFTER` epochs ([`PociState::begin_handoff`]), and puts `C_x`
-    ///   in force from `weights` for `F`, without the keys banned, pruned or
-    ///   exited at `x` ([`PociState::enter`]).
+    ///   of the pending rejoins included at or below `opening(x)`, prunes the
+    ///   keys of the configuration absent from the blocks of epochs
+    ///   `x - PRUNE_AFTER ..= x - 1` when the present ones hold a strict
+    ///   quorum ([`PociState::begin_handoff`]), and puts `C_x` in force from
+    ///   `weights`, without the keys banned, pruned or exited at `x`, never
+    ///   empty ([`PociState::enter`]). Everything `C_x` reads lies at or
+    ///   below `opening(x)`, so it does not depend on which checkpoint of
+    ///   epoch `x` was finalized first.
     /// - **Proof of Corruption** (§5): `poci.evidence` ([`PociState::admit_evidence`],
     ///   included at `b.height + 1` in the ledger's convention); GnB's
     ///   `evidence` is refused. Nothing in force changes.
@@ -1514,6 +1521,10 @@ impl PowitState {
     /// - **No inactivity leak**: absence never changes a weight in force
     ///   (`decay` and `banned` stay empty). Exits, bans and pruning take effect
     ///   at the next handoff.
+    /// - **Window** (§2): the PoCI parameters' `window_epochs` (part of
+    ///   `params_digest`) is the one window of the chain: share work and links
+    ///   are kept for `pp.window_epochs + 2` epochs; `p.window_epochs` and
+    ///   `p.ban_epochs` (GnB's PoWit rules) are not read.
     /// - **Growth cap** (DESIGN-obenblock.md §6.3): `bits` are the block's
     ///   compact bits; the first block of each epoch on the chain records
     ///   them (`G_min` of that epoch; `None`, as from [`Self::apply_full`],
@@ -1572,13 +1583,13 @@ impl PowitState {
         if epoch > s.epoch {
             s.active_this_epoch.clear();
             s.epoch = epoch;
-            let keep_from = epoch.saturating_sub(p.window_epochs + 2).min(cap_from);
+            let keep_from = epoch.saturating_sub(pp.window_epochs + 2).min(cap_from);
             s.epoch_work = s.epoch_work.split_off(&keep_from);
             if !s.exited.is_empty() {
                 let live: BTreeSet<KeyId> = s.epoch_work.values().flat_map(|m| m.keys().copied()).collect();
                 s.exited.retain(|k, _| live.contains(k));
             }
-            let link_floor = b.height.saturating_sub((p.window_epochs + 2) * p.epoch_len);
+            let link_floor = b.height.saturating_sub((pp.window_epochs + 2).saturating_mul(pp.epoch_len));
             for v in s.links.values_mut() {
                 v.retain(|(_, th, _)| *th >= link_floor);
             }
@@ -1591,7 +1602,7 @@ impl PowitState {
         s.cap.as_mut().expect("set above").note_block(epoch, bits);
 
         // ── Launch (§9) ──────────────────────────────────────────────────
-        if s.poci.is_none() && epoch >= pp.bootstrap_epochs {
+        if s.poci.is_none() && b.height >= pp.launch_height() {
             let height = pp.opening(pp.bootstrap_epochs);
             let hash = view.selected_at(height).ok_or("powit: PoCI launch checkpoint is not on the selected chain")?;
             let cp = Checkpoint { height, hash };
@@ -1738,8 +1749,11 @@ impl PowitState {
 ///   the handoff covers (the growth cap runs one step per such epoch and
 ///   gives an excluded key no new credit there). At the launch `state.poci`
 ///   is `None`.
-/// - Only finalized history may be read: share work of epochs `< epoch` (all
-///   below `finalized`, which lies in `epoch`), never the blocks above it.
+/// - Only finalized history at or below `opening(epoch)` may be read (share
+///   work of epochs `< epoch`; the growth cap reads epochs `<= epoch - 2`),
+///   never the blocks between `opening(epoch)` and `finalized`: `C_epoch`
+///   must not depend on which checkpoint of `epoch` was finalized first
+///   (DESIGN-obenblock-poci.md §4, one configuration per epoch).
 /// - Return every key with weight, the excluded ones included: the ledger
 ///   leaves out the keys banned, pruned or exited at `epoch`, and forgets a
 ///   pruned key the provider gives no weight.

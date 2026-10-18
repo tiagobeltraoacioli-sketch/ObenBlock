@@ -479,21 +479,26 @@
       },
       {
        "at_slot": 385,
-       "config_id": "a5346d96edc72275",
+       "config_id": "a6ba9af331a8090f",
        "entries": [
         "a00",
         "a01",
         "a02",
         "a03",
-        "a04"
+        "a04",
+        "b00",
+        "b01",
+        "b02",
+        "b03",
+        "b04"
        ],
        "from_epoch": 1,
        "to_epoch": 32,
-       "total": 5600
+       "total": 9700
       },
       {
        "at_slot": 397,
-       "config_id": "0474f55ad14acb09",
+       "config_id": "ff9d12cd11e022df",
        "entries": [
         "a00",
         "a01",
@@ -508,11 +513,11 @@
        ],
        "from_epoch": 32,
        "to_epoch": 33,
-       "total": 9650
+       "total": 9700
       },
       {
        "at_slot": 409,
-       "config_id": "ad9cadd61f52616c",
+       "config_id": "aa92909a25e90cea",
        "entries": [
         "a00",
         "a01",
@@ -527,11 +532,11 @@
        ],
        "from_epoch": 33,
        "to_epoch": 34,
-       "total": 9650
+       "total": 9700
       },
       {
        "at_slot": 421,
-       "config_id": "77824e8746aae94e",
+       "config_id": "f2af22ba588b2e38",
        "entries": [
         "a00",
         "a01",
@@ -546,11 +551,11 @@
        ],
        "from_epoch": 34,
        "to_epoch": 35,
-       "total": 9650
+       "total": 9700
       },
       {
        "at_slot": 433,
-       "config_id": "9b9874bb5fd1950c",
+       "config_id": "4805455640f0c9c0",
        "entries": [
         "a00",
         "a01",
@@ -565,11 +570,11 @@
        ],
        "from_epoch": 35,
        "to_epoch": 36,
-       "total": 9650
+       "total": 9700
       },
       {
        "at_slot": 445,
-       "config_id": "12f1011a0d04ac9b",
+       "config_id": "82595fa4c80bfab9",
        "entries": [
         "a00",
         "a01",
@@ -584,11 +589,11 @@
        ],
        "from_epoch": 36,
        "to_epoch": 37,
-       "total": 9650
+       "total": 9700
       },
       {
        "at_slot": 457,
-       "config_id": "87bd1f513bc073c3",
+       "config_id": "a264621444c37390",
        "entries": [
         "a00",
         "a01",
@@ -603,11 +608,11 @@
        ],
        "from_epoch": 37,
        "to_epoch": 38,
-       "total": 9650
+       "total": 9700
       },
       {
        "at_slot": 469,
-       "config_id": "a84b8b97c99bcbd1",
+       "config_id": "8923345a1f2c6381",
        "entries": [
         "a00",
         "a01",
@@ -622,11 +627,11 @@
        ],
        "from_epoch": 38,
        "to_epoch": 39,
-       "total": 9650
+       "total": 9700
       },
       {
        "at_slot": 481,
-       "config_id": "b3f1a0aa057d68bc",
+       "config_id": "32e9f94ddc1a0f13",
        "entries": [
         "a00",
         "a01",
@@ -641,11 +646,11 @@
        ],
        "from_epoch": 39,
        "to_epoch": 40,
-       "total": 9650
+       "total": 9700
       },
       {
        "at_slot": 493,
-       "config_id": "859f8dcb62a5db11",
+       "config_id": "7612cc642d8ebfa5",
        "entries": [
         "a00",
         "a01",
@@ -660,7 +665,7 @@
        ],
        "from_epoch": 40,
        "to_epoch": 41,
-       "total": 9650
+       "total": 9700
       }
      ],
      "heal": 32,
@@ -866,22 +871,26 @@
       },
       {
        "at_slot": 385,
-       "config_id": "dd5edbca234f6b11",
+       "config_id": "14566a32ce0290fa",
        "entries": [
         "a00",
         "a01",
         "a02",
         "a03",
         "a04",
-        "a05"
+        "a05",
+        "b00",
+        "b01",
+        "b02",
+        "b03"
        ],
        "from_epoch": 1,
        "to_epoch": 32,
-       "total": 6720
+       "total": 10000
       },
       {
        "at_slot": 397,
-       "config_id": "1abf42aedb8a8619",
+       "config_id": "ab701b60e676b8eb",
        "entries": [
         "a00",
         "a01",
@@ -896,11 +905,11 @@
        ],
        "from_epoch": 32,
        "to_epoch": 33,
-       "total": 9960
+       "total": 10000
       },
       {
        "at_slot": 409,
-       "config_id": "4762ced30603bc22",
+       "config_id": "7b639c90babe3772",
        "entries": [
         "a00",
         "a01",
@@ -915,11 +924,11 @@
        ],
        "from_epoch": 33,
        "to_epoch": 34,
-       "total": 9960
+       "total": 10000
       },
       {
        "at_slot": 421,
-       "config_id": "cc6e9f74a35a4d66",
+       "config_id": "c7821a67ec8718e0",
        "entries": [
         "a00",
         "a01",
@@ -934,11 +943,11 @@
        ],
        "from_epoch": 34,
        "to_epoch": 35,
-       "total": 9960
+       "total": 10000
       },
       {
        "at_slot": 433,
-       "config_id": "0cebbbf86f756da1",
+       "config_id": "6d882c91ea7f4562",
        "entries": [
         "a00",
         "a01",
@@ -953,11 +962,11 @@
        ],
        "from_epoch": 35,
        "to_epoch": 36,
-       "total": 9960
+       "total": 10000
       },
       {
        "at_slot": 445,
-       "config_id": "9ee2cb00826ccff6",
+       "config_id": "7f9fbd98cbcfeadd",
        "entries": [
         "a00",
         "a01",
@@ -972,11 +981,11 @@
        ],
        "from_epoch": 36,
        "to_epoch": 37,
-       "total": 9960
+       "total": 10000
       },
       {
        "at_slot": 457,
-       "config_id": "bb1462d1ba3c9198",
+       "config_id": "e8437efb3e217f54",
        "entries": [
         "a00",
         "a01",
@@ -991,11 +1000,11 @@
        ],
        "from_epoch": 37,
        "to_epoch": 38,
-       "total": 9960
+       "total": 10000
       },
       {
        "at_slot": 469,
-       "config_id": "93a1cec41f60bf24",
+       "config_id": "218157f307766cb4",
        "entries": [
         "a00",
         "a01",
@@ -1010,11 +1019,11 @@
        ],
        "from_epoch": 38,
        "to_epoch": 39,
-       "total": 9960
+       "total": 10000
       },
       {
        "at_slot": 481,
-       "config_id": "25897a458e77eaae",
+       "config_id": "e9ec7bedfbf2ed3c",
        "entries": [
         "a00",
         "a01",
@@ -1029,11 +1038,11 @@
        ],
        "from_epoch": 39,
        "to_epoch": 40,
-       "total": 9960
+       "total": 10000
       },
       {
        "at_slot": 493,
-       "config_id": "ace5d04203d3c559",
+       "config_id": "a5c39ddb961016dd",
        "entries": [
         "a00",
         "a01",
@@ -1048,7 +1057,7 @@
        ],
        "from_epoch": 40,
        "to_epoch": 41,
-       "total": 9960
+       "total": 10000
       }
      ],
      "heal": 32,
@@ -5233,22 +5242,25 @@
       },
       {
        "at_slot": 385,
-       "config_id": "dd5edbca234f6b11",
+       "config_id": "8f274298b7528e0f",
        "entries": [
         "a00",
         "a01",
         "a02",
         "a03",
         "a04",
-        "a05"
+        "a05",
+        "b00",
+        "b01",
+        "b02"
        ],
        "from_epoch": 1,
        "to_epoch": 32,
-       "total": 6720
+       "total": 9180
       },
       {
        "at_slot": 397,
-       "config_id": "2ace799045b3c552",
+       "config_id": "58f2d37feb2b7095",
        "entries": [
         "a00",
         "a01",
@@ -5262,11 +5274,11 @@
        ],
        "from_epoch": 32,
        "to_epoch": 33,
-       "total": 9150
+       "total": 9180
       },
       {
        "at_slot": 409,
-       "config_id": "bc260825581208e6",
+       "config_id": "647357400f2dd83c",
        "entries": [
         "a00",
         "a01",
@@ -5280,11 +5292,11 @@
        ],
        "from_epoch": 33,
        "to_epoch": 34,
-       "total": 9150
+       "total": 9180
       },
       {
        "at_slot": 421,
-       "config_id": "4be6ceb58f844926",
+       "config_id": "85d5a7753f05aba5",
        "entries": [
         "a00",
         "a01",
@@ -5298,11 +5310,11 @@
        ],
        "from_epoch": 34,
        "to_epoch": 35,
-       "total": 9150
+       "total": 9180
       },
       {
        "at_slot": 433,
-       "config_id": "4de3e71e2bde4b27",
+       "config_id": "19a0314d1ba231da",
        "entries": [
         "a00",
         "a01",
@@ -5316,11 +5328,11 @@
        ],
        "from_epoch": 35,
        "to_epoch": 36,
-       "total": 9150
+       "total": 9180
       },
       {
        "at_slot": 445,
-       "config_id": "416dc5d2e907804d",
+       "config_id": "63fbb3352dc9fc03",
        "entries": [
         "a00",
         "a01",
@@ -5334,11 +5346,11 @@
        ],
        "from_epoch": 36,
        "to_epoch": 37,
-       "total": 9150
+       "total": 9180
       },
       {
        "at_slot": 457,
-       "config_id": "8e92c727628b0dc8",
+       "config_id": "fa250ac4aa1d54c3",
        "entries": [
         "a00",
         "a01",
@@ -5352,11 +5364,11 @@
        ],
        "from_epoch": 37,
        "to_epoch": 38,
-       "total": 9150
+       "total": 9180
       },
       {
        "at_slot": 469,
-       "config_id": "fb5a0538fe5688a1",
+       "config_id": "ea0bd80aecfc497a",
        "entries": [
         "a00",
         "a01",
@@ -5370,11 +5382,11 @@
        ],
        "from_epoch": 38,
        "to_epoch": 39,
-       "total": 9150
+       "total": 9180
       },
       {
        "at_slot": 481,
-       "config_id": "c0c2df305a652414",
+       "config_id": "8f23752212af71b6",
        "entries": [
         "a00",
         "a01",
@@ -5388,11 +5400,11 @@
        ],
        "from_epoch": 39,
        "to_epoch": 40,
-       "total": 9150
+       "total": 9180
       },
       {
        "at_slot": 493,
-       "config_id": "6d5b278e9c6c352c",
+       "config_id": "12c53a2060c4dca0",
        "entries": [
         "a00",
         "a01",
@@ -5406,7 +5418,7 @@
        ],
        "from_epoch": 40,
        "to_epoch": 41,
-       "total": 9150
+       "total": 9180
       }
      ],
      "heal": 32,
@@ -12949,8 +12961,11 @@
       },
       {
        "at_slot": 145,
-       "config_id": "7044b1b6531a6c53",
+       "config_id": "ea8d9a3b566af4ad",
        "entries": [
+        "a02",
+        "a03",
+        "a04",
         "b00",
         "b01",
         "b02",
@@ -12959,11 +12974,11 @@
        ],
        "from_epoch": 1,
        "to_epoch": 12,
-       "total": 5600
+       "total": 8660
       },
       {
        "at_slot": 157,
-       "config_id": "27af787f1e9b7060",
+       "config_id": "89ddd05bb0d19e51",
        "entries": [
         "a02",
         "a03",
@@ -12976,11 +12991,11 @@
        ],
        "from_epoch": 12,
        "to_epoch": 13,
-       "total": 8630
+       "total": 8660
       },
       {
        "at_slot": 169,
-       "config_id": "748cff8de3d4dba7",
+       "config_id": "f38ae8b10d0695ab",
        "entries": [
         "a02",
         "a03",
@@ -12993,11 +13008,11 @@
        ],
        "from_epoch": 13,
        "to_epoch": 14,
-       "total": 8630
+       "total": 8660
       },
       {
        "at_slot": 181,
-       "config_id": "72f3c6fe75238540",
+       "config_id": "33d9e9ef8ad40dbe",
        "entries": [
         "a02",
         "a03",
@@ -13010,11 +13025,11 @@
        ],
        "from_epoch": 14,
        "to_epoch": 15,
-       "total": 8630
+       "total": 8660
       },
       {
        "at_slot": 193,
-       "config_id": "6332fb2d5f026715",
+       "config_id": "ced80d9060e61629",
        "entries": [
         "a02",
         "a03",
@@ -13027,11 +13042,11 @@
        ],
        "from_epoch": 15,
        "to_epoch": 16,
-       "total": 8630
+       "total": 8660
       },
       {
        "at_slot": 205,
-       "config_id": "0590bf0dfc231861",
+       "config_id": "e5c1521b68b7ff71",
        "entries": [
         "a02",
         "a03",
@@ -13044,11 +13059,11 @@
        ],
        "from_epoch": 16,
        "to_epoch": 17,
-       "total": 8630
+       "total": 8660
       },
       {
        "at_slot": 217,
-       "config_id": "1b30c7dd9097bdcc",
+       "config_id": "8bf780c697251a47",
        "entries": [
         "a02",
         "a03",
@@ -13061,11 +13076,11 @@
        ],
        "from_epoch": 17,
        "to_epoch": 18,
-       "total": 8630
+       "total": 8660
       },
       {
        "at_slot": 229,
-       "config_id": "fadbfa2895004e43",
+       "config_id": "6e0f5129bcbd85a2",
        "entries": [
         "a02",
         "a03",
@@ -13078,11 +13093,11 @@
        ],
        "from_epoch": 18,
        "to_epoch": 19,
-       "total": 8630
+       "total": 8660
       },
       {
        "at_slot": 241,
-       "config_id": "34d6c1a6b70890dc",
+       "config_id": "dd24cfdadb53d9ed",
        "entries": [
         "a02",
         "a03",
@@ -13095,11 +13110,11 @@
        ],
        "from_epoch": 19,
        "to_epoch": 20,
-       "total": 8630
+       "total": 8660
       },
       {
        "at_slot": 253,
-       "config_id": "5fc90b846c70dc37",
+       "config_id": "24f082162a16510a",
        "entries": [
         "a02",
         "a03",
@@ -13112,16 +13127,13 @@
        ],
        "from_epoch": 20,
        "to_epoch": 21,
-       "total": 8630
+       "total": 8660
       }
      ],
      "heal": 12,
      "honest_evidence": [],
      "original_total": 11200,
-     "pruned": {
-      "a00": 12,
-      "a01": 12
-     },
+     "pruned": {},
      "refused_votes": 0,
      "resume_epoch": 12,
      "rules": "PoCI",

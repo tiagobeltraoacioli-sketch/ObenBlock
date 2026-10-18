@@ -314,7 +314,10 @@ weight_k(e) gains renew_k + admit_k
   and its work does not count in `sum(x)`; its earlier credits stay and expire
   on schedule, so it returns with the unexpired ones.
 - **Handoffs that skip epochs** run the step for every epoch in between, in
-  order, so `C_x` depends on finalized history only.
+  order, so `C_x` depends on finalized history only, and on none of it above
+  `opening(x)` (its inputs are epochs `<= x - 2`; the exclusions are cut at
+  `opening(x)`, DESIGN-obenblock-poci.md §4): one `C_x` per epoch, whichever
+  checkpoint of epoch `x` is finalized first.
 - **Arithmetic.** Credits, weights and totals are u128 (sums saturate, as W
   does today). `sum(x)` and `x_k × G_e` are exact: the Rust code uses 256-bit
   intermediates, since a saturated denominator would admit more than `G_e`.
@@ -366,9 +369,12 @@ mutual anchoring. **Both directions are used** (owner, 2026-10-17).
     alert) and the operator decides with `setfinalitycheckpoint` /
     `ignorefinalized`. An anchor that agrees is reported as corroboration.
   - `--bloch-rpc` must be `https://`, or `http://` to a loopback host.
-  - Automatic use needs a finality certificate in the record (≥ 2/3 of W
-    signing, or a succinct proof of it), checked by the node against the W of
-    the candidate chain. Not planned now.
+  - Automatic use needs a finality certificate in the record (a strict
+    quorum of the configuration in force: votes worth strictly more than two
+    thirds of the total of the PoCI configuration `C_e` the certificate names,
+    DESIGN-obenblock-poci.md §3 and §6, or a succinct proof of it), checked
+    by the node against that configuration (its `config_id`) on the candidate
+    chain. Not planned now.
   This is the same trust model as the bridge signers (docs/SIDECHAIN-BLOCH.md:
   "each signer reads … from its own follower").
 - **Phase 2**: a Bloch light client in the node (header sync of Bloch

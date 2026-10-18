@@ -27,12 +27,17 @@ Rule sets (docs/DESIGN-obenblock-poci.md, docs/DESIGN-obenblock.md §5.2 and
           the finalized history with the §6.3 growth cap; exits, bans and
           expiry only at a handoff; no leak; evidence = double or surround vote
           by one key under one config_id; ban for 100 epochs from the first
-          configuration computed after the evidence is finalized; absence
-          pruning (§4.1): at a handoff to C_x, a key that has been an entry of
-          every configuration since epoch x - 4 or earlier and has no vote
-          included in the finalized history of slots [opening(x-4), F) is left
-          out until a rejoin is finalized (an honest online key that is pruned
-          publishes one at the next epoch start, as its operator would).
+          configuration computed after the evidence is finalized; C_x reads
+          the history up to opening(x) only (evidence, exits and rejoins at
+          slots <= opening(x), DESIGN-obenblock-poci.md §4); absence
+          pruning (§4.1): at a handoff to C_x, if the keys of C_e with a vote
+          included in slots [opening(x-4), opening(x)) hold a strict quorum
+          of C_e, a key that has been an entry of every configuration since
+          epoch x - 4 or earlier and has no such vote is left out until a
+          rejoin is finalized (an honest online key that is pruned publishes
+          one at the next epoch start, as its operator would); without that
+          quorum nobody is pruned; C_x is never empty (it then carries C_e's
+          entries).
 
 Model:
 
@@ -350,13 +355,20 @@ class Sim:
         return p is not None and p[0] <= e and (p[1] is None or e < p[1])
 
     def prune(self, b: Branch, x: int, f_slot: int) -> None:
-        """§4.1 at the handoff to C_x triggered by finalizing slot f_slot."""
+        """§4.1 at the handoff to C_x triggered by finalizing slot f_slot:
+        history up to opening(x) only (§4)."""
+        cut = x * SLOTS_PER_EPOCH
         for slot, k in list(b.rejoins):
-            if slot <= f_slot:
+            if slot <= cut:
                 b.rejoins.remove((slot, k))
                 if k in b.pruned:
                     b.pruned[k][1] = x
         lo = (x - PRUNE_AFTER_EPOCHS) * SLOTS_PER_EPOCH
+
+        def present(k: str) -> bool:
+            return any(lo <= s < cut for s in b.seen.get(k, []))
+        if not quorum(self.rules, sum(w for k, w in b.config.entries if present(k)), b.config.total):
+            return  # no committee present in the window (a stall): nobody is pruned
         for k, _ in b.config.entries:
             if k in b.pruned:
                 continue
@@ -367,7 +379,7 @@ class Sim:
                 if c.epoch <= x - PRUNE_AFTER_EPOCHS:
                     eligible = True
                     break
-            if eligible and not any(lo <= s < f_slot for s in b.seen.get(k, [])):
+            if eligible and not present(k):
                 b.pruned[k] = [x, None]
 
     def ledger(self, b: Branch, upto: int) -> None:
@@ -391,7 +403,8 @@ class Sim:
             e += 1
 
     def poci_config(self, b: Branch, x: int, upto_slot: int) -> Config:
-        """C_x from the finalized history up to the checkpoint at upto_slot."""
+        """C_x from the finalized history up to upto_slot (opening(x) at a
+        handoff)."""
         for ev in b.evidence:
             slot, k = ev
             if slot <= upto_slot and ev not in b.used_evidence:
@@ -411,6 +424,10 @@ class Sim:
             b.rejoins = [(s, k2) for s, k2 in b.rejoins if k2 != k]
         weights = {k: w for k, w in weights.items()
                    if k not in b.excluded and not self.banned_at(b, k, x) and not self.pruned_at(b, k, x)}
+        if not weights and b.config is not None:
+            # Never empty (§4): C_e's entries carry forward, this handoff's prunings are void.
+            b.pruned = {k: v for k, v in b.pruned.items() if not (v[0] == x and v[1] is None)}
+            weights = dict(b.config.entries)
         b.pruned = {k: v for k, v in b.pruned.items() if v[1] is None}
         cfg = make_config(self.rules, x, weights)
         self.registry[cfg.id] = cfg
@@ -486,7 +503,7 @@ class Sim:
             if x > b.config.epoch:
                 old = b.config
                 self.prune(b, x, src)
-                cfg = self.poci_config(b, x, src)
+                cfg = self.poci_config(b, x, x * SLOTS_PER_EPOCH)
                 b.config = cfg
                 b.cfg_hist.append(cfg)
                 b.seen = {k: v for k, v in b.seen.items() if cfg.weight(k) > 0}
