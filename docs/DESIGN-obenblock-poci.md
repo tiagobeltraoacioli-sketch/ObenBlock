@@ -543,6 +543,19 @@ tests.
   the PoCI state of nodes that saw different copies.
 - The witness duty and `gnb-cli powitattest --config-id=<hex>` sign v3 with
   the configuration in force, recorded in the vote record (§8).
+- Gossiped votes (launch rehearsal fix, 2026-10-19, node policy, no rule
+  change): an attestation does not carry the `config_id` its v3 signature
+  covers, the one in force at its voter's tip. A node judges it under its
+  own configuration in force; right after a handoff a neighbour one block
+  ahead or behind signs under another one, so a signature that fails there
+  proves nothing about the voter. `PowitPool::admit_attestation` refuses it
+  for this node's view (`Ignore`, never misbehaviour): refunded when it
+  verifies under the previous configuration, otherwise the deliverer keeps
+  the verification-budget charge (a forged vote costs a KES verification).
+  Classifying it as a context-free fault made the rehearsal's nodes ban
+  each other after every handoff and split (`node/tests/poci_partition.rs`,
+  `votes_across_a_handoff_are_never_a_peer_fault`). PoCI evidence names its
+  configuration, so its signature check stays context-free.
 
 ## 13. Implementation (package B2: handoff, no leak, pruning, rejoin, ban)
 
