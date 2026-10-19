@@ -297,7 +297,8 @@ FAIL means one of these:
   (CPU time between the samples), or not connected to the V1 server; the
   node's own `--mine` on;
 - the witness missing or halted; and, from block 3,600 + 2 checkpoint
-  intervals on: PoCI not active, the host's witness not in the witness set,
+  intervals on: PoCI not active, the host's witness not in the PoCI
+  configuration in force,
   or none of its votes included in the chain; a finality conflict.
 
 WARN: GnB running, the explorer API not active, the V2 key not readable
@@ -443,40 +444,58 @@ provisional.
 
 ## Known issues from the rehearsal (2026-10-19)
 
-- **Peers ban each other on PoWit items after the PoCI launch height
-  (blocker for the node team).** In every regtest run (code of
-  `obenblock/mainnet-launch` at 32cdd10), once finality starts moving after
-  block 100 the nodes log `PoWit item from <peer> invalid regardless of chain
-  state: peer misbehaved` and discourage each other within seconds, and the
-  three nodes split into partitions that finalize different checkpoints. It
-  happens with three competing miners and with a single miner (no
-  competing forks), so it is not only a fork race; the timing points at
-  witness votes or evidence around a configuration handoff being judged
-  "context-free" invalid by a node that is in another state. On mainnet this
-  would partition the three launch hosts. `verify` catches it (peer list,
-  split and finality checks). Reproduce with `rehearse-regtest.sh`
-  (`MINER_NODES=1` for one miner); the node does not log the refusal reason
-  (`ingress::complete` drops it).
-- **Finality can stay at the launch checkpoint.** In another run (three
-  miners, no ban) finality never moved past the launch checkpoint (slot 80,
-  block 79) in 1,800 blocks although every witness had votes included
-  (40 to 225 each): `getfinalityinfo.poci.absent_weight` reported over a
-  third of the configuration absent in every epoch, and one host's witness
-  was not in the witness set. Of four runs: finality advanced to 254 / 509–869
-  on part of the nodes in two, never in one, and the first run stopped at 104.
-  Regtest timing (several blocks per second) is far from mainnet's, but the
-  node team should reproduce it before the launch.
+- **Fixed (branch `obenblock/poci-net-fix`): peers banned each other on
+  PoWit votes after the PoCI launch height.** A PoCI vote's v3 signature
+  covers the `config_id` in force at the voter's tip, and the vote does not
+  carry it. Right after a handoff (every finalized epoch boundary) a node
+  one block ahead or behind verifies a neighbour's honest vote under
+  another configuration; the signature fails there, and gossip classified
+  that as `invalid attestation signature`, a context-free fault: the author
+  was disconnected and discouraged, and the hosts split into partitions
+  finalizing different checkpoints. The node now refuses such a vote for
+  its own view only (`Ignore`, never misbehaviour; the deliverer keeps the
+  verification charge unless the vote verifies under the previous
+  configuration), and a misbehaviour line now names the refusal reason
+  (rate-limited). Regression tests: `ingress::tests::poci_vote_under_another_configuration_is_not_a_fault`,
+  `node/tests/poci_partition.rs` `votes_across_a_handoff_are_never_a_peer_fault`.
+- **Fixed (same branch): finality stuck at the launch checkpoint.** Each
+  witness share thread mined, admitted and gossiped every share it found;
+  where shares are cheap (regtest at the pow limit, and any block whose
+  bits are easy) that is thousands per second, which filled every node's
+  share pool and the transaction topic until gossipsub dropped frames,
+  votes among them (`absent_weight` over a third with votes in the chain;
+  configurations built from very uneven share work). A witness now
+  publishes at most one share per attested block. The rehearsal also paces
+  its CPU miners (`obenblock-cpu-miner --block-pause-ms`, set only by
+  `rehearse-regtest.sh`): unpaced, regtest at the pow limit runs at tens of
+  blocks per second, which no node, the 5-block checkpoint interval or the
+  20-block vote lifetime is made for (mainnet: 30 s blocks, launch target
+  1 EH/s). The "not in the witness set" FAIL read the share-work set of the
+  epoch; `status.py` now reads the key's weight in the PoCI configuration
+  in force (`getpowitinfo.poci.signer_weights`).
 - The node's `stratum_e2e` test `v1_submit_hashes_first_forwards_blocks_over_the_rate_and_dedups_on_the_header`
   failed twice inside the rehearsal on the loaded build host and passed
   when run alone (timing-sensitive).
-- Regtest blocks come several per second at the pow limit, so the
-  rehearsal's "miner not hashing" and "tip did not move" results are
-  artefacts of regtest (the miner waits for a job after each block); on
-  mainnet the same checks are meaningful.
-- With three equal witness weights, strict PoCI (> 2/3) needs all three
-  witnesses online for finality: one host down halts finality (blocks go
-  on). More witness keys on separate machines (four or more) would tolerate
-  one outage.
+- **Three equal witnesses: one host down halts finality.** Strict PoCI
+  needs more than two thirds of the configuration in force (§3 of
+  `docs/DESIGN-obenblock-poci.md`): with three keys of equal weight that is
+  all three (2/3 is not enough). If one host is offline, blocks go on but
+  nothing is finalized until it returns: wallets and exchanges wait, and
+  the absent key is not pruned (a stall is not absence, §4.1). The rule is
+  not changed. Operational guidance:
+  - run four or more witness keys, each on its own machine and power or
+    network domain, with weights as even as possible: with four equal keys
+    one may be down (3/4 > 2/3); with seven, two;
+  - never run one key in two places (the signer lock and the rollback
+    guard stop the second instance; a double vote is evidence and a
+    100-epoch ban, §5); a standby host takes over with the same key only
+    after the first one is stopped for good;
+  - watch `getpowitinfo.poci.absent_weight` (`over_a_third`) and the
+    `verify` warning for a witness whose last included vote is more than
+    an epoch old; restore the host before an outage outlasts what
+    settlement can wait;
+  - if a key is lost for good with no quorum left, recovery is the
+    coordinated `setfinalitycheckpoint` procedure of §7, never automatic.
 - After the hosts' CPU blocks become rare (ASICs raise the difficulty), the
   CPU witness share threads still produce the only witness share work; an
   outside party mining witness shares with header-only ASIC hardware could

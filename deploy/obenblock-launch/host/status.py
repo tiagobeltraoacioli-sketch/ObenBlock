@@ -264,6 +264,10 @@ def main():
                 chain = votes.get("chain") if isinstance(votes, dict) else None
                 chain = chain if isinstance(chain, list) else []
                 top = (pw.get("witness_set") or {}).get("top") or []
+                # PoCI in force: the key's weight in the configuration (the
+                # votes that count), not the share-work set of the epoch.
+                if poci.get("active"):
+                    top = poci.get("signer_weights") or []
                 st["witness"].append({
                     "key": key, "halted": sg.get("halted"), "alert": sg.get("alert"),
                     "votes_recorded": sg.get("votes_recorded"),

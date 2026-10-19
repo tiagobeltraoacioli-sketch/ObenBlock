@@ -581,10 +581,25 @@ class Verify(unittest.TestCase):
         st["node_processes"][0]["mine"] = True
         self.assert_fails([("h", "OBB-STATUS " + json.dumps(st))], "runs --mine as well", "--no-peer-check")
 
+    def test_rehearsal_options(self):
+        # --paced-miner: a miner that pauses after each block is not "not hashing".
+        idle = [("h", self.status(miner_processes=[{"pid": 2, "threads": "30", "cpu_cores_busy": 0.1}]))]
+        p = self.run_verify(idle, "--no-peer-check", "--paced-miner")
+        self.assertEqual(p.returncode, 0, p.stdout)
+        # --miner-hosts: the other hosts must run no miner, the named ones one.
+        p = self.run_verify([("n2", self.status(miner_processes=[]))], "--no-peer-check", "--miner-hosts", "n1,")
+        self.assertEqual(p.returncode, 0, p.stdout)
+        self.assert_fails([("n2", self.status())], "expected none on this host", "--no-peer-check", "--miner-hosts", "n1,")
+        self.assert_fails([("n1", self.status(miner_processes=[]))], "0 obenblock-cpu-miner processes",
+                          "--no-peer-check", "--miner-hosts", "n1,")
+        # --min-finalized.
+        self.assert_fails([("h", self.status(finality={"pin_height": 79, "pin_hash": "e" * 64}))],
+                          "finalized height 79, expected at least 140", "--no-peer-check", "--min-finalized", "140")
+
     def test_witness(self):
         self.assert_fails([("h", self.status(witness=[]))], "no PoWit signer", "--no-peer-check")
         self.assert_fails([("h", self.status(witness=[{"key": "ab" * 20, "weight": None, "votes_in_chain": 3}]))],
-                          "not in the witness set", "--no-peer-check")
+                          "not in the PoCI configuration in force", "--no-peer-check")
         self.assert_fails([("h", self.status(witness=[{"key": "ab" * 20, "weight": "1", "votes_in_chain": 0}]))],
                           "no vote included", "--no-peer-check")
         self.assert_fails([("h", self.status(powit={"tip_height": 4000, "params": {"epoch_len": 720, "checkpoint_interval": 60},

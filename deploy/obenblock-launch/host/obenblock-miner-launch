@@ -59,5 +59,12 @@ case $kernel in
   *) die "OBB_MINER_KERNEL must be auto, sha2, lanes4, avx2 or avx512" ;;
 esac
 
+# Regtest rehearsal only (rehearse-regtest.sh): pause after each block, so
+# a chain where about every hash is a block runs at a block rate the
+# network can carry. The installed miner.env never sets it.
+pause=${OBB_MINER_BLOCK_PAUSE_MS:-0}
+case $pause in ''|*[!0-9]*) die "OBB_MINER_BLOCK_PAUSE_MS must be a decimal number" ;; esac
+[ "$pause" -eq 0 ] || set -- "$@" --block-pause-ms "$pause"
+
 [ "${OBB_LAUNCH_PRINT:-0}" = 1 ] && { printf '%s\n' "$exe $*"; exit 0; }
 exec "$exe" "$@"

@@ -63,6 +63,9 @@ struct Shared {
     accepted: AtomicU64,
     rejected: AtomicU64,
     stop: AtomicBool,
+    /// `--block-pause-ms`: no lane hashes before this instant (set after a
+    /// block).
+    resume_at: Mutex<Option<Instant>>,
 }
 
 struct Args {
@@ -73,11 +76,13 @@ struct Args {
     once: bool,
     kernel: Option<Kernel>,
     bench: Option<f64>,
+    /// After each block, every lane pauses this long (0: never).
+    block_pause: Duration,
 }
 
 fn usage() -> ! {
     eprintln!("usage: obenblock-cpu-miner -o stratum+tcp://HOST:PORT -u <obb1 address>[.<worker>] [-p x] [-t THREADS] \
-               [--kernel sha2|lanes4|avx2|avx512]\n       obenblock-cpu-miner --bench SECS [-t THREADS] [--kernel K]");
+               [--kernel sha2|lanes4|avx2|avx512] [--block-pause-ms MS]\n       obenblock-cpu-miner --bench SECS [-t THREADS] [--kernel K]");
     std::process::exit(2);
 }
 
@@ -91,6 +96,7 @@ fn parse_args() -> Args {
         once: false,
         kernel: None,
         bench: None,
+        block_pause: Duration::ZERO,
     };
     let mut i = 1;
     while i < a.len() {
@@ -111,6 +117,14 @@ fn parse_args() -> Args {
             }
             "--bench" => { args.bench = Some(val().parse().unwrap_or_else(|_| usage())); i += 2; }
             // Exit instead of reconnecting when the connection ends (tests).
+            // Pace a solo miner on a chain where about every hash is a block
+            // (ObenBlock regtest, the launch rehearsal): at most one block per
+            // pause, so the network runs at a block rate like mainnet's
+            // relative to propagation, not thousands of blocks a minute.
+            "--block-pause-ms" => {
+                args.block_pause = Duration::from_millis(val().parse().unwrap_or_else(|_| usage()));
+                i += 2;
+            }
             "--once" => { args.once = true; i += 1; }
             "-h" | "--help" => usage(),
             other => { eprintln!("unknown argument {other}"); usage() }
@@ -155,7 +169,8 @@ fn bench(args: &Args, secs: f64) {
              total / 1e6, total / 1e6 / args.threads as f64, t0.elapsed().as_secs_f64());
 }
 
-fn mine_lane(lane: u32, stride: u32, kernel: Kernel, shared: Arc<Shared>, submit: mpsc::Sender<String>, user: String) {
+fn mine_lane(lane: u32, stride: u32, kernel: Kernel, shared: Arc<Shared>, submit: mpsc::Sender<String>, user: String,
+             block_pause: Duration) {
     // Never reset, not even on a new job: a re-sent identical job must not
     // repeat work. Wraps after 2^32 / threads lanes per thread.
     let mut en2_counter: u64 = lane as u64;
@@ -165,6 +180,11 @@ fn mine_lane(lane: u32, stride: u32, kernel: Kernel, shared: Arc<Shared>, submit
     let mut done_gen = u64::MAX;
     let mut candidates: Vec<u32> = Vec::with_capacity(1024);
     while !shared.stop.load(Ordering::Relaxed) {
+        let paused = shared.resume_at.lock().unwrap_or_else(|e| e.into_inner()).is_some_and(|t| Instant::now() < t);
+        if paused {
+            thread::sleep(Duration::from_millis(20));
+            continue;
+        }
         let work = shared.work.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let Some(w) = work.filter(|w| w.generation != done_gen) else {
             thread::sleep(Duration::from_millis(20));
@@ -191,6 +211,9 @@ fn mine_lane(lane: u32, stride: u32, kernel: Kernel, shared: Arc<Shared>, submit
                 let _ = submit.send(line.to_string());
                 if meets_target(&id, &w.block_target) {
                     done_gen = w.generation;
+                    if !block_pause.is_zero() {
+                        *shared.resume_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + block_pause);
+                    }
                     shared.hashes.fetch_add(CHUNK as u64, Ordering::Relaxed);
                     break 'lane;
                 }
@@ -300,6 +323,7 @@ fn main() {
         accepted: AtomicU64::new(0),
         rejected: AtomicU64::new(0),
         stop: AtomicBool::new(false),
+        resume_at: Mutex::new(None),
     });
     let writer: Arc<Mutex<Option<TcpStream>>> = Arc::new(Mutex::new(None));
     let (subtx, subrx) = mpsc::channel::<String>();
@@ -316,7 +340,8 @@ fn main() {
     for lane in 0..args.threads {
         let (shared, subtx, user) = (shared.clone(), subtx.clone(), args.user.clone());
         let stride = args.threads as u32;
-        thread::spawn(move || mine_lane(lane as u32, stride, kernel, shared, subtx, user));
+        let pause = args.block_pause;
+        thread::spawn(move || mine_lane(lane as u32, stride, kernel, shared, subtx, user, pause));
     }
     {
         let shared = shared.clone();

@@ -39,11 +39,22 @@ REHEARSAL_TS=1792281600
 REHEARSAL_GENESIS=00000000f9db8f81e92e293fae6032d359f731c1c7afebcaca1b75f47bfc32bc
 OWNER_GNB=gnb1q52273b58c1032291d562f582c413bbf05efabcdd0df82055
 OWNER=obb1q52273b58c1032291d562f582c413bbf05efabcdd0df82055
-TARGET_HEIGHT=${TARGET_HEIGHT:-130}
+TARGET_HEIGHT=${TARGET_HEIGHT:-160}
+# Finality the regtest network must reach on every node (the launch
+# checkpoint is slot 80, final at launch_height 100).
+FIN_TARGET=${FIN_TARGET:-$((TARGET_HEIGHT - 20))}
 WAIT_SECS=${WAIT_SECS:-1500}
 MINER_THREADS_REG=${MINER_THREADS_REG:-2}
 # MINER_NODES="1": one CPU miner only (no competing forks; the default runs
 # one per node, as on mainnet).
+MINER_NODES=${MINER_NODES:-1 2 3}
+# Regtest mines at the pow limit (about two hashes per block) and its ASERT
+# anchor is the fixed regtest genesis time, so unpaced CPU miners find
+# blocks as fast as the nodes accept them (tens per second): far beyond the
+# block rate the network, the 5-block checkpoint interval and the 20-block
+# vote lifetime are made for (mainnet: 30 s blocks, launch target 1 EH/s).
+# Each miner pauses this long after a block: about one block a second in all.
+BLOCK_PAUSE_MS=${BLOCK_PAUSE_MS:-$(( 1000 * $(echo $MINER_NODES | wc -w) ))}
 export PATH=$HOME/.cargo/bin:$PATH CARGO_TERM_COLOR=never
 export BINDGEN_EXTRA_CLANG_ARGS=${BINDGEN_EXTRA_CLANG_ARGS:--I/usr/lib/gcc/x86_64-linux-gnu/13/include}
 step() { echo; echo "######## $*"; }
@@ -196,9 +207,9 @@ for i in 1 2 3; do
   sleep 2
 done
 for i in 1 2 3; do for _ in $(seq 1 60); do rpc "2821$i" getblockcount >/dev/null 2>&1 && break; sleep 1; done; done
-for i in ${MINER_NODES:-1 2 3}; do
+for i in $MINER_NODES; do
   env -i PATH="$PATH" OBB_RELEASE_DIR="$REL" OBB_MINER_URL="stratum+tcp://127.0.0.1:2833$i" \
-      OBB_MINER_USER="$REG_OWNER.cpu-n$i" OBB_MINER_THREADS="$MINER_THREADS_REG" \
+      OBB_MINER_USER="$REG_OWNER.cpu-n$i" OBB_MINER_THREADS="$MINER_THREADS_REG" OBB_MINER_BLOCK_PAUSE_MS="$BLOCK_PAUSE_MS" \
       sh "$REL/obenblock-miner-launch" > "$W/miner-n$i.log" 2>&1 &
   PIDS+=($!)
 done
@@ -210,7 +221,7 @@ while :; do
     f=$(rpc "2821$i" getfinalityinfo | jget "(r.get('pin') or {}).get('block_height')" 2>/dev/null || echo "?")
     line="$line n$i h=$h fin=$f"
     case $h in ''|*[!0-9]*) done_all=0 ;; *) [ "$h" -ge "$TARGET_HEIGHT" ] || done_all=0 ;; esac
-    case $f in ''|*[!0-9]*) done_all=0 ;; *) [ "$f" -gt 80 ] || done_all=0 ;; esac
+    case $f in ''|*[!0-9]*) done_all=0 ;; *) [ "$f" -ge "$FIN_TARGET" ] || done_all=0 ;; esac
   done
   el=$(( $(date +%s) - t0 ))
   [ "$line" != "$last" ] && echo "  t+${el}s:$line"; last=$line
@@ -239,6 +250,7 @@ for i in 1 2 3; do
   files+=("n$i=$W/status-n$i.txt")
 done
 python3 -I "$KIT/lib/verify_summary.py" --network regtest --miner-threads "$MINER_THREADS_REG" --no-units --no-peer-check \
+  --paced-miner --miner-hosts "$(for i in $MINER_NODES; do printf 'n%s,' "$i"; done)" --min-finalized "$FIN_TARGET" \
   "${files[@]}" > "$W/verify.txt" || true
 sed 's/^/  /' "$W/verify.txt"
 fin_all=$(for i in 1 2 3; do rpc "2821$i" getfinalityinfo | jget "(r.get('pin') or {}).get('block_height')"; done | tr '\n' ' ')

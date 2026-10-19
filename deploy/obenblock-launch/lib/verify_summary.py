@@ -4,6 +4,8 @@
     verify_summary.py [--network mainnet|regtest] [--genesis <raw hex>]
                       [--miner-threads auto|N] [--node-mine off|on]
                       [--witness on|off] [--no-units]
+                      [--miner-hosts <label,...>] [--paced-miner]
+                      [--min-finalized <height>]
                       <label>=<file with status.py output> ...
 
 FAIL (exit 1): not exactly one node process, node or CPU miner unit not
@@ -17,8 +19,12 @@ listening, not exactly one CPU miner, the wrong thread count (auto =
 logical CPUs - 2), a miner that is not hashing (CPU time between the two
 samples) or not connected to the V1 server, the node's own --mine on when
 the plan says off, witness duty missing, and after the PoCI launch height a
-witness outside the witness set, with no vote included in the chain, or
-PoCI not active; a finality conflict.
+witness outside the PoCI configuration in force (getpowitinfo
+poci.signer_weights), with no vote included in the chain, or PoCI not
+active; a finality conflict; with --min-finalized, a finalized height below
+it. Regtest rehearsal options: --miner-hosts names the hosts that run the
+CPU miner (the others must run none), --paced-miner skips the busy-cores
+check (the miner pauses after each block: --block-pause-ms).
 WARN: GnB processes running, explorer not active, V2 authority key not
 readable, a halted PoWit signer, a tip that did not move between the
 samples, node warnings, finalized heights apart, a witness whose last
@@ -69,7 +75,7 @@ def check_witness(label, st, a, fails, warns):
             if not poci.get("active"):
                 fails.append(f"{label}: PoCI not active at height {tip} (launch height {launch})")
             if w.get("weight") is None:
-                fails.append(f"{name} is not in the witness set at height {tip}")
+                fails.append(f"{name} is not in the PoCI configuration in force at height {tip} (its votes do not count)")
             if not w.get("votes_in_chain"):
                 fails.append(f"{name} has no vote included in the chain at height {tip}")
             elif (w.get("last_vote_target") or 0) < tip - el:
@@ -88,6 +94,12 @@ def main(argv):
     ap.add_argument("--no-peer-check", action="store_true",
                     help="skip the check that each peer list has the other hosts (labels that are not IPs)")
     ap.add_argument("--no-units", action="store_true")
+    ap.add_argument("--miner-hosts", default="",
+                    help="comma-separated labels of the hosts that run the CPU miner (default: every host)")
+    ap.add_argument("--paced-miner", action="store_true",
+                    help="the CPU miners pause after each block (regtest rehearsal): no busy-cores check")
+    ap.add_argument("--min-finalized", type=int, default=None,
+                    help="FAIL when a host's finalized height is below this")
     ap.add_argument("hosts", nargs="+")
     a = ap.parse_args(argv[1:])
 
@@ -155,12 +167,17 @@ def main(argv):
 
         ms = st.get("miner_processes", [])
         want = max(1, (st.get("nproc") or 3) - 2) if a.threads == "auto" else int(a.threads)
-        if len(ms) != 1:
+        miner_here = not a.miner_hosts or label in a.miner_hosts.split(",")
+        if not miner_here:
+            if ms:
+                fails.append(f"{label}: {len(ms)} obenblock-cpu-miner processes, expected none on this host")
+        elif len(ms) != 1:
             fails.append(f"{label}: {len(ms)} obenblock-cpu-miner processes, expected exactly 1")
         elif str(ms[0].get("threads")) != str(want):
             fails.append(f"{label}: CPU miner threads {ms[0].get('threads')}, expected {want}")
         m_threads = ms[0].get("threads") if len(ms) == 1 else None
-        if len(ms) == 1 and ms[0].get("cpu_cores_busy") is not None and ms[0]["cpu_cores_busy"] < 0.5 * want:
+        if (len(ms) == 1 and not a.paced_miner and ms[0].get("cpu_cores_busy") is not None
+                and ms[0]["cpu_cores_busy"] < 0.5 * want):
             fails.append(f"{label}: CPU miner used {ms[0]['cpu_cores_busy']} cores over the sample, expected about {want}: not hashing")
 
         met = st.get("metrics") or {}
@@ -208,6 +225,8 @@ def main(argv):
         hashes[label] = st.get("hashes") or {}
         if fin.get("pin_height") is not None:
             pins[label] = (fin.get("pin_height"), fin.get("pin_hash"))
+        if a.min_finalized is not None and (fin.get("pin_height") or 0) < a.min_finalized:
+            fails.append(f"{label}: finalized height {fin.get('pin_height')}, expected at least {a.min_finalized}")
         if st.get("tip_later") is not None and st.get("tip_later") == tip_h:
             warns.append(f"{label}: the tip did not move in {st.get('sample_secs')} s (normal while CPUs mine at the launch difficulty)")
         check_witness(label, st, a, fails, warns)
