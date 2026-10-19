@@ -3,13 +3,15 @@
 #
 #   release-build.sh <src-dir> <out-dir> <source-label> [--allow-placeholder]
 #
-# Builds the node, CLI, wallet and genesis tool (release profile), the
-# stratum proxy when tools/obenblock-stratum exists, and assembles
+# Builds the node (with the built-in Stratum V1/V2 servers), CLI, wallet and
+# genesis tool (release profile), obenblock-cpu-miner and obenblock-stratum
+# (tools/obenblock-stratum), and assembles
 #   <out-dir>/obenblock-release-<id>/   binaries, launchers, units, host
 #                                       scripts, explorer API, carryover
 #                                       snapshot, RELEASE, SHA256SUMS
 #   <out-dir>/obenblock-release-<id>.tar.gz (+ .sha256)
-# The CPU miner is the node's built-in SHA-256d miner (--mine). A mainnet
+# The CPU miner is obenblock-cpu-miner, run as its own unit through the
+# node's V1 server (the node's --mine stays available, off). A mainnet
 # release needs the mined genesis in the source; --allow-placeholder builds
 # one without it (marked genesis=none; install.sh refuses it on mainnet).
 set -euo pipefail
@@ -41,64 +43,60 @@ echo "== build wallet (gnb-crypto/wallet-cli)"
 cargo build -q --release --locked -p gnb --bin gnb-wallet --features gnb-crypto/wallet-cli
 install -m 755 target/release/gnb-wallet "$STAGE/"
 
-STRATUM_EXEC=""
+# tools/obenblock-stratum is its own cargo workspace (with its own
+# Cargo.lock): obenblock-cpu-miner (the CPU miner unit on every host) and
+# obenblock-stratum (the optional external job server).
 STRATUM_SRC=tools/obenblock-stratum
-if [ -d "$STRATUM_SRC" ]; then
-  echo "== build stratum proxy ($STRATUM_SRC)"
-  if [ -f "$STRATUM_SRC/Cargo.toml" ]; then
-    pkg=$(sed -n 's/^name *= *"\(.*\)"/\1/p' "$STRATUM_SRC/Cargo.toml" | head -1)
-    if cargo metadata -q --no-deps --format-version 1 | grep -q "\"name\":\"$pkg\""; then
-      cargo build -q --release --locked -p "$pkg"
-      STRATUM_DIR=target/release
-    else
-      cargo build -q --release --manifest-path "$STRATUM_SRC/Cargo.toml"
-      STRATUM_DIR=$STRATUM_SRC/target/release
-    fi
-    STRATUM_EXEC=$(sed -n '/^\[\[bin\]\]/,/^\[/{s/^name *= *"\(.*\)"/\1/p}' "$STRATUM_SRC/Cargo.toml" | head -1)
-    STRATUM_EXEC=${STRATUM_EXEC:-$pkg}
-    [ -x "$STRATUM_DIR/$STRATUM_EXEC" ] || die "stratum build produced no $STRATUM_DIR/$STRATUM_EXEC"
-  else
-    echo "   (no Cargo.toml: shipped as files)"
-  fi
-else
-  echo "== no $STRATUM_SRC in this source: the release has no stratum proxy"
-fi
+[ -f "$STRATUM_SRC/Cargo.toml" ] || die "no $STRATUM_SRC in this source: the release needs obenblock-cpu-miner (merge obenblock/stratum)"
+echo "== build obenblock-cpu-miner and obenblock-stratum ($STRATUM_SRC)"
+cargo build -q --release --locked --manifest-path "$STRATUM_SRC/Cargo.toml" --bin obenblock-cpu-miner --bin obenblock-stratum
+STRATUM_DIR=$STRATUM_SRC/target/release
+for b in obenblock-cpu-miner obenblock-stratum; do
+  [ -x "$STRATUM_DIR/$b" ] || die "the stratum build produced no $STRATUM_DIR/$b"
+done
+"$STRATUM_DIR/obenblock-cpu-miner" --bench 1 -t 1 > "$STAGE/miner-bench.txt" 2>&1 || true
 
-ID="$LABEL-$( [ "$GENESIS_DISPLAY" = none ] && echo nogenesis || echo "g${GENESIS_DISPLAY:56:8}")"
-REL=$OUT/obenblock-release-$ID
-rm -rf "$REL" "$REL.tar.gz"
+BASE_ID="$LABEL-$( [ "$GENESIS_DISPLAY" = none ] && echo nogenesis || echo "g${GENESIS_DISPLAY:56:8}")"
+# Assembled under a temporary name; the id gets a digest of the contents
+# (every file but RELEASE), so a rebuild with other binaries, units or
+# launchers never reuses an installed id.
+REL=$OUT/obenblock-release-$BASE_ID.assembling
+rm -rf "$REL"
 mkdir -p "$REL/units" "$REL/host" "$REL/lib" "$REL/share" "$REL/explorer-api"
 install -m 755 "$STAGE/gnb" "$REL/obenblock"
 install -m 755 "$STAGE/gnb-cli" "$REL/obenblock-cli"
 install -m 755 "$STAGE/gnb-wallet" "$REL/obenblock-wallet"
 install -m 755 "$STAGE/gnb-mine-genesis" "$REL/obenblock-mine-genesis"
-rm -rf "$STAGE"
-if [ -n "$STRATUM_EXEC" ]; then
-  for b in $(sed -n '/^\[\[bin\]\]/,/^\[/{s/^name *= *"\(.*\)"/\1/p}' "$STRATUM_SRC/Cargo.toml") $STRATUM_EXEC; do
-    [ -x "$STRATUM_DIR/$b" ] && install -m 755 "$STRATUM_DIR/$b" "$REL/$b"
-  done
-elif [ -d "$STRATUM_SRC" ]; then
-  mkdir -p "$REL/stratum"
-  cp -a "$STRATUM_SRC/." "$REL/stratum/"
-  STRATUM_EXEC="stratum"
-fi
-install -m 755 "$KIT/host/obenblock-launch" "$KIT/host/obenblock-stratum-launch" "$REL/"
+install -m 755 "$STRATUM_DIR/obenblock-cpu-miner" "$STRATUM_DIR/obenblock-stratum" "$REL/"
+install -m 755 "$KIT/host/obenblock-launch" "$KIT/host/obenblock-miner-launch" "$KIT/host/obenblock-stratum-launch" "$REL/"
 install -m 644 "$KIT"/host/*.service "$REL/units/"
 install -m 755 "$KIT/host/install.sh" "$KIT/host/rollback.sh" "$KIT/host/explorer-tls.sh" "$KIT/host/status.py" "$REL/host/"
 install -m 644 "$KIT/lib/apply_genesis.py" "$REL/lib/"
 install -m 644 deploy/explorer-api/gnb_explorer_api.py "$REL/explorer-api/"
 install -m 644 deploy/explorer-api/cloudflare-ips-v4.txt "$REL/share/"
+# The explorer API's Cloudflare-only nftables table (obenblock/site-deploy):
+# the script and its persistent units, used as they are.
+install -m 755 deploy/explorer-api/firewall-cloudflare.sh "$REL/host/"
+install -m 644 deploy/explorer-api/obenblock-explorer-firewall.service deploy/explorer-api/obenblock-explorer-firewall-reapply.service \
+  deploy/explorer-api/obenblock-explorer-firewall-reapply.timer "$REL/units/"
 install -m 644 genesis/bloch-g3-carryover.tsv.gz "$REL/share/"
 
 version=$("$REL/obenblock" --version 2>&1 | head -1)
+DIGEST=$(cd "$REL" && find . -type f | sed 's|^\./||' | LC_ALL=C sort | xargs sha256sum | sha256sum | cut -c1-8)
+ID="$BASE_ID-c$DIGEST"
+FINAL=$OUT/obenblock-release-$ID
+rm -rf "$FINAL" "$FINAL.tar.gz"
+mv "$REL" "$FINAL"
+REL=$FINAL
 {
   echo "id=$ID"
+  echo "content_digest=$DIGEST"
   echo "source=$LABEL"
   echo "genesis=$GENESIS_RAW"
   echo "genesis_display=$GENESIS_DISPLAY"
   echo "genesis_timestamp=$GENESIS_TS"
-  echo "stratum=$STRATUM_EXEC"
-  echo "cpu_miner=built-in (obenblock --mine)"
+  echo "stratum=built-in V1 + V2 (obenblock --stratum --stratum-v2); external obenblock-stratum optional"
+  echo "cpu_miner=obenblock-cpu-miner (on the build host: $(sed -n 's/^\[miner\] kernels (MH\/s, one thread): //p' "$STAGE/miner-bench.txt" | head -1))"
   echo "node_version=$version"
   echo "rustc=$(rustc --version)"
   echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ) on $(hostname)"
@@ -107,6 +105,7 @@ version=$("$REL/obenblock" --version 2>&1 | head -1)
 tar -C "$OUT" -czf "$REL.tar.gz" "obenblock-release-$ID"
 (cd "$OUT" && sha256sum "obenblock-release-$ID.tar.gz" > "obenblock-release-$ID.tar.gz.sha256")
 
+rm -rf "$STAGE"
 echo "== release $ID"
 cat "$REL/RELEASE"
 echo "-- SHA256SUMS (binaries)"

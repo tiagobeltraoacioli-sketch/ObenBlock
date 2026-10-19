@@ -1,0 +1,61 @@
+# CPU miner of an ObenBlock launch host (deploy/obenblock-launch/LAUNCH-RUNBOOK.md).
+# obenblock-cpu-miner (tools/obenblock-stratum, AVX-512/AVX2/SHA-NI kernels)
+# mines through the node's built-in Stratum V1 on 127.0.0.1:3333, exactly the
+# path the ASICs use, as worker <owner obb1 address>.<label>: the node's solo
+# server pays every block it finds to that address.
+#   /etc/obenblock/miner.env  OBB_MINER_URL, OBB_MINER_USER, OBB_MINER_THREADS
+# Threads: logical CPUs - 2 (the node, its witness share thread and the
+# explorer API keep the rest). It runs at the lowest CPU priority, as its own
+# user, and may only talk to loopback.
+[Unit]
+Description=ObenBlock CPU miner (through the local Stratum V1)
+After=obenblock-node.service
+Wants=obenblock-node.service
+
+[Service]
+User=obenblock-miner
+Group=obenblock-miner
+EnvironmentFile=/etc/obenblock/miner.env
+ExecStart=/opt/obenblock/current/obenblock-miner-launch
+Restart=always
+RestartPreventExitStatus=64
+RestartSec=10
+Nice=19
+CPUWeight=10
+CPUSchedulingPolicy=batch
+MemoryMax=2G
+TasksMax=512
+UMask=0077
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+PrivateUsers=true
+PrivateIPC=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+DevicePolicy=closed
+KeyringMode=private
+
+[Install]
+WantedBy=multi-user.target

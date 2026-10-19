@@ -1,10 +1,14 @@
-# Stratum V1 endpoint for the ASICs that mine ObenBlock (STRATUM_HOST only,
-# port 3333 open in ufw). It asks the local node for header jobs over the
-# loopback RPC (getblocktemplate header_job, submitblock; docs/OBENBLOCK-MINING.md)
-# with the node's API key /etc/obenblock/rpc.key (group obenblock-rpc).
-# Runs as its own user: it faces the internet.
+# OPTIONAL external Stratum V1 job server (tools/obenblock-stratum), installed
+# only with STRATUM_PROXY="on" in kit.conf. The primary ASIC endpoints are the
+# node's built-in servers (V1 3333, V2 3334); this one adds vardiff tuning,
+# PPLNS accounting and Prometheus counters on another port (3335 by default,
+# open in ufw), for operators who want them. It asks the local node for
+# header jobs over the loopback RPC (getblocktemplate header_job,
+# submitblock; docs/OBENBLOCK-MINING.md) with the node's API key
+# /etc/obenblock/rpc.key (group obenblock-rpc). Every block it finds pays
+# OBB_STRATUM_PAYOUT_ADDRESS. Runs as its own user: it faces the internet.
 [Unit]
-Description=ObenBlock Stratum V1 proxy (ASICs)
+Description=ObenBlock external Stratum V1 job server (optional)
 After=obenblock-node.service
 Wants=obenblock-node.service
 
