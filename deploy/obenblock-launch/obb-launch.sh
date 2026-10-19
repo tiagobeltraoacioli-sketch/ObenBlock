@@ -372,8 +372,13 @@ step_site() {
   # raw order: what the origins sign). Secrets stay out of the file.
   local fallback="" chain_id=0x4f420001
   for h in $HOSTS; do
-    origins="${origins:+$origins,}https://$(kit_explorer_name "$h"):$EXPLORER_PORT"
-    case $(kit_explorer_name "$h") in *.sslip.io) ;; *) fallback="${fallback:+$fallback,}https://$(kit_dashed "$h").sslip.io:$EXPLORER_PORT" ;; esac
+    # sslip.io names are only fallbacks (the Worker accepts OBB_ORIGINS in the
+    # zone only); a host without a zone name is served through its fallback.
+    case $(kit_explorer_name "$h") in
+      *.sslip.io) fallback="${fallback:+$fallback,}https://$(kit_explorer_name "$h"):$EXPLORER_PORT" ;;
+      *) origins="${origins:+$origins,}https://$(kit_explorer_name "$h"):$EXPLORER_PORT"
+         fallback="${fallback:+$fallback,}https://$(kit_dashed "$h").sslip.io:$EXPLORER_PORT" ;;
+    esac
   done
   python3 -I "$KIT_DIR/lib/site_launch.py" --wrangler "$out/wrangler.toml" --origins "$origins" \
     --fallback-origins "$fallback" --chain-id "$chain_id" --genesis-raw "$GENESIS_HASH_RAW" \

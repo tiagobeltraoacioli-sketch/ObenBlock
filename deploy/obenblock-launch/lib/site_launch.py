@@ -122,7 +122,7 @@ def wrangler_main(argv):
         raise SystemExit("--chain-id must be 0x + 8 hex digits")
     if not re.fullmatch(r"[0-9a-f]{64}", a.genesis_raw):
         raise SystemExit("--genesis-raw must be the 64-hex getblockhash 0")
-    for o in a.origins.split(","):
+    for o in [x for x in a.origins.split(",") if x]:
         host = re.fullmatch(r"https://([a-z0-9.-]+):\d+", o)
         if not host or not (host.group(1) == a.zone or host.group(1).endswith("." + a.zone)):
             raise SystemExit(f"--origins: {o!r} is not https://<name in {a.zone}>:<port> (the Worker ignores it)")
