@@ -729,3 +729,109 @@ fn a_fork_at_the_epoch_4_boundary_is_settled_by_work() {
         assert!(n.dag.read().finality_outcome().conflict.is_none(), "no conflicting finality");
     }
 }
+
+// ── Votes across a handoff (launch rehearsal, 2026-10-18) ───────────────────
+
+/// A v3 vote names the configuration in force at its voter's tip, and the
+/// vote does not carry it. Right after a handoff a node one block behind
+/// still verifies under the configuration before: the signature fails
+/// there although the vote is honest. Gossip used to call that
+/// `invalid attestation signature`, a context-free fault, so the nodes of
+/// the regtest rehearsal banned each other after the first handoffs and
+/// split into fragments that finalized different checkpoints. Here, through
+/// the real acceptance pipeline: two nodes share a chain, A crosses a
+/// handoff that B has not applied yet; A's vote under the new configuration
+/// is refused by B for its view only (no fault, never misbehaviour), B's
+/// stale vote under the old configuration is refused by A for its view
+/// only, and once B has A's blocks it admits A's vote. A forged signature
+/// under the configuration in force is refused the same way (a vote cannot
+/// prove it was signed for another one); only a link that is never valid
+/// anywhere stays a fault.
+#[test]
+fn votes_across_a_handoff_are_never_a_peer_fault() {
+    use gnb::ingress::{powit_admit_error_fault, powit_admit_error_keeps_charge, BlockFault};
+    setup();
+    let ws = witnesses(DEPTH_SHORT, 3);
+    let genesis = mk_genesis(unix_now() - 40_000);
+    let (na, nb) = (node_with(&genesis, &[]), node_with(&genesis, &[]));
+    let shared_tip = common_history(&na, &nb, &genesis, &ws);
+    let c_b = state(&nb, &shared_tip).poci_config().unwrap().clone();
+    // A alone, until its configuration changes (a handoff B has not applied).
+    let all: Vec<usize> = (0..ws.len()).collect();
+    let mut tip_a = shared_tip;
+    let mut ahead = Vec::new();
+    while state(&na, &tip_a).poci_config().unwrap().id() == c_b.id() {
+        assert!(ahead.len() < 2 * EL as usize, "a handoff within two epochs");
+        let b = build(&na, tip_a, &ws, &all, &all, Votes::EverySlot, "a", Extra::default());
+        tip_a = accept(&na, &b).unwrap();
+        ahead.push(b);
+    }
+    let st_a = state(&na, &tip_a);
+    let c_a = st_a.poci_config().unwrap().clone();
+    for w in &ws {
+        assert!(c_a.weight(&w.id).is_some() && c_b.weight(&w.id).is_some(), "every key is a member of both");
+    }
+    // B gets every block but the one that handed off: one block behind.
+    deliver(&nb, &ahead[..ahead.len() - 1]);
+    let tip_b = ahead[ahead.len() - 2].block_hash();
+    assert_eq!(sel_tip(&nb), Some(tip_b));
+    assert_eq!(state(&nb, &tip_b).poci_config().unwrap().id(), c_b.id(), "B is still under C_b");
+    let h_b = height_of(&nb, &tip_b);
+    let h_a = height_of(&na, &tip_a);
+    assert_eq!(h_a, h_b + 1);
+
+    // The slot above B's justified checkpoint, open on both nodes.
+    let j_b = state(&nb, &tip_b).justified;
+    let slot = j_b.height + IV;
+    assert!(slot <= h_b + IV && slot > j_b.height, "open at B: slot {slot}, B at {h_b}");
+    let target = {
+        let d = na.dag.read();
+        Checkpoint { height: slot, hash: DagChainView { dag: &d, start: Some(tip_a) }.selected_at(slot).unwrap() }
+    };
+    // A vote under C_a (its voter's tip is past the handoff, as A's):
+    // refused by B, for its view.
+    let vote_a = ws[0].vote_unguarded(&c_a.id(), j_b, target);
+    let (_, kind, data) = powit::attestation_item(&vote_a);
+    let err = powit::admit_item(kind, &data, &nb.dag.read(), &nb.store).expect_err("B has not reached C_a");
+    assert_eq!(err, powit::POWIT_ATTESTATION_OTHER_CONFIG);
+    assert_eq!(powit_admit_error_fault(kind, &err), None, "an honest voter one handoff ahead is no peer fault");
+    assert!(powit_admit_error_keeps_charge(kind, &err));
+
+    // A forged signature under B's configuration: the same refusal (no
+    // proof either way), charged but not penalised.
+    let mut forged = ws[1].vote_unguarded(&c_b.id(), j_b, target);
+    forged.sig.sig[0] ^= 1;
+    let (_, kind, data) = powit::attestation_item(&forged);
+    let err = powit::admit_item(kind, &data, &nb.dag.read(), &nb.store).expect_err("forged");
+    assert_eq!(err, powit::POWIT_ATTESTATION_OTHER_CONFIG);
+    assert_eq!(powit_admit_error_fault(kind, &err), None);
+
+    // A link that is never valid (target not above its source) stays a fault.
+    let mut backwards = vote_a.clone();
+    backwards.source = Checkpoint { height: slot + IV, hash: [0xAB; 32] };
+    let (_, kind, data) = powit::attestation_item(&backwards);
+    let err = powit::admit_item(kind, &data, &nb.dag.read(), &nb.store).expect_err("never valid");
+    assert_eq!(powit_admit_error_fault(kind, &err), Some(BlockFault::ContextFree), "{err}");
+
+    // B's stale vote under C_b, for a slot A considers open: refused by A,
+    // for its view (the voter is one handoff behind), refunded.
+    let stale = ws[2].vote_unguarded(&c_b.id(), j_b, target);
+    let (_, kind, data) = powit::attestation_item(&stale);
+    let err = powit::admit_item(kind, &data, &na.dag.read(), &na.store).expect_err("A is past C_b");
+    assert_eq!(err, powit::POWIT_ATTESTATION_PREVIOUS_CONFIG);
+    assert_eq!(powit_admit_error_fault(kind, &err), None);
+    assert!(!powit_admit_error_keeps_charge(kind, &err));
+
+    // B catches up: A's vote verifies there now.
+    deliver(&nb, &ahead[ahead.len() - 1..]);
+    assert_eq!(sel_tip(&nb), Some(tip_a));
+    let (_, kind, data) = powit::attestation_item(&vote_a);
+    let caught_up = powit::admit_item(kind, &data, &nb.dag.read(), &nb.store);
+    match caught_up {
+        Ok(()) => {}
+        Err(e) => {
+            assert_ne!(e, powit::POWIT_ATTESTATION_OTHER_CONFIG, "verifies under C_a");
+            assert_eq!(powit_admit_error_fault(kind, &e), None, "{e}");
+        }
+    }
+}

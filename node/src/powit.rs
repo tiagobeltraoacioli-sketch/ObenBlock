@@ -869,6 +869,18 @@ pub fn item_kind_max() -> u8 {
 }
 
 /// `PowitPool::admit_rejoin`'s refusal of a bad signature (context-free).
+/// `PowitPool::admit_attestation`'s refusal (PoCI) of a vote whose v3
+/// signature verifies under neither the configuration in force at this
+/// node's tip nor the one before it: it may name a configuration this node
+/// has not reached yet (the voter's tip is past a handoff this node has not
+/// applied), so it is never a misbehaviour; the delivering peer keeps the
+/// verification-budget charge (`ingress::powit_admit_error_keeps_charge`),
+/// as for a forged vote it costs this node a KES verification.
+pub const POWIT_ATTESTATION_OTHER_CONFIG: &str =
+    "attestation signature does not verify under the PoCI configuration in force (another configuration?)";
+/// The same for a vote signed under the configuration in force before the
+/// last handoff at this node's tip: an honest voter one handoff behind.
+pub const POWIT_ATTESTATION_PREVIOUS_CONFIG: &str = "attestation names the PoCI configuration before the one in force";
 pub const POWIT_BAD_REJOIN_SIGNATURE: &str = "invalid PoCI rejoin signature";
 
 /// `PowitPool::admit_exit`'s refusal of a bad signature (context-free).
@@ -1006,6 +1018,18 @@ impl PowitPool {
         // activation: it commits the witness key); PoCI: the v3 message of
         // the configuration in force.
         if !view.verify_attestation(&att, chain, &p, act) {
+            // PoCI: the v3 message names a configuration the attestation
+            // does not carry, so a signature that fails under the one in
+            // force here may be valid under the configuration in force at
+            // the voter's tip (one handoff ahead of this node, or behind
+            // it): this node's view, never a proof of misbehaviour.
+            if let Some(pp) = view.poci {
+                let previous = view.state.poci.as_ref().and_then(|st| st.previous());
+                if previous.is_some_and(|c| att.verify_signature_v3(&pp, &c.id())) {
+                    return Err(POWIT_ATTESTATION_PREVIOUS_CONFIG.into());
+                }
+                return Err(POWIT_ATTESTATION_OTHER_CONFIG.into());
+            }
             return Err("invalid attestation signature".into());
         }
         let config_id = view.poci_config().map(|c| c.id());
@@ -1772,6 +1796,14 @@ fn poci_info_json(dag: &GhostDAG, store: &Storage, st: Option<&PowitState>) -> s
         // §4.1: absence pruning by the old committee.
         "prune_after_epochs": poci::POCI_PRUNE_AFTER_EPOCHS,
         "absent_weight": absent,
+        // This node's witness keys in the configuration in force (`null`:
+        // not an entry, so its votes do not count; the launch kit's verify
+        // checks every launch host's key is one).
+        "signer_weights": crate::powit_signer::statuses().iter().map(|sg| {
+            let w = hex::decode(&sg.key).ok().and_then(|k| <KeyId>::try_from(k.as_slice()).ok())
+                .and_then(|k| c.weight(&k));
+            serde_json::json!({ "key": sg.key, "weight": w.map(|w| w.to_string()) })
+        }).collect::<Vec<_>>(),
         "pruned": ps.pruned.iter().map(|(k, p)| serde_json::json!({
             "key": hex::encode(k), "since_epoch": p.start, "rejoin_included_at": ps.rejoins.get(k) })).collect::<Vec<_>>(),
         "growth_cap": growth_cap_json(s.cap.as_ref()),

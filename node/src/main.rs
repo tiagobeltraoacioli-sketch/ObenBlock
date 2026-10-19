@@ -1414,7 +1414,9 @@ async fn main() {
                             // A PoWit item verified off this task.
                             Some((job, result)) = powit_done_rx.recv() => {
                                 if let Err(e) = &result {
-                                    debug!("PoWit item {} refused: {}", hex::encode(&job.id[..8]), e);
+                                    if POWIT_REFUSAL_LOG.allow() {
+                                        debug!("PoWit item {} (kind {}) refused: {}", hex::encode(&job.id[..8]), job.payload.kind, e);
+                                    }
                                 }
                                 let in_force = ingress::block_penalties_in_force(selected_tip_height(&dag_t), activation_t);
                                 let v = powit_core.complete(job, &result, in_force, std::time::Instant::now());
@@ -2422,9 +2424,19 @@ async fn main() {
 
         // Share miners: read the tip under a short lock, mine without it.
         let threads = cli.share_threads.unwrap_or(2);
+        // One share of this witness per attested block, whatever the
+        // threads: a block carries at most 16 shares and a share attests
+        // the tip it was mined on, so more add nothing a block can include.
+        // Where shares are cheap (regtest, the first CPU-mined blocks) a
+        // thread finds thousands a second; each was admitted and gossiped,
+        // filling every node's share pool and the transaction topic until
+        // gossip dropped frames, votes among them (launch rehearsal: no
+        // finality past the launch checkpoint).
+        let shared_tip: Arc<parking_lot::Mutex<Option<consensus::BlockHash>>> = Arc::new(parking_lot::Mutex::new(None));
         for t in 0..threads {
             let (dag_s, store_s, otx_s, payout, witness) =
                 (dag.clone(), store.clone(), outbound_tx.clone(), duty.payout_script.clone(), duty.key_id);
+            let shared_tip = shared_tip.clone();
             std::thread::Builder::new().name(format!("share-miner-{t}")).spawn(move || {
                 let stop = std::sync::atomic::AtomicBool::new(false);
                 loop {
@@ -2443,11 +2455,22 @@ async fn main() {
                         std::thread::sleep(std::time::Duration::from_secs(5));
                         continue;
                     };
+                    if *shared_tip.lock() == Some(tip) {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        continue;
+                    }
                     let Some(attested) = store_s.get_block(&tip).ok().flatten() else {
                         std::thread::sleep(std::time::Duration::from_secs(1));
                         continue;
                     };
                     if let Some(share) = powit::mine_share(&attested, tip, witness, &payout, rand::random(), 16, &stop) {
+                        {
+                            let mut g = shared_tip.lock();
+                            if *g == Some(tip) {
+                                continue;
+                            }
+                            *g = Some(tip);
+                        }
                         let admitted = {
                             let d = dag_s.read();
                             powit::pool().admit_share(share.clone(), &d, &store_s)
@@ -3483,11 +3506,21 @@ fn report_powit_verdict(
     report_verdict(vtx, &v.origin, v.penalty.gossip);
     if v.penalty.misbehaving {
         if let Some(peer) = v.origin.peer() {
-            warn!("PoWit item from {} invalid regardless of chain state: peer misbehaved", peer);
+            // The reason, rate-limited: what made this node call it a fault.
+            if POWIT_FAULT_LOG.allow() {
+                warn!("PoWit item from {} invalid regardless of chain state: peer misbehaved ({})", peer,
+                      v.reason.as_deref().unwrap_or("no reason recorded"));
+            }
             let _ = net_ctl.try_send(network::NetworkControl::Misbehaving(peer));
         }
     }
 }
+
+/// At most 20 misbehaviour lines per minute for PoWit items (a relay can
+/// deliver many invalid items before it is disconnected).
+static POWIT_FAULT_LOG: ingress::LogLimiter = ingress::LogLimiter::new(20, 60);
+/// At most 600 refusal lines (debug) per minute.
+static POWIT_REFUSAL_LOG: ingress::LogLimiter = ingress::LogLimiter::new(600, 60);
 
 /// B1-T5: report the withheld verdicts of buffered orphan frames — Accept
 /// for an orphan that connected, the (B1-T7-gated) penalty for one

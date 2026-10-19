@@ -3148,10 +3148,48 @@ impl BlockIngress {
 //   in force ([`block_penalties_in_force`]); a fault that depends on this
 //   node's chain (a share for a block not on its selected chain or outside
 //   the window, an attestation from another justified checkpoint or by a key
-//   outside the witness set, a full pool) is `Ignore`, never penalised;
+//   outside the witness set, a full pool; on PoCI chains a vote whose v3
+//   signature fails under the configuration in force here: the vote names
+//   the configuration of its voter's tip, which may be one handoff ahead or
+//   behind this node's, `powit::POWIT_ATTESTATION_OTHER_CONFIG`) is
+//   `Ignore`, never penalised;
 //   an equivocation proof against a key outside the recent witness sets is
 //   refused before its signatures are checked and keeps its budget charge
 //   ([`powit_admit_error_keeps_charge`]).
+
+/// A fixed-window log rate limit: at most `max` lines per `window_secs`
+/// (the PoWit refusal and misbehaviour lines; a peer controls how many items
+/// it sends, never how much this node logs).
+pub struct LogLimiter {
+    max: u32,
+    window: Duration,
+    state: std::sync::Mutex<(Option<Instant>, u32)>,
+}
+
+impl LogLimiter {
+    pub const fn new(max: u32, window_secs: u64) -> Self {
+        Self { max, window: Duration::from_secs(window_secs), state: std::sync::Mutex::new((None, 0)) }
+    }
+
+    /// Whether one more line may be logged now.
+    pub fn allow(&self) -> bool {
+        self.allow_at(Instant::now())
+    }
+
+    pub fn allow_at(&self, now: Instant) -> bool {
+        let mut g = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        match g.0 {
+            Some(start) if now.saturating_duration_since(start) < self.window => {}
+            _ => *g = (Some(now), 0),
+        }
+        if g.1 < self.max {
+            g.1 += 1;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 /// The context-free checks of a gossiped PoWit item, before any
 /// verification is queued: the claimed id is `powit::item_id(kind, data)` and
@@ -3239,7 +3277,8 @@ pub fn poci_evidence_fault_is_context_free(err: &str) -> bool {
 /// costs the relay its budget as an invalid item would, as Bitcoin Core
 /// counts what a peer makes it do before the expensive checks.
 pub fn powit_admit_error_keeps_charge(kind: u8, err: &str) -> bool {
-    kind == crate::powit::ITEM_EVIDENCE && err == crate::powit::EVIDENCE_NOT_A_WITNESS
+    (kind == crate::powit::ITEM_EVIDENCE && err == crate::powit::EVIDENCE_NOT_A_WITNESS)
+        || (kind == crate::powit::ITEM_ATTESTATION && err == crate::powit::POWIT_ATTESTATION_OTHER_CONFIG)
 }
 
 /// A gossiped PoWit item waiting for (or under) verification.
@@ -3260,6 +3299,9 @@ pub type PowitJob = PowJob<PowitItem>;
 pub struct PowitVerdict {
     pub origin:  crate::network::InboundOrigin,
     pub penalty: BlockPenalty,
+    /// Why the item was refused (`None` when it was admitted or the queue
+    /// refused it unverified): logged with a misbehaviour.
+    pub reason:  Option<String>,
 }
 
 /// The transaction relay task's PoWit gossip core (see the section comment):
@@ -3307,7 +3349,7 @@ impl PowitIngress {
             debug!("PoWit item {} refused before verification: {}", hex::encode(&claimed[..8]), e);
             let _ = self.sched.charge(&source, now);
             let penalty = block_penalty(GossipVerdict::Reject, BlockFault::ContextFree, self_authored, penalties_in_force);
-            return Some(PowitVerdict { origin, penalty });
+            return Some(PowitVerdict { origin, penalty, reason: Some(e) });
         }
         let job = PowJob {
             id: claimed,
@@ -3321,7 +3363,7 @@ impl PowitIngress {
             Ok(()) => None,
             Err((refusal, job)) => {
                 debug!("PoWit item {} not verified: queue refused it ({:?})", hex::encode(&claimed[..8]), refusal);
-                Some(PowitVerdict { origin: job.payload.origin, penalty: plain_penalty(GossipVerdict::Ignore) })
+                Some(PowitVerdict { origin: job.payload.origin, penalty: plain_penalty(GossipVerdict::Ignore), reason: None })
             }
         }
     }
@@ -3353,7 +3395,8 @@ impl PowitIngress {
             (Err(_), Some(f)) => block_penalty(GossipVerdict::Reject, f, job.payload.self_authored, penalties_in_force),
             (Err(_), None) => plain_penalty(GossipVerdict::Ignore),
         };
-        PowitVerdict { origin: job.payload.origin, penalty }
+        let reason = result.as_ref().err().map(|e| format!("{} (kind {})", e, job.payload.kind));
+        PowitVerdict { origin: job.payload.origin, penalty, reason }
     }
 
     /// Housekeeping of the budget maps.
@@ -4344,6 +4387,66 @@ mod tests {
     /// view), but keeps its verification-budget charge: re-rooted proofs are
     /// free to forge in bulk, so a peer relaying them runs out of budget and
     /// its next items are refused unverified.
+    /// Launch rehearsal (2026-10-18): on PoCI a vote's v3 message names the
+    /// configuration in force at the VOTER's tip, which the vote does not
+    /// carry, so a signature that fails under the receiver's configuration
+    /// (the voter one handoff ahead, or behind) is this node's view, never a
+    /// fault. It used to be `invalid attestation signature`, context-free:
+    /// the nodes banned each other right after every handoff and the
+    /// network split into fragments finalizing different checkpoints. The
+    /// author delivering it itself is not misbehaving; an unknown
+    /// configuration keeps its budget charge (a forged vote costs a KES
+    /// verification), a vote under the previous configuration is refunded.
+    #[test]
+    fn poci_vote_under_another_configuration_is_not_a_fault() {
+        use crate::network::GossipVerdict::Ignore;
+        use crate::pow::verifier::StartNext;
+        use crate::powit::{ITEM_ATTESTATION, POWIT_ATTESTATION_OTHER_CONFIG, POWIT_ATTESTATION_PREVIOUS_CONFIG};
+        for e in [POWIT_ATTESTATION_OTHER_CONFIG, POWIT_ATTESTATION_PREVIOUS_CONFIG] {
+            assert_eq!(powit_admit_error_fault(ITEM_ATTESTATION, e), None, "{e}");
+            assert_ne!(e, POWIT_BAD_ATTESTATION_SIGNATURE);
+        }
+        assert!(powit_admit_error_keeps_charge(ITEM_ATTESTATION, POWIT_ATTESTATION_OTHER_CONFIG));
+        assert!(!powit_admit_error_keeps_charge(ITEM_ATTESTATION, POWIT_ATTESTATION_PREVIOUS_CONFIG));
+        let t0 = Instant::now();
+        let limits = PowLimits {
+            workers: 1, max_queued: 8, max_queued_per_peer: 4, max_queued_per_group: 8, max_queued_solicited: 0,
+            peer_burst: 4, peer_refill_per_sec: 0.0, group_burst: 100, group_refill_per_sec: 0.0,
+            verdict_ttl: Duration::from_secs(10), results_cap: 1,
+        };
+        let mut p = PowitIngress::new(limits);
+        let author = PeerId::random();
+        let src = PowSource { peer: Some(author), group: None };
+        for (n, err) in [(10, POWIT_ATTESTATION_PREVIOUS_CONFIG), (11, POWIT_ATTESTATION_OTHER_CONFIG)] {
+            // Delivered by its author, penalties in force: still no fault.
+            let (id, _, data) = share_frame(n);
+            let kind = ITEM_ATTESTATION;
+            let job = PowJob {
+                id, height: 0, source: src, solicited: false, received_at: t0,
+                payload: PowitItem { kind, data, origin: gossip_from(author, Some(author), t0), self_authored: true },
+            };
+            p.sched.submit(job, t0).map_err(|_| ()).expect("queued");
+            let StartNext::Start(job) = p.start_next(t0) else { panic!("a free worker") };
+            let v = p.complete(job, &Err(err.into()), true, t0);
+            assert_eq!(v.penalty, BlockPenalty { gossip: Ignore, misbehaving: false }, "{err}");
+            assert_eq!(v.reason.as_deref(), Some(format!("{err} (kind {kind})").as_str()));
+        }
+        assert_eq!(p.scheduler().stats().invalid, 1, "only the unknown configuration keeps its charge");
+        assert_eq!(p.scheduler().stats().valid, 1);
+        let src_rs = include_str!("powit.rs");
+        assert!(src_rs.contains("Err(POWIT_ATTESTATION_OTHER_CONFIG.into())"));
+        assert!(src_rs.contains("Err(POWIT_ATTESTATION_PREVIOUS_CONFIG.into())"));
+    }
+
+    #[test]
+    fn log_limiter_caps_lines_per_window() {
+        let l = LogLimiter::new(3, 60);
+        let t0 = Instant::now();
+        assert_eq!((0..5).filter(|_| l.allow_at(t0)).count(), 3);
+        assert!(!l.allow_at(t0 + Duration::from_secs(59)));
+        assert!(l.allow_at(t0 + Duration::from_secs(60)), "a new window");
+    }
+
     #[test]
     fn powit_evidence_against_a_non_witness_keeps_its_charge() {
         use crate::network::GossipVerdict::Ignore;
