@@ -437,7 +437,7 @@ step_backup_keys() {
     dst="$STATE_DIR/secrets/keys-$h-$(date -u +%Y%m%dT%H%M%SZ).tgz"
     kit_log "== keys of $h -> $dst"
     kit_run "$h" 'set -e; rm -rf /tmp/obenblock-keys; mkdir -m 700 /tmp/obenblock-keys
-cd /var/lib/obenblock && sudo tar -czf /tmp/obenblock-keys/keys.tgz $(sudo sh -c "cd /var/lib/obenblock && ls -d witness stratum-v2-authority.json powit-votes-*.json 2>/dev/null")
+sudo tar -C /var/lib/obenblock -czf /tmp/obenblock-keys/keys.tgz $(sudo sh -c "cd /var/lib/obenblock && ls -d witness stratum-v2-authority.json powit-votes-*.json 2>/dev/null")
 sudo chown "$(id -u)" /tmp/obenblock-keys/keys.tgz; ls -l /tmp/obenblock-keys/keys.tgz' | tr -d '\r'
     (umask 077; kit_get "$h" /tmp/obenblock-keys/keys.tgz "$dst")
     kit_run "$h" 'rm -rf /tmp/obenblock-keys' | tr -d '\r'
