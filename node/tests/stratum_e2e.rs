@@ -621,11 +621,25 @@ fn v1_submit_hashes_first_forwards_blocks_over_the_rate_and_dedups_on_the_header
     assert_eq!(code(&r), Some(22));
     assert_eq!(blocks.load(Ordering::SeqCst), 1);
     // Over the rate, a share that is not a block is refused (and raises the
-    // difficulty) without being remembered.
-    let miss = (0u32..).find(|&k| {
-        let mut hh = h;
+    // difficulty) without being remembered. Each session draws a random
+    // extranonce1, so the nonce must miss on this session's header and, for
+    // the "low difficulty" case below, also miss the share target a fresh
+    // session judges by (as submit.rs computes it) on that session's header.
+    let (s2, job2) = mk();
+    let h2 = job2.share_header(&s2.extranonce(&en2), job2.version, job2.time, 0).unwrap();
+    let share_target2 = {
+        use stratum::difficulty::{difficulty_from_bits, easier, target_from_difficulty};
+        easier(&target_from_difficulty(s2.judged_difficulty().min(difficulty_from_bits(job2.bits))),
+               &job2.block_target())
+    };
+    let with_nonce = |hdr: &[u8; 80], k: u32| {
+        let mut hh = *hdr;
         hh[76..80].copy_from_slice(&k.to_le_bytes());
-        !gnb_smh::sha256d::meets_target(&gnb_smh::sha256d::block_id(&hh), &job.block_target())
+        gnb_smh::sha256d::block_id(&hh)
+    };
+    let miss = (0u32..).find(|&k| {
+        !gnb_smh::sha256d::meets_target(&with_nonce(&h, k), &job.block_target())
+            && !gnb_smh::sha256d::meets_target(&with_nonce(&h2, k), &share_target2)
     }).unwrap();
     let before = s.remembered_shares();
     let r = stratum::submit::handle_submit(&s, &v1_submit("j", "0a0b0c0d", &format!("{:08x}", job.time),
@@ -635,8 +649,8 @@ fn v1_submit_hashes_first_forwards_blocks_over_the_rate_and_dedups_on_the_header
     assert_eq!(s.remembered_shares(), before);
 
     // Under the rate, the same miss is low difficulty and not remembered.
-    let (s, _) = mk();
-    let r = stratum::submit::handle_submit(&s, &v1_submit("j", "0a0b0c0d", &format!("{:08x}", job.time),
+    let s = s2;
+    let r = stratum::submit::handle_submit(&s, &v1_submit("j", "0a0b0c0d", &format!("{:08x}", job2.time),
                                                          &format!("{miss:08x}")), &*cb);
     assert_eq!(code(&r), Some(23));
     assert_eq!(s.remembered_shares(), 0, "a share without proof of work costs no memory");
