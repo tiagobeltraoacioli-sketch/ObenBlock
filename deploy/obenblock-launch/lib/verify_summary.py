@@ -214,9 +214,14 @@ def main(argv):
             warns.append(f"{label}: node warnings: {net.get('warnings')}")
         if not a.no_peer_check:
             plist = " ".join(str(x) for x in st.get("peer_list") or [])
-            for other in labels:
-                if other != label and other not in plist:
-                    fails.append(f"{label}: {other} is not among its peers ({plist or 'none'})")
+            if not plist:
+                # getpeerinfo reports only peer_count on this node: the count
+                # check above is all that can be verified.
+                warns.append(f"{label}: the node does not list peer addresses; only the peer count was checked")
+            else:
+                for other in labels:
+                    if other != label and other not in plist:
+                        fails.append(f"{label}: {other} is not among its peers ({plist})")
         fin = st.get("finality") or {}
         if fin.get("conflict"):
             fails.append(f"{label}: finality conflict {fin['conflict']} (docs/RUNNING.md)")
