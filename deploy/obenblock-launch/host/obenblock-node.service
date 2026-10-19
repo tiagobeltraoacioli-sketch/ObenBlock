@@ -1,13 +1,17 @@
-# systemd unit of an ObenBlock mainnet node with its CPU miner
-# (deploy/obenblock-launch/LAUNCH-RUNBOOK.md).
+# systemd unit of an ObenBlock mainnet node (deploy/obenblock-launch/LAUNCH-RUNBOOK.md).
 #   /opt/obenblock/current/       the active release (symlink into releases/)
-#   /var/lib/obenblock            data dir (user obenblock, mode 0750)
-#   /etc/obenblock/obenblock.env  OBB_MINER_ADDRESS, OBB_MINE_THREADS, OBB_PEERS,
-#                                 OBB_CARRYOVER, OBB_RPC_KEY_FILE, OBB_DNS_SEED
-# P2P 18110 (public), RPC 18210 (127.0.0.1 only). GnB's gnb-node and the
-# Bloch units on the same host are separate and untouched.
+#   /var/lib/obenblock            data dir (user obenblock, mode 0750): chain,
+#                                 stratum-v2-authority.json (created on first
+#                                 start), witness/ (KES key, vote record)
+#   /etc/obenblock/obenblock.env  OBB_PAYOUT_ADDRESS, OBB_PEERS, OBB_STRATUM*,
+#                                 OBB_WITNESS*, OBB_CARRYOVER, OBB_RPC_KEY_FILE,
+#                                 OBB_DNS_SEED, OBB_METRICS (host/obenblock-launch)
+# P2P 18110 (public), RPC 18210 and metrics 18310 (127.0.0.1 only), built-in
+# Stratum V1 3333 and V2 3334 (public). The CPU miner is its own unit
+# (obenblock-cpu-miner.service, through the V1 server). GnB's gnb-node and
+# the Bloch units on the same host are separate and untouched.
 [Unit]
-Description=ObenBlock node (SHA-256d, PoWit) with CPU miner
+Description=ObenBlock node (SHA-256d, PoWit/PoCI) with built-in Stratum V1/V2
 After=network-online.target
 Wants=network-online.target
 
@@ -23,7 +27,7 @@ TimeoutStopSec=120
 LimitNOFILE=65536
 # Secret keys are kept in mlock()ed pages (audit CRY-4).
 LimitMEMLOCK=16M
-# SHA-256d mining needs no scratchpad; the node itself stays far below this.
+# SHA-256d needs no scratchpad; the node itself stays far below this.
 MemoryMax=24G
 Nice=10
 UMask=0077

@@ -1,75 +1,104 @@
 # ObenBlock mainnet launch runbook
 
-> **Read this before you rent ASICs.** Under the consensus rules of this
-> code base, stock Stratum V1 firmware cannot find ObenBlock blocks. This
-> covers Antminer and Whatsminer stock firmware, NiceHash,
-> MiningRigRentals and every V1 rental service. A V1 miner computes
-> Bitcoin's SHA-256d Merkle root, while the ObenBlock header commits to its
-> own body root (`docs/OBENBLOCK-MINING.md` §4,
-> `tools/obenblock-stratum/README.md` §1).
->
-> The stratum proxy accepts such devices. It counts their work in
-> `obb_stratum_shares_bitcoin_root_total`, and `verify` warns about it. The
-> work never becomes a block, so rented V1 hashrate costs the rent and
-> finds nothing.
->
-> ASIC mining needs one of these:
->
-> - the open consensus change of package O3b (header root = Bitcoin's
->   transaction tree, body roots in the coinbase), decided **before the
->   genesis is mined**;
-> - firmware that speaks the proxy's `obenblock-root` extension;
-> - Stratum V2 standard channels (not implemented).
->
-> Without one of them, the launch runs on the three CPU hosts alone. Expect
-> the first block about half a day after the genesis (see "First blocks").
-
 This runbook launches ObenBlock mainnet on three servers. Every step runs
 from the Mac, through `obb-launch.sh` in this folder. Each step prints what
-it did. The checks to make before you go on are listed after each step.
+it did; the checks to make before you go on are listed after each step.
+
+The code launched is branch `obenblock/mainnet-launch` (PoCI from genesis,
+Bitcoin's header Merkle tree, the node's built-in Stratum V1/V2, the
+SIMD CPU miner, the explorer API and the site). What that means for the
+launch:
+
+- **Stock SHA-256 ASICs work.** The header Merkle root is Bitcoin's
+  transaction tree (the rest of the body is committed in the coinbase), so
+  unmodified Antminer/Whatsminer firmware, NiceHash and MiningRigRentals mine
+  ObenBlock over Stratum V1 (`tools/obenblock-stratum/README.md` §1,
+  `docs/STRATUM.md`). SV2 firmware uses the V2 server.
+- **PoCI is strict from genesis.** The first 4 epochs (24 h) have no
+  finality. The configuration that then enters into force is built from the
+  witness share work of those epochs, and only at block 3,600 (one epoch of
+  burial). **No witness running from the genesis means no finality, ever,
+  and the first outside witness would own it.** The kit runs one witness on
+  each host, from the first start.
+- The genesis target is sized for 1 EH/s; stall relief lowers it while
+  blocks are late (see "First blocks").
 
 | Host | Login | Role |
 | --- | --- | --- |
-| 136.244.93.186 | key `~/.ssh/edgevana_fleet_g4`, user `ubuntu` | build host, node, CPU miner, explorer API, **stratum :3333** |
-| 209.250.236.240 | key `~/.ssh/edgevana_fleet_g4`, user `ubuntu` | node, CPU miner, explorer API |
-| 152.236.5.112 | password only (`senha:` line of `~/Desktop/gnb-servidor-teste-152.txt`), user `ubuntu` | node, CPU miner, explorer API |
+| 136.244.93.186 | key `~/.ssh/edgevana_fleet_g4`, user `ubuntu` | build host; node, witness, Stratum V1/V2, CPU miner, explorer API |
+| 209.250.236.240 | key `~/.ssh/edgevana_fleet_g4`, user `ubuntu` | node, witness, Stratum V1/V2, CPU miner, explorer API |
+| 152.236.5.112 | password only (`senha:` line of `~/Desktop/gnb-servidor-teste-152.txt`), user `ubuntu` | node, witness, Stratum V1/V2, CPU miner, explorer API |
 
 On every host:
 
 | Item | Value |
 | --- | --- |
-| user | `obenblock` (node), `obenblock-api` (explorer API), `obenblock-pool` (stratum, on 136 only) |
-| binaries | `/opt/obenblock/current/` → `/opt/obenblock/releases/<id>/` |
-| data | `/var/lib/obenblock` (archive node: every block body is kept) |
-| config | `/etc/obenblock/obenblock.env`, `explorer-api.env`, `stratum.env`, `rpc.key`, `explorer-api.key` |
-| units | `obenblock-node`, `obenblock-explorer-api`, `obenblock-stratum` (136) |
-| ports | P2P 18110/tcp public (ufw), RPC 18210 on 127.0.0.1 only, stratum 3333/tcp public on 136, explorer API 2087/tcp open to Cloudflare's IPv4 ranges only |
-| miner | `--mine --mine-threads <logical CPUs - 1>` (31 on these hosts), paid to `OWNER_ADDRESS` |
-| peers | `--peer /ip4/<other host>/tcp/18110` for the other two hosts |
+| users | `obenblock` (node), `obenblock-miner` (CPU miner), `obenblock-api` (explorer API), `obenblock-pool` (optional proxy) |
+| binaries | `/opt/obenblock/current/` → `/opt/obenblock/releases/<id>/` (the id carries a content digest) |
+| data | `/var/lib/obenblock` (archive node), with `witness/` (KES key, vote record) and `stratum-v2-authority.json` |
+| config | `/etc/obenblock/obenblock.env`, `miner.env`, `explorer-api.env`, `rpc.key`, `explorer-api.key`, `witness.pw` (0600 root, given to the node by systemd `LoadCredential`) |
+| units | `obenblock-node`, `obenblock-cpu-miner`, `obenblock-explorer-api` (and `obenblock-stratum` only with `STRATUM_PROXY="on"`) |
+| ports | P2P 18110/tcp public; Stratum V1 3333/tcp and V2 3334/tcp public (ufw); explorer API 2087/tcp from Cloudflare's IPv4 ranges only (ufw per range AND the nftables table `inet gnb_explorer` of `obenblock-explorer-firewall`, re-applied every 5 min); RPC 18210 and metrics 18310 on 127.0.0.1 only |
+| explorer API | TLS on 2087 with a Let's Encrypt certificate for `nodeN.obenblock.xyz` (+ the sslip.io name as a second SAN during the move); every request HMAC-signed by the Worker (`OBB_API_AUTH=hmac+static` at launch, then `hmac`); clock on NTP |
+| node | `--stratum --stratum-max-sessions 1024 --stratum-max-sessions-per-ip 256 --stratum-v2 --stratum-v2-max-sessions 1024 --stratum-v2-max-sessions-per-ip 64 --stratum-payout <OWNER> --witness-key … --share-threads 1 --rpc-api-key-file … --archive --metrics`, `--peer` = the other two hosts, no `--mine` |
+| CPU miner | `obenblock-cpu-miner -o stratum+tcp://127.0.0.1:3333 -u <OWNER>.cpu-<ip-dashes> -p d=<0.03 × threads> -t <logical CPUs - 2>` |
+| payout | `OWNER_ADDRESS` = `obb1q52273b58c1032291d562f582c413bbf05efabcdd0df82055`, the owner's GnB miner key `gnb1q52273…df82055` in ObenBlock notation (same key hash; only the prefix differs) |
+
+Why a separate CPU miner and not the node's `--mine`: `obenblock-cpu-miner`
+picks AVX-512/AVX2/SHA-NI kernels at run time (about 8× the node's
+per-thread rate on the build host), it mines through exactly the stratum
+path the ASICs use (so the V1 server is exercised from block 1), and it runs
+as its own unprivileged, loopback-only, lowest-priority unit. Running both
+would only split the same cores. `NODE_MINE="on"` exists for a fallback.
 
 The kit never stops, starts, edits or removes GnB's `gnb-node`, its data
 (`/opt/gnb`, `/var/lib/gnb`) or any `bloch-*` unit. `preflight` and
 `verify` report their state and nothing more.
 
-Mainnet launches with the current PoWit rules. PoCI
-(`docs/DESIGN-obenblock-poci.md`) comes later through a hard fork.
+## The command sequence
+
+```
+cp kit.conf.example kit.conf
+./obb-launch.sh preflight
+./obb-launch.sh genesis --rehearsal
+./obb-launch.sh dns
+./obb-launch.sh genesis
+git -C <SRC_DIR> add <the four files the step prints>
+git -C <SRC_DIR> -c user.name=gnb-smh -c user.email=gnb-smh@proton.me commit -m "obenblock: mainnet genesis <id>"
+./obb-launch.sh build
+./obb-launch.sh deploy
+./obb-launch.sh explorer-tls
+./obb-launch.sh start
+./obb-launch.sh verify
+./obb-launch.sh backup-keys
+./obb-launch.sh site
+```
+
+then the `node scripts/site-launch-fill.mjs …` and `npx wrangler …`
+commands that `site` prints, run by the owner, and once the Worker reads
+all three origins: `./obb-launch.sh explorer-auth hmac` and the key
+rotation of step 8.
 
 ## 0. Prepare (the day before)
 
-1. Create the launch checkout from the final integration tip. Merge this
-   kit's branch into it if it is not merged yet. Note the commit.
-
-   ```
-   git -C ~/repos/github/gnb-smh worktree add -b obenblock/mainnet-launch ~/worktrees/obenblock-mainnet obenblock/integration
-   ```
-
+1. The launch checkout is the worktree of `obenblock/mainnet-launch`
+   (`/Users/tiagobulhoes/worktrees/obenblock-mainnet`). Merge this kit's
+   branch into it if it is not merged yet. Note the commit.
 2. Fill `kit.conf` (copy it from `kit.conf.example`):
-   - `OWNER_ADDRESS`: the owner's `obb1…` payout address;
-   - `SRC_DIR`: the launch checkout, for example
-     `/Users/tiagobulhoes/worktrees/obenblock-mainnet`;
-   - `LAUNCH_TS`: the launch moment in Unix seconds, or leave it empty to
-     use the moment the genesis step runs.
-3. Rehearse the genesis step. It runs on a scratch copy at the documented
+   - `OWNER_ADDRESS`: already the owner's key in `obb1` form (both forms
+     are recorded there);
+   - `SRC_DIR`: the launch checkout;
+   - `LAUNCH_TS`: the launch moment in Unix seconds, or empty for the moment
+     the genesis step runs;
+   - `EXPLORER_NAMES`: the explorer origin names (default
+     `node1/node2/node3.obenblock.xyz`); remove an entry to use the host's
+     sslip.io name instead.
+3. Create the DNS records `./obb-launch.sh dns` prints, in the Cloudflare
+   dashboard of `obenblock.xyz`: the three A records `node1/node2/node3`
+   (the host's IP, proxy status **DNS only**, grey cloud) and the CAA record
+   `obenblock.xyz CAA 0 issue "letsencrypt.org"`. The A records must resolve
+   before step 4.
+4. Rehearse the genesis step. It runs on a scratch copy at the documented
    rehearsal time and never touches `SRC_DIR`:
 
    ```
@@ -77,70 +106,66 @@ Mainnet launches with the current PoWit rules. PoCI
    ```
 
    It must print `GENESIS BLOCK ID (display order):
-   00000000721a9cb402747bea3f34d0ecc7095952173a5606cd50711230c74d6d`.
-4. Run the read-only checks:
+   00000000f9db8f81e92e293fae6032d359f731c1c7afebcaca1b75f47bfc32bc` and
+   `rehearsal genesis reproduced`.
+5. Run the read-only checks:
 
    ```
    ./obb-launch.sh preflight
    ```
 
    Check for each host:
-   - `sudo=passwordless` on 136 and 209, and `sudo=password-ok` on 152;
-   - `gnb-node=inactive`;
-   - no `port … in use` line for 18110, 18210, 3333 or 2087;
-   - `python3` present;
-   - `ufw: Status: active`. If ufw is inactive, the rules are recorded but
-     not enforced; decide this before the launch.
-   Port 80 must also be free for the certificate step (step 4).
-5. ASICs: read the warning at the top first. Rent hashrate only for
-   devices that can mine the ObenBlock root, and keep their pool settings at
-   hand (section "Stratum").
+   - `sudo=passwordless` on 136 and 209, `sudo=password-ok` on 152;
+   - `gnb-node=inactive` (GnB is stopped on these hosts);
+   - no `port … in use` line for 18110, 18210, 18310, 3333, 3334, 2087
+     (3335 only matters with the proxy);
+   - the `cpu:` line (AVX2 / AVX-512 / SHA-NI flags: the miner picks its
+     kernel from them);
+   - `python3` present, `ufw: Status: active`. If ufw is inactive the rules
+     are recorded but not enforced; decide this before the launch.
+   Port 80 must be free for the certificate step.
+6. ASICs: line up the rented hashrate (MiningRigRentals, NiceHash) for the
+   launch time, pool settings in "Stratum" below. They are what makes the
+   first blocks come in minutes instead of hours.
 
-## 1. Genesis (launch day, T - about 1 h)
+## 1. Genesis (launch day, T − about 1 h)
 
 ```
 ./obb-launch.sh genesis
 ```
 
-Type `MINE` when asked. The step does the following:
+Type `MINE` when asked. The step:
 
-1. It copies `SRC_DIR` to `136:~/obenblock-launch/src`.
-2. It builds `gnb-mine-genesis` and mines the 80-byte SHA-256d header at
-   `LAUNCH_TS`. This takes about 2^32 hashes, about 10 s on 32 threads.
-3. It writes the constants into `crates/gnb-crypto/src/core/genesis.rs`
-   (the LAUNCH PLACEHOLDER block) and `reference/obb_genesis.py`.
-4. It rewrites `reference/obb_genesis_vectors.json` and checks the
-   reference.
-5. It runs the genesis tests and the SHA-256d mining test.
-6. It copies the four changed files back into `SRC_DIR`.
-
-Add `--full-tests` to run the whole workspace, which takes much longer.
+1. copies `SRC_DIR` to `136:~/obenblock-launch/src` (without `.git`,
+   `target/`, this kit's `state/` and `kit.conf`: no secret leaves the Mac);
+2. builds `gnb-mine-genesis` and mines the 80-byte SHA-256d header at
+   `LAUNCH_TS` (ObenBlock mode: Bitcoin's root over the coinbase txid, the
+   body commitment in the coinbase; about 2^32 hashes, seconds on 32
+   threads);
+3. writes the constants into `crates/gnb-crypto/src/core/genesis.rs` and
+   `reference/obb_genesis.py`, rewrites `reference/obb_genesis_vectors.json`
+   and checks the reference;
+4. runs the genesis, Merkle and SHA-256d mining tests (`--full-tests`: the
+   whole workspace);
+5. copies the four changed files into a scratch tree, checks them, and only
+   then replaces them in `SRC_DIR` together.
 
 Before you go on:
 
-- the step ends with `GENESIS BLOCK ID (display order): 00000000…` and
-  `launched <timestamp> <display id> <raw id>`;
-- `git -C $SRC_DIR diff --stat` shows exactly these files:
-  - `crates/gnb-crypto/src/core/genesis.rs`;
-  - `reference/obb_genesis.py`;
-  - `reference/obb_genesis_vectors.json`;
-  - `docs/OBENBLOCK-GENESIS.md`.
+- the step ends with `GENESIS BLOCK ID (display order): 00000000…`;
+- `git -C $SRC_DIR status` shows exactly the four files;
+- commit them with the command the step printed. **The build refuses a
+  tree with uncommitted or untracked files** and a genesis that differs
+  from the committed one, so the release is exactly that commit.
 
-Commit the files with the command the step printed. The release label is
-that commit. A tree with uncommitted changes builds as `<sha>-dirty`.
+The timestamp is also the ASERT anchor time. A block may not be stamped more
+than 600 s ahead of the nodes' clocks, and none can come before `LAUNCH_TS`:
+never set it more than a few minutes in the future. A timestamp somewhat in
+the past is harmless (stall relief already counts from it).
 
-The timestamp matters:
-
-- It is also the ASERT anchor time.
-- A block must not be stamped more than 600 s ahead of the nodes' clocks,
-  and no block can come before `LAUNCH_TS`. Never set it in the future by
-  more than a few minutes.
-- A timestamp somewhat in the past is harmless: the first block's stall
-  relief already counts from it (see "First blocks").
-
-The browser wallet core compiles the genesis constants in. Rebuild and
-re-pin it with `scripts/build-wallet-wasm.sh` from `SRC_DIR`, for the site
-deploy (step 7).
+The browser wallet core compiles the genesis constants in: rebuild and
+re-pin it with `scripts/build-wallet-wasm.sh` in `SRC_DIR` and commit, for
+the site (step 8).
 
 ## 2. Build
 
@@ -148,25 +173,20 @@ deploy (step 7).
 ./obb-launch.sh build
 ```
 
-The step runs on 136 and builds these binaries (release profile):
+On 136, from the committed tree:
 
-- `obenblock` (the node, built as `gnb`);
-- `obenblock-cli`;
-- `obenblock-wallet`;
-- `obenblock-mine-genesis`;
-- the stratum proxy, when `tools/obenblock-stratum` exists in the source.
+- `obenblock` (the node, built as `gnb`, with the built-in Stratum V1 and V2
+  servers), `obenblock-cli`, `obenblock-wallet`, `obenblock-mine-genesis`;
+- `obenblock-cpu-miner` and `obenblock-stratum` (`tools/obenblock-stratum`,
+  its own workspace and lock file);
+- the launchers, units, host scripts, explorer API, carry-over snapshot,
+  `RELEASE` and `SHA256SUMS`, as
+  `obenblock-release-<commit>-g<last 8 hex of the genesis id>-c<content digest>`.
 
-The CPU miner is the node's built-in SHA-256d miner (`--mine`). The step
-then assembles `obenblock-release-<commit>-g<last 8 hex of the genesis
-id>/`. It holds the binaries, the launchers, the units, the host scripts,
-the explorer API, the carry-over snapshot, `RELEASE` and `SHA256SUMS`. The
-tarball and its `.sha256` are copied to `state/dist/`.
+The tarball and its `.sha256` are copied to `state/dist/`.
 
-Before you go on:
-
-- `RELEASE` shows `genesis=<raw id>` equal to the genesis step's raw id;
-- the tarball checksum is OK on the Mac (the step checks it);
-- if the source has a stratum proxy, `stratum=<program>` is set.
+Before you go on: `RELEASE` shows `genesis=<raw id>` equal to the genesis
+step's raw id; the Mac's checksum check says OK.
 
 ## 3. Deploy
 
@@ -174,33 +194,37 @@ Before you go on:
 ./obb-launch.sh deploy
 ```
 
-For each host, the step copies the tarball and the explorer API key to
-`/tmp/obenblock-kit/`. It then runs `install.sh` with sudo. Nothing is
-started yet. `install.sh` does the following:
+For each host the step copies the tarball and the explorer API key to
+`/tmp/obenblock-kit/` and runs `install.sh` with sudo. It:
 
-- It checks `SHA256SUMS`. It refuses a release without a mainnet genesis
-  and a port that belongs to another process.
-- It creates the users.
-- It installs the release under `/opt/obenblock/releases/<id>` and points
-  `current` at it. The previous release becomes `previous`.
-- It unpacks the carry-over snapshot.
-- It writes the env files. It creates `rpc.key` once.
-- It installs and enables the units.
-- It adds the ufw rules:
-  - `18110/tcp`;
-  - `3333/tcp` on 136;
-  - `2087/tcp` from each Cloudflare IPv4 range.
+- checks `SHA256SUMS`; refuses a release without a mainnet genesis, without
+  the CPU miner, a port that belongs to another process, and a release id
+  that is already installed with other contents;
+- creates the users; installs the release and points `current` at it
+  (`previous` keeps the last one);
+- writes the env files; creates `rpc.key` once;
+- **generates the host's PoWit witness key** once (`obenblock-cli
+  witnesskeygen`, KES depth 12, 4,096 epochs ≈ 2.8 years) in
+  `/var/lib/obenblock/witness/`, with a random password in
+  `/etc/obenblock/witness.pw` (0600 root; the node reads it through systemd
+  `LoadCredential`; it is never logged or put on a command line). It prints
+  the witness id;
+- installs and enables the units; opens 18110, 3333, 3334 and, for the
+  explorer API, 2087 from each Cloudflare IPv4 range in ufw; installs and
+  starts `obenblock-explorer-firewall` (+ its 5-minute re-apply timer: the
+  nftables table `inet gnb_explorer`, nothing else) — the API's drop-in
+  requires it and refuses to start without the table; turns NTP on if it is
+  off (the API refuses requests 60 s off);
+- if the node already runs (an upgrade or a config change), restarts the
+  node and then the miner and the explorer API on the new release, one host
+  at a time.
 
-The explorer API's shared secret is created once on the Mac, in
-`state/secrets/explorer-api.key`. It is the same on all three hosts, and it
-is the Worker secret `GNB_API_KEY`.
+The explorer API's shared secret is created once on the Mac
+(`state/secrets/explorer-api.key`), the same on the three hosts: it is the
+Worker secret `OBB_API_KEY`.
 
-Before you go on:
-
-- each host prints `installed release <id> (genesis <raw id>); units
-  enabled, not started`;
-- on 136, `/etc/obenblock/stratum.env` exists, with
-  `OBB_STRATUM_PAYOUT_ADDRESS` = the owner address (see "Stratum" below).
+Before you go on: each host prints `witness key … (witness id …)` and
+`installed release <id> (genesis <raw id>); units enabled, not started`.
 
 ## 4. Explorer API certificates
 
@@ -208,25 +232,19 @@ Before you go on:
 ./obb-launch.sh explorer-tls
 ```
 
-For each host, the step gets a Let's Encrypt certificate for
-`<ip-with-dashes>.sslip.io` with certbot's standalone challenge:
+It prints the DNS records again, then on each host checks that the names
+resolve to that host, and gets one Let's Encrypt certificate for
+`nodeN.obenblock.xyz` and the host's sslip.io name (certbot standalone;
+`EXPLORER_SSLIP_SAN="off"` drops the second name at a later issuance). The hooks live in this certificate's own renewal file:
+80/tcp is opened only if it was not already allowed, and only the rule the
+kit added is deleted afterwards. The certificate is copied to
+`/etc/obenblock/tls`, and the explorer API is enabled and started.
 
-- port 80 is open only during the challenge;
-- the renewal hooks do the same;
-- the certificate is copied to `/etc/obenblock/tls`;
-- the explorer API is enabled and started.
-
-The Worker origins are:
-
-```
-https://136-244-93-186.sslip.io:2087
-https://209-250-236-240.sslip.io:2087
-https://152-236-5-112.sslip.io:2087
-```
-
-If port 80 is taken on a host, the step refuses. Leave that host out of
-the Worker's origins, or set `EXPLORER_TLS="none"` and use a Cloudflare
-Tunnel (`deploy/explorer-api/README.md`).
+The Worker's `OBB_ORIGINS` are `https://nodeN.obenblock.xyz:2087`, its
+`OBB_FALLBACK_ORIGINS` the sslip.io names (used only while no in-zone origin
+answers). If port 80 is taken on a host, the step refuses: leave that host out
+of the origins, or set `EXPLORER_TLS="none"` and use a Cloudflare Tunnel
+(`deploy/explorer-api/README.md`).
 
 ## 5. Start
 
@@ -234,19 +252,23 @@ Tunnel (`deploy/explorer-api/README.md`).
 ./obb-launch.sh start
 ```
 
-The step starts `obenblock-node` on 136 first, then on 209, then on 152. It
-waits for each RPC to answer. Then it starts the explorer API and the
-stratum unit where they are enabled.
+On 136 first, then 209, then 152: the node (waits for its RPC), then the
+CPU miner, the explorer API and the optional proxy. It refuses a host
+where an `obenblock` process runs outside the unit.
 
-The step refuses to start a host where an `obenblock` process already runs
-outside the unit.
+The node writes the genesis ledger on its first boot (the log says
+`carryover VERIFIED: 452726 Bloch outputs`; 72 vesting tranches), after
+checking the genesis proof and its pinned id. It creates the **Stratum V2
+authority key** (`/var/lib/obenblock/stratum-v2-authority.json`). The step
+prints, per host:
 
-The node writes the genesis ledger on its first boot:
+```
+STRATUM V1 on 136.244.93.186: stratum+tcp://136.244.93.186:3333
+STRATUM V2 on 136.244.93.186: stratum2+tcp://136.244.93.186:3334/<authority key>
+```
 
-- 452,725 carry-over UTXOs (the log says `carryover VERIFIED: 452726 Bloch outputs`);
-- 72 vesting tranches.
-
-It verifies the genesis proof and its pinned id first.
+and keeps the keys in `state/stratum-v2-<host>.key`. These URLs go into
+the miners' configuration and the site.
 
 ## 6. Verify
 
@@ -254,199 +276,252 @@ It verifies the genesis proof and its pinned id first.
 ./obb-launch.sh verify
 ```
 
-The step prints one row per host and `RESULT OK` or `RESULT FAIL`.
+It runs `status.py` (as root, read-only) on each host, takes two samples
+15 s apart, and prints one row per host, the stratum endpoints and
+`RESULT OK` or `RESULT FAIL`.
 
 FAIL means one of these:
 
-- not exactly one node process on the host;
-- the unit is not active;
-- the RPC does not answer;
-- the chain id is not `0x4f420001`;
-- the genesis differs from the mined one, or between hosts;
-- fewer than 2 peers;
-- the miner is off, or does not run with `nproc - 1` threads.
+- not exactly one node process, or one CPU miner process; the node or the
+  miner unit not active; a process running another release than
+  `/opt/obenblock/current` (a deploy that was not restarted);
+- the RPC silent, public, or without its API key;
+- chain id not `0x4f420001`; genesis differs from the mined one or between
+  hosts;
+- **a chain split**: different block ids at the lowest common height, or
+  different finalized checkpoints at one height; tips more than 29 blocks
+  apart; a node syncing or behind;
+- a peer list without the other two kit hosts;
+- Stratum V1 or V2 off or not listening;
+- the miner with the wrong thread count (logical CPUs − 2), not hashing
+  (CPU time between the samples), or not connected to the V1 server; the
+  node's own `--mine` on;
+- the witness missing or halted; and, from block 3,600 + 2 checkpoint
+  intervals on: PoCI not active, the host's witness not in the witness set,
+  or none of its votes included in the chain; a finality conflict.
 
-WARN means one of these:
+WARN: GnB running, the explorer API not active, the V2 key not readable
+yet, a tip that did not move between the samples (normal while only CPUs
+mine at the launch difficulty), finalized heights apart, a witness whose
+last included vote is more than an epoch old, no share work in the
+bootstrap epochs.
 
-- GnB is running;
-- the explorer API or stratum is not active;
-- the tips are more than 3 blocks apart.
+Run it a few minutes after the start, after the first block, during the
+bootstrap (the witnesses must show share work), and after block 3,600 (the
+witnesses must be in the configuration and voting).
+`./obb-launch.sh logs <host> [lines] [obenblock-cpu-miner]` shows a journal.
 
-Run the step again a few minutes after the start, and after the first
-block. `./obb-launch.sh logs <host> [lines]` shows the node's journal.
-
-Known display quirk: `getnetworkinfo` reports `"chain": "gnb"` (a duplicate
-key in the RPC code overrides `"obenblock"`). The verify step checks
-`chain_id` instead.
-
-## Stratum (ASICs)
-
-The ASICs connect to:
+## 7. Back up the keys
 
 ```
-stratum+tcp://136.244.93.186:3333
-worker / username: <OWNER_ADDRESS>.<rig name>   (an obb1… mainnet address; rig name optional)
-password:          x
+./obb-launch.sh backup-keys
 ```
 
-Enable version rolling (BIP 320, mask `1fffe000`) in the firmware if it
-asks.
+Copies each host's witness directory (KES key, vote record, high-water
+file), vote records and V2 authority key into
+`state/secrets/keys-<host>-<time>.tgz` (0600). Keep them off the hosts.
 
-The proxy is `tools/obenblock-stratum`, a solo pool:
+- The V2 authority key is what miners pin: if it is lost, every V2 miner
+  must be reconfigured with a new URL.
+- A witness key must never run on two nodes at once (PoCI §8: a double vote
+  is evidence and bars the key). Restore a backup only on a replacement host
+  with the original stopped; the signer's rollback guard halts signing if
+  its record is stale, and `gnb-cli powitsignerclear` clears it once the
+  operator has checked (`docs/RUNNING.md`, "Witness signer protection").
 
-- It takes the node's `getblocktemplate` header jobs and submits with
-  `submitblock` (`docs/OBENBLOCK-MINING.md` §3).
-- Every block it finds pays `OBB_STRATUM_PAYOUT_ADDRESS`, the owner
-  address. The worker name only identifies the device. The username must
-  be an ObenBlock address of the network unless `OBB_STRATUM_ANY_USER=true`.
-- It reads the node key `/etc/obenblock/rpc.key` (group `obenblock-rpc`).
+## 8. Site and Worker
 
-`/etc/obenblock/stratum.env` on 136 is written once, so a redeploy keeps
-your edits:
+```
+./obb-launch.sh site
+```
 
-- `OBB_STRATUM_NETWORK=mainnet`;
-- `OBB_STRATUM_LISTEN=0.0.0.0:3333`;
-- `OBB_STRATUM_RPC=127.0.0.1:18210`;
-- `OBB_STRATUM_RPC_API_KEY_FILE`;
-- `OBB_STRATUM_PAYOUT_ADDRESS`;
-- `OBB_STRATUM_METRICS=127.0.0.1:9333`.
+Refuses unless the last verify was `RESULT OK`. It copies `site/`,
+`worker/`, `wrangler.toml` and `scripts/site-launch-fill.mjs` from
+`SRC_DIR` to `state/site-deploy/` and:
 
-Optional tuning is described in the proxy's README:
+- writes `launch.json` (genesis hash, launch time, seed nodes, Stratum V1
+  and V2 endpoints with the V2 keys, release id and tarball SHA-256, the
+  launch bits), checked against every `data-launch` key of the pages, and
+  fills the pages with `--strict` when `node` is installed;
+- sets the Worker's `[vars]` in the copied `wrangler.toml`:
+  `OBB_ORIGIN_ZONE=obenblock.xyz`, `OBB_ORIGINS` (the three
+  `https://nodeN.obenblock.xyz:2087`), `OBB_FALLBACK_ORIGINS` (the sslip.io
+  names), `OBB_CHAIN_ID=0x4f420001`, `OBB_GENESIS_HASH` (`getblockhash 0`
+  of the mined genesis, the raw order the origins sign);
+- prints the commands, which it never runs:
 
-- `OBB_STRATUM_DIFFICULTY`, `_DIFFICULTY_MIN` and `_MAX`;
-- `OBB_STRATUM_SHARE_SECS`.
+```
+cd state/site-deploy
+node scripts/site-launch-fill.mjs launch.json site --strict
+npx wrangler login
+npx wrangler secret delete OBB_ORIGINS
+npx wrangler secret put OBB_API_KEY < state/secrets/explorer-api.key
+npx wrangler deploy
+```
 
-After you edit the file, run `sudo systemctl restart obenblock-stratum` on
-136, then `./obb-launch.sh verify 136.244.93.186`.
+(with absolute paths; `secret delete` removes an `OBB_ORIGINS` secret of an
+older deploy, a variable and a secret cannot share a name). Then check
+`https://obenblock.xyz/api/originstatus` (the three hosts `ok`, `fallback:
+false`), `https://obenblock.xyz/api/getnetworkinfo` (`chain_id`
+`0x4f420001`) and `https://obenblock.xyz/#launch`.
 
-When the integration branch that is built has no `tools/obenblock-stratum`,
-the release has no proxy: `RELEASE` shows `stratum=` empty, and the
-stratum unit refuses to start. `verify` warns "nothing listens on :3333".
+Once the three origins have answered through the Worker:
 
-Test one device first. `./obb-launch.sh verify 136.244.93.186` prints the
-proxy's counters (workers, shares). It warns if any share was computed over
-Bitcoin's Merkle root: that device runs stock V1 firmware and will never
-find a block. A found block shows as `accepted` in the node log
-(`./obb-launch.sh logs 136.244.93.186`). Only then point the rest of the
-rented hashrate at the endpoint.
+1. `./obb-launch.sh explorer-auth hmac` (the API stops accepting the old
+   static header);
+2. rotate the shared key: move `state/secrets/explorer-api.key` aside, run
+   `./obb-launch.sh deploy` (a new key is created and installed; the running
+   units are restarted), then
+   `npx wrangler secret put OBB_API_KEY < state/secrets/explorer-api.key`;
+3. later, empty `OBB_FALLBACK_ORIGINS` in `wrangler.toml`, redeploy the
+   Worker, and set `EXPLORER_SSLIP_SAN="off"` for the next certificate.
 
-The proxy package also ships `obenblock-cpu-miner`, which mines through
-stratum with the `obenblock-root` extension. The kit does not use it on the
-three hosts: their CPUs mine through the node's built-in miner.
+## Stratum (ASICs and rentals)
+
+Every host serves both, solo (a block pays the address in the worker
+name):
+
+| | V1 | V2 |
+| --- | --- | --- |
+| URL | `stratum+tcp://<host>:3333` | `stratum2+tcp://<host>:3334/<authority key>` (from `start`) |
+| worker | `<obb1 address>.<rig>` (e.g. `obb1q52273…df82055.mrr1`) | the same, as `user_identity` |
+| password | `x` | – |
+| firmware | stock Bitcoin firmware, MRR, NiceHash, V1 proxies (version rolling BIP 320 supported) | SV2 firmware (Braiins OS), SRI translator |
+
+- A plain label (`rig1`) pays `OWNER_ADDRESS` (`--stratum-payout`). An
+  address of another chain or network is refused, never paid to the owner.
+- V1 is plaintext: anyone who reaches 3333 can mine to their own address
+  (that is solo mining), and a man in the middle can rewrite the worker
+  name. V2 is encrypted and authenticated by the pinned key.
+- MiningRigRentals: pool `stratum+tcp://<host>:3333`, worker
+  `<OWNER_ADDRESS>.mrr`, password `d=<difficulty>` (or `x`). MRR rigs
+  arrive from a few MRR proxy addresses: the kit raises the per-IP caps
+  (V1 256 and V2 64 sessions per address, 1,024 in all per host).
+- Start difficulty: the server starts a session at difficulty 1 unless the
+  miner sends `mining.suggest_difficulty` or a `d=<difficulty>` password.
+  For an ASIC set `d=` to about one share per 10 s:
+  `d ≈ hashrate (H/s) × 10 / 2^32` (100 TH/s → `d=232831`, 1 PH/s →
+  `d=2328306`); vardiff takes over after the first shares. The kit's CPU
+  miner sends `d=0.03 × threads` (about 0.9 for 30 AVX-512 threads).
+- Test one rig first: its shares show in `verify`
+  (`stratum blocks …; shares …`), a found block in
+  `./obb-launch.sh logs <host>` (`BLOCK FOUND`).
+- `STRATUM_PROXY="on"` adds `tools/obenblock-stratum` on 3335 (vardiff
+  tuning, PPLNS accounting, metrics on 127.0.0.1:9333); it is optional.
 
 ## First blocks: what to expect
 
 The genesis is anchored at the launch difficulty, 1 EH/s of SHA-256d
-(`OBB_LAUNCH_BITS = 0x19009d69`). ASERT does not lower block 1, because
-block 1's parent is the genesis. The stall relief lowers it (DESIGN §5.1):
-once a block is 180 s late, its target doubles every 30 minutes, in 60 s
-steps. The slow start pays almost nothing for the first blocks: the
-subsidy ramps up over 5,760 blocks.
+(`OBB_LAUNCH_BITS = 0x19009d69`). ASERT cannot lower block 1, whose parent
+is the genesis; stall relief does (DESIGN §5.1): once a block is 180 s
+late its target doubles every 30 minutes, in 60 s steps. The slow start
+pays almost nothing for the first blocks (the subsidy ramps up over 5,760
+blocks).
 
-The table below gives median times from the genesis timestamp, from
-`lib/first_blocks.py` (the consensus formulas, Monte Carlo):
+Median times from the genesis timestamp (`lib/first_blocks.py`, the
+consensus formulas, Monte Carlo):
 
 | hashrate | block 1 | block 10 | block 100 | block 1,000 |
 | --- | --- | --- | --- | --- |
-| 3 CPU hosts only (0.15 to 0.65 GH/s, see note) | 12 to 13 h | 1.9 to 2 d | 2.4 to 2.6 d | 2.9 to 3.1 d |
+| 3 CPU hosts, `obenblock-cpu-miner` (about 3 × 0.4 GH/s, see note) | about 10 h | about 1.7 d | about 2.3 d | about 2.9 d |
 | 100 TH/s | 3.3 h | 13.8 h | 23 h | 35 h |
 | 1 PH/s | 1.5 h | 8 h | 17 h | 28 h |
 | 10 PH/s | 30 min | 3.4 h | 10 h | 21 h |
 | 100 PH/s | 3 min | 40 min | 4.2 h | 15 h |
 | 1 EH/s | 24 s | 5 min | 50 min | 8.3 h (on schedule) |
 
-CPU rate note: the rehearsal measured the CPU rate twice on the build host.
+CPU note: `obenblock-cpu-miner --bench` on the build host (Cascade Lake,
+no SHA-NI) measured 14.3 MH/s per thread with AVX-512 and 6.3 with AVX2;
+30 threads per host is about 0.2–0.43 GH/s. Run
+`python3 lib/first_blocks.py 25P` for the rented hashrate (also with
+`--start-delay <s>` if the ASICs start later than `LAUNCH_TS`).
 
-- The genesis search ran on a host busy with other builds: 1.6 MH/s per
-  thread.
-- The node's regtest miners reported about 7 MH/s per thread.
+Finality: none before block 3,600 (24 h of epochs plus one epoch of burial
+at 30 s blocks, so about 30 h after the genesis if blocks are on schedule,
+later if they are not). Wallets and exchanges treat everything before it as
+provisional.
 
-For 3 × 31 threads that is 0.15 to 0.65 GH/s. Either way, the CPUs alone do
-not make a fast launch.
+## Known issues from the rehearsal (2026-10-19)
 
-To get the times for the rented hashrate, run
-`python3 lib/first_blocks.py 25P` (also with `--start-delay <s>`, if the
-ASICs start that long after `LAUNCH_TS`).
-
-What to read from the table:
-
-- Below 1 EH/s, the first block comes after one to a few hours. The
-  following blocks also need relief until ASERT has moved the target.
-- After that, blocks settle at 30 s.
-- The CPUs alone are a lottery of many hours. The ASICs are what makes the
-  launch.
-- DESIGN §4.2 says "at 1 PH/s, the first block comes after about 6 h". That
-  is when the target reaches the 1 PH/s level. The median first block comes
-  earlier.
-
-## 7. Publish
-
-Once `verify` is OK and block 1 is in:
-
-1. **Genesis hash**: the display-order id printed in step 1, in the release
-   notes, `docs/OBENBLOCK-GENESIS.md` (the genesis step already filled the
-   table) and on the site.
-2. **Seeds**:
-   - create `seed.obenblock.xyz` A records (DNS only, not proxied) for
-     136.244.93.186, 209.250.236.240 and 152.236.5.112;
-   - publish the fixed peers `/ip4/<ip>/tcp/18110`;
-   - then set `DNS_SEED="default"` in `kit.conf` and redeploy with
-     `./obb-launch.sh deploy`, then `./obb-launch.sh start`, one host at a
-     time.
-3. **Binaries**: the tarball and its `SHA256SUMS` from `state/dist/`
-   (downloads page and GitHub release).
-4. **Stratum endpoint**: `stratum+tcp://136.244.93.186:3333`, if it is
-   public.
-5. **Site placeholders** (obenblock.xyz, `site/` in the repository): every
-   `At launch` / `MAINNET NOT LAUNCHED YET` marker. Find them with:
-
-   ```
-   grep -rn "At launch\|NOT LAUNCHED\|AT LAUNCH" site
-   ```
-
-   They are:
-   - `site/index.html`, network table: DNS seed, genesis block hash,
-     binaries; the FAQ "Is ObenBlock live yet?"; the announcement bar;
-   - `site/downloads.html`, release files and checksums, genesis block
-     hash, DNS seed, the three download cards; the announcement bar;
-   - `site/brand.html` and the footers: `MAINNET NOT LAUNCHED YET`;
-   - the Worker: `GNB_ORIGINS` = the three https origins of step 4, and
-     `GNB_API_KEY` = `state/secrets/explorer-api.key`;
-   - the browser wallet core rebuilt with the genesis (step 1).
-6. Tell the owner's other agents the genesis hash. The anchoring
-   (`deploy/obenblock-anchor`) and the bridge need it.
+- **Peers ban each other on PoWit items after the PoCI launch height
+  (blocker for the node team).** In every regtest run (code of
+  `obenblock/mainnet-launch` at 32cdd10), once finality starts moving after
+  block 100 the nodes log `PoWit item from <peer> invalid regardless of chain
+  state: peer misbehaved` and discourage each other within seconds, and the
+  three nodes split into partitions that finalize different checkpoints. It
+  happens with three competing miners and with a single miner (no
+  competing forks), so it is not only a fork race; the timing points at
+  witness votes or evidence around a configuration handoff being judged
+  "context-free" invalid by a node that is in another state. On mainnet this
+  would partition the three launch hosts. `verify` catches it (peer list,
+  split and finality checks). Reproduce with `rehearse-regtest.sh`
+  (`MINER_NODES=1` for one miner); the node does not log the refusal reason
+  (`ingress::complete` drops it).
+- **Finality can stay at the launch checkpoint.** In another run (three
+  miners, no ban) finality never moved past the launch checkpoint (slot 80,
+  block 79) in 1,800 blocks although every witness had votes included
+  (40 to 225 each): `getfinalityinfo.poci.absent_weight` reported over a
+  third of the configuration absent in every epoch, and one host's witness
+  was not in the witness set. Of four runs: finality advanced to 254 / 509–869
+  on part of the nodes in two, never in one, and the first run stopped at 104.
+  Regtest timing (several blocks per second) is far from mainnet's, but the
+  node team should reproduce it before the launch.
+- The node's `stratum_e2e` test `v1_submit_hashes_first_forwards_blocks_over_the_rate_and_dedups_on_the_header`
+  failed twice inside the rehearsal on the loaded build host and passed
+  when run alone (timing-sensitive).
+- Regtest blocks come several per second at the pow limit, so the
+  rehearsal's "miner not hashing" and "tip did not move" results are
+  artefacts of regtest (the miner waits for a job after each block); on
+  mainnet the same checks are meaningful.
+- With three equal witness weights, strict PoCI (> 2/3) needs all three
+  witnesses online for finality: one host down halts finality (blocks go
+  on). More witness keys on separate machines (four or more) would tolerate
+  one outage.
+- After the hosts' CPU blocks become rare (ASICs raise the difficulty), the
+  CPU witness share threads still produce the only witness share work; an
+  outside party mining witness shares with header-only ASIC hardware could
+  grow its weight, limited by the growth cap (DESIGN-obenblock.md §6.3).
 
 ## Stop and rollback
 
 | Command | Effect |
 | --- | --- |
 | `./obb-launch.sh stop [host…]` | stops and disables the obenblock units; data kept |
-| `./obb-launch.sh rollback [host…]` | `current` back to `previous` (a bad binary upgrade); restarts what was running |
-| `./obb-launch.sh remove [host…]` | stops the units and deletes them and the ufw rules; moves `/etc/obenblock`, `/opt/obenblock`, `/var/lib/obenblock` to `*.removed-<UTC time>`; deletes nothing |
+| `./obb-launch.sh rollback [host…]` | `current` back to `previous`, that release's units reinstalled, every enabled obenblock unit restarted (also a failed one) |
+| `./obb-launch.sh remove [host…]` | stops the units and deletes them, their drop-ins, the kit's ufw rules (by their `ObenBlock` comment) and the explorer certificate; moves `/etc/obenblock`, `/opt/obenblock`, `/var/lib/obenblock` (with the witness and V2 keys) to `*.removed-<UTC time>`; deletes nothing else |
 
 A wrong genesis (a wrong timestamp, for example) is a new chain:
 
-1. Run `stop` on all hosts.
-2. Run `remove` on all hosts. The data is moved aside.
-3. Revert the genesis commit in `SRC_DIR`.
-4. Repeat steps 1 to 6.
+1. `stop` on all hosts, then `remove` on all hosts (the data is moved
+   aside);
+2. revert the genesis commit in `SRC_DIR`;
+3. repeat steps 1 to 6. The witness keys are generated anew by `deploy`
+   (the old ones are in the moved-aside data and in your backups).
 
 ## Rehearsal (done before the launch)
 
-`rehearse-regtest.sh` runs the kit end to end on the build host. It needs
-no root, does not use systemd and touches no service:
-
-1. the kit tests;
-2. the genesis step on a scratch copy at the rehearsal time (it reproduces
-   the documented id);
-3. the release step and its checksums;
-4. a staged install;
-5. an isolated loopback boot of the rehearsal genesis, and the placeholder
-   build's refusal;
-6. three regtest nodes from the release launcher, peered and mining, run
-   through `status.py` and `verify_summary.py`;
-7. stop.
+`rehearse-regtest.sh` runs the kit end to end on the build host, without
+root or systemd and without touching any service:
 
 ```
 ~/worktrees/obb-remote.sh run ~/worktrees/obenblock-launch bash deploy/obenblock-launch/rehearse-regtest.sh
 ```
+
+It covers: the kit tests; `genesis --rehearsal` on a scratch copy (the
+documented id); the release build of every binary; a staged install with
+the real owner address and a real witness key; a loopback boot of the
+rehearsal mainnet genesis with V1 + V2 (V2 key created, owner address
+valid in both forms); the placeholder build's refusal; three regtest nodes
+from the release launcher on separate ports, peered, each with V1 + V2 and
+a witness and no `--mine`, one CPU miner per node through its V1 server,
+run past the regtest PoCI launch height (100) until finality advances;
+`status.py` + `verify_summary.py` on them; the explorer API over TLS; the
+node's V1/V2 end-to-end test (SRI's codec) and the job server's own test;
+the site values; a clean stop.
+
+What it cannot cover: systemd (units, `LoadCredential`, sandboxing are
+checked statically and with `systemd-analyze` only), ufw, certbot and the
+DNS names, the password host's expect path, the real hosts' CPUs and
+network, real ASICs or MRR rigs, an SV2 firmware (the V2 path is covered by
+the SRI-codec test), mainnet difficulty and timing (regtest blocks are at
+the pow limit), the Worker and wrangler.

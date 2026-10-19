@@ -1,6 +1,6 @@
 #!/bin/sh
-# Launcher of obenblock-stratum.service: the Stratum V1 endpoint for the
-# rented ASICs (port 3333), run from the active release.
+# Launcher of obenblock-stratum.service: the optional external Stratum V1
+# job server (tools/obenblock-stratum, port 3335), run from the active release.
 #
 # /etc/obenblock/stratum.env:
 #   OBB_STRATUM_EXEC  program inside /opt/obenblock/current/ (no slashes)

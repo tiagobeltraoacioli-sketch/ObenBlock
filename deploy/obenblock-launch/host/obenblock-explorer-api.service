@@ -1,13 +1,15 @@
 # Read-only explorer API for obenblock.xyz, in front of the local ObenBlock
-# node (deploy/explorer-api/gnb_explorer_api.py, shipped in the release).
+# node (deploy/explorer-api/gnb_explorer_api.py of obenblock/site-deploy,
+# shipped in the release; its own unit there is the same program with the
+# /opt/obenblock/bin layout).
 #
 # /etc/obenblock/explorer-api.env selects the layout (install.sh writes it):
-#   letsencrypt: GNB_API_BIND=0.0.0.0, GNB_API_PORT=2087 and a certificate for
+#   letsencrypt: OBB_API_BIND=0.0.0.0, OBB_API_PORT=2087 and a certificate for
 #                <ip-with-dashes>.sslip.io in /etc/obenblock/tls; the port is
 #                open in ufw to Cloudflare's IPv4 ranges only (the Worker).
-#   none:        GNB_API_BIND=127.0.0.1, GNB_API_PORT=2086; the drop-in
+#   none:        OBB_API_BIND=127.0.0.1, OBB_API_PORT=2086; the drop-in
 #                loopback.conf then also limits the unit's peers to loopback.
-# The shared secret (header X-GnB-Key, the Worker's GNB_API_KEY) is
+# The shared secret (header X-GnB-Key, the Worker secret OBB_API_KEY) is
 # /etc/obenblock/explorer-api.key, mode 0640 root:obenblock-api; it is the
 # same file on the three hosts.
 #
@@ -20,12 +22,13 @@ Wants=obenblock-node.service
 [Service]
 User=obenblock-api
 Group=obenblock-api
-Environment=GNB_RPC_URL=http://127.0.0.1:18210/
-Environment=GNB_API_KEY_FILE=/etc/obenblock/explorer-api.key
-Environment=GNB_CARRYOVER=/opt/obenblock/share/bloch-g3-carryover.tsv
-Environment=GNB_API_MAX_CONNECTIONS=64
-Environment=GNB_API_TIMEOUT=10
-Environment=GNB_API_DEADLINE=30
+Environment=OBB_CHAIN=obenblock
+Environment=OBB_RPC_URL=http://127.0.0.1:18210/
+Environment=OBB_API_KEY_FILE=/etc/obenblock/explorer-api.key
+Environment=OBB_CARRYOVER=/opt/obenblock/share/bloch-g3-carryover.tsv
+Environment=OBB_API_MAX_CONNECTIONS=64
+Environment=OBB_API_TIMEOUT=10
+Environment=OBB_API_DEADLINE=30
 EnvironmentFile=/etc/obenblock/explorer-api.env
 ExecStart=/usr/bin/python3 -I /opt/obenblock/current/explorer-api/gnb_explorer_api.py
 Restart=always

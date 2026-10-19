@@ -1,0 +1,63 @@
+#!/bin/sh
+# Launcher of obenblock-cpu-miner.service: the SHA-256d CPU miner of the
+# release (tools/obenblock-stratum, obenblock-cpu-miner: AVX-512 / AVX2 /
+# SHA-NI kernels picked at start) mining through the node's built-in
+# Stratum V1 server on this host.
+#
+# /etc/obenblock/miner.env (install.sh writes it):
+#   OBB_MINER_URL      stratum+tcp://127.0.0.1:3333 (loopback only)
+#   OBB_MINER_USER     <owner obb1 address>.<label>: the node's V1 server pays
+#                      the address in the worker name (solo)
+#   OBB_MINER_THREADS  auto (= logical CPUs - 2, at least 1) or N
+#   OBB_MINER_KERNEL   auto | sha2 | lanes4 | avx2 | avx512
+#   OBB_MINER_START_DIFF  auto (0.03 per thread) | <difficulty>: password d=
+# Every value is validated; nothing reaches the command line unchecked.
+set -euf
+die() { echo "obenblock-miner-launch: $*" >&2; exit 64; }
+
+base=${OBB_RELEASE_DIR:-/opt/obenblock/current}
+exe=$base/obenblock-cpu-miner
+[ -x "$exe" ] || die "$exe is missing: this release has no CPU miner"
+
+url=${OBB_MINER_URL:-stratum+tcp://127.0.0.1:3333}
+case $url in
+  stratum+tcp://127.0.0.1:[0-9]*|stratum+tcp://localhost:[0-9]*) ;;
+  *) [ "${OBB_MINER_ALLOW_REMOTE:-0}" = 1 ] || die "OBB_MINER_URL must be stratum+tcp://127.0.0.1:<port> (got '$url')" ;;
+esac
+case $url in *[!A-Za-z0-9.:/+_-]*) die "OBB_MINER_URL has characters outside a stratum URL" ;; esac
+
+user=${OBB_MINER_USER:-}
+case $user in
+  ''|*LAUNCH-PLACEHOLDER*) die "OBB_MINER_USER is not set" ;;
+  *[!A-Za-z0-9._-]*) die "OBB_MINER_USER must be <obb1 address>.<label> ([A-Za-z0-9._-])" ;;
+  obb1*|tobb1*) ;;
+  *) die "OBB_MINER_USER must start with the owner's obb1 address" ;;
+esac
+
+threads=${OBB_MINER_THREADS:-auto}
+if [ "$threads" = auto ]; then
+  threads=$(( $(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN) - 2 ))
+  [ "$threads" -ge 1 ] || threads=1
+fi
+case $threads in ''|*[!0-9]*) die "OBB_MINER_THREADS must be auto or a decimal number" ;; esac
+[ "$threads" -ge 1 ] || die "OBB_MINER_THREADS must be at least 1"
+
+# Start difficulty (password d=<diff>, read by the node's V1 server): about
+# one share per 10 s from the first job instead of the server's start
+# difficulty; "auto" = 0.03 per thread (13 MH/s per AVX-512 thread x 10 s /
+# 2^32). The miner's own suggest_difficulty refines it after its benchmark.
+diff=${OBB_MINER_START_DIFF:-auto}
+if [ "$diff" = auto ]; then
+  diff=$(awk -v t="$threads" 'BEGIN { printf "%.4f", t * 0.03 }')
+fi
+case $diff in ''|*[!0-9.]*|*.*.*) die "OBB_MINER_START_DIFF must be auto or a decimal number" ;; esac
+set -- -o "$url" -u "$user" -p "d=$diff" -t "$threads"
+kernel=${OBB_MINER_KERNEL:-auto}
+case $kernel in
+  auto) ;;
+  sha2|lanes4|avx2|avx512) set -- "$@" --kernel "$kernel" ;;
+  *) die "OBB_MINER_KERNEL must be auto, sha2, lanes4, avx2 or avx512" ;;
+esac
+
+[ "${OBB_LAUNCH_PRINT:-0}" = 1 ] && { printf '%s\n' "$exe $*"; exit 0; }
+exec "$exe" "$@"

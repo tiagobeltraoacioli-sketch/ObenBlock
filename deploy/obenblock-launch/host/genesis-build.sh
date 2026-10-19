@@ -42,7 +42,7 @@ python3 reference/obb_genesis.py --check
 
 echo "== genesis and consensus tests"
 cargo test -q --release -p gnb-crypto genesis
-cargo test -q --release -p gnb-crypto --test obb_genesis_vectors --test obb_genesis_process_chain --test obb_genesis_regtest
+cargo test -q --release -p gnb-crypto --test obb_genesis_vectors --test obb_genesis_process_chain --test obb_genesis_regtest --test obb_merkle_vectors
 cargo test -q --release -p gnb --test obb_regtest_genesis --test obb_sha256d_mining
 if [ "$FULL" = --full-tests ]; then
   echo "== workspace tests"

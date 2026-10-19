@@ -7,39 +7,50 @@ the Mac. The procedure is in [LAUNCH-RUNBOOK.md](LAUNCH-RUNBOOK.md).
 cp kit.conf.example kit.conf
 ./obb-launch.sh preflight
 ./obb-launch.sh genesis --rehearsal
+./obb-launch.sh dns
 ./obb-launch.sh genesis
 ./obb-launch.sh build
 ./obb-launch.sh deploy
 ./obb-launch.sh explorer-tls
 ./obb-launch.sh start
 ./obb-launch.sh verify
+./obb-launch.sh backup-keys
+./obb-launch.sh site
+./obb-launch.sh explorer-auth hmac
 ```
+
+Each host runs the node (peers = the other two, P2P 18110, RPC 18210 on
+loopback with an API key, built-in Stratum V1 3333 and V2 3334, PoWit
+witness), `obenblock-cpu-miner` through the local V1 server (logical CPUs −
+2 threads, payout = the owner's address) and the explorer API (TLS on 2087
+for the obenblock.xyz Worker).
 
 | File | Runs on | Purpose |
 | --- | --- | --- |
-| `obb-launch.sh` | Mac | The steps: preflight, genesis, build, deploy, explorer-tls, start, verify, logs, stop, rollback, remove |
-| `kit.conf.example` | Mac | Hosts, owner address, launch time, ports |
-| `lib/common.sh` | Mac | SSH, scp and rsync for key hosts; expect for the password host |
+| `obb-launch.sh` | Mac | The steps: preflight, genesis, build, dns, deploy, explorer-tls, start, verify, backup-keys, site, explorer-auth, logs, stop, rollback, remove |
+| `kit.conf.example` | Mac | Hosts, owner address (obb1 and GnB forms), launch time, ports, witness, explorer names |
+| `lib/common.sh` | Mac | SSH, scp and rsync for key hosts; expect for the password host; the source excludes (no secret leaves the Mac) |
 | `lib/pw-ssh.exp` | Mac | Password login (`ssh -tt`, sudo prompts); never installs a key |
 | `lib/apply_genesis.py` | Mac, build host | Writes the mined constants over the LAUNCH PLACEHOLDER |
 | `lib/check_address.py` | Mac | Checks the owner address with the reference codec |
-| `lib/verify_summary.py` | Mac | Checks the hosts' status against the plan |
+| `lib/verify_summary.py` | Mac | Checks the hosts' status against the plan (split, finality, witness, stratum, miner) |
+| `lib/site_launch.py` | Mac | Builds `launch.json` for `scripts/site-launch-fill.mjs`; sets the Worker's `[vars]` |
+| `lib/explorer_probe.py` | anywhere | One HMAC-signed request to an explorer origin, as the Worker sends it, with the answer's signature checked |
 | `lib/first_blocks.py` | anywhere | First-block timing for a given hashrate |
 | `host/genesis-build.sh` | build host | Mines, writes, rewrites the vectors, runs the genesis tests |
-| `host/release-build.sh` | build host | Builds the release binaries and the bundle with `SHA256SUMS` |
-| `host/install.sh` | each host (sudo) | Users, directories, env files, keys, units, ufw; starts nothing |
-| `host/obenblock-launch` | each host | Builds the node's command line from `/etc/obenblock/obenblock.env` |
-| `host/obenblock-stratum-launch` | 136 | Builds the stratum proxy's command line from `/etc/obenblock/stratum.env` |
-| `host/*.service` | each host | `obenblock-node`, `obenblock-explorer-api`, `obenblock-stratum` |
-| `host/explorer-tls.sh` | each host (sudo) | Let's Encrypt certificate for the sslip.io origin |
+| `host/release-build.sh` | build host | Builds the release (node, cli, wallet, genesis tool, CPU miner, job server) and the bundle with `SHA256SUMS` |
+| `host/install.sh` | each host (sudo) | Users, directories, env files, keys (RPC, witness), units, ufw; starts nothing |
+| `host/obenblock-launch` | each host | The node's command line from `/etc/obenblock/obenblock.env` |
+| `host/obenblock-miner-launch` | each host | The CPU miner's command line from `/etc/obenblock/miner.env` |
+| `host/obenblock-stratum-launch` | each host (optional) | The external job server's command line from `/etc/obenblock/stratum.env` |
+| `host/*.service` | each host | `obenblock-node`, `obenblock-cpu-miner`, `obenblock-explorer-api`, `obenblock-stratum` (optional) |
+| `host/explorer-tls.sh` | each host (sudo) | Let's Encrypt certificate for the origin name, hooks scoped to it |
 | `host/status.py` | each host | Status as one JSON line |
 | `host/rollback.sh` | each host (sudo) | stop, previous, remove |
 | `rehearse-regtest.sh` | build host | The whole kit in regtest, without systemd or root |
 | `test_launch_kit.py` | anywhere | Kit tests (Linux runs all of them) |
 
-`state/` (created on first use, never committed) holds:
-
-- the release tarballs;
-- the logs;
-- the genesis result;
-- the explorer API shared secret.
+`state/` (created on first use, never committed, never copied to a host)
+holds the release tarballs, the logs, the genesis result, the Stratum V2
+keys the hosts reported, the site tree and `secrets/` (the explorer API
+shared secret, the key backups).
