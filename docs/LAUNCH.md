@@ -304,6 +304,6 @@ endpoints, difficulty and first-block timing.
 - Security issues: report them privately to
   `[AT LAUNCH: security contact]`, not in public issues. The repository
   has no SECURITY policy file yet.
-- Other issues: https://github.com/gnb-smh/ObenBlock/issues.
+- Other issues: https://github.com/tiagobeltraoacioli-sketch/ObenBlock/issues.
 - Include the output of `getnetworkinfo`, `getblockhash 0` and
   `getfinalityinfo`.

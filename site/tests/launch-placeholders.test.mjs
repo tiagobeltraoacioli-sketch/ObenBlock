@@ -41,8 +41,8 @@ test("filling escapes text and turns markers into values", () => {
 test("the home page links the explorer, the wallet, the OBIPs and the PoCI design", () => {
   const html = read("index.html");
   for (const href of ['href="/explorer"', 'href="/wallet"', 'href="/downloads"',
-    'href="https://github.com/gnb-smh/ObenBlock/tree/main/docs/obip"',
-    'href="https://github.com/gnb-smh/ObenBlock/blob/main/docs/DESIGN-obenblock-poci.md"']) {
+    'href="https://github.com/tiagobeltraoacioli-sketch/ObenBlock/tree/main/docs/obip"',
+    'href="https://github.com/tiagobeltraoacioli-sketch/ObenBlock/blob/main/docs/DESIGN-obenblock-poci.md"']) {
     assert.ok(html.includes(href), href);
   }
   for (let n = 2; n <= 13; n++) assert.match(html, new RegExp(`<td class="obip">${n}</td>`));
