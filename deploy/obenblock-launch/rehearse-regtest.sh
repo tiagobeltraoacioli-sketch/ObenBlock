@@ -42,6 +42,8 @@ OWNER=obb1q52273b58c1032291d562f582c413bbf05efabcdd0df82055
 TARGET_HEIGHT=${TARGET_HEIGHT:-130}
 WAIT_SECS=${WAIT_SECS:-1500}
 MINER_THREADS_REG=${MINER_THREADS_REG:-2}
+# MINER_NODES="1": one CPU miner only (no competing forks; the default runs
+# one per node, as on mainnet).
 export PATH=$HOME/.cargo/bin:$PATH CARGO_TERM_COLOR=never
 export BINDGEN_EXTRA_CLANG_ARGS=${BINDGEN_EXTRA_CLANG_ARGS:--I/usr/lib/gcc/x86_64-linux-gnu/13/include}
 step() { echo; echo "######## $*"; }
@@ -194,7 +196,7 @@ for i in 1 2 3; do
   sleep 2
 done
 for i in 1 2 3; do for _ in $(seq 1 60); do rpc "2821$i" getblockcount >/dev/null 2>&1 && break; sleep 1; done; done
-for i in 1 2 3; do
+for i in ${MINER_NODES:-1 2 3}; do
   env -i PATH="$PATH" OBB_RELEASE_DIR="$REL" OBB_MINER_URL="stratum+tcp://127.0.0.1:2833$i" \
       OBB_MINER_USER="$REG_OWNER.cpu-n$i" OBB_MINER_THREADS="$MINER_THREADS_REG" \
       sh "$REL/obenblock-miner-launch" > "$W/miner-n$i.log" 2>&1 &
@@ -263,8 +265,10 @@ echo "  no auth -> $(curl -sk -m 10 -o /dev/null -w '%{http_code}' https://127.0
 result "explorer API over TLS (HMAC): $probe"
 
 step "8. stratum end-to-end tests (node V1/V2 with SRI's codec; external job server)"
-(cd "$W/src" && cargo test -q --release -p gnb --test stratum_e2e 2>&1 | grep -E '^test result|FAILED|panicked' | head -5) | sed 's/^/  node stratum_e2e: /'
-(cd "$W/src" && OBB_NODE_BIN="$REL/obenblock" cargo test -q --release --manifest-path tools/obenblock-stratum/Cargo.toml --test e2e_regtest -- --ignored 2>&1 | grep -E '^test result|FAILED|panicked' | head -5) | sed 's/^/  obenblock-stratum e2e_regtest: /'
+# The regtest network and the API stop first: the tests time their own nodes.
+cleanup; PIDS=(); sleep 3
+(cd "$W/src" && cargo test -q --release -p gnb --test stratum_e2e 2>&1 | grep -E '^test result|FAILED|panicked' | head -5 || true) | sed 's/^/  node stratum_e2e: /'
+(cd "$W/src" && OBB_NODE_BIN="$REL/obenblock" cargo test -q --release --manifest-path tools/obenblock-stratum/Cargo.toml --test e2e_regtest -- --ignored 2>&1 | grep -E '^test result|FAILED|panicked' | head -5 || true) | sed 's/^/  obenblock-stratum e2e_regtest: /'
 result "stratum e2e: see the two lines above"
 
 step "9. site values (lib/site_launch.py on a copy of site/)"

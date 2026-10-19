@@ -441,6 +441,47 @@ at 30 s blocks, so about 30 h after the genesis if blocks are on schedule,
 later if they are not). Wallets and exchanges treat everything before it as
 provisional.
 
+## Known issues from the rehearsal (2026-10-19)
+
+- **Peers ban each other on PoWit items after the PoCI launch height
+  (blocker for the node team).** In every regtest run (code of
+  `obenblock/mainnet-launch` at 32cdd10), once finality starts moving after
+  block 100 the nodes log `PoWit item from <peer> invalid regardless of chain
+  state: peer misbehaved` and discourage each other within seconds, and the
+  three nodes split into partitions that finalize different checkpoints. It
+  happens with three competing miners and with a single miner (no
+  competing forks), so it is not only a fork race; the timing points at
+  witness votes or evidence around a configuration handoff being judged
+  "context-free" invalid by a node that is in another state. On mainnet this
+  would partition the three launch hosts. `verify` catches it (peer list,
+  split and finality checks). Reproduce with `rehearse-regtest.sh`
+  (`MINER_NODES=1` for one miner); the node does not log the refusal reason
+  (`ingress::complete` drops it).
+- **Finality can stay at the launch checkpoint.** In another run (three
+  miners, no ban) finality never moved past the launch checkpoint (slot 80,
+  block 79) in 1,800 blocks although every witness had votes included
+  (40 to 225 each): `getfinalityinfo.poci.absent_weight` reported over a
+  third of the configuration absent in every epoch, and one host's witness
+  was not in the witness set. Of four runs: finality advanced to 254 / 509–869
+  on part of the nodes in two, never in one, and the first run stopped at 104.
+  Regtest timing (several blocks per second) is far from mainnet's, but the
+  node team should reproduce it before the launch.
+- The node's `stratum_e2e` test `v1_submit_hashes_first_forwards_blocks_over_the_rate_and_dedups_on_the_header`
+  failed twice inside the rehearsal on the loaded build host and passed
+  when run alone (timing-sensitive).
+- Regtest blocks come several per second at the pow limit, so the
+  rehearsal's "miner not hashing" and "tip did not move" results are
+  artefacts of regtest (the miner waits for a job after each block); on
+  mainnet the same checks are meaningful.
+- With three equal witness weights, strict PoCI (> 2/3) needs all three
+  witnesses online for finality: one host down halts finality (blocks go
+  on). More witness keys on separate machines (four or more) would tolerate
+  one outage.
+- After the hosts' CPU blocks become rare (ASICs raise the difficulty), the
+  CPU witness share threads still produce the only witness share work; an
+  outside party mining witness shares with header-only ASIC hardware could
+  grow its weight, limited by the growth cap (DESIGN-obenblock.md §6.3).
+
 ## Stop and rollback
 
 | Command | Effect |
