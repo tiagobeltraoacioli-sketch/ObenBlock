@@ -17,10 +17,10 @@ pin both.
 | chain id | `0x4F420001` | `0x4F420002` |
 | header bits | `0x1d00ffff` (pow limit, difficulty 1) | `0x207fffff` (pow limit) |
 | ASERT anchor | genesis height and time, launch bits `0x19009d69` (1 EH/s) | genesis height and time, `0x207fffff` |
-| timestamp | **set at launch** | 1,792,281,600 (2026-10-18 00:00 UTC) |
-| version | `0x20000000` + rolled BIP 320 bits, **set at launch** | `0x20000000` |
-| nonce | **set at launch** | 0 |
-| block id (display order) | **set at launch** | `6918ae0c…0117163d` |
+| timestamp | 1792398411 | 1,792,281,600 (2026-10-18 00:00 UTC) |
+| version | `0x20000000` | `0x20000000` |
+| nonce | 2042483606 | 0 |
+| block id (display order) | `000000002f515b31fd21a057705d081567616836b529439184ce2196d756dda0` | `6918ae0c…0117163d` |
 
 The header is the 80-byte SHA-256d header (§4.1). It has no parents, so the
 parent commitment is `SHA-256d("OBB-PARENTS-v1" ‖ 00000000)`. The Merkle
