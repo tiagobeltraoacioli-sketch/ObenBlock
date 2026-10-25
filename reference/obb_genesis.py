@@ -56,22 +56,22 @@ VESTING_SPEC_SHA3 = "e24828c3cc6d56fe635581b8214af8733f4b060784d13bd92f2d558940d
 
 def genesis_text(network: str) -> str:
     return (f"ObenBlock {network} genesis: SHA-256d proof of work, PoWit finality, every rule from height 0, "
-            f"12.5M OBB cap. Carryover Bloch G3 terminal snapshot sha3 {CARRYOVER_SNAPSHOT_SHA3} "
-            "3810744000 BLCH -> 1000000 OBB, the key hashes of GnB's genesis. "
-            "Team 1250000 + founder 1250000 OBB locked, 1y cliff + 36 monthly, keys sha3 "
+            f"1M OBB cap. Carryover Bloch G3 terminal snapshot sha3 {CARRYOVER_SNAPSHOT_SHA3} "
+            "3810744000 BLCH -> 80000 OBB, the key hashes of GnB's genesis. "
+            "Team 100000 + founder 100000 OBB locked, 1y cliff + 36 monthly, keys sha3 "
             f"{VESTING_SPEC_SHA3}.")
 
 
 NETWORKS = {
-    # LAUNCHED: the constants gnb-mine-genesis printed at launch.
-    "mainnet": {"bits": o.POW_LIMIT_BITS,
-                "timestamp": 1792398411, "version": 0x20000000, "nonce": 2042483606},
+    # LAUNCH PLACEHOLDER: at launch add "timestamp", "version" and "nonce"
+    # (the constants gnb-mine-genesis printed) and run --write.
+    "mainnet": {"bits": o.POW_LIMIT_BITS},
     "regtest": {"bits": o.REGTEST_POW_LIMIT_BITS,
                 "timestamp": 1_792_281_600, "version": o.BLOCK_VERSION, "nonce": 0},
 }
 # A mainnet solution at an example timestamp (2026-10-18 00:00 UTC), found by
 # the launch tool; NOT the mainnet genesis.
-MAINNET_REHEARSAL = {"timestamp": 1_792_281_600, "version": o.BLOCK_VERSION, "nonce": 3_461_588_150}
+MAINNET_REHEARSAL = {"timestamp": 1_792_281_600, "version": o.BLOCK_VERSION, "nonce": 2_641_456_225}
 
 EMPTY_SHIELDED_ROOT = hashlib.sha3_256(b"gnb:block:shielded:v1").digest()
 EMPTY_POWIT_ROOT = hashlib.sha3_256(b"GNB-POWIT-v1/body" + b"\x00\x00\x00\x00").digest()

@@ -38,8 +38,8 @@ repository (`docs/OBENBLOCK-GENESIS.md`, `reference/obb_genesis.py
   leaves.
 - A slow start: the block subsidy ramps up over the first 5,760 blocks
   (about two days). Early blocks pay almost nothing.
-- Supply cap 12,500,000 OBB: 9.0M mined, 1.0M Bloch Genesis-3 carry-over
-  (paid to the same keys as in GnB's genesis), 1.25M team and 1.25M founder,
+- Supply cap 1,000,000 OBB: 720k mined, 80k Bloch Genesis-3 carry-over
+  (paid to the same keys as in GnB's genesis), 100k team and 100k founder,
   both locked by consensus (a one-year cliff, then 36 monthly tranches).
 - No balance from the GnB chain. GnB keeps running separately.
 - `obb1…` addresses. Existing `gnb1…` and `bloch1…` keys work, and a
@@ -95,7 +95,7 @@ docs/MINING-ASIC.md.
 ## Short version (for a post with a character limit)
 
 ObenBlock (OBB) mainnet is live. SHA-256d PoW on Bitcoin's header (stock
-ASICs work), PoCI finality from height 3,600, 12.5M cap, slow start.
+ASICs work), PoCI finality from height 3,600, 1M cap, 1% fee shared by miners and witnesses, slow start.
 Genesis `[AT LAUNCH: first 16 hex of GENESIS_HASH]…`: verify it from
 several sources before you use it. Release 0.2.0 and guide:
 `[AT LAUNCH: GitHub release URL]`

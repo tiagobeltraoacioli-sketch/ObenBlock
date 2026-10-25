@@ -26,6 +26,9 @@
 //! pays its slot to the attester's `payout` script, minus an inclusion bonus
 //! (`INCLUSION_BONUS_BPS` of the slot) paid to the block miner. Empty slots
 //! are not issued, so the miner never gains by dropping other people's shares.
+//! On ObenBlock the block's transaction fees are split the same way, apart
+//! from the subsidy ([`split_reward`]): fee slots left empty are burned. On
+//! GnB every fee goes to the miner.
 //!
 //! Under the SHA-256d proof-of-work scheme (ObenBlock,
 //! `core::pow_scheme::PowScheme::Sha256d`) the share proof is an 80-byte
@@ -345,27 +348,55 @@ where
     Ok(total)
 }
 
-/// How the subsidy of a block with `n_shares` shares is split.
+/// How an amount (a block's subsidy, its fees, or both: [`split_reward`]) is
+/// split in a block with `n_shares` shares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Split {
-    /// Subsidy part of the miner's coinbase output (fees come on top).
+    /// The miner's part (its coinbase output may claim at most this).
     pub miner: u64,
     /// Paid to each included share's payout script.
     pub per_attester: u64,
-    /// Never issued (empty slots and rounding).
+    /// Never paid (empty slots and rounding): not issued for the subsidy,
+    /// burned for the fees.
     pub unissued: u64,
 }
 
-pub fn split_subsidy(height: u64, n_shares: usize) -> Split {
-    let subsidy = tokenomics::block_subsidy_sat(height);
-    let pool = subsidy * WITNESS_POOL_BPS / 10_000;
+/// Split `amount` between the miner and `n_shares` attesters: `WITNESS_POOL_BPS`
+/// in `MAX_SHARES_PER_BLOCK` slots, `INCLUSION_BONUS_BPS` of each filled slot
+/// to the miner. Exact for every `u64` (`miner + n × per_attester + unissued
+/// == amount`).
+pub const fn split_amount(amount: u64, n_shares: usize) -> Split {
+    let pool = (amount as u128 * WITNESS_POOL_BPS as u128 / 10_000) as u64;
     let slot = pool / MAX_SHARES_PER_BLOCK as u64;
-    let bonus = slot * INCLUSION_BONUS_BPS / 10_000;
+    let bonus = (slot as u128 * INCLUSION_BONUS_BPS as u128 / 10_000) as u64;
     let per_attester = slot - bonus;
-    let n = n_shares.min(MAX_SHARES_PER_BLOCK) as u64;
-    let miner = subsidy - pool + n * bonus;
-    let unissued = subsidy - miner - n * per_attester;
+    let n = if n_shares < MAX_SHARES_PER_BLOCK { n_shares } else { MAX_SHARES_PER_BLOCK } as u64;
+    let miner = amount - pool + n * bonus;
+    let unissued = amount - miner - n * per_attester;
     Split { miner, per_attester, unissued }
+}
+
+/// The split of the subsidy of a block at `height` with `n_shares` shares.
+pub fn split_subsidy(height: u64, n_shares: usize) -> Split {
+    split_amount(tokenomics::block_subsidy_sat(height), n_shares)
+}
+
+/// The whole reward of a block at `height` with `n_shares` shares and
+/// `total_fees` of transaction fees: the subsidy split ([`split_subsidy`])
+/// plus, on ObenBlock, the fees split the same way on their own (each
+/// attester output carries both parts; empty fee slots are burned). On GnB
+/// the fees all go to the miner. `None` if the miner's part overflows.
+pub fn split_reward(height: u64, total_fees: u64, n_shares: usize) -> Option<Split> {
+    let sub = split_subsidy(height, n_shares);
+    let fee = match super::node_chain_id().chain() {
+        super::chain::Chain::Gnb => Split { miner: total_fees, per_attester: 0, unissued: 0 },
+        super::chain::Chain::ObenBlock => split_amount(total_fees, n_shares),
+    };
+    Some(Split {
+        miner: sub.miner.checked_add(fee.miner)?,
+        per_attester: sub.per_attester.checked_add(fee.per_attester)?,
+        unissued: sub.unissued.checked_add(fee.unissued)?,
+    })
 }
 
 #[cfg(test)]
@@ -491,9 +522,35 @@ mod tests {
         }
         let full = split_subsidy(1, MAX_SHARES_PER_BLOCK);
         let none = split_subsidy(1, 0);
-        // Initial subsidy 1.07020547 GNB: 20% pool, 16 slots.
+        // Initial subsidy 0.08561643 OBB: 20% pool, 16 slots.
         assert_eq!(none.miner, tokenomics::INITIAL_SUBSIDY_SAT - tokenomics::INITIAL_SUBSIDY_SAT * 2 / 10);
         assert!(full.per_attester > 0 && full.miner > none.miner);
         assert!(full.unissued < 100, "rounding only");
+    }
+
+    /// The fee split: 20% of the fees in 16 slots, 10% of a filled slot to
+    /// the miner, empty slots burned; exact for 0, 5 and 16 shares and for
+    /// the largest amounts.
+    #[test]
+    fn fees_split_like_the_subsidy() {
+        let fees = 1_000_000_000u64; // 10 OBB of fees
+        let none = split_amount(fees, 0);
+        assert_eq!(none, Split { miner: 800_000_000, per_attester: 11_250_000, unissued: 200_000_000 });
+        let five = split_amount(fees, 5);
+        assert_eq!(five.miner, 800_000_000 + 5 * 1_250_000);
+        assert_eq!(five.per_attester, 11_250_000);
+        assert_eq!(five.unissued, 11 * 12_500_000, "11 empty slots burned");
+        let full = split_amount(fees, MAX_SHARES_PER_BLOCK);
+        assert_eq!(full.miner, 800_000_000 + 16 * 1_250_000);
+        assert_eq!(full.miner + 16 * full.per_attester, fees, "all paid with every slot filled");
+        assert_eq!(full.unissued, 0);
+        assert_eq!(split_amount(fees, 99), full, "shares beyond the cap earn nothing more");
+        for amount in [0, 1, 79, 80, 12_345_678, u64::MAX / 3, u64::MAX] {
+            for n in [0, 5, MAX_SHARES_PER_BLOCK] {
+                let s = split_amount(amount, n);
+                assert_eq!(s.miner as u128 + n as u128 * s.per_attester as u128 + s.unissued as u128,
+                           amount as u128, "amount={amount} n={n}");
+            }
+        }
     }
 }

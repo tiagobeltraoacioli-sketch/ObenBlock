@@ -61,9 +61,12 @@ checkpoints are anchored in **Bloch**.
   - the conservative suite 0x0003.
   None of the legacy regimes is reachable on ObenBlock. The code keeps them
   for GnB.
-- **Allocations**: the four allocations of the tokenomics stay as they are:
-  9.0M mined, 1.0M carry-over, 1.25M team, 1.25M founder, so the supply is
-  12,500,000 OBB (owner, 2026-10-17).
+- **Allocations**: the four allocations of the tokenomics keep their shares,
+  scaled to a 1,000,000 OBB cap (owner, 2026-10-25; was 12,500,000 on
+  2026-10-17): 720k mined, 80k carry-over, 100k team, 100k founder. Every
+  transaction pays at least 1% of the value it sends to others (change is
+  exempt), and the block's fees are split like its subsidy, 80% miner / 20%
+  witnesses (docs/MONETARY-POLICY.md).
 - **Carry-over: as in GnB today** (owner, 2026-10-17). The genesis pays the
   1.0M carry-over allocation exactly as GnB's genesis does:
   - the same Bloch Genesis-3 snapshot (`genesis/`);

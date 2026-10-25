@@ -405,8 +405,8 @@ impl PqPsbt {
         if tx.wire_size(true) > MAX_TX_BYTES {
             return Err("final transaction exceeds size limit".into());
         }
-        core::check_min_fee(&tx, review.fee)?;
         let prevouts: Vec<_> = self.inputs.iter().map(|i| i.prevout.clone()).collect();
+        core::check_min_fee(&tx, review.fee, &prevouts)?;
         let activation =
             core::activation::hardening_activation_height_for_signer(self.spend.chain_id());
         core::sighash::verify_tx_scripts(
@@ -1701,7 +1701,7 @@ mod tests {
             core::tokenomics::min_tx_fee_sat(transaction.wire_size(true))
         );
         assert!(
-            core::check_min_fee(&transaction, fee).is_err(),
+            core::check_min_fee(&transaction, fee, &[]).is_err(),
             "fixture must fail shared consensus minimum"
         );
         assert!(

@@ -14,7 +14,7 @@
 //!
 //! The genesis ledger is the outputs no transaction creates ([`GenesisLedger`]):
 //! the converted Bloch carryover and the 72 locked vesting tranches
-//! (`core::vesting`, 2 × 1,250,000 GNB, policy outputs with an absolute
+//! (`core::vesting`, 2 × 100,000 OBB, policy outputs with an absolute
 //! timelock; locked or not, they are in the set and in the total). The
 //! applied chain is the set of blocks that hold an undo record (every
 //! connected block keeps one, pruned or not; the genesis has none and pays
@@ -32,7 +32,8 @@
 //! is ever replaced by an output with the same outpoint: this chain enforces
 //! BIP30 at every height (audit VAL-2). A total above `max_supply` is
 //! inflation or corruption. Fees move value between outputs and are not
-//! issuance, and the proof of work (GnB-SMH v1, v3 from the PoWit height)
+//! issuance (on ObenBlock the fee slots a block leaves empty are burned,
+//! `witness_share::split_reward`, which only lowers the total), and the proof of work (GnB-SMH v1, v3 from the PoWit height)
 //! does not enter the bound: the subsidy depends on the header height alone.
 //!
 //! Independently, the scan's totals over 20-byte (address) scripts are

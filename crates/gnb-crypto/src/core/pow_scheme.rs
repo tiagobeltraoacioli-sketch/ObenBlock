@@ -506,7 +506,7 @@ mod tests {
         assert_eq!(slow_start_subsidy_sat(full, SLOW_START_BLOCKS), full);
         assert_eq!(slow_start_subsidy_sat(full, u64::MAX), full);
         let withheld: u64 = (1..SLOW_START_BLOCKS).map(|h| full - slow_start_subsidy_sat(full, h)).sum();
-        assert_eq!(withheld / super::super::tokenomics::SAT_PER_GNB, 3_081, "about 3,080 OBB (§4.2)");
+        assert_eq!(withheld / super::super::tokenomics::SAT_PER_GNB, 246, "about 246 OBB (§4.2)");
         assert_eq!(slow_start_subsidy_sat(u64::MAX, SLOW_START_BLOCKS - 1), (u64::MAX as u128 * 5_759 / 5_760) as u64);
     }
 

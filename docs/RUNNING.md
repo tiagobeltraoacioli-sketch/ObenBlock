@@ -519,7 +519,7 @@ and answers:
 | `hash_serialized` | SHA3-256 of the UTXO rows in key order (domain `gnb/utxo-set/v1`; each row `u32 LE len ‖ key ‖ u32 LE len ‖ value`). Two nodes with the same set report the same hash; compare it across nodes at the same `bestblock` |
 | `applied_blocks`, `undo_off_chain`, `chain_without_undo`, `chain_ok` | blocks with an undo record (the connected chain, genesis excluded); of those, the ones not on the selected chain of `bestblock` (a stale record, whose subsidy would inflate `max_supply_sat`); the blocks of that chain without a record (their subsidy is missing from it; a chain whose walk stops at a missing DAG record counts one more); `chain_ok` when the records are exactly that chain (both counts 0 and `applied_blocks` = `height`) |
 | `expected.carryover_sat` | the genesis ledger's verified Bloch carryover |
-| `expected.locked_sat` | the genesis ledger's locked team and founder allocations (2 × 1,250,000 GNB in 72 timelocked policy outputs, `core::vesting`; in the set whether unlocked or not) |
+| `expected.locked_sat` | the genesis ledger's locked team and founder allocations (2 × 100,000 OBB in 72 timelocked policy outputs, `core::vesting`; in the set whether unlocked or not) |
 | `expected.subsidy_sat` | the subsidy of every connected block, at the header height its coinbase was checked against |
 | `expected.max_supply_sat` | carryover + locked + subsidy: the most the set may hold |
 | `expected.schedule_issued_sat` | `issued_through_sat(height)`, the schedule through the tip's position, an upper bound of `subsidy_sat` |

@@ -1,13 +1,13 @@
 //! GNB monetary policy. Consensus rules: changing anything here is a hard fork.
 //!
-//! Hard cap of 12,500,000 GNB, split in four fixed allocations:
+//! Hard cap of 1,000,000 OBB, split in four fixed allocations:
 //!
-//! - **Bloch carryover, 1,000,000 GNB (8%).** The Bloch Genesis-3 terminal
+//! - **Bloch carryover, 80,000 OBB (8%).** The Bloch Genesis-3 terminal
 //!   snapshot (3,810,744,000 BLCH over 452,726 outputs) is converted
 //!   proportionally into the genesis ledger: every output of `v` BLCH base
 //!   units becomes `floor(v × CARRYOVER_ALLOCATION_SAT / CARRYOVER_SOURCE_TOTAL_SAT)`
 //!   GNB base units, same 20-byte owner hash. See `core::carryover`.
-//! - **Team, 1,250,000 GNB (10%), and founder, 1,250,000 GNB (10%), locked.**
+//! - **Team, 100,000 OBB (10%), and founder, 100,000 OBB (10%), locked.**
 //!   Written into the genesis ledger as 36 monthly tranches each, every
 //!   tranche an output locked by a spend policy (`core::policy`) with an
 //!   absolute timelock: nothing is spendable during the first year
@@ -15,37 +15,42 @@
 //!   [`VESTING_TRANCHE_BLOCKS`] for three years; the last unlocks at height
 //!   4,204,800. The lock is a consensus rule, not a promise. Keys and tranche
 //!   layout: `core::vesting`.
-//! - **Mining, 9,000,000 GNB (72%).** 100% of every block subsidy and 100% of
-//!   every transaction fee go to the miner. The subsidy starts at
+//! - **Mining, 720,000 OBB (72%).** Every block subsidy and every block's
+//!   transaction fees are split the same way between the miner and the PoWit
+//!   witnesses whose shares the block includes (`witness_share::split_reward`:
+//!   20% in 16 witness slots, empty slots are not issued). The subsidy starts at
 //!   `INITIAL_SUBSIDY_SAT` and halves (integer right shift, in base units)
 //!   every `HALVING_INTERVAL` blocks, about 4 years at 30-second blocks.
-//!   After 27 halvings it is zero and stays zero: there is no tail emission.
-//!   Mined issuance is 8,999,998.51392253 GNB.
+//!   After 24 halvings it is zero and stays zero: there is no tail emission.
+//!   Mined issuance is at most 719,999.33953557 OBB.
 //! - The genesis coinbase is unspendable and pays nothing, so mining starts
-//!   at height 1. Carryover, team, founder and mining together are
-//!   12,499,998.51182046 GNB, strictly below `MAX_SUPPLY_SAT` (asserted by
+//!   at height 1. Carryover, team, founder and mining together are at most
+//!   999,999.33628909 OBB, strictly below `MAX_SUPPLY_SAT` (asserted by
 //!   the tests below).
-//! - Once the subsidy is exhausted, miners are paid by fees alone. Every
-//!   non-coinbase transaction must pay at least [`min_tx_fee_sat`] by
-//!   consensus, so block production always carries a revenue floor.
+//! - Once the subsidy is exhausted, miners and witnesses are paid by fees
+//!   alone. Every non-coinbase transaction must pay at least
+//!   [`min_tx_fee_for_sat`] by consensus: 1% of the value it sends to others
+//!   (outputs that are not change, [`PAYMENT_FEE_BPS`]), and never less than
+//!   the size floor [`min_tx_fee_sat`]. Block production always carries a
+//!   revenue floor.
 
 /// Base units per GNB.
 pub const SAT_PER_GNB: u64 = 100_000_000;
 
 /// Hard cap: total issuance never reaches this.
-pub const MAX_SUPPLY_SAT: u64 = 12_500_000 * SAT_PER_GNB;
+pub const MAX_SUPPLY_SAT: u64 = 1_000_000 * SAT_PER_GNB;
 
 /// Converted Bloch Genesis-3 carryover (8% of the cap).
-pub const CARRYOVER_ALLOCATION_SAT: u64 = 1_000_000 * SAT_PER_GNB;
+pub const CARRYOVER_ALLOCATION_SAT: u64 = 80_000 * SAT_PER_GNB;
 
 /// Team allocation, locked (10%).
-pub const TEAM_ALLOCATION_SAT: u64 = 1_250_000 * SAT_PER_GNB;
+pub const TEAM_ALLOCATION_SAT: u64 = 100_000 * SAT_PER_GNB;
 
 /// Founder allocation, locked (10%).
-pub const FOUNDER_ALLOCATION_SAT: u64 = 1_250_000 * SAT_PER_GNB;
+pub const FOUNDER_ALLOCATION_SAT: u64 = 100_000 * SAT_PER_GNB;
 
 /// Emitted by mining (72%).
-pub const MINING_ALLOCATION_SAT: u64 = 9_000_000 * SAT_PER_GNB;
+pub const MINING_ALLOCATION_SAT: u64 = 720_000 * SAT_PER_GNB;
 
 const _: () = assert!(
     CARRYOVER_ALLOCATION_SAT + TEAM_ALLOCATION_SAT + FOUNDER_ALLOCATION_SAT + MINING_ALLOCATION_SAT
@@ -88,7 +93,7 @@ pub const TARGET_BLOCK_TIME_SECS: u64 = 30;
 pub const HALVING_INTERVAL: u64 = 4 * 365 * 2_880;
 
 /// Subsidy of the first halving epoch:
-/// floor(MINING_ALLOCATION / (2 × HALVING_INTERVAL)) = 1.07020547 GNB.
+/// floor(MINING_ALLOCATION / (2 × HALVING_INTERVAL)) = 0.08561643 OBB.
 pub const INITIAL_SUBSIDY_SAT: u64 = MINING_ALLOCATION_SAT / (2 * HALVING_INTERVAL);
 
 /// Number of halvings after which the subsidy is zero.
@@ -101,7 +106,7 @@ pub const LAST_SUBSIDY_HEIGHT_EXCLUSIVE: u64 = SUBSIDY_HALVINGS * HALVING_INTERV
 /// (genesis) pays nothing. GnB: [`schedule_subsidy_sat`]. ObenBlock (both
 /// networks): the same schedule under the slow start of
 /// docs/DESIGN-obenblock.md §4.2, `floor(full × min(height, 5,760) / 5,760)`
-/// (`pow_scheme::slow_start_subsidy_sat`); the withheld part (about 3,080
+/// (`pow_scheme::slow_start_subsidy_sat`); the withheld part (about 246
 /// OBB) is never issued, so [`issued_through_sat`] stays an upper bound.
 pub fn block_subsidy_sat(height: u64) -> u64 {
     let full = schedule_subsidy_sat(height);
@@ -164,6 +169,48 @@ pub const fn min_tx_fee_sat(size_bytes: usize) -> u64 {
     }
 }
 
+/// Part of the value a transaction sends to others that it must pay as fee
+/// on ObenBlock, in basis points (1%). "Sent to others" is the value of its
+/// outputs that are not change (`core::paid_to_others_sat`: an output whose
+/// script is the script of a coin the transaction spends is change).
+pub const PAYMENT_FEE_BPS: u64 = 100;
+
+/// `ceil(paid_to_others × PAYMENT_FEE_BPS / 10,000)`, saturating at
+/// `u64::MAX` (unreachable: the value is bounded by the supply).
+pub const fn payment_fee_sat(paid_to_others: u128) -> u64 {
+    let fee = paid_to_others.saturating_mul(PAYMENT_FEE_BPS as u128).div_ceil(10_000);
+    if fee > u64::MAX as u128 { u64::MAX } else { fee as u64 }
+}
+
+/// Consensus minimum fee of a non-coinbase transaction of `size_bytes` that
+/// sends `paid_to_others` base units to others. ObenBlock (both networks):
+/// `max(min_tx_fee_sat(size), payment_fee_sat(paid_to_others))`. GnB: the
+/// size rule alone.
+pub fn min_tx_fee_for_sat(size_bytes: usize, paid_to_others: u128) -> u64 {
+    min_tx_fee_on(super::node_chain_id().chain(), size_bytes, paid_to_others)
+}
+
+/// The value part of the node chain's minimum fee: [`payment_fee_sat`] on
+/// ObenBlock, 0 on GnB.
+pub fn payment_fee_for_sat(paid_to_others: u128) -> u64 {
+    match super::node_chain_id().chain() {
+        super::chain::Chain::Gnb => 0,
+        super::chain::Chain::ObenBlock => payment_fee_sat(paid_to_others),
+    }
+}
+
+/// [`min_tx_fee_for_sat`] under the rules of `chain`.
+pub const fn min_tx_fee_on(chain: super::chain::Chain, size_bytes: usize, paid_to_others: u128) -> u64 {
+    let by_size = min_tx_fee_sat(size_bytes);
+    match chain {
+        super::chain::Chain::Gnb => by_size,
+        super::chain::Chain::ObenBlock => {
+            let by_value = payment_fee_sat(paid_to_others);
+            if by_value > by_size { by_value } else { by_size }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,17 +225,17 @@ mod tests {
             let sum: u128 = (1..=VESTING_TRANCHES).map(|k| vesting_tranche_value(total, k) as u128).sum();
             assert_eq!(sum, total as u128, "tranches must sum to the allocation ({total})");
         }
-        assert_eq!(vesting_tranche_value(TEAM_ALLOCATION_SAT, 1), 3_472_222_222_222);
-        assert_eq!(vesting_tranche_value(TEAM_ALLOCATION_SAT, 36), 3_472_222_222_230);
+        assert_eq!(vesting_tranche_value(TEAM_ALLOCATION_SAT, 1), 277_777_777_777);
+        assert_eq!(vesting_tranche_value(TEAM_ALLOCATION_SAT, 36), 277_777_777_805);
     }
 
     #[test]
     fn schedule_constants() {
         assert_eq!(HALVING_INTERVAL, 4_204_800);
-        assert_eq!(INITIAL_SUBSIDY_SAT, 107_020_547);
+        assert_eq!(INITIAL_SUBSIDY_SAT, 8_561_643);
         assert_eq!(CARRYOVER_ALLOCATION_SAT + TEAM_ALLOCATION_SAT + FOUNDER_ALLOCATION_SAT
                    + MINING_ALLOCATION_SAT, MAX_SUPPLY_SAT);
-        assert_eq!(SUBSIDY_HALVINGS, 27);
+        assert_eq!(SUBSIDY_HALVINGS, 24);
         assert_eq!(INITIAL_SUBSIDY_SAT >> SUBSIDY_HALVINGS, 0);
         assert!(INITIAL_SUBSIDY_SAT >> (SUBSIDY_HALVINGS - 1) > 0);
     }
@@ -196,13 +243,13 @@ mod tests {
     #[test]
     fn total_issuance_is_below_the_hard_cap() {
         let total = issued_through_sat(u64::MAX);
-        assert_eq!(total, 899_999_851_392_253);
+        assert_eq!(total, 71_999_933_953_557);
         assert!(total <= MINING_ALLOCATION_SAT);
         let carryover = crate::core::carryover::CARRYOVER_CONVERTED_TOTAL_SAT;
         assert!(carryover <= CARRYOVER_ALLOCATION_SAT);
-        assert_eq!(total + carryover, 999_999_851_182_046);
+        assert_eq!(total + carryover, 79_999_933_628_909);
         let all = total + carryover + TEAM_ALLOCATION_SAT + FOUNDER_ALLOCATION_SAT;
-        assert_eq!(all, 1_249_999_851_182_046);
+        assert_eq!(all, 99_999_933_628_909);
         assert!(all < MAX_SUPPLY_SAT);
         assert_eq!(issued_through_sat(LAST_SUBSIDY_HEIGHT_EXCLUSIVE - 1), total);
     }
@@ -230,11 +277,11 @@ mod tests {
 
     #[test]
     fn hard_cap_and_allocations() {
-        assert_eq!(MAX_SUPPLY_SAT, 1_250_000_000_000_000);
-        assert_eq!(TEAM_ALLOCATION_SAT + FOUNDER_ALLOCATION_SAT, 250_000_000_000_000);
-        assert_eq!(CARRYOVER_ALLOCATION_SAT, 100_000_000_000_000);
-        assert_eq!(MINING_ALLOCATION_SAT, 900_000_000_000_000);
-        assert_eq!(LAST_SUBSIDY_HEIGHT_EXCLUSIVE, 27 * 4_204_800);
+        assert_eq!(MAX_SUPPLY_SAT, 100_000_000_000_000);
+        assert_eq!(TEAM_ALLOCATION_SAT + FOUNDER_ALLOCATION_SAT, 20_000_000_000_000);
+        assert_eq!(CARRYOVER_ALLOCATION_SAT, 8_000_000_000_000);
+        assert_eq!(MINING_ALLOCATION_SAT, 72_000_000_000_000);
+        assert_eq!(LAST_SUBSIDY_HEIGHT_EXCLUSIVE, 24 * 4_204_800);
     }
 
     /// The shift guard: from the 64th halving on the subsidy is zero without
@@ -287,5 +334,32 @@ mod tests {
         assert_eq!(min_tx_fee_sat(usize::MAX), u64::MAX.div_ceil(1000));
         #[cfg(not(target_pointer_width = "64"))]
         assert_eq!(min_tx_fee_sat(usize::MAX), 2 * usize::MAX as u64);
+    }
+
+    #[test]
+    fn payment_fee_is_one_percent_rounded_up_and_never_overflows() {
+        assert_eq!(PAYMENT_FEE_BPS, 100);
+        assert_eq!(payment_fee_sat(0), 0);
+        assert_eq!(payment_fee_sat(1), 1, "rounds up");
+        assert_eq!(payment_fee_sat(100), 1);
+        assert_eq!(payment_fee_sat(101), 2);
+        assert_eq!(payment_fee_sat(SAT_PER_GNB as u128), SAT_PER_GNB / 100, "1 OBB pays 0.01 OBB");
+        assert_eq!(payment_fee_sat(MAX_SUPPLY_SAT as u128), MAX_SUPPLY_SAT / 100);
+        assert_eq!(payment_fee_sat(u128::MAX), u64::MAX, "saturates");
+        assert_eq!(payment_fee_sat(u64::MAX as u128 * 100), u64::MAX);
+    }
+
+    #[test]
+    fn obenblock_minimum_is_the_larger_of_size_and_one_percent() {
+        use crate::core::chain::Chain;
+        // 1 OBB sent: 0.01 OBB, above the size floor of a typical 8.6 kB spend.
+        assert_eq!(min_tx_fee_on(Chain::ObenBlock, 8_600, SAT_PER_GNB as u128), 1_000_000);
+        // A tiny payment: the size floor rules.
+        assert_eq!(min_tx_fee_on(Chain::ObenBlock, 8_600, 1_000), 17_200);
+        // Nothing sent to others (a consolidation to oneself): size floor.
+        assert_eq!(min_tx_fee_on(Chain::ObenBlock, 8_600, 0), 17_200);
+        // GnB keeps the size rule alone.
+        assert_eq!(min_tx_fee_on(Chain::Gnb, 8_600, SAT_PER_GNB as u128), 17_200);
+        assert_eq!(min_tx_fee_on(Chain::ObenBlock, usize::MAX, u128::MAX), u64::MAX);
     }
 }

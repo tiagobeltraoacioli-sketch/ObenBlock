@@ -34,7 +34,7 @@
 //!   same 20-byte key hashes (`carryover::verify_and_convert`), and the same
 //!   locked team and founder tranches (`vesting::genesis_tranches`). The node
 //!   writes it with the same code for both chains. The allocations are
-//!   GnB's: 9.0M mined, 1.0M carry-over, 1.25M team, 1.25M founder
+//!   scaled to the 1M cap: 720k mined, 80k carry-over, 100k team, 100k founder
 //!   (`tokenomics`). Nothing mined or moved on GnB exists on ObenBlock.
 //!
 //! The executable reference is `reference/obb_genesis.py`; it recomputes
@@ -86,9 +86,9 @@ macro_rules! obb_genesis_text {
     ($network:literal) => {
         concat!(
             "ObenBlock ", $network, " genesis: SHA-256d proof of work, PoWit finality, every rule from height 0, \
-12.5M OBB cap. Carryover Bloch G3 terminal snapshot sha3 3d67246e94881a17d302b464f79fee55886d8068794e76fed43081117fbe308d \
-3810744000 BLCH -> 1000000 OBB, the key hashes of GnB's genesis. \
-Team 1250000 + founder 1250000 OBB locked, 1y cliff + 36 monthly, keys sha3 \
+1M OBB cap. Carryover Bloch G3 terminal snapshot sha3 3d67246e94881a17d302b464f79fee55886d8068794e76fed43081117fbe308d \
+3810744000 BLCH -> 80000 OBB, the key hashes of GnB's genesis. \
+Team 100000 + founder 100000 OBB locked, 1y cliff + 36 monthly, keys sha3 \
 e24828c3cc6d56fe635581b8214af8733f4b060784d13bd92f2d558940d90d20."
         )
     };
@@ -99,23 +99,21 @@ pub const OBB_MAINNET_GENESIS_TEXT: &str = obb_genesis_text!("mainnet");
 /// Genesis text of ObenBlock regtest.
 pub const OBB_REGTEST_GENESIS_TEXT: &str = obb_genesis_text!("regtest");
 
-// LAUNCHED: mined with `OBB_MAINNET_GENESIS_MINE_COMMAND` at the launch
-// timestamp (docs/OBENBLOCK-GENESIS.md; deploy/obenblock-launch). Block id
-// 000000002f515b31fd21a057705d081567616836b529439184ce2196d756dda0 (display order).
+// LAUNCH PLACEHOLDER (owner decision, docs/DESIGN-obenblock.md §3: the
+// mainnet genesis is mined at launch). The three values below and
+// `OBB_MAINNET_GENESIS_HASH` are produced by
+// `OBB_MAINNET_GENESIS_MINE_COMMAND` with the launch timestamp; until then
+// the timestamp is 0 and a node refuses to start ObenBlock mainnet.
 /// Unix time of the ObenBlock mainnet genesis (also the ASERT anchor time).
-pub const OBB_MAINNET_GENESIS_TIMESTAMP: u64 = 1792398411;
+/// **0 = not launched (placeholder).**
+pub const OBB_MAINNET_GENESIS_TIMESTAMP: u64 = 0;
 /// Header version of the mainnet genesis: [`OBB_BLOCK_VERSION`] plus the
-/// BIP 320 bits the genesis search rolled.
-pub const OBB_MAINNET_GENESIS_VERSION: u32 = 0x20000000;
-/// Nonce of the mainnet genesis.
-pub const OBB_MAINNET_GENESIS_NONCE: u64 = 2042483606;
-/// Block id of the mainnet genesis (raw SHA-256d digest).
-pub const OBB_MAINNET_GENESIS_HASH: [u8; 32] = [
-    0xa0, 0xdd, 0x56, 0xd7, 0x96, 0x21, 0xce, 0x84,
-    0x91, 0x43, 0x29, 0xb5, 0x36, 0x68, 0x61, 0x67,
-    0x15, 0x08, 0x5d, 0x70, 0x57, 0xa0, 0x21, 0xfd,
-    0x31, 0x5b, 0x51, 0x2f, 0x00, 0x00, 0x00, 0x00,
-];
+/// BIP 320 bits the genesis search rolled. **Placeholder until launch.**
+pub const OBB_MAINNET_GENESIS_VERSION: u32 = OBB_BLOCK_VERSION;
+/// Nonce of the mainnet genesis. **Placeholder until launch.**
+pub const OBB_MAINNET_GENESIS_NONCE: u64 = 0;
+/// Block id of the mainnet genesis. **All zero = not launched (placeholder).**
+pub const OBB_MAINNET_GENESIS_HASH: [u8; 32] = [0u8; 32];
 /// Header bits of the mainnet genesis: the pow limit (difficulty 1).
 pub const OBB_MAINNET_GENESIS_BITS: u32 = OBB_POW_LIMIT_BITS;
 
@@ -126,13 +124,13 @@ pub const OBB_REGTEST_GENESIS_VERSION: u32 = OBB_BLOCK_VERSION;
 /// Nonce of the regtest genesis (`gnb-mine-genesis --chain obenblock --regtest`).
 pub const OBB_REGTEST_GENESIS_NONCE: u64 = 0;
 /// Block id of the regtest genesis (raw SHA-256d digest;
-/// 6918ae0c247b3c7475edd95f406b676e5fe42351c0df7c8488a51cfe0117163d in
+/// 08d99125c5787327260726ebab9f4b60efde6e0e081bb29915ceca6565e8d4c6 in
 /// Bitcoin's display order).
 pub const OBB_REGTEST_GENESIS_HASH: [u8; 32] = [
-    0x3d, 0x16, 0x17, 0x01, 0xfe, 0x1c, 0xa5, 0x88,
-    0x84, 0x7c, 0xdf, 0xc0, 0x51, 0x23, 0xe4, 0x5f,
-    0x6e, 0x67, 0x6b, 0x40, 0x5f, 0xd9, 0xed, 0x75,
-    0x74, 0x3c, 0x7b, 0x24, 0x0c, 0xae, 0x18, 0x69,
+    0xc6, 0xd4, 0xe8, 0x65, 0x65, 0xca, 0xce, 0x15,
+    0x99, 0xb2, 0x1b, 0x08, 0x0e, 0x6e, 0xde, 0xef,
+    0x60, 0x4b, 0x9f, 0xab, 0xeb, 0x26, 0x07, 0x26,
+    0x27, 0x73, 0x78, 0xc5, 0x25, 0x91, 0xd9, 0x08,
 ];
 /// Header bits of the regtest genesis: the regtest pow limit.
 pub const OBB_REGTEST_GENESIS_BITS: u32 = OBB_REGTEST_POW_LIMIT_BITS;
@@ -377,7 +375,7 @@ mod tests {
             assert!(text.starts_with(&format!("ObenBlock {net} genesis: ")), "{text}");
             assert!(text.contains(&hex::encode(carryover::CARRYOVER_SNAPSHOT_SHA3)));
             assert!(text.contains(&hex::encode(vesting::VESTING_SPEC_SHA3)));
-            assert!(text.contains("3810744000 BLCH -> 1000000 OBB"));
+            assert!(text.contains("3810744000 BLCH -> 80000 OBB"));
             assert!(crate::core::GENESIS_COINBASE_TEXT.contains(&hex::encode(carryover::CARRYOVER_SNAPSHOT_SHA3)));
             assert!(text.len() < 1_000, "far below the script_sig cap");
         }

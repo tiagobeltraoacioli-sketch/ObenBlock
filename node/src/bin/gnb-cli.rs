@@ -1767,10 +1767,12 @@ fn do_vault_lock(params: &[&str], target: &RpcTarget, stated: Option<gnb::addres
     let outputs = gnb::bridge::lock_outputs(&vault.script().unwrap(), amount, l2);
     let mut fee = fee;
     let mut tx = None;
+    // Every input is one of the wallet's coins: their scripts mark change.
+    let spent: Vec<gnb::core::TxOutput> = available.iter().map(|a| a.2.clone()).collect();
     for _ in 0..16 {
         let built = gnb::wallet::TxBuilder::build_outputs(&keypair, &available, outputs.clone(), fee, next_height)
             .unwrap_or_else(|e| die(&e));
-        let min = gnb::core::tokenomics::min_tx_fee_sat(built.to_wire_bytes(true).len());
+        let min = gnb::core::min_fee_of(&built, &spent);
         if fee >= min { tx = Some(built); break; }
         fee = fee.max(min);
     }
@@ -1872,10 +1874,12 @@ fn do_bloch_anchor(params: &[&str], target: &RpcTarget, stated: Option<gnb::addr
             .into_iter().map(|u| (u.txid.to_vec(), u.index, u.output)).collect();
     let mut fee = fee;
     let mut tx = None;
+    // Every input is one of the wallet's coins: their scripts mark change.
+    let spent: Vec<gnb::core::TxOutput> = available.iter().map(|a| a.2.clone()).collect();
     for _ in 0..16 {
         let built = gnb::wallet::TxBuilder::build_outputs(&keypair, &available, outputs.clone(), fee, next_height)
             .unwrap_or_else(|e| die(&e));
-        let min = gnb::core::tokenomics::min_tx_fee_sat(built.to_wire_bytes(true).len());
+        let min = gnb::core::min_fee_of(&built, &spent);
         if fee >= min { tx = Some(built); break; }
         fee = fee.max(min);
     }

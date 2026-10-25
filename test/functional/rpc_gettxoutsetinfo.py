@@ -56,7 +56,7 @@ class GetTxOutSetInfoTest(GnbTestFramework):
         self.same_set(start, self.audit(n1))
         assert_true(start["txouts"] > 0 and int(start["expected"]["carryover_sat"]) > 0, str(start))
         # 2 x 1,250,000 GNB in 72 timelocked tranches (core::vesting).
-        assert_equal(int(start["expected"]["locked_sat"]), 2 * 1_250_000 * 10**8)
+        assert_equal(int(start["expected"]["locked_sat"]), 2 * 100_000 * 10**8)
 
         self.log.info("a payment and its block: fees move value, unclaimed is unchanged")
         n1.cli_send(self.wallet_copy(), PAYEE, "3")

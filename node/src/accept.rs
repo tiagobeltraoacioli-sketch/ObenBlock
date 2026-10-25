@@ -1069,6 +1069,7 @@ pub fn revalidate_mempool(store: &storage::Storage, mempool: &mempool::Mempool, 
             return false;
         }
         let mut total_in: u64 = 0;
+        let mut prevouts = Vec::with_capacity(e.tx.inputs.len());
         for inp in &e.tx.inputs {
             let prev = match store.get_utxo(&inp.prev_txid, inp.prev_index) {
                 Ok(Some(o)) => Some(o),
@@ -1077,7 +1078,10 @@ pub fn revalidate_mempool(store: &storage::Storage, mempool: &mempool::Mempool, 
             };
             match prev {
                 Some(o) => match core::limits::money_add(total_in, o.value) {
-                    Ok(t) => total_in = t,
+                    Ok(t) => {
+                        total_in = t;
+                        prevouts.push(o);
+                    }
                     Err(_) => return false,
                 },
                 None => return false,
@@ -1089,7 +1093,7 @@ pub fn revalidate_mempool(store: &storage::Storage, mempool: &mempool::Mempool, 
             return false;
         }
         match core::limits::check_tx_money_range(&e.tx) {
-            Ok(out) if out <= total_in => core::check_min_fee(&e.tx, total_in - out).is_ok(),
+            Ok(out) if out <= total_in => core::check_min_fee(&e.tx, total_in - out, &prevouts).is_ok(),
             _ => false,
         }
     })
@@ -4168,7 +4172,7 @@ struct CommittedTx {
 /// and two checks that read witness-bearing rules but that no `script_sig`
 /// can satisfy:
 ///
-/// * the fee must reach `min_tx_fee_sat` of the size `tx` has with every
+/// * the fee must reach `min_tx_fee_for_sat` of the size `tx` has with every
 ///   `script_sig` empty (its one-byte length prefix only: the smallest any
 ///   body with this txid can have, so at least `MIN_TX_FEE_SAT`); the
 ///   size-based minimum of the actual body is checked by
@@ -4230,10 +4234,11 @@ fn check_tx_inputs_committed(
     }
     let fee = total_in - total_out;
     // The floor no witness can lower (B1-T13): the size with every
-    // script_sig empty (a one-byte length each). Same message as
+    // script_sig empty (a one-byte length each), and the 1% of the value
+    // sent to others (outputs and prevouts are committed). Same message as
     // `core::check_min_fee`, of which it is the witness-free part.
     let floor_size = tx.wire_size(false) + tx.inputs.len();
-    let floor = core::tokenomics::min_tx_fee_sat(floor_size);
+    let floor = core::tokenomics::min_tx_fee_for_sat(floor_size, core::paid_to_others_sat(tx, &prevouts));
     if fee < floor {
         return Err(format!(
             "fee {fee} below consensus minimum {floor} for a transaction of at least {floor_size} bytes \
@@ -4274,7 +4279,7 @@ fn check_tx_witnesses(
         ),
     }
     .map_err(TxFailure::witness)?;
-    core::check_min_fee(tx, committed.fee).map_err(TxFailure::witness)?;
+    core::check_min_fee(tx, committed.fee, &committed.prevouts).map_err(TxFailure::witness)?;
     Ok(())
 }
 

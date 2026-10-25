@@ -20,8 +20,8 @@ use gnb::core::{self, activation, Transaction, TxOutput};
 use gnb::mempool::admission::{self, AdmissionPolicy};
 use gnb::template;
 
-/// 4,500,000 GNB: three hops of it sum above `MAX_SUPPLY_SAT` (12,500,000 GNB).
-const BIG: u64 = 4_500_000 * core::tokenomics::SAT_PER_GNB;
+/// 400,000 OBB: three hops of it sum above `MAX_SUPPLY_SAT` (1,000,000 OBB).
+const BIG: u64 = 400_000 * core::tokenomics::SAT_PER_GNB;
 const HOP_FEE: u64 = 100_000;
 
 /// A chain of `keys.len() - 1` signed spends: hop i moves the previous

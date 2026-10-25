@@ -106,7 +106,7 @@ rotation of step 8.
    ```
 
    It must print `GENESIS BLOCK ID (display order):
-   00000000f9db8f81e92e293fae6032d359f731c1c7afebcaca1b75f47bfc32bc` and
+   00000000780c0cdc6532c5d64b9477fe6fe9738b811e0b8d72ebf7af065ff1bb` and
    `rehearsal genesis reproduced`.
 5. Run the read-only checks:
 

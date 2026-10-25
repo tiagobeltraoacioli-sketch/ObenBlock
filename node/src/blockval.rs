@@ -280,7 +280,7 @@ pub fn validate_tx_inputs(
         return Err(format!("inputs {} < outputs {}", total_in, total_out));
     }
     let fee = total_in - total_out;
-    core::check_min_fee(tx, fee)?;
+    core::check_min_fee(tx, fee, &prevouts)?;
     Ok(fee)
 }
 

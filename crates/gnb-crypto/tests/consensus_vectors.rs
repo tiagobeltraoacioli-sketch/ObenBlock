@@ -131,7 +131,7 @@ fn connect_core(c: &TxVector, tx: &Transaction, chain: ChainId, act: u64, expect
         return Connect::Decided(Err("inputs-below-outputs".into()));
     }
     let fee = total_in - total_out;
-    if fee < core::tokenomics::min_tx_fee_sat(tx.wire_size(false) + tx.inputs.len()) {
+    if fee < core::tokenomics::min_tx_fee_for_sat(tx.wire_size(false) + tx.inputs.len(), core::paid_to_others_sat(tx, &spent)) {
         return Connect::Decided(Err("min-fee".into()));
     }
     if spent.iter().any(|o| core::policy::output_kind(&o.script_pubkey).is_none()) {
@@ -142,7 +142,7 @@ fn connect_core(c: &TxVector, tx: &Transaction, chain: ChainId, act: u64, expect
     if let Err(e) = core::sighash::verify_tx_scripts(tx, &spent, chain, c.height, act) {
         return fail(e);
     }
-    match core::check_min_fee(tx, fee) {
+    match core::check_min_fee(tx, fee, &spent) {
         Ok(()) => Connect::Decided(Ok(())),
         Err(e) => fail(e),
     }

@@ -445,7 +445,13 @@ pub fn handle(req: &Value) -> Result<Value, String> {
             // CRY-8: `as usize` wrapped modulo 2^32 on wasm32 and quoted the
             // floor fee for sizes >= 2^32 (e.g. 2^32 + 100 -> 100 bytes).
             let size = usize::try_from(size).map_err(|_| "`size` too large")?;
-            Ok(json!({ "fee": tokenomics::min_tx_fee_sat(size).to_string() }))
+            // Optional `amount`: the value sent to others (change excluded),
+            // of which ObenBlock charges 1% (`tokenomics::PAYMENT_FEE_BPS`).
+            let amount = match req.get("amount") {
+                None | Some(Value::Null) => 0,
+                Some(_) => parse_amount(req, "amount")?,
+            };
+            Ok(json!({ "fee": tokenomics::min_tx_fee_for_sat(size, amount as u128).to_string() }))
         }
         other => Err(format!("unknown op `{other}`")),
     }
@@ -798,7 +804,7 @@ mod tests {
             locktime: 0,
         };
         let txid = hex::encode(prev.txid());
-        let lied = json!([{"txid": txid, "index": 0, "value": "100050000", "script_pubkey": hex::encode(&spk)}]);
+        let lied = json!([{"txid": txid, "index": 0, "value": "101050000", "script_pubkey": hex::encode(&spk)}]);
         // A supplied previous transaction is still checked before signing.
         let prevtxs = json!({ txid.clone(): hex::encode(prev.to_wire_bytes(true)) });
         let err = handle(&json!({"op": "pay", "utxos": lied, "to": to, "amount": "100000000", "fee": "0",
@@ -808,7 +814,7 @@ mod tests {
             "next_height": "11", "require_verified": true})).unwrap();
         assert_eq!(r["amounts_committed"], true);
         let tx = Transaction::from_wire_bytes(&hex::decode(r["raw"].as_str().unwrap()).unwrap()).unwrap();
-        let claimed = TxOutput { value: 100_050_000, script_pubkey: spk.clone() };
+        let claimed = TxOutput { value: 101_050_000, script_pubkey: spk.clone() };
         let real = prev.outputs[0].clone();
         let verify = |spent: &TxOutput| gnb_crypto::core::sighash::verify_tx_scripts(
             &tx, std::slice::from_ref(spent), ChainId::ObenBlockMainnet, 11, 0);
@@ -880,6 +886,18 @@ mod tests {
         }
         assert!(handle(&json!({"op": "create", "network": "testnet3"})).is_err());
         handle(&json!({"op": "wipe"})).unwrap();
+    }
+
+    /// ObenBlock's minimum: the larger of the size floor and 1% of the
+    /// amount sent to others.
+    #[test]
+    fn minfee_counts_one_percent_of_the_amount() {
+        let fee = |amount: &str| handle(&json!({"op": "minfee", "size": 8_600, "amount": amount})).unwrap()["fee"].clone();
+        assert_eq!(fee("100000000"), "1000000", "1 OBB pays 0.01 OBB");
+        assert_eq!(fee("1000"), tokenomics::min_tx_fee_sat(8_600).to_string(), "size floor");
+        assert_eq!(handle(&json!({"op": "minfee", "size": 8_600})).unwrap()["fee"],
+                   tokenomics::min_tx_fee_sat(8_600).to_string(), "no amount: size floor");
+        assert!(handle(&json!({"op": "minfee", "size": 8_600, "amount": "x"})).is_err());
     }
 
     /// CRY-8: a size of 2^32 + 100 bytes must not be quoted as 100 bytes on a

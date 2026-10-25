@@ -56,7 +56,7 @@ KIT_DIR=$(cd "$(dirname "$0")" && pwd)
 REHEARSAL_TS=1792281600
 # reference/obb_genesis_vectors.json mainnet.rehearsal (Bitcoin's header
 # Merkle root and the ObenBlock body commitment, obenblock/asic-merkle).
-REHEARSAL_GENESIS=00000000f9db8f81e92e293fae6032d359f731c1c7afebcaca1b75f47bfc32bc
+REHEARSAL_GENESIS=00000000780c0cdc6532c5d64b9477fe6fe9738b811e0b8d72ebf7af065ff1bb
 
 GENESIS_FILES="crates/gnb-crypto/src/core/genesis.rs reference/obb_genesis.py reference/obb_genesis_vectors.json docs/OBENBLOCK-GENESIS.md"
 

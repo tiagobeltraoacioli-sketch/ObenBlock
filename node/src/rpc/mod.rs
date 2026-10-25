@@ -1885,6 +1885,9 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 // R3: satoshi amounts → decimal strings.
                 "feerate_sat_per_kb": rate.to_string(),
                 "min_fee_sat":        crate::core::tokenomics::MIN_TX_FEE_SAT.to_string(),
+                // Plus 1% of the amount sent to others (change exempt) on
+                // ObenBlock: the consensus minimum is the larger of the two.
+                "payment_fee_bps":    crate::core::tokenomics::payment_fee_for_sat(10_000),
                 "typical_tx_bytes":   typical_size,
                 "typical_tx_fee_sat": typical_fee.to_string(),
                 // Legacy key: now the recommended ABSOLUTE fee for a typical
@@ -2468,9 +2471,16 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 "halving_interval":        t::HALVING_INTERVAL,
                 "next_halving_height":     next_halving,
                 "last_subsidy_height":     t::LAST_SUBSIDY_HEIGHT_EXCLUSIVE - 1,
-                "miner_share_bps":         10_000,
+                // Of every block's subsidy and (ObenBlock) fees, before the
+                // inclusion bonus: the rest is the 16 witness slots
+                // (`witness_share::split_reward`).
+                "miner_share_bps":         10_000 - crate::core::witness_share::WITNESS_POOL_BPS,
+                "witness_pool_bps":        crate::core::witness_share::WITNESS_POOL_BPS,
                 "min_fee_rate_sat_per_kb": t::MIN_FEE_RATE_SAT_PER_KB.to_string(),
                 "min_tx_fee_sat":          t::MIN_TX_FEE_SAT.to_string(),
+                // Fee on the value sent to others, in bps (the fee on 10,000
+                // base units); change exempt; 0 on GnB.
+                "payment_fee_bps":         t::payment_fee_for_sat(10_000),
             })
         }
 
@@ -2646,13 +2656,15 @@ async fn dispatch(method: &str, params: Option<&Value>, state: &AppState) -> Val
                 "inputs":           n_in,
                 "outputs":          n_out,
                 "min_fee_sat":      crate::core::tokenomics::min_tx_fee_sat(fee.tx_bytes).to_string(),
+                "payment_fee_bps":  crate::core::tokenomics::payment_fee_for_sat(10_000),
                 "feerate_sat_per_kb": {
                     "floor":      fee.floor_rate_per_kb.to_string(),
                     "medium":     fee.medium_rate_per_kb.to_string(),
                     "next_block": fee.next_block_rate_per_kb.to_string(),
                 },
                 "note": "absolute fees for a transaction of tx_bytes wire bytes (params [n_inputs, n_outputs], default [1, 2]); \
-                         none below the consensus minimum for that size or the mempool's rolling minimum",
+                         none below the consensus minimum for that size or the mempool's rolling minimum; \
+                         the consensus minimum is also at least payment_fee_bps of the amount sent to others (change exempt)",
             })
         }
 

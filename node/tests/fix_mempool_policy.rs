@@ -770,7 +770,7 @@ fn mem6_cpfp_template_orders_parents_first_and_is_valid() {
     let parent = signed_spend(&k, &[(fp.0, 0)], vec![out(975_000, &k.spk)]); // fee 25,000
     let child = signed_spend(&k, &[(parent.txid(), 0)], vec![out(775_000, &[0x63; 20])]); // fee 200,000
     let indep = signed_spend(&k, &[(fx.0, 0)], vec![out(940_000, &[0x64; 20])]); // fee 60,000
-    assert!(core::check_min_fee(&parent, 25_000).is_ok(), "the parent alone is valid");
+    assert!(core::check_min_fee(&parent, 25_000, &[]).is_ok(), "the parent alone is valid");
     for t in [&parent, &indep, &child] {
         admission::admit(&n.store, &n.mempool, t.clone(), &policy).expect("admitted");
     }

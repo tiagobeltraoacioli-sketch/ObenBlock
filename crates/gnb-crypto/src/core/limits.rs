@@ -2,7 +2,7 @@
 //!
 //! # VAL-11: MoneyRange
 //!
-//! The 12.5 M GNB cap follows from the genesis ledger, the subsidy schedule,
+//! The 1 M OBB cap follows from the genesis ledger, the subsidy schedule,
 //! the coinbase rule (witness-share outputs included) and value conservation; nothing compared amounts with
 //! [`tokenomics::MAX_SUPPLY_SAT`] at validation time. [`money_range`] and the
 //! `check_*_money_range` helpers below are the Bitcoin-Core-style defence in
@@ -110,7 +110,7 @@ pub fn check_tx_money_range(tx: &Transaction) -> Result<u64, String> {
 /// There is NO block-wide output total (re-audit B1-T1). The value moving
 /// through a chain of in-block spends is counted once per hop, so the
 /// outputs of a valid block can sum far above the supply (three hops of
-/// 4,500,000 GNB sum to 13,500,000, above the 12,500,000 cap); the sum
+/// 400,000 OBB sum to 1,200,000, above the 1,000,000 cap); the sum
 /// bounds nothing. The remaining
 /// bounds are Bitcoin Core's: `nValueOut` per transaction (CheckTransaction),
 /// the input total per transaction (CheckTxInputs, `accept.rs`) and the
@@ -405,12 +405,12 @@ mod tests {
     }
 
     /// Re-audit B1-T1: a chain of in-block spends moves the same coins once
-    /// per hop. Three hops of 4,500,000 GNB (13,500,000 GNB of outputs, above
-    /// the 12,500,000 GNB supply) are within every MoneyRange rule; the
+    /// per hop. Three hops of 400,000 OBB (1,200,000 OBB of outputs, above
+    /// the 1,000,000 OBB supply) are within every MoneyRange rule; the
     /// block-wide output total the VAL-11 remediation added refused it.
     #[test]
     fn chained_spends_above_the_supply_in_total_are_in_range() {
-        let v = 4_500_000 * tokenomics::SAT_PER_GNB;
+        let v = 400_000 * tokenomics::SAT_PER_GNB;
         let mut txs = Vec::new();
         let mut prev = [0x31u8; 32];
         for hop in 0..3u64 {

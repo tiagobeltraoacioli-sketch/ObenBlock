@@ -38,10 +38,10 @@ use sha3::{Digest, Sha3_256};
 
 const DUST_THRESHOLD: u64 = 546;
 const COINBASE_MATURITY: u64 = 100;
-const MAX_SUPPLY_SAT: u64 = 1_250_000_000_000_000;
+const MAX_SUPPLY_SAT: u64 = 100_000_000_000_000;
 const MIN_TX_FEE_SAT: u64 = 10_000;
 const MIN_FEE_RATE_SAT_PER_KB: u64 = 2_000;
-const INITIAL_SUBSIDY_SAT: u64 = 107_020_547;
+const INITIAL_SUBSIDY_SAT: u64 = 8_561_643;
 const HALVING_INTERVAL: u64 = 4_204_800;
 const MAX_BLOCK_SIZE: usize = 1_000_000;
 /// `script_sig` cap of the wire parser: the largest policy witness
@@ -1974,9 +1974,9 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
             b, vec![p1, p2], None);
 
         // Re-audit B1-T1: chained spends inside the block move the same coins
-        // once per hop. Three hops of 4,500,000 GNB: outputs sum to about
-        // 13,500,000 GNB, above the 12,500,000 GNB supply, in a valid block.
-        let v = 450_000_000_000_000u64;
+        // once per hop. Three hops of 400,000 OBB: outputs sum to about
+        // 1,200,000 OBB, above the 1,000,000 OBB supply, in a valid block.
+        let v = 40_000_000_000_000u64;
         let keys = [ka, kb, &k.c, ka];
         let p0 = fund(&l("chained-total"), v, &keys[0].spk());
         let mut prev = p0.clone();
@@ -1994,7 +1994,7 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
         let mut b = raw_block(h, ACT, one_parent(), txs);
         seal(&mut b, ACT);
         c.push("value/chained-spends-output-total-above-max-supply", r,
-            "Three chained spends of a 4,500,000 GNB coin inside the block (each spends the previous transaction's output, fee 100,000 each): every transaction is in the money range, the outputs sum to about 13,500,000 GNB, above MAX_SUPPLY_SAT (12,500,000 GNB). Valid in both regimes (re-audit B1-T1: the block-wide output total the VAL-11 remediation added rejected it).",
+            "Three chained spends of a 400,000 OBB coin inside the block (each spends the previous transaction's output, fee 100,000 each): every transaction is in the money range, the outputs sum to about 1,200,000 OBB, above MAX_SUPPLY_SAT (1,000,000 OBB). Valid in both regimes (re-audit B1-T1: the block-wide output total the VAL-11 remediation added rejected it).",
             b, vec![p0], None);
 
         // Dust and in-block value rules.
@@ -2368,8 +2368,12 @@ fn block_cases(k: &Keys) -> Vec<BlockCase> {
         ("size/wire-1000001-bincode-below", Pre, DUST_THRESHOLD, Some(MAX_BLOCK_SIZE + 1), None, Some("block-size")),
         ("size/wire-exactly-1000000", Post, DUST_THRESHOLD, Some(MAX_BLOCK_SIZE), None, None),
         ("size/wire-exactly-1000000", Pre, DUST_THRESHOLD, Some(MAX_BLOCK_SIZE), None, None),
-        ("size/bincode-1000001-wire-below", Pre, 5_000_000_000, None, Some(MAX_BLOCK_SIZE + 1), None),
-        ("size/bincode-1000001-wire-below", Post, 5_000_000_000, None, Some(MAX_BLOCK_SIZE + 1), None),
+        // The `size/bincode-1000001-wire-below` pair (40,000 outputs of
+        // 5,000,000,000) left with the 1,000,000 OBB cap (2026-10-25): a
+        // transaction's outputs above 2^32 base units (the only ones larger
+        // in bincode than on the wire) can no longer fill a block within
+        // MoneyRange. A bincode measure is still caught by
+        // `size/wire-1000001-bincode-below`.
     ] {
         let h = r.height();
         let l = format!("block/{id}/{}", r.tag());

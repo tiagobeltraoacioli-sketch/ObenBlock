@@ -91,10 +91,10 @@ fn obenblock_regtest_runs_every_rule_from_genesis() {
     assert!(tokenomics::issued_through_sat(SLOW_START_BLOCKS)
         >= (1..=SLOW_START_BLOCKS).map(tokenomics::block_subsidy_sat).sum::<u64>(), "an upper bound");
 
-    // The allocations are GnB's.
-    assert_eq!(tokenomics::MAX_SUPPLY_SAT, 12_500_000 * tokenomics::SAT_PER_GNB);
-    assert_eq!(tokenomics::MINING_ALLOCATION_SAT, 9_000_000 * tokenomics::SAT_PER_GNB);
-    assert_eq!(tokenomics::CARRYOVER_ALLOCATION_SAT, 1_000_000 * tokenomics::SAT_PER_GNB);
-    assert_eq!(tokenomics::TEAM_ALLOCATION_SAT, 1_250_000 * tokenomics::SAT_PER_GNB);
-    assert_eq!(tokenomics::FOUNDER_ALLOCATION_SAT, 1_250_000 * tokenomics::SAT_PER_GNB);
+    // GnB's allocation shares, scaled to the 1M OBB cap.
+    assert_eq!(tokenomics::MAX_SUPPLY_SAT, 1_000_000 * tokenomics::SAT_PER_GNB);
+    assert_eq!(tokenomics::MINING_ALLOCATION_SAT, 720_000 * tokenomics::SAT_PER_GNB);
+    assert_eq!(tokenomics::CARRYOVER_ALLOCATION_SAT, 80_000 * tokenomics::SAT_PER_GNB);
+    assert_eq!(tokenomics::TEAM_ALLOCATION_SAT, 100_000 * tokenomics::SAT_PER_GNB);
+    assert_eq!(tokenomics::FOUNDER_ALLOCATION_SAT, 100_000 * tokenomics::SAT_PER_GNB);
 }

@@ -30,8 +30,8 @@ import test_deploy_files  # noqa: E402  (REQUIRED, parse_unit, MAX_EXPOSURE)
 
 # The documented rehearsal solution (reference/obb_genesis_vectors.json
 # mainnet.rehearsal: Bitcoin's header Merkle root and the body commitment).
-REHEARSAL = {"timestamp": 1_792_281_600, "version": 0x20000000, "nonce": 3_461_588_150,
-             "display": "00000000f9db8f81e92e293fae6032d359f731c1c7afebcaca1b75f47bfc32bc"}
+REHEARSAL = {"timestamp": 1_792_281_600, "version": 0x20000000, "nonce": 2_641_456_225,
+             "display": "00000000780c0cdc6532c5d64b9477fe6fe9738b811e0b8d72ebf7af065ff1bb"}
 UNITS = ["obenblock-node.service", "obenblock-cpu-miner.service", "obenblock-explorer-api.service",
          "obenblock-stratum.service"]
 FIREWALL_UNITS = ["obenblock-explorer-firewall.service", "obenblock-explorer-firewall-reapply.service",
@@ -100,12 +100,12 @@ class ApplyGenesis(unittest.TestCase):
         rs = (src / apply_genesis.GENESIS_RS).read_text()
         self.assertIn("pub const OBB_MAINNET_GENESIS_TIMESTAMP: u64 = 1792281600;", rs)
         self.assertIn("pub const OBB_MAINNET_GENESIS_VERSION: u32 = 0x20000000;", rs)
-        self.assertIn("pub const OBB_MAINNET_GENESIS_NONCE: u64 = 3461588150;", rs)
+        self.assertIn("pub const OBB_MAINNET_GENESIS_NONCE: u64 = 2641456225;", rs)
         self.assertNotIn("LAUNCH PLACEHOLDER", rs)
         raw = bytes.fromhex(REHEARSAL["display"])[::-1].hex()
         self.assertEqual(apply_genesis.status(src), f"launched 1792281600 {REHEARSAL['display']} {raw}")
         py = (src / apply_genesis.REFERENCE_PY).read_text()
-        self.assertIn('"timestamp": 1792281600, "version": 0x20000000, "nonce": 3461588150', py)
+        self.assertIn('"timestamp": 1792281600, "version": 0x20000000, "nonce": 2641456225', py)
         doc = (src / apply_genesis.DOC_MD).read_text()
         self.assertIn(REHEARSAL["display"], doc)
         with self.assertRaises(apply_genesis.Refused):

@@ -127,7 +127,9 @@ impl PolicySpend {
         // Size with the largest possible witnesses → minimum fee.
         let witness_upper = max_witness_size(&policy) * inputs.len();
         let size = tx.to_wire_bytes(true).len() + witness_upper;
-        let fee = fee.max(core::tokenomics::min_tx_fee_sat(size));
+        // Every input pays the policy's script: an output to it is change.
+        let paid_to_others = core::paid_to_others_sat(&tx, &tx.outputs[1..]);
+        let fee = fee.max(core::tokenomics::min_tx_fee_for_sat(size, paid_to_others));
         let change = total.checked_sub(amount).and_then(|r| r.checked_sub(fee))
             .ok_or_else(|| format!("insufficient funds: {} available, {} + fee {} needed", total, amount, fee))?;
         if change >= core::DUST_THRESHOLD {
@@ -184,7 +186,10 @@ impl PolicySpend {
         };
         tx.outputs.push(TxOutput { value: 0, script_pubkey: tree.script_pubkey() });
         let size = tx.to_wire_bytes(true).len() + max_branch_witness_size(&policy) * inputs.len();
-        let fee = fee.max(core::tokenomics::min_tx_fee_sat(size));
+        // Every input pays the tree's script: an output to it is change.
+        let change_script = [TxOutput { value: 0, script_pubkey: tree.script_pubkey() }];
+        let paid_to_others = core::paid_to_others_sat(&tx, &change_script);
+        let fee = fee.max(core::tokenomics::min_tx_fee_for_sat(size, paid_to_others));
         let change = total.checked_sub(paid).and_then(|r| r.checked_sub(fee))
             .ok_or_else(|| format!("insufficient funds: {} available, {} + fee {} needed", total, paid, fee))?;
         if change >= core::DUST_THRESHOLD {

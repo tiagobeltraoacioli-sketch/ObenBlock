@@ -85,7 +85,7 @@ fn built_in_miner_and_header_jobs_produce_accepted_blocks() {
     assert_eq!(tmpl_empty.bits, OBB_REGTEST_POW_LIMIT_BITS);
 
     // ── Built-in miner on a template with one transaction ─────────────────
-    let spend = signed_spend_at(&k, &[(fund.0, 0)], std::slice::from_ref(&fund.2), vec![out(999_000_000, &[0x44; 20])], 1);
+    let spend = signed_spend_at(&k, &[(fund.0, 0)], std::slice::from_ref(&fund.2), vec![out(989_000_000, &[0x44; 20])], 1);
     n.mempool.add(spend.clone(), 1_000_000).unwrap();
     let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap();
     assert_eq!(tmpl.transactions.len(), 1);
@@ -362,7 +362,7 @@ fn stock_stratum_v1_miner_finds_a_block_the_node_accepts() {
     let n = node_with(&genesis, &funds);
     for (i, f) in funds.iter().enumerate() {
         let spend = signed_spend_at(&k, &[(f.0, 0)], std::slice::from_ref(&f.2),
-                                    vec![out(999_000_000 - i as u64, &[0x44 + i as u8; 20])], 1);
+                                    vec![out(989_000_000 - i as u64, &[0x44 + i as u8; 20])], 1);
         n.mempool.add(spend, 1_000_000).unwrap();
     }
     let tmpl = template::build_block_template(&n.dag, &n.store, &n.mempool, template::EXTERNAL_COINBASE_RESERVE).unwrap();
@@ -494,3 +494,4 @@ fn header_jobs_commit_the_powit_section_with_exits() {
     assert_eq!(stripped.block_hash(), b.block_hash(), "the section is not in the header");
     assert!(core::block_rules::check_block_hardened_at(&stripped, 0).unwrap_err().starts_with("bad witness commitment"));
 }
+

@@ -30,7 +30,7 @@ import { html, raw, isAddress, watchAddress, isHex64, num, sats } from "/assets/
 
 // SHA-256 of /wallet/gnb_wallet.wasm. Written by scripts/build-wallet-wasm.sh
 // and checked by `node --test site/tests/`; loadCore refuses any other binary.
-const WASM_SHA256 = "d7fdb66f9912b0bc202ac55d9b33626c6c9163a513b63da01485a5c5e847c83c";
+const WASM_SHA256 = "0ed88e02ff93c3ee9990ab5f50f6cdd2c3f253c70bcdb73518fe175871c1490a";
 
 const SAT = 100000000n;
 // UTXO_WINDOW / UTXO_WIDE_WINDOW (core.js): rows asked of getutxos, the same
@@ -399,14 +399,14 @@ function paintSend(pane = document.getElementById("pane")) {
   show(pane, html`<h3>Send OBB</h3>
    <label>To<input id="to" spellcheck="false" placeholder="obb1q…"></label>
    <div class="field-row"><label>Amount (OBB)<input id="amt" inputmode="decimal" placeholder="0.00"></label><button class="btn ghost" id="max">Max</button></div>
-   <p class="note">The network fee is the consensus minimum for the transaction's real size (≈ 0.00002 OBB per kB, at least 0.0001 OBB). Fees above 0.02 OBB are refused.</p>
+   <p class="note">The network fee is the consensus minimum: 1% of the amount sent (change is exempt), and never below the size floor (≈ 0.00002 OBB per kB, at least 0.0001 OBB). It is split between the miner and the PoWit witnesses. Fees more than 0.02 OBB above the 1% are refused.</p>
    <button class="btn" id="review">Review payment</button><div id="send-out"></div>`);
   document.getElementById("max").addEventListener("click", () => {
     // Leave room for the fee of up to UTXO_WINDOW (47) inputs (~403 kB at
-    // 2,000 sat/kB).
+    // 2,000 sat/kB) and for the 1% of the amount (amount × 1.01 must fit).
     // utxoTotal counts only the coins spendable in the next block.
     const reserve = 900000n, spendable = state.utxoTotal || 0n;
-    document.getElementById("amt").value = spendable > reserve ? fmt(spendable - reserve) : "0";
+    document.getElementById("amt").value = spendable > reserve ? fmt((spendable - reserve) * 100n / 101n) : "0";
   });
   document.getElementById("review").addEventListener("click", async (ev) => {
     const btn = ev.currentTarget, out = document.getElementById("send-out"); out.innerHTML = "";

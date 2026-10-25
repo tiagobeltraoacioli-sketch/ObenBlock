@@ -48,9 +48,9 @@ class ObbPowTest(unittest.TestCase):
         self.assertFalse(o.version_ok(0x60000000))
 
     def test_slow_start_withheld(self):
-        full = 107_020_547
+        full = 8_561_643
         withheld = sum(full - o.slow_start_subsidy(full, h) for h in range(1, o.SLOW_START_BLOCKS))
-        self.assertEqual(withheld // 10 ** 8, 3_081)
+        self.assertEqual(withheld // 10 ** 8, 246)
 
 
 if __name__ == "__main__":

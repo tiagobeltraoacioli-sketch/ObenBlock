@@ -210,13 +210,13 @@ How long vardiff takes to settle on real ASICs has not been measured.
 ## 6. What a block pays
 
 - Slow start: block `h` pays a subsidy of
-  `floor(1.07020547 OBB × min(h, 5,760) / 5,760)` (DESIGN-obenblock.md
-  §4.2, `pow_scheme::slow_start_subsidy_sat`). Block 1 pays 0.00018579 OBB,
-  block 720 pays 0.13377568 OBB, block 3,600 pays 0.66887841 OBB, and the
-  full 1.07020547 OBB is reached at block 5,760.
-- The miner gets 80 % of the subsidy, plus 10 % of every witness-share slot
-  it fills, plus all fees. The other 20 % pays witness shares
-  (docs/MONETARY-POLICY.md, "Mining subsidy").
+  `floor(0.08561643 OBB × min(h, 5,760) / 5,760)` (DESIGN-obenblock.md
+  §4.2, `pow_scheme::slow_start_subsidy_sat`). Block 1 pays 0.00001486 OBB,
+  block 720 pays 0.01070205 OBB, block 3,600 pays 0.05351026 OBB, and the
+  full 0.08561643 OBB is reached at block 5,760.
+- The miner gets 80 % of the subsidy and 80 % of the fees, plus 10 % of
+  every witness-share slot it fills. The other 20 % pays witness shares;
+  fee slots left empty are burned (docs/MONETARY-POLICY.md, "Rewards").
 - A coinbase is spendable after 100 blocks (`COINBASE_MATURITY`).
 - Before height 3,600 there is no finality (docs/LAUNCH.md §5). A block
   can be reorganized out by a heavier chain, and its reward with it.
@@ -257,7 +257,7 @@ How to read it:
 ## 8. What not to expect
 
 - **No pool.** The built-in servers are solo: no shares are paid, no
-  balances are kept, and there is no fee split. A share below the block
+  balances are kept, and there is no pool fee. A share below the block
   target only shows your hashrate. With small hashrate you may find no
   block for a long time.
 - **Little reward in the first two days.** The slow start pays almost

@@ -39,7 +39,7 @@ window in which its vote carried weight.
      rolls the block back restores them exactly;
    - `escrow[K]` is cleared.
 
-   Burned coins are destroyed: total supply only decreases, so the 12.5M cap
+   Burned coins are destroyed: total supply only decreases, so the 1M cap
    still holds.
 
 4. **No bounty.** The including miner gets nothing extra. A bounty would pay

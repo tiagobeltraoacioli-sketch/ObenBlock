@@ -20,7 +20,7 @@ has a clean genesis. The GnB chain is not changed by it
 | Proof of work | SHA-256d on Bitcoin's 80-byte header layout. Stock Bitcoin ASICs can mine it (DESIGN-obenblock.md §4.1, docs/OBENBLOCK-MINING.md). There is no merged mining. |
 | Block time | 30 s target, ASERT with a 2 h half-life, plus stall relief (DESIGN-obenblock.md §4.2, §5.1). |
 | Finality | none for the first 3,599 blocks. From height 3,600: PoCI (§5 below). |
-| Supply cap | 12,500,000 OBB: 9.0M mined, 1.0M Bloch carry-over, 1.25M team (locked), 1.25M founder (locked) (DESIGN-obenblock.md §3, docs/MONETARY-POLICY.md). |
+| Supply cap | 1,000,000 OBB: 720k mined, 80k Bloch carry-over, 100k team (locked), 100k founder (locked); fee 1% of the amount sent (change exempt), split 80/20 miner/witnesses (DESIGN-obenblock.md §3, docs/MONETARY-POLICY.md). |
 | Genesis ledger | no balance from the GnB chain. It holds the Bloch Genesis-3 carry-over, paid to the same keys as in GnB's genesis, and 72 locked team and founder tranches (docs/OBENBLOCK-GENESIS.md). |
 | Subsidy | slow start: block `h` pays `floor(full × min(h, 5,760) / 5,760)`, then GnB's halving schedule. The withheld part (about 3,080 OBB) is never issued (`crates/gnb-crypto/src/core/pow_scheme.rs`, `SLOW_START_BLOCKS`). |
 | Subsidy split | 80 % to the block's miner, 20 % to 16 witness-share slots. Fees go 100 % to the miner (docs/MONETARY-POLICY.md, "Mining subsidy"). |
@@ -48,7 +48,7 @@ These values are compiled into the release
 | P2P protocol id | `/obenblock/pq/1.0.0` | |
 | Built-in DNS seed | `seed.obenblock.xyz` `[AT LAUNCH: DNS records published]` | none |
 | Seed peers | `[AT LAUNCH: list of /ip4/<host>/tcp/18110 multiaddrs]` | |
-| Genesis block id (display order) | `[AT LAUNCH: GENESIS_HASH]` | `6918ae0c…0117163d` |
+| Genesis block id (display order) | `[AT LAUNCH: GENESIS_HASH]` | `08d99125…65e8d4c6` |
 | Genesis timestamp | `[AT LAUNCH: LAUNCH_TIME, Unix seconds and UTC]` | 1,792,281,600 |
 | Genesis header bits | `0x1d00ffff` | `0x207fffff` |
 | ASERT anchor bits | `0x19009d69` (1 EH/s at 30 s blocks) | `0x207fffff` |

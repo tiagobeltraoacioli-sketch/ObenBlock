@@ -38,7 +38,8 @@
 //! * **WAL-6** — coin selection minimises the number of ~8.6 kB post-quantum
 //!   inputs (smallest single input that covers the payment, else largest
 //!   first with a smallest-sufficient last input), fees are size-aware from
-//!   the consensus formula ([`tokenomics::min_tx_fee_sat`]), sub-dust change
+//!   the consensus formula ([`tokenomics::min_tx_fee_for_sat`]: the size
+//!   floor, and on ObenBlock 1% of the amount sent to others), sub-dust change
 //!   is reported as part of the fee, and there is one dust comparison
 //!   ([`keeps_change`]).
 //! * **CRY-1/CRY-2 (wallet side)** — every input is signed through a
@@ -113,13 +114,17 @@ impl FeePolicy {
         FeePolicy { max_fee_sat, max_fee_rate_sat_per_kb: u64::MAX }
     }
 
-    /// `Ok` when `fee` is acceptable for a signed transaction of `size_bytes`.
-    /// The consensus minimum for that size is always acceptable.
-    pub fn check(&self, fee: u64, size_bytes: usize) -> Result<(), String> {
-        if fee <= tokenomics::min_tx_fee_sat(size_bytes) {
+    /// `Ok` when `fee` is acceptable for a signed transaction of `size_bytes`
+    /// that sends `paid_to_others` to others. The consensus minimum is always
+    /// acceptable; the ceilings bound what is paid above its value part (the
+    /// 1% of the amount on ObenBlock, `tokenomics::payment_fee_for_sat`).
+    pub fn check(&self, fee: u64, size_bytes: usize, paid_to_others: u128) -> Result<(), String> {
+        if fee <= tokenomics::min_tx_fee_for_sat(size_bytes, paid_to_others) {
             return Ok(());
         }
-        if fee > self.max_fee_sat {
+        let value_part = tokenomics::payment_fee_for_sat(paid_to_others);
+        let extra = fee.saturating_sub(value_part);
+        if extra > self.max_fee_sat {
             return Err(format!(
                 "fee {fee} sat exceeds the maximum-fee guard of {} sat; refusing to sign \
                  (override the guard explicitly if this fee is intended)",
@@ -129,7 +134,7 @@ impl FeePolicy {
         let cap = (size_bytes as u128)
             .saturating_mul(self.max_fee_rate_sat_per_kb as u128)
             .div_ceil(1000);
-        if fee as u128 > cap {
+        if extra as u128 > cap {
             return Err(format!(
                 "fee {fee} sat for {size_bytes} bytes exceeds the guard of {} sat/kB; \
                  refusing to sign (override the guard explicitly if this fee is intended)",
@@ -150,7 +155,7 @@ pub enum FeeChoice {
     /// Exactly this fee plus any sub-dust change (legacy builder semantics;
     /// not raised to the consensus minimum).
     Exact(u64),
-    /// max(requested, consensus minimum for the signed size).
+    /// max(requested, consensus minimum for the signed size and amount).
     AtLeast(u64),
     /// max(consensus minimum, size × rate / 1000), rate in base units per kB.
     Rate(u64),
@@ -160,8 +165,8 @@ impl FeeChoice {
     /// Size-aware consensus minimum.
     pub const AUTO: FeeChoice = FeeChoice::AtLeast(0);
 
-    fn fee_for(self, size_upper_bound: usize) -> u64 {
-        let min = tokenomics::min_tx_fee_sat(size_upper_bound);
+    fn fee_for(self, size_upper_bound: usize, paid_to_others: u128) -> u64 {
+        let min = tokenomics::min_tx_fee_for_sat(size_upper_bound, paid_to_others);
         match self {
             FeeChoice::Exact(fee) => fee,
             FeeChoice::AtLeast(fee) => fee.max(min),
@@ -397,6 +402,7 @@ fn select(
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan(
     utxos: &[Utxo],
     candidates: &[usize],
@@ -405,10 +411,11 @@ fn plan(
     change_spk_len: usize,
     public_key_len: usize,
     fee: FeeChoice,
+    paid_to_others: u128,
 ) -> Option<Plan> {
     let fee_for = |n: usize, with_change: bool| {
         let outputs: &[usize] = if with_change { &[to_spk_len, change_spk_len] } else { &[to_spk_len] };
-        fee.fee_for(signed_size_upper_bound(n, outputs, public_key_len))
+        fee.fee_for(signed_size_upper_bound(n, outputs, public_key_len), paid_to_others)
     };
     let inputs = select(utxos, candidates, amount, &fee_for)?;
     let total = inputs.iter().try_fold(0u64, |t, &i| t.checked_add(utxos[i].output.value))?;
@@ -456,9 +463,10 @@ fn prepare(
     Ok((verified, total))
 }
 
-/// Inputs a payment would spend, chosen on the claimed values. Front ends
-/// call this first, fetch the creating transactions of the returned
-/// outpoints into a [`PrevTxs`], then call [`build_payment`] with them.
+/// Inputs a payment would spend, chosen on the claimed values (for a payment
+/// to someone else: the 1% of `amount` is counted). Front ends call this
+/// first, fetch the creating transactions of the returned outpoints into a
+/// [`PrevTxs`], then call [`build_payment`] with them.
 pub fn plan_payment_inputs(
     utxos: &[Utxo],
     amount: u64,
@@ -468,7 +476,7 @@ pub fn plan_payment_inputs(
     let candidates: Vec<usize> = (0..utxos.len()).collect();
     let total = utxos.iter().try_fold(0u64, |t, u| t.checked_add(u.output.value))
         .ok_or("UTXO value total overflow")?;
-    let plan = plan(utxos, &candidates, amount, 20, 20, public_key_len, fee)
+    let plan = plan(utxos, &candidates, amount, 20, 20, public_key_len, fee, amount as u128)
         .ok_or_else(|| insufficient(total, amount))?;
     Ok(plan.inputs.iter().map(|&i| (utxos[i].txid, utxos[i].index)).collect())
 }
@@ -537,7 +545,12 @@ pub fn build_payment(
     // its value).
     let verified_only: Vec<usize> = (0..utxos.len()).filter(|&i| verified[i]).collect();
     let all: Vec<usize> = (0..utxos.len()).collect();
-    let plan_with = |c: &[usize]| plan(utxos, c, amount, to_spk.len(), own_spk.len(), public_key.len(), opts.fee);
+    // The change output pays `own_spk`, the script of every input: never
+    // counted. A payment to `own_spk` itself sends nothing to others.
+    let paid_to_others: u128 = if to_spk == own_spk { 0 } else { amount as u128 };
+    let plan_with = |c: &[usize]| {
+        plan(utxos, c, amount, to_spk.len(), own_spk.len(), public_key.len(), opts.fee, paid_to_others)
+    };
     let plan = (!amounts_committed && !verified_only.is_empty()).then(|| plan_with(&verified_only)).flatten()
         .or_else(|| plan_with(&all))
         .ok_or_else(|| insufficient(total, amount))?;
@@ -571,7 +584,7 @@ pub fn build_payment(
     // actual signed size below.
     let spk_lens: Vec<usize> = tx.outputs.iter().map(|o| o.script_pubkey.len()).collect();
     let bound = signed_size_upper_bound(tx.inputs.len(), &spk_lens, public_key.len());
-    opts.fee_policy.check(plan.fee, bound)?;
+    opts.fee_policy.check(plan.fee, bound, paid_to_others)?;
 
     let spent: Vec<TxOutput> = plan.inputs.iter().map(|&i| utxos[i].output.clone()).collect();
     sign_inputs(&mut tx, &spent, public_key, chain_id, sign)?;
@@ -588,8 +601,8 @@ pub fn build_payment(
     let outputs_total = tx.total_output().ok_or("output value overflow")?;
     let fee = inputs_total.checked_sub(outputs_total).ok_or("outputs exceed inputs")?;
     debug_assert_eq!(fee, plan.fee);
-    opts.fee_policy.check(fee, size)?;
-    if !matches!(opts.fee, FeeChoice::Exact(_)) && fee < tokenomics::min_tx_fee_sat(size) {
+    opts.fee_policy.check(fee, size, paid_to_others)?;
+    if !matches!(opts.fee, FeeChoice::Exact(_)) && fee < tokenomics::min_tx_fee_for_sat(size, paid_to_others) {
         return Err(format!("fee {fee} below the consensus minimum for {size} bytes"));
     }
 
@@ -648,11 +661,18 @@ pub fn sign_inputs(
     Ok(())
 }
 
-/// Fee-guard check for an UNSIGNED transaction (e.g. `Wallet::build_tx`),
-/// using the signed-size upper bound for the rate ceiling.
-pub fn check_unsigned_fee(tx: &Transaction, fee: u64, public_key_len: usize, policy: &FeePolicy) -> Result<(), String> {
+/// Fee-guard check for an UNSIGNED transaction (e.g. `Wallet::build_tx`)
+/// sending `paid_to_others` to others, using the signed-size upper bound
+/// for the rate ceiling.
+pub fn check_unsigned_fee(
+    tx: &Transaction,
+    fee: u64,
+    public_key_len: usize,
+    policy: &FeePolicy,
+    paid_to_others: u128,
+) -> Result<(), String> {
     let spks: Vec<usize> = tx.outputs.iter().map(|o| o.script_pubkey.len()).collect();
-    policy.check(fee, signed_size_upper_bound(tx.inputs.len(), &spks, public_key_len))
+    policy.check(fee, signed_size_upper_bound(tx.inputs.len(), &spks, public_key_len), paid_to_others)
 }
 
 /// Coin selection for an unsigned build with an exact fee: returns the chosen
@@ -664,7 +684,7 @@ pub(crate) fn select_exact_fee(
     public_key_len: usize,
 ) -> Option<(Vec<usize>, u64)> {
     let candidates: Vec<usize> = (0..utxos.len()).collect();
-    let plan = plan(utxos, &candidates, amount, 20, 20, public_key_len, FeeChoice::Exact(fee))?;
+    let plan = plan(utxos, &candidates, amount, 20, 20, public_key_len, FeeChoice::Exact(fee), 0)?;
     Some((plan.inputs, plan.change))
 }
 
@@ -706,15 +726,15 @@ mod tests {
     #[test]
     fn fee_policy_allows_the_minimum_and_caps_the_rest() {
         let p = FeePolicy::DEFAULT;
-        assert!(p.check(tokenomics::min_tx_fee_sat(8_600), 8_600).is_ok());
-        assert!(p.check(50_000, 8_600).is_ok());
-        assert!(p.check(99 * SAT, 8_600).unwrap_err().contains("maximum-fee guard"));
+        assert!(p.check(tokenomics::min_tx_fee_sat(8_600), 8_600, 0).is_ok());
+        assert!(p.check(50_000, 8_600, 0).is_ok());
+        assert!(p.check(99 * SAT, 8_600, 0).unwrap_err().contains("maximum-fee guard"));
         // Under the absolute cap but far above the per-kB cap.
-        assert!(p.check(1_500_000, 8_600).unwrap_err().contains("sat/kB"));
+        assert!(p.check(1_500_000, 8_600, 0).unwrap_err().contains("sat/kB"));
         // The consensus minimum of the largest transaction is allowed.
-        assert!(p.check(tokenomics::min_tx_fee_sat(MAX_STANDARD_TX_BYTES), MAX_STANDARD_TX_BYTES).is_ok());
-        assert!(FeePolicy::UNLIMITED.check(99 * SAT, 8_600).is_ok());
-        assert!(FeePolicy::with_max_fee(99 * SAT).check(99 * SAT, 8_600).is_ok());
+        assert!(p.check(tokenomics::min_tx_fee_sat(MAX_STANDARD_TX_BYTES), MAX_STANDARD_TX_BYTES, 0).is_ok());
+        assert!(FeePolicy::UNLIMITED.check(99 * SAT, 8_600, 0).is_ok());
+        assert!(FeePolicy::with_max_fee(99 * SAT).check(99 * SAT, 8_600, 0).is_ok());
     }
 
     /// WAL-1 regression: a server that under-reports a UTXO value is caught

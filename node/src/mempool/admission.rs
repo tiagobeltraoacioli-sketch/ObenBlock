@@ -957,7 +957,7 @@ pub fn check_transaction_gated_with_wtxid(
         return Err(AdmissionError::Rejected(format!("inputs {} < outputs {}", total_in, total_out)));
     }
     let fee = total_in - total_out;
-    core::check_min_fee(tx, fee).map_err(AdmissionError::Rejected)?;
+    core::check_min_fee(tx, fee, &prevouts).map_err(AdmissionError::Rejected)?;
     let size = tx.actual_size();
     if fee < (size as u64).saturating_mul(MIN_RELAY_FEE_RATE) {
         return Err(AdmissionError::LowFee(format!(

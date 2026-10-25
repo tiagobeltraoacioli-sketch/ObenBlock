@@ -10,8 +10,8 @@
   "max_parents": 256,
   "slow_start_blocks": 5760,
   "genesis_time": 1800000000,
-  "full_subsidy_sat": 107020547,
-  "slow_start_withheld_sat": 308165667966
+  "full_subsidy_sat": 8561643,
+  "slow_start_withheld_sat": 24653253897
  },
  "bitcoin_headers": [
   {
@@ -1391,35 +1391,35 @@
   },
   {
    "height": 1,
-   "subsidy_sat": 18579
+   "subsidy_sat": 1486
   },
   {
    "height": 2,
-   "subsidy_sat": 37159
+   "subsidy_sat": 2972
   },
   {
    "height": 2879,
-   "subsidy_sat": 53491693
+   "subsidy_sat": 4279335
   },
   {
    "height": 2880,
-   "subsidy_sat": 53510273
+   "subsidy_sat": 4280821
   },
   {
    "height": 5759,
-   "subsidy_sat": 107001967
+   "subsidy_sat": 8560156
   },
   {
    "height": 5760,
-   "subsidy_sat": 107020547
+   "subsidy_sat": 8561643
   },
   {
    "height": 5761,
-   "subsidy_sat": 107020547
+   "subsidy_sat": 8561643
   },
   {
    "height": 1000000000,
-   "subsidy_sat": 107020547
+   "subsidy_sat": 8561643
   }
  ]
 }

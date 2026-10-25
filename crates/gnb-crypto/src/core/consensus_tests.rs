@@ -433,15 +433,31 @@ fn min_fee_boundary_is_inclusive() {
     let size = big.to_wire_bytes(true).len();
     let min = tokenomics::min_tx_fee_sat(size);
     assert!(min > tokenomics::MIN_TX_FEE_SAT, "size-based minimum");
-    assert_eq!(check_min_fee(&big, min), Ok(()));
-    assert_eq!(check_min_fee(&big, min + 1), Ok(()));
+    assert_eq!(check_min_fee(&big, min, &[]), Ok(()));
+    assert_eq!(check_min_fee(&big, min + 1, &[]), Ok(()));
     assert_eq!(
-        check_min_fee(&big, min - 1),
+        check_min_fee(&big, min - 1, &[]),
         Err(format!("fee {} below consensus minimum {min} for a {size}-byte transaction", min - 1))
     );
     let small = spend_tx(2, &[1_000]);
-    assert_eq!(check_min_fee(&small, tokenomics::MIN_TX_FEE_SAT), Ok(()));
-    assert!(check_min_fee(&small, tokenomics::MIN_TX_FEE_SAT - 1).is_err());
+    assert_eq!(check_min_fee(&small, tokenomics::MIN_TX_FEE_SAT, &[]), Ok(()));
+    assert!(check_min_fee(&small, tokenomics::MIN_TX_FEE_SAT - 1, &[]).is_err());
+}
+
+#[test]
+fn change_is_an_output_to_a_spent_coin_script() {
+    let mut tx = spend_tx(1, &[700, 300]);
+    tx.outputs[0].script_pubkey = vec![0x11; 20];
+    tx.outputs[1].script_pubkey = vec![0x22; 20];
+    let own = TxOutput { value: 1_000, script_pubkey: vec![0x22; 20] };
+    let other = TxOutput { value: 1_000, script_pubkey: vec![0x33; 20] };
+    assert_eq!(paid_to_others_sat(&tx, &[own.clone()]), 700, "output 1 is change");
+    assert_eq!(paid_to_others_sat(&tx, &[other.clone()]), 1_000, "no change");
+    assert_eq!(paid_to_others_sat(&tx, &[]), 1_000);
+    tx.outputs[0].script_pubkey = vec![0x22; 20];
+    assert_eq!(paid_to_others_sat(&tx, &[other, own]), 0, "everything back to a spent script");
+    let max = Transaction { outputs: vec![TxOutput { value: u64::MAX, script_pubkey: vec![1; 20] }; 3], ..tx };
+    assert_eq!(paid_to_others_sat(&max, &[]), 3 * u64::MAX as u128, "exact in u128");
 }
 
 #[test]

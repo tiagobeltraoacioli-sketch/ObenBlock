@@ -125,7 +125,7 @@ export async function loadCore(url, sha256Hex) {
       const r = call({ op: "normalize", address: String(address ?? "").trim() });
       return { address: r.address, network: r.network };
     },
-    minFee: (size) => call({ op: "minfee", size }).fee,
+    minFee: (size, amount = 0n) => call({ op: "minfee", size, amount: String(amount) }).fee,
     // BIP174-style public roles; the document remains a string so duplicate
     // JSON fields reach the strict shared parser. Caller-supplied `op` cannot
     // redirect this public-data binding to an operation using the session key.

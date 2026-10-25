@@ -306,7 +306,7 @@ id (POW-8; re-audit B1-T0).
 
 ## Value ranges (MoneyRange, all heights)
 
-`MAX_SUPPLY_SAT = 12,500,000 GNB = 1.25 x 10^15` base units. A block is
+`MAX_SUPPLY_SAT = 1,000,000 OBB = 10^14` base units. A block is
 invalid if any of these values leaves `0..=MAX_SUPPLY_SAT` (a sum that
 overflows u64 is out of range too):
 

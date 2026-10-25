@@ -37,7 +37,7 @@ activation" regime, the vectors pin this chain's rule:
   below the activation and `tx-64-bytes` (the context-free rule, first) from
   it; the 10,000-byte output script is `bad-output-script`.
 - **Caps**: `script_sig` up to 114,834 bytes (the largest policy witness),
-  `script_pubkey` up to 10,000; `MAX_SUPPLY_SAT` 12,500,000 GNB; genesis
+  `script_pubkey` up to 10,000; `MAX_SUPPLY_SAT` 1,000,000 OBB (the 2026-10-25 cap); genesis
   timestamp 1,791,685,648.
 - **PoW + PoWit from height 10,000** (mainnet): the block encoding and body
   root carry the PoWit section (`reference/gnb_merkle.py` `header_root`),
@@ -537,7 +537,7 @@ build):
 | minimum fee off by one | node | `fee/exact-minimum/*` (consensus and mempool) |
 | tagged Merkle tree pairs an odd node with itself | both | gnb-crypto: tagged and witness roots of 25 block cases; node: the 5 post-activation blocks with an odd transaction count |
 | coinbase may not claim the full subsidy + fees | node | 27 block cases |
-| block size measured on bincode from the activation | both | `size/bincode-1000001-wire-below/post` |
+| block size measured on bincode from the activation | both | `size/wire-1000001-bincode-below/post` (the `size/bincode-1000001-wire-below` pair left with the 1,000,000 OBB cap: no transaction within MoneyRange has enough outputs above 2^32 to make bincode exceed the wire size) |
 | hardened pow limit = the old pow limit | both | `pow/pow-limit-bits-from-the-activation`, `pow/genesis-target-plus-one-from-the-activation`, `pow/mainnet-17500-pow-limit-bits` |
 | commitment height also accepted big-endian | both | `commitment/height-big-endian/post` |
 | lenient witness framing made exact below the activation | both | `witness/one-trailing-byte/pre`, `witness/1000-trailing-bytes/pre`, `size/script-sig-10000-bytes/pre`, `fee/witness-padding-raises-the-minimum/pre`, `witness/padded-witness-same-block-id/pre` |
@@ -708,8 +708,8 @@ version 1 at it.
   audit's VAL-11 remediation merged by 28a619d; every release of this chain
   before 28a619d accepts these blocks), and
   `value/chained-spends-output-total-above-max-supply/{pre,post}` (three
-  chained spends of a 4,500,000 GNB coin, outputs summing to about
-  13,500,000 GNB, above the 12,500,000 GNB supply) are new and valid. The effectiveness rows above that name
+  chained spends of a 400,000 OBB coin, outputs summing to about
+  1,200,000 OBB, above the 1,000,000 OBB supply) are new and valid. The effectiveness rows above that name
   the block-wide sum ("block-wide output total not summed", and that case in
   the `check_block_money_range` row) describe the rule as it was; the runners
   now require both cases to be valid (`vector_coverage`), and restoring the

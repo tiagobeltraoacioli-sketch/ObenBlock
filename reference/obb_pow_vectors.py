@@ -17,7 +17,7 @@ import obb_pow as o
 
 VECTOR_FILE = Path(__file__).with_name("obb_pow_vectors.json")
 GENESIS_TIME = 1_800_000_000          # an example anchor time (O6c fixes the real one)
-FULL_SUBSIDY = 107_020_547            # tokenomics::INITIAL_SUBSIDY_SAT
+FULL_SUBSIDY = 8_561_643              # tokenomics::INITIAL_SUBSIDY_SAT
 
 
 class Rng:

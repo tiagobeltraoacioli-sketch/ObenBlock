@@ -715,7 +715,7 @@ fn self_check(
         return Err(TemplateReject::Evict(format!("inputs {} < outputs {}", total_in, total_out)));
     }
     let fee = total_in - total_out;
-    core::check_min_fee(tx, fee).map_err(TemplateReject::Evict)?;
+    core::check_min_fee(tx, fee, &prevouts).map_err(TemplateReject::Evict)?;
     if verify_scripts {
         // Normally a verified-signature cache hit: pooled transactions were
         // verified at admission, re-injected ones when their block connected.

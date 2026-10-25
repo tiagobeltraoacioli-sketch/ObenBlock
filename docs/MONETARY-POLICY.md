@@ -1,29 +1,33 @@
 # ObenBlock monetary policy
 
-Consensus rules, defined in `crates/gnb-crypto/src/core/tokenomics.rs` and
-`crates/gnb-crypto/src/core/carryover.rs`. They are GnB's (ticker GNB), as
-the code implements them today. The ObenBlock relaunch (ticker OBB) keeps the
-same cap and allocations. Its genesis carries no balance from the GnB chain
-and pays the Bloch carryover exactly as GnB's genesis does: the same
-snapshot, conversion and keys. It adds a slow start, in which the subsidy
-ramps up over the first 5,760 blocks
-([DESIGN-obenblock.md](DESIGN-obenblock.md) §3, §4.2). That is not
-implemented yet.
+Consensus rules, defined in `crates/gnb-crypto/src/core/tokenomics.rs`,
+`crates/gnb-crypto/src/core/carryover.rs` and
+`crates/gnb-crypto/src/core/witness_share.rs`. ObenBlock (ticker OBB) keeps
+the four allocations of GnB's tokenomics, scaled to a 1,000,000 OBB cap
+(owner decision, 2026-10-25). Its genesis carries no balance from the GnB
+chain and pays the Bloch carryover from the same snapshot to the same keys,
+converted proportionally to 8% of the cap. The subsidy ramps up over the
+first 5,760 blocks (slow start, [DESIGN-obenblock.md](DESIGN-obenblock.md)
+§3, §4.2). The constants are shared with the discontinued GnB chain; the 1%
+payment fee and the fee split below are ObenBlock rules (GnB keeps the size
+floor and 100% of fees to the miner).
 
-## Hard cap: 12,500,000 GNB
+## Hard cap: 1,000,000 OBB
 
 | Allocation | Share | Amount |
 | --- | --- | --- |
-| Bloch Genesis-3 carryover | 8% | 1,000,000 GNB (999,999.99789793 issued after rounding) |
-| Team, locked | 10% | 1,250,000 GNB |
-| Founder, locked | 10% | 1,250,000 GNB |
-| Mining | 72% | 9,000,000 GNB (8,999,998.51392253 issued after rounding) |
-| **Total issued** | | **12,499,998.51182046 GNB** |
+| Bloch Genesis-3 carryover | 8% | 80,000 OBB (79,999.99675352 issued after rounding) |
+| Team, locked | 10% | 100,000 OBB |
+| Founder, locked | 10% | 100,000 OBB |
+| Mining | 72% | 720,000 OBB (at most 719,999.33953557 issued after rounding) |
+| **Total, at most** | | **999,999.33628909 OBB** |
 
-No pools. **Until PoWit activates**, 100% of every subsidy and fee goes to the
-miner. From `powit_height()`, 20% of the subsidy pays witness shares (see
-[Mining subsidy](#mining-subsidy)); fees still go 100% to the miner. Mainnet
-keeps PoWit off (`POWIT_HEIGHT_MAINNET = u64::MAX`).
+The slow start withholds about 246 OBB more, and empty witness slots and
+rounding are never issued, so the real total is lower.
+
+No pools. Every block's subsidy AND its transaction fees are split between
+the miner (80%, plus an inclusion bonus) and the PoWit witnesses whose shares
+the block includes (20%, in 16 slots); see [Rewards](#rewards).
 
 ## Team and founder allocations (locked)
 
@@ -38,49 +42,63 @@ anyone, the beneficiary included.
 | Cliff | 1,051,200 blocks (1 year): nothing unlocks |
 | Tranches | 36, one every 87,600 blocks (1 month) |
 | Tranche k unlocks at | 1,051,200 + k × 87,600 (first 1,138,800; last 4,204,800, 4 years) |
-| Tranche value | 1,250,000 GNB / 36 = 34,722.22222222 GNB, remainder in the last |
+| Tranche value | 100,000 OBB / 36 = 2,777.77777777 OBB, remainder in the last (2,777.77777805 OBB) |
 | Founder | one key (1-of-1) |
 | Team | m-of-n multisig |
 
 The public keys live in `crates/gnb-crypto/genesis/vesting.json`; its
-SHA3-256 is the consensus constant `VESTING_SPEC_SHA3`, and the relaunch genesis
-coinbase text must commit to it (re-mined once the keys are set). Outpoints are synthetic, like the carryover:
+SHA3-256 is the consensus constant `VESTING_SPEC_SHA3`, and the genesis
+coinbase text commits to it. Outpoints are synthetic, like the carryover:
 `txid = SHA3-256("GNB-VESTING-v1" ‖ role ‖ k ‖ policy hash)`, `vout = 0`.
 Until the file holds the keys, nodes refuse to create a genesis ledger.
 
 ## Mining subsidy
 
-- Initial subsidy 1.07020547 GNB per block (floor(9,000,000 GNB / (2 × 4,204,800))).
+- Initial subsidy 0.08561643 OBB per block (floor(720,000 OBB / (2 × 4,204,800))),
+  reached after the slow start (`floor(full × min(h, 5,760) / 5,760)`).
 - Halving every 4,204,800 blocks (4 × 365 days at 30 s), by integer right
   shift in base units.
-- The subsidy reaches zero after 27 halvings (height 113,529,600, about 108
+- The subsidy reaches zero after 24 halvings (height 100,915,200, about 96
   years) and stays zero. There is no tail emission.
 - The genesis block pays nothing; mining starts at height 1.
-- **Before PoWit:** the coinbase has exactly one output, worth at most
-  subsidy + fees, paid to an address of the miner's choice. 100% of fees go
-  to the miner.
-- **From PoWit activation:** the subsidy splits 80% to the miner and 20% to
-  16 witness-share slots (`core::witness_share::split_subsidy`). Each
-  included share pays 90% of a slot to its payout script, and the miner gets
-  the other 10% as an inclusion bonus. Coinbase output 0 pays the miner (at
-  most its part plus 100% of fees); outputs `1..=n` pay the shares exactly.
-  Empty slots are not issued, so mined issuance can only fall below the
-  schedule above, never exceed it. See
-  [DESIGN-witness-shares.md](DESIGN-witness-shares.md).
+
+## Rewards
+
+PoWit applies from height 0 on ObenBlock. The subsidy and the block's total
+fees are each split the same way (`core::witness_share::split_reward`):
+
+- 20% of the amount goes to 16 witness-share slots; each included share pays
+  90% of a slot to its payout script, and the miner gets the other 10% as an
+  inclusion bonus;
+- the miner gets the other 80%, plus the bonuses;
+- slots left empty are not paid: not issued for the subsidy, burned for the
+  fees. So the miner never gains by dropping other people's shares.
+
+Coinbase output 0 pays the miner at most its part; outputs `1..=n` pay each
+share exactly its slot of the subsidy plus its slot of the fees. See
+[DESIGN-witness-shares.md](DESIGN-witness-shares.md).
 
 ## Fees
 
 Every non-coinbase transaction must pay, by consensus,
 
 ```text
-min_fee = max(10,000, ceil(size_bytes × 2,000 / 1,000))   base units
-        = max(0.0001 GNB, 0.00002 GNB per kB)
+size_fee  = max(10,000, ceil(size_bytes × 2,000 / 1,000))        base units
+value_fee = ceil(paid_to_others × 100 / 10,000)                  (1%)
+min_fee   = max(size_fee, value_fee)
 ```
 
-A typical one-input, two-output transaction (hybrid ML-DSA-65 + Falcon-1024
-signature and public key, about 8.6 kB) pays at least about 0.00017 GNB. When
-the subsidy is exhausted, fees are the only miner revenue, and this floor
-keeps it from going to zero.
+`paid_to_others` is the value of the outputs that are not change. An output
+is change when its `script_pubkey` is the script of one of the coins the
+transaction spends (`core::paid_to_others_sat`). A consolidation to oneself
+pays the size floor only. Sending 1 OBB costs at least 0.01 OBB; a tiny
+payment pays the size floor (a typical one-input, two-output transaction of
+about 8.6 kB: about 0.00017 OBB).
+
+The rule is checked on data the txid commits to (outputs and spent coins), so
+no witness can lower it. A payee that contributes an input of its own to the
+transaction makes its output "change" by this definition; that is the one
+way around the 1%, and it needs the payee's signature.
 
 ## Bloch Genesis-3 carryover
 
@@ -94,8 +112,8 @@ Bloch Genesis-4 opened with (`genesis/bloch-g3-carryover.tsv.gz`):
 | SHA3-256 (uncompressed) | `3d67246e94881a17d302b464f79fee55886d8068794e76fed43081117fbe308d` |
 | SHA-256 (uncompressed) | `84ddbbac2afdd5c78618096a7d4f66cf5b04a3e5757a03fe90550e50096183f6` |
 
-Conversion, per output: `gnb = floor(blch × 1,000,000 GNB / 3,810,744,000 BLCH)`,
-same owner hash. A Genesis-3 block reward of 8,400 BLCH becomes 2.20429396 GNB.
+Conversion, per output: `obb = floor(blch × 80,000 OBB / 3,810,744,000 BLCH)`,
+same owner hash. A Genesis-3 block reward of 8,400 BLCH becomes 0.17634351 OBB.
 
 - One row of value 0 converts to nothing and is dropped: 452,725 UTXOs are
   written.

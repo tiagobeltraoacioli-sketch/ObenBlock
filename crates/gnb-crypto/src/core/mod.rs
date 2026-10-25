@@ -7,7 +7,7 @@ use sha2::Sha256;
 use sha3::{Digest, Sha3_256};
 use serde::{Serialize, Deserialize};
 
-/// Monetary policy: 12,500,000 GNB hard cap (carryover, locked team and founder, mining), consensus minimum fee.
+/// Monetary policy: 1,000,000 OBB hard cap (carryover, locked team and founder, mining), consensus minimum fee.
 pub mod tokenomics;
 pub mod policy;      // m-of-n multisig + absolute/relative timelocks
 pub mod vesting;     // locked team and founder allocations (genesis ledger)
@@ -330,10 +330,29 @@ pub fn asert_anchor() -> gnb_smh::difficulty::AsertAnchor {
     }
 }
 
-/// Consensus minimum fee check for a non-coinbase transaction paying `fee`.
-pub fn check_min_fee(tx: &Transaction, fee: u64) -> Result<(), String> {
+/// Value `tx` sends to others: the sum of its outputs that are not change.
+/// An output is change when its `script_pubkey` is byte-equal to the script
+/// of one of the coins it spends (`prevouts`, one per input; only the
+/// scripts are read). Exact in `u128`.
+pub fn paid_to_others_sat(tx: &Transaction, prevouts: &[TxOutput]) -> u128 {
+    tx.outputs.iter()
+        .filter(|o| !prevouts.iter().any(|p| p.script_pubkey == o.script_pubkey))
+        .map(|o| o.value as u128)
+        .sum()
+}
+
+/// Consensus minimum fee of `tx` spending `prevouts`
+/// (`tokenomics::min_tx_fee_for_sat` of its full wire size and of
+/// [`paid_to_others_sat`]).
+pub fn min_fee_of(tx: &Transaction, prevouts: &[TxOutput]) -> u64 {
+    tokenomics::min_tx_fee_for_sat(tx.to_wire_bytes(true).len(), paid_to_others_sat(tx, prevouts))
+}
+
+/// Consensus minimum fee check for a non-coinbase transaction paying `fee`
+/// and spending `prevouts` (one per input, in order).
+pub fn check_min_fee(tx: &Transaction, fee: u64, prevouts: &[TxOutput]) -> Result<(), String> {
     let size = tx.to_wire_bytes(true).len();
-    let min = tokenomics::min_tx_fee_sat(size);
+    let min = min_fee_of(tx, prevouts);
     if fee < min {
         return Err(format!("fee {fee} below consensus minimum {min} for a {size}-byte transaction"));
     }
@@ -1477,9 +1496,11 @@ impl Block {
         Ok(())
     }
 
-    /// From `powit_height()`: output 0 pays the miner at most its share of
-    /// the subsidy (`witness_share::split_subsidy`) plus fees; output `1 + k`
-    /// pays exactly `per_attester` to share `k`'s payout script. Nothing else.
+    /// From `powit_height()`: output 0 pays the miner at most its part of
+    /// the subsidy and fees (`witness_share::split_reward`: on ObenBlock the
+    /// fees are split like the subsidy); output `1 + k` pays exactly
+    /// `per_attester` (subsidy and fee parts) to share `k`'s payout script.
+    /// Nothing else.
     fn validate_coinbase_value_powit(&self, total_fees: u64) -> Result<(), &'static str> {
         let cb = &self.transactions[0];
         let shares = &self.powit.shares;
@@ -1489,9 +1510,9 @@ impl Block {
         if cb.outputs.len() != 1 + shares.len() {
             return Err("coinbase must have 1 miner output plus 1 output per witness share");
         }
-        let split = witness_share::split_subsidy(self.height, shares.len());
-        let max_miner = split.miner.checked_add(total_fees)
+        let split = witness_share::split_reward(self.height, total_fees, shares.len())
             .ok_or("coinbase reward computation overflowed (subsidy + fees)")?;
+        let max_miner = split.miner;
         if cb.outputs[0].value > max_miner {
             return Err("miner coinbase output exceeds allowed amount");
         }
@@ -1512,8 +1533,9 @@ impl Block {
             let v = tokenomics::block_subsidy_sat(height).saturating_add(total_fees);
             return vec![TxOutput { value: v, script_pubkey: miner_script }];
         }
-        let split = witness_share::split_subsidy(height, shares.len());
-        let mut outs = vec![TxOutput { value: split.miner.saturating_add(total_fees), script_pubkey: miner_script }];
+        let split = witness_share::split_reward(height, total_fees, shares.len())
+            .unwrap_or(witness_share::Split { miner: u64::MAX, per_attester: 0, unissued: 0 });
+        let mut outs = vec![TxOutput { value: split.miner, script_pubkey: miner_script }];
         outs.extend(shares.iter().map(|s| TxOutput { value: split.per_attester, script_pubkey: s.payout.clone() }));
         outs
     }

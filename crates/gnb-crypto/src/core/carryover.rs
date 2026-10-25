@@ -1,8 +1,8 @@
 //! Bloch Genesis-3 carryover: the opening ledger of GnB.
 //!
 //! GnB's genesis state is the Bloch Genesis-3 terminal snapshot (the same file
-//! Bloch Genesis-4 opened with), converted proportionally into 10% of the GNB
-//! hard cap. The snapshot is a TSV, one unspent output per line:
+//! Bloch Genesis-4 opened with), converted proportionally into 8% of the hard
+//! cap (80,000 OBB). The snapshot is a TSV, one unspent output per line:
 //!
 //! ```text
 //! txid_hex \t vout \t value_blch_sat \t script_pubkey_hex(20 bytes)
@@ -43,8 +43,8 @@ pub const CARRYOVER_SOURCE_ROWS: u64 = 452_726;
 pub const CARRYOVER_SOURCE_TOTAL_SAT: u64 = 3_810_744_000 * SAT_PER_GNB;
 /// UTXOs written to the GnB genesis ledger (zero conversions dropped).
 pub const CARRYOVER_CONVERTED_UTXOS: u64 = 452_725;
-/// GNB base units written to the genesis ledger (999,999.99789793 GNB).
-pub const CARRYOVER_CONVERTED_TOTAL_SAT: u64 = 99_999_999_789_793;
+/// Base units written to the genesis ledger (79,999.99675352 OBB).
+pub const CARRYOVER_CONVERTED_TOTAL_SAT: u64 = 7_999_999_675_352;
 /// Corrupted vout written by the Bloch exporter, and the real vout.
 pub const CARRYOVER_BAD_VOUT: u32 = 0x0100_0000;
 pub const CARRYOVER_FIXED_VOUT: u32 = 1;
@@ -190,8 +190,8 @@ mod tests {
     fn conversion_is_proportional_and_rounds_down() {
         assert_eq!(convert_value(CARRYOVER_SOURCE_TOTAL_SAT), CARRYOVER_ALLOCATION_SAT);
         assert_eq!(convert_value(0), 0);
-        // One Genesis-3 coinbase (8,400 BLCH) = 2.20429396 GNB.
-        assert_eq!(convert_value(8_400 * SAT_PER_GNB), 220_429_396);
+        // One Genesis-3 coinbase (8,400 BLCH) = 0.17634351 OBB.
+        assert_eq!(convert_value(8_400 * SAT_PER_GNB), 17_634_351);
         assert_eq!(convert_value(1), 0);
         assert_eq!(convert_value(u64::MAX), ((u64::MAX as u128 * CARRYOVER_ALLOCATION_SAT as u128) / CARRYOVER_SOURCE_TOTAL_SAT as u128) as u64);
     }
@@ -256,7 +256,7 @@ mod tests {
         let c = parse_and_convert(text.as_bytes()).unwrap();
         assert_eq!(c.source_rows, 3);
         assert_eq!(c.source_total_sat, 3 + 8_400 * SAT_PER_GNB as u128);
-        assert_eq!(c.converted_total_sat, 220_429_396);
+        assert_eq!(c.converted_total_sat, 17_634_351);
         assert_eq!((c.dropped_zero, c.fixed_vouts), (2, 0), "1 sat and 0 sat both convert to 0");
         assert_eq!(c.utxos.len(), 1);
         assert_eq!((c.utxos[0].txid, c.utxos[0].vout), ([2; 32], 5));
@@ -281,7 +281,7 @@ mod tests {
         assert_eq!(f[1], format!("snapshot has 2 rows, chain requires {CARRYOVER_SOURCE_ROWS}"));
         assert_eq!(f[2], format!("snapshot sums to {} BLCH sat, chain requires {CARRYOVER_SOURCE_TOTAL_SAT}", 8_400 * SAT_PER_GNB));
         assert_eq!(f[3], format!("1 converted UTXOs, chain requires {CARRYOVER_CONVERTED_UTXOS}"));
-        assert_eq!(f[4], format!("converted total 220429396 sat, chain requires {CARRYOVER_CONVERTED_TOTAL_SAT}"));
+        assert_eq!(f[4], format!("converted total 17634351 sat, chain requires {CARRYOVER_CONVERTED_TOTAL_SAT}"));
         // A structurally broken snapshot reports the parse failures only.
         assert_eq!(verify_and_convert(b"x\n").unwrap_err().len(), 1);
     }

@@ -512,7 +512,9 @@ impl Wallet {
             locktime: 0,
         };
         let actual_fee = selected_total - amount - change;
-        payment::check_unsigned_fee(&tx, actual_fee, self.keypair.public.len(), fee_policy)
+        let paid_to_others: u128 =
+            if recipient.hash() == self.address.hash() { 0 } else { amount as u128 };
+        payment::check_unsigned_fee(&tx, actual_fee, self.keypair.public.len(), fee_policy, paid_to_others)
             .map_err(WalletError::FeeTooHigh)?;
         Ok(tx)
     }
