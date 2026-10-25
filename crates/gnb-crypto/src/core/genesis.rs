@@ -99,21 +99,23 @@ pub const OBB_MAINNET_GENESIS_TEXT: &str = obb_genesis_text!("mainnet");
 /// Genesis text of ObenBlock regtest.
 pub const OBB_REGTEST_GENESIS_TEXT: &str = obb_genesis_text!("regtest");
 
-// LAUNCH PLACEHOLDER (owner decision, docs/DESIGN-obenblock.md §3: the
-// mainnet genesis is mined at launch). The three values below and
-// `OBB_MAINNET_GENESIS_HASH` are produced by
-// `OBB_MAINNET_GENESIS_MINE_COMMAND` with the launch timestamp; until then
-// the timestamp is 0 and a node refuses to start ObenBlock mainnet.
+// LAUNCHED: mined with `OBB_MAINNET_GENESIS_MINE_COMMAND` at the launch
+// timestamp (docs/OBENBLOCK-GENESIS.md; deploy/obenblock-launch). Block id
+// 000000004baf19fe8f8ece82d6d3bcd203aafd7afc4adb21acb21becbbb8437b (display order).
 /// Unix time of the ObenBlock mainnet genesis (also the ASERT anchor time).
-/// **0 = not launched (placeholder).**
-pub const OBB_MAINNET_GENESIS_TIMESTAMP: u64 = 0;
+pub const OBB_MAINNET_GENESIS_TIMESTAMP: u64 = 1792968604;
 /// Header version of the mainnet genesis: [`OBB_BLOCK_VERSION`] plus the
-/// BIP 320 bits the genesis search rolled. **Placeholder until launch.**
-pub const OBB_MAINNET_GENESIS_VERSION: u32 = OBB_BLOCK_VERSION;
-/// Nonce of the mainnet genesis. **Placeholder until launch.**
-pub const OBB_MAINNET_GENESIS_NONCE: u64 = 0;
-/// Block id of the mainnet genesis. **All zero = not launched (placeholder).**
-pub const OBB_MAINNET_GENESIS_HASH: [u8; 32] = [0u8; 32];
+/// BIP 320 bits the genesis search rolled.
+pub const OBB_MAINNET_GENESIS_VERSION: u32 = 0x20002000;
+/// Nonce of the mainnet genesis.
+pub const OBB_MAINNET_GENESIS_NONCE: u64 = 3658528418;
+/// Block id of the mainnet genesis (raw SHA-256d digest).
+pub const OBB_MAINNET_GENESIS_HASH: [u8; 32] = [
+    0x7b, 0x43, 0xb8, 0xbb, 0xec, 0x1b, 0xb2, 0xac,
+    0x21, 0xdb, 0x4a, 0xfc, 0x7a, 0xfd, 0xaa, 0x03,
+    0xd2, 0xbc, 0xd3, 0xd6, 0x82, 0xce, 0x8e, 0x8f,
+    0xfe, 0x19, 0xaf, 0x4b, 0x00, 0x00, 0x00, 0x00,
+];
 /// Header bits of the mainnet genesis: the pow limit (difficulty 1).
 pub const OBB_MAINNET_GENESIS_BITS: u32 = OBB_POW_LIMIT_BITS;
 

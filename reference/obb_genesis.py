@@ -63,9 +63,9 @@ def genesis_text(network: str) -> str:
 
 
 NETWORKS = {
-    # LAUNCH PLACEHOLDER: at launch add "timestamp", "version" and "nonce"
-    # (the constants gnb-mine-genesis printed) and run --write.
-    "mainnet": {"bits": o.POW_LIMIT_BITS},
+    # LAUNCHED: the constants gnb-mine-genesis printed at launch.
+    "mainnet": {"bits": o.POW_LIMIT_BITS,
+                "timestamp": 1792968604, "version": 0x20002000, "nonce": 3658528418},
     "regtest": {"bits": o.REGTEST_POW_LIMIT_BITS,
                 "timestamp": 1_792_281_600, "version": o.BLOCK_VERSION, "nonce": 0},
 }
